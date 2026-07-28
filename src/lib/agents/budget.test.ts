@@ -1,15 +1,18 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-// ── Supabase mock ───────────────────────────────────────────────────────────
-const supabaseMock: any = {
-    from: vi.fn(),
-    select: vi.fn(),
-    eq: vi.fn(),
-    insert: vi.fn(),
-    update: vi.fn(),
-    upsert: vi.fn(),
-    maybeSingle: vi.fn(),
-};
+// ── Supabase mock (vi.hoisted so it exists when vi.mock factory runs) ──────
+const { supabaseMock } = vi.hoisted(() => {
+    const supabaseMock: any = {
+        from: vi.fn(),
+        select: vi.fn(),
+        eq: vi.fn(),
+        insert: vi.fn(),
+        update: vi.fn(),
+        upsert: vi.fn(),
+        maybeSingle: vi.fn(),
+    };
+    return { supabaseMock };
+});
 
 function resetChain() {
     supabaseMock.from.mockReturnValue(supabaseMock);

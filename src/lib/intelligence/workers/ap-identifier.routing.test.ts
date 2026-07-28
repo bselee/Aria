@@ -9,62 +9,66 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// ─── Mocks ────────────────────────────────────────────────────────────────────
+// ─── Mocks (vi.hoisted so they exist when vi.mock factories run) ─────────────
 
-const mockGmailModify = vi.fn();
-const mockGmailGet = vi.fn();
-const mockGmailLabelsCreate = vi.fn();
-const mockGmailLabelsList = vi.fn();
-const mockStorageUpload = vi.fn();
+const { mockGmailModify, mockGmailGet, mockGmailLabelsCreate, mockGmailLabelsList, mockStorageUpload, mockSupabaseFrom } = vi.hoisted(() => {
+    const mockGmailModify = vi.fn();
+    const mockGmailGet = vi.fn();
+    const mockGmailLabelsCreate = vi.fn();
+    const mockGmailLabelsList = vi.fn();
+    const mockStorageUpload = vi.fn();
 
-const mockSupabaseFrom = vi.fn((table: string) => {
-    const chain: any = {
-        select: vi.fn(() => chain),
-        in: vi.fn(() => chain),
-        eq: vi.fn(() => chain),
-        is: vi.fn(() => chain),
-        lt: vi.fn(() => chain),
-        gte: vi.fn(() => chain),
-        order: vi.fn(() => chain),
-        limit: vi.fn(() => chain),
-        insert: vi.fn(() => ({ error: null })),
-        update: vi.fn(() => ({ eq: () => ({ error: null }) })),
-        maybeSingle: vi.fn(() => Promise.resolve({ data: null, error: null })),
-        single: vi.fn(() => Promise.resolve({ data: null, error: null })),
-    };
-    if (table === "email_inbox_queue") {
-        chain.limit = vi.fn(() => Promise.resolve({
-            data: [
-                {
-                    id: 1,
-                    gmail_message_id: "msg-terminix",
-                    from_email: "billing@terminix.com",
-                    subject: "Monthly Service Invoice",
-                    body_snippet: "Your Terminix pest control invoice",
-                    pdf_filenames: [],
-                    has_pdf: false,
-                    source_inbox: "ap",
-                    processed_by_ap: false,
-                },
-                {
-                    id: 2,
-                    gmail_message_id: "msg-autopot",
-                    from_email: "quickbooks@notification.intuit.com",
-                    subject: "New payment request from AutoPot USA - Invoice APUS-245389",
-                    body_snippet: "Invoice from AutoPot USA",
-                    pdf_filenames: ["Invoice_APUS245389_from_AutoPot_Watering_Systems_USA.pdf"],
-                    has_pdf: true,
-                    source_inbox: "ap",
-                    processed_by_ap: false,
-                },
-            ],
-            error: null,
-        }));
-    }
-    if (table === "ap_inbox_queue") {
-        chain.insert = vi.fn(() => Promise.resolve({ data: null, error: null }));
-    }
-    return chain;
+    const mockSupabaseFrom = vi.fn((table: string) => {
+        const chain: any = {
+            select: vi.fn(() => chain),
+            in: vi.fn(() => chain),
+            eq: vi.fn(() => chain),
+            is: vi.fn(() => chain),
+            lt: vi.fn(() => chain),
+            gte: vi.fn(() => chain),
+            order: vi.fn(() => chain),
+            limit: vi.fn(() => chain),
+            insert: vi.fn(() => ({ error: null })),
+            update: vi.fn(() => ({ eq: () => ({ error: null }) })),
+            maybeSingle: vi.fn(() => Promise.resolve({ data: null, error: null })),
+            single: vi.fn(() => Promise.resolve({ data: null, error: null })),
+        };
+        if (table === "email_inbox_queue") {
+            chain.limit = vi.fn(() => Promise.resolve({
+                data: [
+                    {
+                        id: 1,
+                        gmail_message_id: "msg-terminix",
+                        from_email: "billing@terminix.com",
+                        subject: "Monthly Service Invoice",
+                        body_snippet: "Your Terminix pest control invoice",
+                        pdf_filenames: [],
+                        has_pdf: false,
+                        source_inbox: "ap",
+                        processed_by_ap: false,
+                    },
+                    {
+                        id: 2,
+                        gmail_message_id: "msg-autopot",
+                        from_email: "quickbooks@notification.intuit.com",
+                        subject: "New payment request from AutoPot USA - Invoice APUS-245389",
+                        body_snippet: "Invoice from AutoPot USA",
+                        pdf_filenames: ["Invoice_APUS245389_from_AutoPot_Watering_Systems_USA.pdf"],
+                        has_pdf: true,
+                        source_inbox: "ap",
+                        processed_by_ap: false,
+                    },
+                ],
+                error: null,
+            }));
+        }
+        if (table === "ap_inbox_queue") {
+            chain.insert = vi.fn(() => Promise.resolve({ data: null, error: null }));
+        }
+        return chain;
+    });
+
+    return { mockGmailModify, mockGmailGet, mockGmailLabelsCreate, mockGmailLabelsList, mockStorageUpload, mockSupabaseFrom };
 });
 
 vi.mock("../../gmail/auth", () => ({

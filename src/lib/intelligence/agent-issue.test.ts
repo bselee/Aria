@@ -4,40 +4,51 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // default) so `await supabase.from(...).insert({...})` works in addition to
 // `.insert(...).select().single()`. Each terminal method (single, maybeSingle)
 // queues its own resolved value via mockResolvedValueOnce.
-let terminalAwaitValue: any = { error: null };
+//
+// vi.hoisted ensures the mock object exists when vi.mock factory runs (TDZ fix).
+const { supabaseMock, resetChain, setNextChainResult } = vi.hoisted(() => {
+    let terminalAwaitValue: any = { error: null };
 
-const supabaseMock: any = {
-    from: vi.fn(),
-    select: vi.fn(),
-    eq: vi.fn(),
-    in: vi.fn(),
-    upsert: vi.fn(),
-    update: vi.fn(),
-    insert: vi.fn(),
-    maybeSingle: vi.fn(),
-    single: vi.fn(),
-    then: (resolve: any) => resolve(terminalAwaitValue),
-};
+    const supabaseMock: any = {
+        from: vi.fn(),
+        select: vi.fn(),
+        eq: vi.fn(),
+        in: vi.fn(),
+        upsert: vi.fn(),
+        update: vi.fn(),
+        insert: vi.fn(),
+        maybeSingle: vi.fn(),
+        single: vi.fn(),
+        order: vi.fn(),
+        limit: vi.fn(),
+        then: (resolve: any) => resolve(terminalAwaitValue),
+    };
 
-function resetChain() {
-    terminalAwaitValue = { error: null };
-    supabaseMock.from.mockReturnValue(supabaseMock);
-    supabaseMock.select.mockReturnValue(supabaseMock);
-    supabaseMock.eq.mockReturnValue(supabaseMock);
-    supabaseMock.in.mockReturnValue(supabaseMock);
-    supabaseMock.upsert.mockReturnValue(supabaseMock);
-    supabaseMock.update.mockReturnValue(supabaseMock);
-    supabaseMock.insert.mockReturnValue(supabaseMock);
-}
+    function resetChain() {
+        terminalAwaitValue = { error: null };
+        supabaseMock.from.mockReturnValue(supabaseMock);
+        supabaseMock.select.mockReturnValue(supabaseMock);
+        supabaseMock.eq.mockReturnValue(supabaseMock);
+        supabaseMock.in.mockReturnValue(supabaseMock);
+        supabaseMock.upsert.mockReturnValue(supabaseMock);
+        supabaseMock.update.mockReturnValue(supabaseMock);
+        supabaseMock.insert.mockReturnValue(supabaseMock);
+        supabaseMock.order.mockReturnValue(supabaseMock);
+        supabaseMock.limit.mockReturnValue(supabaseMock);
+    }
+
+    function setNextChainResult(value: any) {
+        terminalAwaitValue = value;
+    }
+
+    return { supabaseMock, resetChain, setNextChainResult };
+});
 
 vi.mock("@/lib/db", () => ({ createClient: () => supabaseMock }));
 
 import { createOrAdvance, getCurrentlyHandlingCounts, findLinkedOpenTask } from "./agent-issue";
 
-// Helper: override what the chained supabase mock resolves to next time.
-function setNextChainResult(value: any) {
-    terminalAwaitValue = value;
-}
+// setNextChainResult and resetChain are provided by vi.hoisted above.
 
 describe("createOrAdvance", () => {
     beforeEach(() => {
@@ -118,7 +129,7 @@ describe("createOrAdvance", () => {
     });
 
     it("recordHandoff updates current_handler and writes ledger event", async () => {
-        terminalAwaitValue = { error: null };
+        setNextChainResult({ error: null });
         const { recordHandoff } = await import("./agent-issue");
         let appliedPatch: any = null;
         supabaseMock.update.mockImplementationOnce((p: any) => {

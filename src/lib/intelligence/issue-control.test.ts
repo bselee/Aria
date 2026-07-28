@@ -1,13 +1,16 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-// Mock supabase before importing the module under test.
-const supabaseMock: any = {
-    from: vi.fn(),
-    update: vi.fn(),
-    eq: vi.fn(),
-    select: vi.fn(),
-    single: vi.fn(),
-};
+// Mock supabase (vi.hoisted so it exists when vi.mock factory runs).
+const { supabaseMock } = vi.hoisted(() => {
+    const supabaseMock: any = {
+        from: vi.fn(),
+        update: vi.fn(),
+        eq: vi.fn(),
+        select: vi.fn(),
+        single: vi.fn(),
+    };
+    return { supabaseMock };
+});
 
 function resetChain() {
     supabaseMock.from.mockReturnValue(supabaseMock);
