@@ -49,6 +49,20 @@ const RETIRED_PANELS: ReadonlySet<string> = new Set([
     "chat-mirror",
     "reorder",
     "axiom-queue",
+    // HERMIA(2026-07-28): status wallpaper — not on the lean home surface.
+    // Still reachable via More → Builds / Activity if needed later; not auto-mounted.
+    "purchasing-calendar",
+    "vendor-scorecard",
+    "daily-ops-summary",
+    "dedup-activity",
+    "recent-runs",
+    "oversight",
+    "po-lifecycle",
+    "reconciliation",
+    "deposit-match",
+    "basauto-requests",
+    "statement-reconciliation",
+    "tracking-board",
 ]);
 
 export type ColumnId = "left" | "midLeft" | "midRight" | "right";
@@ -58,18 +72,16 @@ export const ALL_COLUMNS: ColumnId[] = ["left", "midLeft", "midRight", "right"];
 
 // ── Default layout — keep in sync with `src/app/dashboard/page.tsx` ─────────
 export const DEFAULT_LAYOUT: DashboardLayout = {
-    left: ["build-risk", "receivings", "basauto-requests"],
-    midLeft: [
-        "invoice-queue",
-        "statement-reconciliation",
-        "active-purchases",
-        "tracking-board",
-    ],
-    midRight: ["purchasing", "purchasing-calendar"],
-    right: ["activity", "build-schedule", "oversight", "recent-runs", "vendor-scorecard", "daily-ops-summary", "po-lifecycle", "dedup-activity", "reconciliation", "deposit-match"],
+    // HERMIA(2026-07-28): Lean default for legacy 4-col wall rollback only.
+    // Command board home is Lifecycle (Order/Active/Receivings). These panels
+    // are the actionable core; status wallpaper is not auto-mounted.
+    left: ["receivings"],
+    midLeft: ["invoice-queue", "active-purchases"],
+    midRight: ["purchasing"],
+    right: ["activity", "build-risk"],
 };
 
-export const LAYOUT_STORAGE_KEY = "aria-dash-layout";
+export const LAYOUT_STORAGE_KEY = "aria-dash-layout-v2-lean";
 
 function emptyLayout(): DashboardLayout {
     return { left: [], midLeft: [], midRight: [], right: [] };

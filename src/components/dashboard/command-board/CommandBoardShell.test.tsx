@@ -283,13 +283,16 @@ describe("CommandBoardShell", () => {
         expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
     });
 
-    it("clicking the Activity tab swaps in the activity panel", async () => {
+    it("More menu exposes Activity and switches to it", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
+        fireEvent.click(await screen.findByTestId("shell-tab-more"));
         const activityTab = await screen.findByTestId("shell-tab-activity");
         fireEvent.click(activityTab);
-        expect(activityTab.getAttribute("aria-selected")).toBe("true");
+        // option itself may not keep aria-selected after menu closes; active primary shows via More label
+        expect(await screen.findByTestId("shell-tab-more")).toBeTruthy();
+        expect(screen.getByTestId("shell-tab-more").textContent || "").toMatch(/Activity/i);
     });
 });
 

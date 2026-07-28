@@ -637,7 +637,7 @@ export default function ReceivedItemsPanel() {
 
         useEffect(() => {
             fetchReceivings();
-            const t = setInterval(() => fetchReceivings(true), 10 * 60 * 1000);
+            const t = setInterval(() => fetchReceivings(true), 30 * 60 * 1000);
             return () => clearInterval(t);
         }, [fetchReceivings]);
 

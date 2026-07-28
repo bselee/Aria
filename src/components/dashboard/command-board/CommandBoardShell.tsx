@@ -68,35 +68,38 @@ type TabDef = { id: TabId; label: string; render: () => React.ReactNode };
 const TAB_STORAGE_KEY = "aria-dash-active-tab";
 
 function PurchasingLifecyclePanel() {
+    // HERMIA(2026-07-28): Single vertical scroll — Order → Active → Receivings.
+    // 3-column squeeze made every panel fight for height and felt like three apps.
     return (
         <PurchasingLifecycleProvider>
-            <div className="flex flex-col h-full min-h-0 overflow-hidden">
-                <div
-                    className="flex-1 min-h-0 grid grid-cols-[minmax(560px,1.4fr)_minmax(480px,1fr)_minmax(400px,0.9fr)] gap-2 p-2 overflow-x-auto"
-                    data-testid="purchasing-lifecycle-panel"
+            <div
+                className="flex flex-col h-full min-h-0 overflow-y-auto gap-2 p-2"
+                data-testid="purchasing-lifecycle-panel"
+            >
+                <section
+                    className="shrink-0 min-h-[480px] border border-zinc-800/70 bg-zinc-950/50"
+                    data-testid="lifecycle-pane-ordering"
                 >
-            <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-ordering">
-                <div className="h-full min-h-0 overflow-hidden">
                     <PanelErrorBoundary label="PurchasingPanel">
                         <PurchasingPanel />
                     </PanelErrorBoundary>
-                </div>
-            </section>
-            <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-purchases">
-                <div className="h-full min-h-0 overflow-hidden">
+                </section>
+                <section
+                    className="shrink-0 min-h-[380px] border border-zinc-800/70 bg-zinc-950/50"
+                    data-testid="lifecycle-pane-purchases"
+                >
                     <PanelErrorBoundary label="ActivePurchasesPanel">
                         <ActivePurchasesPanel />
                     </PanelErrorBoundary>
-                </div>
-            </section>
-            <section className="min-w-0 min-h-0 overflow-hidden border border-zinc-800/70 bg-zinc-950/50" data-testid="lifecycle-pane-rcv">
-                <div className="h-full min-h-0 overflow-hidden">
+                </section>
+                <section
+                    className="shrink-0 min-h-[380px] border border-zinc-800/70 bg-zinc-950/50"
+                    data-testid="lifecycle-pane-rcv"
+                >
                     <PanelErrorBoundary label="ReceivedItemsPanel">
                         <ReceivedItemsPanel />
                     </PanelErrorBoundary>
-                </div>
-            </section>
-                </div>
+                </section>
             </div>
         </PurchasingLifecycleProvider>
     );
@@ -112,7 +115,7 @@ function HealthChip({ label, value, accent }: { label: string; value: string | n
     );
 }
 
-export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: CommandBoardShellProps) {
+export function CommandBoardShell({ pollIntervalMs = 5 * 60_000, fetchImpl }: CommandBoardShellProps) {
     const fx = fetchImpl ?? fetch;
 
     const [catalog, setCatalog] = useState<CommandBoardCatalog | null>(null);
@@ -123,10 +126,11 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     const [crons, setCrons] = useState<CommandBoardCron[]>([]);
 
     const [activeTab, setActiveTab] = useState<TabId>("lifecycle");
-    // Tabs that have been visited stay MOUNTED so switching back is instant.
-    // First visit pays the JIT-compile + data-fetch cost once; subsequent
-    // switches are pure CSS visibility flips.
-    const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["lifecycle"]));
+        // Tabs that have been visited stay MOUNTED so switching back is instant.
+        // First visit pays the JIT-compile + data-fetch cost once; subsequent
+        // switches are pure CSS visibility flips.
+        const [visitedTabs, setVisitedTabs] = useState<Set<TabId>>(new Set(["lifecycle"]));
+        const [moreOpen, setMoreOpen] = useState(false);
 
     const [refreshing, setRefreshing] = useState(false);
     const [lastError, setLastError] = useState<string | null>(null);
@@ -207,33 +211,52 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
     );
 
     const tabs: TabDef[] = useMemo(
-        () => [
-            { id: "lifecycle", label: "Lifecycle", render: () => <PurchasingLifecyclePanel /> },
-            {
-                id: "builds",
-                label: "Builds",
-                // Schedule + risk consolidated into one stacked view.
-                // All-needed components surface in Ordering (lifecycle tab), so
-                // this tab is for situational awareness on the build queue.
-                render: () => (
-                    <div className="flex flex-col h-full min-h-0 overflow-auto gap-2 p-2">
-                        <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
-                            {panelById("build-schedule")}
-                        </section>
-                        <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
-                            {panelById("build-risk")}
-                        </section>
-                    </div>
-                ),
-            },
-            { id: "axiom-skus", label: "Axiom SKUs", render: () => <AxiomSkuMappingPanel /> },
-            { id: "kanban", label: "Kanban", render: () => <KanbanBoard /> },
-            { id: "activity", label: "Activity", render: () => panelById("activity") },
-        ],
-        [panelById],
-    );
+            () => [
+                { id: "lifecycle", label: "Lifecycle", render: () => <PurchasingLifecyclePanel /> },
+                {
+                    id: "builds",
+                    label: "Builds",
+                    // Schedule + risk consolidated into one stacked view.
+                    // All-needed components surface in Ordering (lifecycle tab), so
+                    // this tab is for situational awareness on the build queue.
+                    render: () => (
+                        <div className="flex flex-col h-full min-h-0 overflow-auto gap-2 p-2">
+                            <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
+                                {panelById("build-schedule")}
+                            </section>
+                            <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
+                                {panelById("build-risk")}
+                            </section>
+                        </div>
+                    ),
+                },
+                { id: "axiom-skus", label: "Axiom SKUs", render: () => <AxiomSkuMappingPanel /> },
+                { id: "kanban", label: "Kanban", render: () => <KanbanBoard /> },
+                { id: "activity", label: "Activity", render: () => panelById("activity") },
+            ],
+            [panelById],
+        );
 
-    const activeTabDef = tabs.find(t => t.id === activeTab) ?? tabs[0];
+        // HERMIA(2026-07-28): Lifecycle is the only primary tab. Secondary tabs
+        // (Builds / Axiom / Kanban / Activity) live under a More menu so the home
+        // surface is one purchasing workflow, not five competing apps.
+        const primaryTabs = useMemo(() => tabs.filter(t => t.id === "lifecycle"), [tabs]);
+        const secondaryTabs = useMemo(() => tabs.filter(t => t.id !== "lifecycle"), [tabs]);
+
+        // Close More menu on outside click
+        useEffect(() => {
+            if (!moreOpen) return;
+            const onDown = (e: MouseEvent) => {
+                const t = e.target as HTMLElement | null;
+                if (t?.closest?.("[data-testid='shell-tab-more']")) return;
+                if (t?.closest?.("[role='listbox']")) return;
+                setMoreOpen(false);
+            };
+            document.addEventListener("mousedown", onDown);
+            return () => document.removeEventListener("mousedown", onDown);
+        }, [moreOpen]);
+
+        const activeTabDef = tabs.find(t => t.id === activeTab) ?? tabs[0];
 
     // Health summary
     const summaryCounts = useMemo(() => {
@@ -315,30 +338,77 @@ export function CommandBoardShell({ pollIntervalMs = 30_000, fetchImpl }: Comman
                     </button>
                 </header>
 
-            {/* Module tab bar */}
-            <nav
-                role="tablist"
-                aria-label="Operational modules"
-                className="flex flex-wrap gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/60"
-            >
-                {tabs.map(tab => (
-                    <button
-                        key={tab.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={activeTab === tab.id}
-                        onClick={() => setActiveTab(tab.id)}
-                        data-testid={`shell-tab-${tab.id}`}
-                        className={`px-2.5 py-1 rounded text-xs font-mono uppercase tracking-wider border transition-colors ${
-                            activeTab === tab.id
-                                ? "bg-blue-500/20 text-blue-100 border-blue-500/40"
-                                : "bg-zinc-900 text-zinc-300 border-zinc-800 hover:text-zinc-100 hover:border-zinc-700"
-                        }`}
-                    >
-                        {tab.label}
-                    </button>
-                ))}
-            </nav>
+            {/* Module tab bar — Lifecycle is home. Everything else lives under More. */}
+                        <nav
+                            role="tablist"
+                            aria-label="Operational modules"
+                            className="flex flex-wrap items-center gap-1 px-3 py-1.5 border-b border-zinc-800/60 bg-zinc-950/60"
+                        >
+                            {primaryTabs.map(tab => (
+                                <button
+                                    key={tab.id}
+                                    type="button"
+                                    role="tab"
+                                    aria-selected={activeTab === tab.id}
+                                    onClick={() => setActiveTab(tab.id)}
+                                    data-testid={`shell-tab-${tab.id}`}
+                                    className={`px-2.5 py-1 rounded text-xs font-mono uppercase tracking-wider border transition-colors ${
+                                        activeTab === tab.id
+                                            ? "bg-blue-500/20 text-blue-100 border-blue-500/40"
+                                            : "bg-zinc-900 text-zinc-300 border-zinc-800 hover:text-zinc-100 hover:border-zinc-700"
+                                    }`}
+                                >
+                                    {tab.label}
+                                </button>
+                            ))}
+                            {secondaryTabs.length > 0 && (
+                                <div className="relative ml-1">
+                                    <button
+                                        type="button"
+                                        data-testid="shell-tab-more"
+                                        aria-haspopup="listbox"
+                                        aria-expanded={moreOpen}
+                                        onClick={() => setMoreOpen(o => !o)}
+                                        className={`px-2.5 py-1 rounded text-xs font-mono uppercase tracking-wider border transition-colors ${
+                                            secondaryTabs.some(t => t.id === activeTab)
+                                                ? "bg-blue-500/20 text-blue-100 border-blue-500/40"
+                                                : "bg-zinc-900 text-zinc-300 border-zinc-800 hover:text-zinc-100 hover:border-zinc-700"
+                                        }`}
+                                    >
+                                        More{secondaryTabs.some(t => t.id === activeTab)
+                                            ? ` · ${secondaryTabs.find(t => t.id === activeTab)?.label}`
+                                            : ""} ▾
+                                    </button>
+                                    {moreOpen && (
+                                        <div
+                                            role="listbox"
+                                            className="absolute left-0 top-full mt-1 z-40 min-w-[10rem] rounded border border-zinc-700 bg-zinc-900 shadow-xl py-1"
+                                        >
+                                            {secondaryTabs.map(tab => (
+                                                <button
+                                                    key={tab.id}
+                                                    type="button"
+                                                    role="option"
+                                                    aria-selected={activeTab === tab.id}
+                                                    data-testid={`shell-tab-${tab.id}`}
+                                                    onClick={() => {
+                                                        setActiveTab(tab.id);
+                                                        setMoreOpen(false);
+                                                    }}
+                                                    className={`w-full text-left px-3 py-1.5 text-xs font-mono uppercase tracking-wider ${
+                                                        activeTab === tab.id
+                                                            ? "bg-blue-500/20 text-blue-100"
+                                                            : "text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
+                                                    }`}
+                                                >
+                                                    {tab.label}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </nav>
 
             {/* Main: full-canvas tab content. Every visited tab stays
                 mounted so switching is instant after first load — only

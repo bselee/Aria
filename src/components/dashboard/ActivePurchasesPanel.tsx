@@ -365,7 +365,7 @@ export default function ActivePurchasesPanel() {
 
     useEffect(() => {
         fetchPurchases();
-        const t = setInterval(() => fetchPurchases(true), 15 * 60 * 1000); // 15m
+        const t = setInterval(() => fetchPurchases(true), 30 * 60 * 1000); // 30m — Finale doesn't move that fast
         return () => clearInterval(t);
     }, [fetchPurchases]);
 
