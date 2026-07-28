@@ -22,15 +22,74 @@ import * as crypto from "crypto";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-/** Lazy — evaluated at first call so dotenv has time to load before the module is imported. */
+/**
+ * True when running under vitest / NODE_ENV=test.
+ *
+ * Deliberately checks VITEST (set by the runner itself) in addition to NODE_ENV,
+ * because vitest does not force NODE_ENV=test in every invocation path.
+ */
+function isTestEnv(): boolean {
+  return process.env.VITEST === "true" || process.env.NODE_ENV === "test";
+}
+
+/**
+ * Lazy — evaluated at first call so dotenv has time to load before the module is imported.
+ *
+ * TEST-ISOLATION GUARD (2026-07-28)
+ * ---------------------------------
+ * The `"http://localhost:5434"` literal below is a developer convenience for
+ * runtime, but under a test runner it was a live-data hazard: vitest does NOT load
+ * .env.local (no setupFiles / env plugin in vitest.config.ts), so PGRST_URL is
+ * undefined, the chain fell through to the literal, and createClient() returned a
+ * FULLY WORKING client aimed at the developer's real PostgREST.
+ *
+ * An unmocked test therefore did not crash — it silently succeeded against live
+ * data. Observed: po-receipt-recheck.test.ts and po-lifecycle.test.ts have ZERO
+ * vi.mock() calls and printed "9 POs checked" — nine real purchase orders. Their
+ * assertions are shape-only (toHaveProperty, >= 0), so any real response satisfies
+ * them; they could only ever fail on infrastructure timing, which made the suite
+ * nondeterministic (failing-file membership changed run to run under load).
+ *
+ * Today those paths only READ. The same fallback applies to writes, which is
+ * exactly how a unit test previously wrote to production data in this repo.
+ *
+ * So: in a test environment we refuse to silently invent a DB endpoint. Either the
+ * test mocks @/lib/db (the norm), or it opts in explicitly and visibly.
+ *
+ * ESCAPE HATCH for genuine integration tests:
+ *   ARIA_TEST_ALLOW_LIVE_DB=true  (plus a real PGRST_URL)
+ *
+ * Runtime behaviour is UNCHANGED: outside a test env the literal fallback still
+ * applies exactly as before.
+ */
 function getPgrstUrl(): string {
-  return (
+  const explicit =
     process.env.PGRST_URL ||
     process.env.PGREST_URL ||
     process.env.NEXT_PUBLIC_SUPABASE_URL?.replace(".supabase.co", "") ||
-    process.env.SUPABASE_URL ||
-    "http://localhost:5434"
-  );
+    process.env.SUPABASE_URL;
+
+  if (explicit) return explicit;
+
+  if (isTestEnv() && process.env.ARIA_TEST_ALLOW_LIVE_DB !== "true") {
+    throw new Error(
+      "[db] REFUSING to fall back to http://localhost:5434 under a test runner.\n" +
+      "  A test reached the real PostgREST client without mocking it, which means it was\n" +
+      "  about to read (or write) your LIVE local database.\n" +
+      "\n" +
+      "  Fix one of these:\n" +
+      "    1. Mock the module the code under test imports:\n" +
+      "         vi.mock(\"@/lib/db\", () => ({ createClient: () => fakeClient }))\n" +
+      "       NOTE: mocking \"@/lib/supabase\" does NOT work — it is only a re-export\n" +
+      "       shim of \"@/lib/db\" and nothing imports it on most paths.\n" +
+      "    2. For a deliberate integration test, set BOTH:\n" +
+      "         ARIA_TEST_ALLOW_LIVE_DB=true  and  PGRST_URL=<endpoint>\n" +
+      "\n" +
+      "  See skills/test-isolation-verification for the full rationale."
+    );
+  }
+
+  return "http://localhost:5434";
 }
 
 /**
@@ -41,7 +100,15 @@ function getPgrstUrl(): string {
  * @returns true if PostgREST returns a body (200 or 503 schema loading)
  */
 export async function probePostgrest(timeoutMs = 2000): Promise<boolean> {
-  const base = getPgrstUrl().replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
+  // Must stay non-throwing: callers use this as a cheap "is the DB up?" gate before
+  // optional enrichment, and several treat a throw as fatal. Under the test guard
+  // getPgrstUrl() throws by design, which correctly means "no DB available here".
+  let base: string;
+  try {
+    base = getPgrstUrl().replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
+  } catch {
+    return false;
+  }
   if (!base) return false;
   try {
     const res = await fetch(base + "/", {
@@ -58,6 +125,19 @@ export async function probePostgrest(timeoutMs = 2000): Promise<boolean> {
 
 const PGRST_SECRET =
   process.env.PGRST_JWT_SECRET || "aria-local-dev-secret-not-for-production";
+
+/**
+ * Retry budget for transient PostgREST failures (502/503/connection-refused).
+ *
+ * Overridable via ARIA_DB_MAX_RETRIES so the test harness can collapse it to 1:
+ * the default 3 attempts with 1s/2s/4s backoff exceeds vitest's 5s testTimeout,
+ * which turned a clean "no DB configured here" signal into a confusing timeout.
+ * Read lazily so vitest.setup.ts can set it before first use.
+ */
+function getMaxRetries(): number {
+  const raw = Number(process.env.ARIA_DB_MAX_RETRIES);
+  return Number.isFinite(raw) && raw > 0 ? raw : 3;
+}
 
 const SERVER_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "mock-key";
 
@@ -379,7 +459,7 @@ class QueryBuilder {
     // KAIZEN(2026-07-22): Retry transient failures (502=proxy rebind, 503=schema
     // cache reload, fetch failed=connection refused). Up to 3 attempts with
     // exponential backoff (1s → 2s → 4s). No retry on 4xx (client errors).
-    const MAX_RETRIES = 3;
+    const MAX_RETRIES = getMaxRetries();
     let lastError: any = null;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -516,7 +596,7 @@ class RpcBuilder {
     };
 
     // Retry transient failures (502/503/fetch errors) up to 3x with backoff
-    const MAX_RETRIES = 3;
+    const MAX_RETRIES = getMaxRetries();
     let lastError: any = null;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {

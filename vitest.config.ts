@@ -7,6 +7,10 @@ export default defineConfig({
         environment: "node",
         include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
         exclude: ["node_modules", ".next"],
+        // Test-isolation guardrails — points DB/network env at unroutable addresses so
+        // an unmocked test fails fast instead of silently hitting the live local DB.
+        // See vitest.setup.ts for the full incident rationale.
+        setupFiles: ["./vitest.setup.ts"],
     },
     resolve: {
         alias: {

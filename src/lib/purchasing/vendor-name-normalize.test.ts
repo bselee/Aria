@@ -232,7 +232,46 @@ describe("resolveCanonicalVendor", () => {
     });
 });
 
-// ── loadVendorAliases (integration-light) ──────────────────────────────────
+// ── loadVendorAliases ───────────────────────────────────────────────────────
+// GUARD FIX (2026-07-28): these three cases used to hit the LIVE local database.
+// The original comment read "the DB is local, so no mocking needed" and one test
+// asserted "vendor_aliases has 32 rows" — a value that drifts the moment anyone
+// edits the table, and which only passed because vitest never loaded .env.local so
+// db.ts silently fell back to the developer's real PostgREST on :5434.
+//
+// Now the DB is mocked, so these assert the CACHING CONTRACT (the actual unit under
+// test) rather than the current contents of a live table. That makes them
+// deterministic and safe: previously they contributed to a suite whose failing-file
+// membership changed between identical runs, because they raced real HTTP.
+//
+// For a genuine end-to-end check against the real table, run with
+// ARIA_TEST_ALLOW_LIVE_DB=true — see vitest.setup.ts.
+
+// `aliasQueryResult` is mutable so individual tests can flip the mock between the
+// happy path and the error branch. It goes through vi.hoisted() because vitest
+// hoists vi.mock() above the module body — a plain `const` would be in the Temporal
+// Dead Zone when the factory runs (the exact TDZ bug fixed in a158788).
+const { aliasRows, getAliasQueryResult, setAliasQueryResult } = vi.hoisted(() => {
+    const aliasRows = [
+        { finale_supplier_name: "BUILDASOIL", alias: "Build A Soil" },
+        { finale_supplier_name: "ULINE", alias: "Uline Shipping" },
+    ];
+    let current: { data: unknown; error: unknown } = { data: aliasRows, error: null };
+    return {
+        aliasRows,
+        getAliasQueryResult: () => current,
+        setAliasQueryResult: (v: { data: unknown; error: unknown }) => { current = v; },
+    };
+});
+
+vi.mock("@/lib/db", () => ({
+    createClient: () => ({
+        from: () => ({
+            select: () => Promise.resolve(getAliasQueryResult()),
+        }),
+    }),
+    probePostgrest: () => Promise.resolve(true),
+}));
 
 describe("loadVendorAliases", () => {
     beforeEach(() => {
@@ -243,9 +282,7 @@ describe("loadVendorAliases", () => {
         clearVendorAliasesCache();
     });
 
-    it("returns rows from the live database (vendor_aliases has 32 rows)", async () => {
-        // This is a light integration test — the DB is local, so no mocking needed.
-        // The table has exactly 32 rows as verified during setup.
+    it("returns alias rows with the expected shape", async () => {
         const rows = await loadVendorAliases();
         expect(rows.length).toBeGreaterThanOrEqual(1);
         expect(rows[0]).toHaveProperty("finale_supplier_name");
@@ -261,17 +298,19 @@ describe("loadVendorAliases", () => {
         expect(rows1).toBe(rows2);
     });
 
-    it("returns empty array gracefully on error when no cache exists", async () => {
-        // Temporarily break the DB URL to force an error
-        const origUrl = process.env.PGRST_URL;
-        process.env.PGRST_URL = "http://localhost:1";
+    it("degrades to an empty array when the query errors and no cache exists", async () => {
+        // Drive the ERROR branch explicitly: flip the shared mock to return a
+        // PostgREST-style error for this one call. Previously this test broke
+        // PGRST_URL to force a real connection failure, which only "worked" because
+        // the suite was talking to a live DB in the first place.
+        setAliasQueryResult({ data: null, error: { message: "relation does not exist" } });
         clearVendorAliasesCache();
 
         const rows = await loadVendorAliases();
         expect(rows).toEqual([]);
 
-        // Restore
-        process.env.PGRST_URL = origUrl;
+        // Restore the happy path so later tests are unaffected.
+        setAliasQueryResult({ data: aliasRows, error: null });
         clearVendorAliasesCache();
     });
 });
