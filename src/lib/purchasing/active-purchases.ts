@@ -10,7 +10,6 @@
 import { leadTimeService } from "../builds/lead-time-service";
 import type { FinaleClient, FullPO } from "../finale/client";
 import { createClient, probePostgrest } from "../db";
-import { RECEIVED_DASHBOARD_RETENTION_DAYS, shouldKeepReceivedPurchase } from "./calendar-lifecycle";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
 import { classifyShipmentEvidence, listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
@@ -211,22 +210,21 @@ export async function loadActivePurchases(
 
             completionSignals = await loadPOCompletionSignalIndex(db, poNumbers);
 
-            const healMismatches: Array<{ po_number: string; lifecycle_stage: string; last_movement_summary: string; updated_at: string }> = [];
+            const healMismatches: Array<{ po_number: string; last_movement_summary: string; updated_at: string }> = [];
             for (const po of pos) {
                 if (!po.orderId) continue;
                 const isRcvd = hasPurchaseOrderReceipt({ status: po.status, receiveDate: po.receiveDate, shipments: po.shipments });
                 if (!isRcvd) continue;
                 const lifecycle = lifecycleMap.get(po.orderId);
                 if (!lifecycle) continue;
-                const stage = lifecycle.lifecycle_stage;
-                if (stage === "sent" || stage === "vendor_acknowledged" || stage === "tracking_unavailable" || stage === "ap_follow_up") {
+                const rawStage = lifecycle.lifecycle_stage;
+                if (rawStage === "sent" || rawStage === "vendor_acknowledged" || rawStage === "tracking_unavailable" || rawStage === "ap_follow_up") {
                     healMismatches.push({
                         po_number: po.orderId,
-                        lifecycle_stage: "received",
-                        last_movement_summary: `Auto-healed ${new Date().toISOString().slice(0, 10)}: Finale reports received but lifecycle was stuck at "${stage}"`,
+                        last_movement_summary: `Auto-healed ${new Date().toISOString().slice(0, 10)}: Finale reports received but lifecycle was stuck at "${rawStage}"`,
                         updated_at: new Date().toISOString(),
                     });
-                    lifecycleMap.set(po.orderId, { ...lifecycle, lifecycle_stage: "received" });
+                    lifecycleMap.set(po.orderId, { ...lifecycle, lifecycle_stage: "RECEIVED" });
                 }
             }
             if (healMismatches.length > 0) {
@@ -238,6 +236,19 @@ export async function loadActivePurchases(
                     console.log(`[active-purchases] Self-healed ${healMismatches.length} PO lifecycle_stage mismatches`);
                 } catch (e: any) {
                     console.warn("[active-purchases] Self-heal upsert failed:", e.message);
+                }
+                // Fire-and-forget lifecycle transitions for each healed PO
+                try {
+                    const { transitionLifecycleState } = await import("./po-lifecycle");
+                    for (const match of healMismatches) {
+                        transitionLifecycleState(match.po_number, "RECEIVED", "active-purchases-selfheal", {
+                            detail: "received",
+                            autoHealed: true,
+                            summary: match.last_movement_summary,
+                        }).catch(() => {});
+                    }
+                } catch (tlErr: any) {
+                    console.warn("[active-purchases] Self-heal lifecycle transitions failed:", tlErr.message);
                 }
             }
         } catch (e: any) {
@@ -287,8 +298,10 @@ export async function loadActivePurchases(
             continue;
         }
 
-        // Finale-only: hide old fully-received POs outside retention window
-        if (isReceived && !shouldKeepReceivedPurchase(resolvedReceiveDate, RECEIVED_DASHBOARD_RETENTION_DAYS)) {
+        // Received with no exceptions → move to Receivings, not Active Purchases.
+        // Active Purchases tracks goods that haven't arrived yet.
+        // Only keep received POs if there's an unresolved problem (exception, partial, missing).
+        if (isReceived && completionState !== "exception") {
             continue;
         }
 

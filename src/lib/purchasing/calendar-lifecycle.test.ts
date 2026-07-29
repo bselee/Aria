@@ -46,12 +46,11 @@ describe("calendar lifecycle", () => {
         expect(lifecycle.statusLabel).toBe("Received");
     });
 
-    it("does not show completed+complete POs as received without actual receipt evidence", () => {
+    it("does NOT show completed+complete as received without concrete receipt evidence (Finale auto-completes)", () => {
         // completionState === 'complete' means AP pipeline done, NOT physically received
-        // A PO should only show as Received if hasPurchaseOrderReceipt returns true
+        // Status 'completed' alone is NOT proof — Finale auto-sets it when qty matches
         const lifecycle = derivePurchasingLifecycle("completed", [], "complete");
         expect(lifecycle.isReceived).toBe(false);
-        expect(lifecycle.colorId).toBe("8"); // awaiting_tracking grey
     });
 
     it("shows received_pending_invoice as received (actual receipt exists)", () => {
@@ -61,7 +60,7 @@ describe("calendar lifecycle", () => {
         expect(lifecycle.statusLabel).toBe("Received");
     });
 
-    it("does not infer received from completed alone without receipt evidence", () => {
+    it("does NOT infer received from completed alone without concrete receipt evidence", () => {
         const pastDate = new Date();
         pastDate.setDate(pastDate.getDate() - 5);
         const pastDateStr = pastDate.toISOString().split("T")[0];

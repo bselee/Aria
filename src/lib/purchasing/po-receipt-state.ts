@@ -17,34 +17,21 @@ function normalizeDateOnly(value: string | null | undefined): string | null {
     return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().split("T")[0];
 }
 
-function isShipmentMarkedReceived(shipment: POShipmentReceiptLike): boolean {
-    const status = String(shipment.status || "").toLowerCase();
-    return status.includes("received") || !!normalizeDateOnly(shipment.receiveDate);
-}
-
 export function resolvePurchaseOrderReceiptDate(input: POReceiptStateInput): string | null {
-    // Trust PO-level receiveDate as a fallback — Finale sets it when any reception is created
-    // (even if the PO status stays "Committed"/"Completed" rather than "Received")
+    // PO-level receiveDate — Finale sets this when a reception is created.
     const poLevelDate = normalizeDateOnly(input.receiveDate);
 
-    // For shipments, only trust dates from shipments that are actually marked "Received"
-    const receivedShipmentDates = (input.shipments || [])
-        .filter(s => {
-            const sStatus = String(s.status || "").toLowerCase();
-            return sStatus.includes("received") && s.receiveDate;
-        })
+    // Shipment receiveDates. Do NOT gate on the status string: Finale
+    // auto-completes shipments when quantities match, so status is not proof
+    // of receipt. The presence of a receiveDate is the concrete signal, which
+    // keeps this consistent with hasPurchaseOrderReceipt().
+    const shipmentDates = (input.shipments || [])
         .map(s => normalizeDateOnly(s.receiveDate))
         .filter((value): value is string => Boolean(value));
 
     const receiveDates: string[] = [];
-
-    // Always trust PO-level receiveDate (Finale sets it when reception is created)
-    if (poLevelDate) {
-        receiveDates.push(poLevelDate);
-    }
-
-    // Also include shipment receiveDates for shipments marked "Received"
-    receiveDates.push(...receivedShipmentDates);
+    if (poLevelDate) receiveDates.push(poLevelDate);
+    receiveDates.push(...shipmentDates);
 
     if (receiveDates.length === 0) return null;
     return receiveDates.sort().at(-1) || null;
@@ -53,18 +40,32 @@ export function resolvePurchaseOrderReceiptDate(input: POReceiptStateInput): str
 export function hasPurchaseOrderReceipt(input: POReceiptStateInput): boolean {
     const normalizedStatus = String(input.status || "").toLowerCase();
 
-    // Manual confirmation: user changed PO status to "received"
+    // Explicit staff action: changed PO status to "received"
     if (normalizedStatus === "received") return true;
 
-    // Staff receptions: at least one shipment has EXACT status "received"
-    // Be strict - don't match "Partially Received", "Received into Stock", etc.
+    // Concrete evidence: Finale sets receiveDate when a receipt is created.
+    // Unlike "Completed" status (which Finale auto-sets when quantities match),
+    // receiveDate is only set by an actual reception — staff physically received goods.
+    // Only trust past dates (future dates on Committed POs are planned ETAs).
+    const receiptDate = resolvePurchaseOrderReceiptDate(input);
+    if (receiptDate) {
+        const today = new Date().toISOString().slice(0, 10);
+        if (receiptDate <= today) return true;
+    }
+
+    // Shipment-level evidence: at least one shipment has a past receiveDate
+    // (staff explicitly recorded receipt on this shipment). Status string alone
+    // is NOT sufficient — Finale auto-completes shipments, so "Completed" doesn't
+    // mean physical receipt. Only a past receiveDate is concrete proof.
     const shipments = input.shipments || [];
     if (shipments.length > 0) {
-        const hasReceivedShipment = shipments.some(s => {
-            const sStatus = String(s.status || "").toLowerCase().trim();
-            return sStatus === "received";
+        const hasConcreteReceipt = shipments.some(s => {
+            const date = normalizeDateOnly(s.receiveDate);
+            if (!date) return false;
+            const today = new Date().toISOString().slice(0, 10);
+            return date <= today;
         });
-        if (hasReceivedShipment) return true;
+        if (hasConcreteReceipt) return true;
     }
 
     return false;
