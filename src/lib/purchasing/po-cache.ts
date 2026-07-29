@@ -68,6 +68,7 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
             line_items: po.items || [],
             issue_date: po.orderDate || null,
             required_date: (po as any).expectedDate || (po as any).dueDate || null,
+            receive_date: po.receiveDate || null,
             updated_at: now,
         });
     }
@@ -111,6 +112,7 @@ async function readCachedPos(): Promise<FullPO[]> {
                 orderDate: row.issue_date ? new Date(row.issue_date).toISOString().split("T")[0] : "",
                 status: row.status || "",
                 total: Number(row.total) || 0,
+                receiveDate: row.receive_date ? new Date(row.receive_date).toISOString().split("T")[0] : null,
                 items,
                 itemList: { edges: items.map((i: any) => ({ node: { product: { productId: i.productId }, quantity: i.quantity } })) },
                 supplier: { name: row.vendor_name || "" },
