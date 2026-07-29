@@ -687,8 +687,86 @@ export async function POST(req: NextRequest) {
 
             const now = new Date().toISOString();
 
-            // Update ap_pending_approvals
-            if (invoiceId) {
+            // ── HERMIA(2026-07-29): 3-way match enforcement ─────────────────
+            // This handler previously flipped ap_pending_approvals,
+            // reconciliation_outcomes, invoices and vendor_invoices to
+            // 'approved'/'reconciled' and returned ok:true — WITHOUT ever
+            // contacting Finale and without comparing the three documents.
+            // Every click wrote a false "reconciled" state: the DB claimed the
+            // corrections had posted while Finale never received them.
+            //
+            // Correct AP order of operations is now enforced:
+            //   1. Load the stored reconciliation for this PO.
+            //   2. Push the approved price/freight changes to Finale FIRST.
+            //   3. Only if Finale accepts the write, record 'reconciled' in the DB.
+            // A failure at step 2 returns 4xx/5xx so the operator sees it,
+            // instead of a green tick over an unposted correction.
+            const { data: approval } = await sb
+                .from('ap_pending_approvals')
+                .select('id, reconciliation_result, invoice_number, status')
+                .eq('order_id', orderId)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+            const reconciliationResult = (approval as any)?.reconciliation_result;
+
+            if (!reconciliationResult) {
+                // Nothing to post. Refuse rather than mark the PO reconciled.
+                return NextResponse.json(
+                    {
+                        error: 'No reconciliation on file for this PO',
+                        detail:
+                            `No stored reconciliation_result was found for ${orderId}, so there is ` +
+                            `nothing to push to Finale. Re-run the AP match for this PO before approving.`,
+                        orderId,
+                        applied: false,
+                    },
+                    { status: 409 },
+                );
+            }
+
+            // Step 2: post to Finale BEFORE claiming success anywhere.
+            let appliedCount = 0;
+            try {
+                const { applyReconciliation } = await import('@/lib/finale/reconciler');
+                const finaleClient = new FinaleClient();
+                const applyResult = await applyReconciliation(reconciliationResult as any, finaleClient);
+                appliedCount = applyResult.applied.length;
+
+                if (applyResult.errors.length > 0) {
+                    return NextResponse.json(
+                        {
+                            error: 'Finale rejected part of the reconciliation',
+                            detail: applyResult.errors.join('; '),
+                            orderId,
+                            applied: false,
+                            appliedCount,
+                        },
+                        { status: 502 },
+                    );
+                }
+            } catch (err: any) {
+                console.error(`[receivings/approve] Finale apply failed for ${orderId}:`, err?.message);
+                return NextResponse.json(
+                    {
+                        error: 'Failed to apply reconciliation to Finale',
+                        detail: err?.message ?? String(err),
+                        orderId,
+                        applied: false,
+                    },
+                    { status: 502 },
+                );
+            }
+
+            // Step 3: Finale accepted the write — now it is true to say reconciled.
+            const approvalId = (approval as any)?.id;
+            if (approvalId) {
+                await sb
+                    .from('ap_pending_approvals')
+                    .update({ status: 'approved', resolved_at: now })
+                    .eq('id', approvalId);
+            } else if (invoiceId) {
                 await sb
                     .from('ap_pending_approvals')
                     .update({ status: 'approved', resolved_at: now })
@@ -726,10 +804,10 @@ export async function POST(req: NextRequest) {
                 orderId,
                 'RECONCILED',
                 'dashboard-receivings',
-                { invoiceId: invoiceId || null, approvedAt: now },
+                { invoiceId: invoiceId || null, approvedAt: now, appliedCount },
             );
 
-            return NextResponse.json({ ok: true, orderId, reconciled: true });
+            return NextResponse.json({ ok: true, orderId, reconciled: true, applied: true, appliedCount });
         }
 
         if (action === 'complete_po') {

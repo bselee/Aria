@@ -102,7 +102,6 @@ export async function POST(req: Request) {
                 po_sent_verified_at: now,
                 po_sent_verified_source: "manual",
                 po_sent_verified_evidence: [evidence],
-                lifecycle_stage: "sent",
                 updated_at: now,
             }, { onConflict: "po_number" });
 
@@ -182,7 +181,6 @@ export async function POST(req: Request) {
             const upsertPayload: any = {
                 po_number: orderId,
                 tracking_numbers: trackingList,
-                lifecycle_stage: "moving_with_tracking",
                 updated_at: now,
             };
 
@@ -195,6 +193,19 @@ export async function POST(req: Request) {
                 .upsert(upsertPayload, { onConflict: "po_number" });
 
             if (updateErr) throw updateErr;
+
+            // Transition lifecycle: moving_with_tracking → SENT (flag, preserve in metadata)
+            try {
+                const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
+                await transitionLifecycleState(orderId, "SENT", "dashboard-active-purchases", {
+                    trackingAdded: true,
+                    trackingNumber,
+                    trackingSource: trackingSource || null,
+                    detail: "moving_with_tracking",
+                });
+            } catch (tlErr: any) {
+                console.warn(`[active-purchases] Lifecycle transition failed for ${orderId}:`, tlErr.message);
+            }
 
             // Also learn the pattern: save typical_tracking_source in vendor_profiles
             if (vendorName && trackingSource) {
@@ -346,9 +357,23 @@ export async function POST(req: Request) {
                 .upsert({
                     po_number: orderId,
                     tracking_requested_at: now,
-                    lifecycle_stage: "ap_follow_up",
                     updated_at: now,
                 }, { onConflict: "po_number" });
+
+            // Transition lifecycle: ap_follow_up → SENT (flag, preserve in metadata)
+            try {
+                const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
+                await transitionLifecycleState(orderId, "SENT", "dashboard-active-purchases", {
+                    followUpSent: true,
+                    detail: "ap_follow_up",
+                    recipient: recipientEmail,
+                    subject,
+                    gmailMessageId: sendRes.data.id,
+                    gmailThreadId: sendRes.data.threadId,
+                });
+            } catch (tlErr: any) {
+                console.warn(`[active-purchases] Lifecycle transition failed for ${orderId}:`, tlErr.message);
+            }
 
             // Create activity log entry
             try {
@@ -422,35 +447,87 @@ export async function POST(req: Request) {
 
             // 1. Apply reconciliation to Finale — this is the actual work
             //    Load the reconciliation result from ap_pending_approvals
+            //
+            // HERMIA(2026-07-29): this lookup previously filtered on
+            // .eq("status","pending"). All 22 rows in ap_pending_approvals had
+            // already aged past the 24h TTL into status='expired', so the query
+            // returned NULL, the apply block below was skipped, and the handler
+            // still marked invoices 'matched_approved' and the PO 'reconciled'
+            // before returning ok:true. Result: the database asserted the
+            // correction had posted to Finale when nothing was ever sent.
+            //
+            // The status filter is removed (an operator clicking Approve intends
+            // to approve THIS PO's reconciliation regardless of TTL bookkeeping),
+            // and a missing/failed apply is now a hard error rather than a
+            // silent success.
             const { data: approval } = await db
                 .from("ap_pending_approvals")
-                .select("reconciliation_result, invoice_number, order_id")
+                .select("id, reconciliation_result, invoice_number, order_id, status")
                 .eq("order_id", orderId)
-                .eq("status", "pending")
                 .order("created_at", { ascending: false })
                 .limit(1)
                 .maybeSingle();
 
-            if (approval?.reconciliation_result) {
-                try {
-                    const { applyReconciliation } = await import("@/lib/finale/reconciler");
-                    const { FinaleClient } = await import("@/lib/finale/client");
-                    const finale = new FinaleClient();
-                    const result = approval.reconciliation_result as any;
-                    const applyResult = await applyReconciliation(result, finale);
-                    console.log(`[approve_reconciliation] Applied to Finale: ${applyResult.applied.length} changes for ${orderId}`);
-                } catch (err: any) {
-                    console.error(`[approve_reconciliation] Finale apply failed for ${orderId}:`, err.message);
-                    // Continue — still mark as approved in DB even if Finale fails
+            if (!approval?.reconciliation_result) {
+                return NextResponse.json(
+                    {
+                        error: "No reconciliation on file for this PO",
+                        detail:
+                            `No stored reconciliation_result was found for ${orderId}. ` +
+                            `Nothing can be pushed to Finale, so this PO was NOT marked reconciled. ` +
+                            `Re-run the AP match for this PO before approving.`,
+                        orderId,
+                        applied: false,
+                    },
+                    { status: 409 },
+                );
+            }
+
+            let appliedCount = 0;
+            try {
+                const { applyReconciliation } = await import("@/lib/finale/reconciler");
+                const { FinaleClient } = await import("@/lib/finale/client");
+                const finale = new FinaleClient();
+                const result = approval.reconciliation_result as any;
+                const applyResult = await applyReconciliation(result, finale);
+                appliedCount = applyResult.applied.length;
+                console.log(`[approve_reconciliation] Applied to Finale: ${appliedCount} changes for ${orderId}`);
+
+                if (applyResult.errors.length > 0) {
+                    // Finale rejected part of the write. Do NOT mark reconciled.
+                    return NextResponse.json(
+                        {
+                            error: "Finale rejected part of the reconciliation",
+                            detail: applyResult.errors.join("; "),
+                            orderId,
+                            applied: false,
+                            appliedCount,
+                        },
+                        { status: 502 },
+                    );
                 }
+            } catch (err: any) {
+                console.error(`[approve_reconciliation] Finale apply failed for ${orderId}:`, err.message);
+                // HERMIA(2026-07-29): previously this swallowed the error and
+                // continued to mark the PO approved. Surface it instead.
+                return NextResponse.json(
+                    {
+                        error: "Failed to apply reconciliation to Finale",
+                        detail: err?.message ?? String(err),
+                        orderId,
+                        applied: false,
+                    },
+                    { status: 502 },
+                );
             }
 
             // 2. Update ap_pending_approvals status
+            //    Key off the row id we actually loaded, so the write cannot
+            //    silently match zero rows because of a status mismatch.
             await db
                 .from("ap_pending_approvals")
                 .update({ status: "approved", updated_at: now })
-                .eq("order_id", orderId)
-                .eq("status", "pending");
+                .eq("id", (approval as any).id);
 
             // 3. Update invoices table: status = 'matched_approved' where po_number = orderId
             const { error: invErr } = await db
@@ -460,18 +537,20 @@ export async function POST(req: Request) {
 
             if (invErr) throw invErr;
 
-            // 4. Update purchase_orders: lifecycle_stage = 'reconciled'
-            const { error: poErr } = await db
-                .from("purchase_orders")
-                .upsert({
-                    po_number: orderId,
-                    lifecycle_stage: "reconciled",
-                    updated_at: now,
-                }, { onConflict: "po_number" });
+            // 4. Update purchase_orders via lifecycle state machine: reconciled → RECONCILED
+            try {
+                const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
+                await transitionLifecycleState(orderId, "RECONCILED", "dashboard-active-purchases", {
+                    invoiceId,
+                    source: "approve_reconciliation",
+                    appliedCount,
+                    detail: "reconciled",
+                });
+            } catch (tlErr: any) {
+                console.warn(`[active-purchases] Lifecycle transition failed for ${orderId}:`, tlErr.message);
+            }
 
-            if (poErr) throw poErr;
-
-            return NextResponse.json({ ok: true, orderId, applied: !!approval?.reconciliation_result });
+            return NextResponse.json({ ok: true, orderId, applied: true, appliedCount });
         }
 
         // Action 7b: Resend PO Email — re-sends the PO to the vendor via Gmail
@@ -587,15 +666,19 @@ export async function POST(req: Request) {
             });
         }
 
-        // Action 7: Close stale PO — mark lifecycle as closed_stale without cancelling in Finale
+        // Action 7: Close stale PO — transition lifecycle to CANCELLED without cancelling in Finale
         if (action === "close_stale") {
-            const { error: upErr } = await db.from("purchase_orders").upsert({
-                po_number: orderId,
-                lifecycle_stage: "closed_stale",
-                updated_at: now,
-            }, { onConflict: "po_number" });
-
-            if (upErr) throw upErr;
+            // Transition lifecycle: closed_stale → CANCELLED (flag, preserve in metadata)
+            try {
+                const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
+                await transitionLifecycleState(orderId, "CANCELLED", "dashboard-close-stale", {
+                    detail: "closed_stale",
+                    reason: body.reason || "stale",
+                    note: "PO remains open in Finale",
+                });
+            } catch (tlErr: any) {
+                console.warn(`[active-purchases] Lifecycle transition failed for ${orderId}:`, tlErr.message);
+            }
 
             // Audit log entry for the change
             await db.from("ap_activity_log").insert({
@@ -606,7 +689,7 @@ export async function POST(req: Request) {
                 metadata: { orderId, closedAt: now, reason: body.reason || "stale" },
             });
 
-            return NextResponse.json({ ok: true, orderId, lifecycle_stage: "closed_stale" });
+            return NextResponse.json({ ok: true, orderId, lifecycle_stage: "CANCELLED" });
         }
 
         return NextResponse.json({ error: "unhandled action" }, { status: 400 });
