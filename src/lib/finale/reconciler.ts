@@ -973,6 +973,27 @@ export interface PriceChange {
     dollarImpact: number;       // (invoicePrice - poPrice) × quantity
     verdict: ReconciliationVerdict;
     reason: string;
+    /**
+     * HERMIA(2026-07-29): The price actually written to Finale.
+     *
+     * `invoicePrice` is the RAW per-line price as printed on the invoice, which
+     * may be per-CASE while the Finale PO line is per-EA. Writing the raw price
+     * onto an EA line overstates it by the pack multiplier (e.g. $126/case
+     * written onto a $10.50/EA line = 12x error).
+     *
+     * `effectivePrice` is the UOM-normalized per-base-unit price — the same
+     * number the verdict was computed against. applyReconciliation() MUST write
+     * this, never `invoicePrice`, so the verdict and the write always agree.
+     *
+     * Optional for backward compatibility: results persisted before this field
+     * existed replay through applyReconciliation()'s `invoicePrice` fallback,
+     * which reproduces the original (un-normalized) behaviour for those rows.
+     */
+    effectivePrice?: number;
+    /** Pack multiplier used to normalize (1 = no conversion applied). */
+    packMultiplier?: number;
+    /** How the pack multiplier was determined — receipt evidence beats UOM string. */
+    packSource?: "receipt_qty" | "uom_string" | "none";
 }
 
 export interface FeeChange {
@@ -1097,7 +1118,7 @@ export interface ReconciliationResult {
     report?: ReconciliationReport;  // Structured audit report — populated at end of reconcileInvoiceToPO()
     populateItems?: Array<{ productId: string; quantity: number; unitPrice: number; description: string }>;  // Set when PO is empty draft — items to add on approval
     // Gap 1: SKU base cost update status — tracks whether the underlying SKU supplier pricing was synced
-    skuCostUpdateStatus?: 'updated' | 'not_found' | 'skipped';
+    skuCostUpdateStatus?: 'updated' | 'not_found' | 'skipped' | 'unit_mismatch_blocked';
     // Gap 2: Residual gap — difference between PO projected total and invoice total after all adjustments
     residualGap?: number;
     residualGapNote?: string;
@@ -1599,6 +1620,55 @@ const UOM_TO_LB: Record<string, number> = {
 };
 
 /**
+ * HERMIA(2026-07-29): Infer the pack multiplier from PHYSICAL RECEIPT quantity.
+ *
+ * Bill's rule: "Should also be apparent by amount received and previous pricing —
+ * no reason for a large swing in pricing usually."
+ *
+ * Finale receipts are always recorded in base units (EA/LB). If the vendor bills
+ * 10 CASE and the warehouse received 120 EA, the true pack size is 12 — measured,
+ * not assumed. This is strictly better than the UOM_TO_EA lookup table, which
+ * hardcodes "case = 12" and is wrong for any vendor that ships 6- or 24-packs.
+ *
+ * Returns null when there is no clean integer relationship, in which case the
+ * caller falls back to the UOM string.
+ *
+ * @param invoiceQty  Quantity as billed on the invoice line
+ * @param receivedQty Physical quantity received in Finale (base units)
+ * @param poQty       Quantity ordered on the PO line (base units)
+ */
+export function inferPackMultiplierFromReceipt(
+    invoiceQty: number,
+    receivedQty: number,
+    poQty: number,
+): { multiplier: number; source: "receipt_qty"; evidence: string } | null {
+    if (!Number.isFinite(invoiceQty) || invoiceQty <= 0) return null;
+
+    // Prefer physical receipt; fall back to ordered qty when nothing received yet.
+    const basis = receivedQty > 0 ? receivedQty : poQty;
+    const basisLabel = receivedQty > 0 ? "received" : "PO";
+    if (!Number.isFinite(basis) || basis <= 0) return null;
+
+    const ratio = basis / invoiceQty;
+
+    // 1:1 — invoice and Finale agree on units. No conversion.
+    if (Math.abs(ratio - 1) < 0.02) return null;
+
+    // Only trust clean integer pack sizes. A ratio of 12.03 is a pack of 12;
+    // a ratio of 7.4 is a short shipment, NOT a unit conversion — and must not
+    // be silently treated as one.
+    const nearest = Math.round(ratio);
+    if (nearest < 2 || nearest > 1000) return null;
+    if (Math.abs(ratio - nearest) / nearest > 0.02) return null;
+
+    return {
+        multiplier: nearest,
+        source: "receipt_qty",
+        evidence: `${basisLabel} ${basis} base units ÷ invoice qty ${invoiceQty} = pack of ${nearest}`,
+    };
+}
+
+/**
  * Normalize a line item to a common base unit for apples-to-apples comparison.
  *
  * Returns `{ baseQty, normalizedPrice, normalized }` where:
@@ -1829,7 +1899,41 @@ function reconcileLineItems(
         // price before comparison. This prevents a false "price change" when the
         // invoice bills per-case (e.g., $120/case of 12) but Finale tracks per-EA
         // ($10/EA). Finale PO lines carry no UOM field so we always pass null there.
-        const invoiceNorm = normalizeLineTotal(invLine.qty, invLine.unitPrice, invLine.unit ?? null);
+        //
+        // HERMIA(2026-07-29): Receipt quantity now takes priority over the UOM string.
+        // Finale receipts are in base units, so received÷invoiced IS the pack size —
+        // measured rather than assumed. The UOM_TO_EA table hardcodes "case = 12",
+        // which is wrong for any vendor shipping 6- or 24-packs.
+        const receivedQtyForLine = receivedQtyMap.get(poLine.productId) || 0;
+        const receiptPack = inferPackMultiplierFromReceipt(
+            invLine.qty,
+            receivedQtyForLine,
+            poLine.quantity,
+        );
+
+        let invoiceNorm: { baseQty: number; normalizedPrice: number; normalized: boolean };
+        let packMultiplier = 1;
+        let packSource: "receipt_qty" | "uom_string" | "none" = "none";
+        let packEvidence = "";
+
+        if (receiptPack) {
+            packMultiplier = receiptPack.multiplier;
+            packSource = "receipt_qty";
+            packEvidence = receiptPack.evidence;
+            const baseQty = invLine.qty * receiptPack.multiplier;
+            invoiceNorm = {
+                baseQty,
+                normalizedPrice: baseQty > 0 ? (invLine.qty * invLine.unitPrice) / baseQty : invLine.unitPrice,
+                normalized: true,
+            };
+        } else {
+            invoiceNorm = normalizeLineTotal(invLine.qty, invLine.unitPrice, invLine.unit ?? null);
+            if (invoiceNorm.normalized && invLine.qty > 0) {
+                packMultiplier = invoiceNorm.baseQty / invLine.qty;
+                packSource = "uom_string";
+            }
+        }
+
         const poNorm = normalizeLineTotal(poLine.quantity, poLine.unitPrice, null);
 
         // Effective prices to compare (per base unit after normalization)
@@ -1853,33 +1957,69 @@ function reconcileLineItems(
 
         // Append UOM normalization context to the reason when a conversion was applied
         if (invoiceNorm.normalized) {
-            const uomKey = (invLine.unit ?? "").trim().toLowerCase();
-            const eaMult = UOM_TO_EA[uomKey];
-            const lbMult = UOM_TO_LB[uomKey];
-            const mult = eaMult ?? lbMult ?? 1;
-            const baseUnit = eaMult !== undefined ? "EA" : "LB";
-            pReason += ` | UOM normalized: ${(invLine.unit ?? "").toUpperCase()} →${baseUnit !== "EA" ? " per " : " "}${baseUnit} (×${mult})`;
+            if (packSource === "receipt_qty") {
+                // Measured from physical receipt — no assumption, so no extra approval gate.
+                pReason += ` | UOM normalized from RECEIPT: ${packEvidence}. ` +
+                    `Effective $${invoiceNorm.normalizedPrice.toFixed(2)}/base unit vs PO $${poNorm.normalizedPrice.toFixed(2)}.`;
+            } else {
+                const uomKey = (invLine.unit ?? "").trim().toLowerCase();
+                const eaMult = UOM_TO_EA[uomKey];
+                const lbMult = UOM_TO_LB[uomKey];
+                const mult = eaMult ?? lbMult ?? 1;
+                const baseUnit = eaMult !== undefined ? "EA" : "LB";
+                pReason += ` | UOM normalized: ${(invLine.unit ?? "").toUpperCase()} →${baseUnit !== "EA" ? " per " : " "}${baseUnit} (×${mult})`;
 
-            // Ambiguous case/bag keys: the multiplier was assumed, not stated explicitly
-            // in the UOM string. Force needs_approval so Will can verify the pack size.
-            const AMBIGUOUS_CASE_KEYS = new Set(["case", "cs", "cse"]);
-            const AMBIGUOUS_BAG_KEYS = new Set(["bag", "bg"]);
+                // Ambiguous case/bag keys: the multiplier was assumed, not stated explicitly
+                // in the UOM string. Force needs_approval so Will can verify the pack size.
+                const AMBIGUOUS_CASE_KEYS = new Set(["case", "cs", "cse"]);
+                const AMBIGUOUS_BAG_KEYS = new Set(["bag", "bg"]);
 
-            if (AMBIGUOUS_CASE_KEYS.has(uomKey)) {
+                if (AMBIGUOUS_CASE_KEYS.has(uomKey)) {
+                    pVerdict = "needs_approval";
+                    pReason += " | case size assumed 12 — verify";
+                } else if (AMBIGUOUS_BAG_KEYS.has(uomKey)) {
+                    pVerdict = "needs_approval";
+                    pReason += " | bag weight assumed 50 lb — verify";
+                }
+            }
+        }
+
+        // HERMIA(2026-07-29): Unit-mismatch tripwire.
+        // If NO normalization was applied but the raw invoice price differs from the
+        // PO price by a clean integer factor (2x, 6x, 12x, 24x...), the invoice is
+        // almost certainly in different units than the PO and the UOM string failed
+        // to say so. Writing that raw price would corrupt the PO line. Hold it.
+        if (!invoiceNorm.normalized && effectivePoPrice > 0 && effectiveInvPrice > 0) {
+            const priceRatio = effectiveInvPrice > effectivePoPrice
+                ? effectiveInvPrice / effectivePoPrice
+                : effectivePoPrice / effectiveInvPrice;
+            const nearestFactor = Math.round(priceRatio);
+            const isCleanFactor =
+                nearestFactor >= 2 &&
+                nearestFactor <= 100 &&
+                Math.abs(priceRatio - nearestFactor) / nearestFactor < 0.05;
+
+            if (isCleanFactor && pVerdict === "auto_approve") {
                 pVerdict = "needs_approval";
-                pReason += " | case size assumed 12 — verify";
-            } else if (AMBIGUOUS_BAG_KEYS.has(uomKey)) {
-                pVerdict = "needs_approval";
-                pReason += " | bag weight assumed 50 lb — verify";
+                pReason +=
+                    ` | ⚠️ UNIT MISMATCH SUSPECTED: price differs by exactly ${nearestFactor}x ` +
+                    `($${effectivePoPrice.toFixed(2)} vs $${effectiveInvPrice.toFixed(2)}) with no UOM conversion applied. ` +
+                    `Likely each-vs-case billing. Verify pack size before applying.`;
             }
         }
 
         // Guard 2: Quantity overbill — never auto-approve if invoice qty > PO qty.
         // Even a tiny price change is suspicious when the vendor is billing for
         // more units than were ordered.
-        if (invLine.qty > poLine.quantity && pVerdict === "auto_approve") {
+        //
+        // HERMIA(2026-07-29): Compare in BASE units. invLine.qty may be in cases
+        // while poLine.quantity is in eaches — a raw compare reports a false
+        // overbill (10 cases vs 120 EA) or masks a real one.
+        const invoiceQtyBase = invoiceNorm.normalized ? invoiceNorm.baseQty : invLine.qty;
+
+        if (invoiceQtyBase > poLine.quantity && pVerdict === "auto_approve") {
             pVerdict = "needs_approval";
-            pReason += ` | ⚠️  OVERBILL: Invoice qty ${invLine.qty} > PO qty ${poLine.quantity} — may be billed for more units than ordered.`;
+            pReason += ` | ⚠️  OVERBILL: Invoice qty ${invoiceQtyBase} base units > PO qty ${poLine.quantity} — may be billed for more units than ordered.`;
         }
 
         const receivedQty = receivedQtyMap.get(poLine.productId) || 0;
@@ -1892,37 +2032,42 @@ function reconcileLineItems(
             description: invLine.description,
             poPrice: poLine.unitPrice,
             invoicePrice: invLine.unitPrice,
+            // effectivePrice is what actually gets written to Finale — always the
+            // per-base-unit price the verdict was computed against.
+            effectivePrice: effectiveInvPrice,
+            packMultiplier,
+            packSource,
             quantity: invLine.qty,
             percentChange,
             dollarImpact,
             verdict: pVerdict,
             reason: pReason,
             receivedQty,
-            receivingGap: Math.max(0, invoiceQty - receivedQty),
+            receivingGap: Math.max(0, invoiceQtyBase - receivedQty),
         };
 
-        // 3-Way Quantity Verification
+        // 3-Way Quantity Verification — all comparisons in BASE units.
         if (totalReceived === 0) {
             // State A: PO is Unreceived — "invoice RCV on purchase prior to receiving" bypass.
             // Check if invoice line quantity perfectly matches PO ordered quantity.
-            if (invoiceQty === poQty) {
+            if (invoiceQtyBase === poQty) {
                 // Perfect ordered quantity match — let price/fee guards stand
-                console.log(`     [reconciler] Bypass: clean unreceived match for ${poLine.productId} (qty=${invoiceQty})`);
+                console.log(`     [reconciler] Bypass: clean unreceived match for ${poLine.productId} (qty=${invoiceQtyBase} base units)`);
             } else {
                 // Quantity mismatch and no receiving records to back it up
                 changeItem.verdict = "needs_approval";
-                changeItem.reason += ` | QTY MISMATCH (Unreceived): Invoice qty ${invoiceQty} != PO qty ${poQty} and PO has no receipt records.`;
+                changeItem.reason += ` | QTY MISMATCH (Unreceived): Invoice qty ${invoiceQtyBase} base units != PO qty ${poQty} and PO has no receipt records.`;
             }
         } else {
             // State B: PO is Partially/Fully Received — Enforce physical receipt verification.
-            if (invoiceQty > receivedQty) {
+            if (invoiceQtyBase > receivedQty) {
                 // Short shipment or overbill relative to physical receipt — hold for review or credit memo
                 changeItem.verdict = "short_shipment_hold";
-                changeItem.reason += ` | SHORT SHIPMENT: Invoice qty ${invoiceQty} > Received qty ${receivedQty} (Gap: ${invoiceQty - receivedQty} units).`;
-            } else if (invoiceQty > poQty) {
+                changeItem.reason += ` | SHORT SHIPMENT: Invoice qty ${invoiceQtyBase} base units > Received qty ${receivedQty} (Gap: ${invoiceQtyBase - receivedQty} units).`;
+            } else if (invoiceQtyBase > poQty) {
                 // Overbill relative to ordered quantity (even if physically received)
                 changeItem.verdict = "needs_approval";
-                changeItem.reason += ` | OVERBILL: Invoice qty ${invoiceQty} > PO qty ${poQty}.`;
+                changeItem.reason += ` | OVERBILL: Invoice qty ${invoiceQtyBase} base units > PO qty ${poQty}.`;
             }
         }
 
@@ -2304,47 +2449,106 @@ export async function applyReconciliation(
         }
 
         try {
+            // HERMIA(2026-07-29): Write the UOM-NORMALIZED price, never the raw
+            // invoice price. The verdict above was computed against the normalized
+            // per-base-unit price; writing the raw per-case price onto a per-EA
+            // Finale line silently multiplies the line value by the pack size.
+            // Fall back to invoicePrice only for legacy results that predate this field.
+            const priceToWrite = Number.isFinite(pc.effectivePrice as number)
+                ? (pc.effectivePrice as number)
+                : pc.invoicePrice;
+
+            if (priceToWrite !== pc.invoicePrice) {
+                console.log(
+                    `     [reconciler] ${pc.productId}: writing normalized $${priceToWrite.toFixed(4)}/base unit ` +
+                    `(invoice showed $${pc.invoicePrice.toFixed(2)}, pack ×${pc.packMultiplier ?? "?"} via ${pc.packSource ?? "unknown"})`
+                );
+            }
+
             const updateRes = await withToolAudit(
                 "finale_update_order_item_price",
                 auditCtx,
-                { orderId: result.orderId, productId: pc.productId, newPrice: pc.invoicePrice },
-                () => client.updateOrderItemPrice(result.orderId, pc.productId, pc.invoicePrice),
+                { orderId: result.orderId, productId: pc.productId, newPrice: priceToWrite },
+                () => client.updateOrderItemPrice(result.orderId, pc.productId, priceToWrite),
             );
 
             // NEW(2026-03-18): Sync the underlying SKU supplier pricing so FUTURE orders are correct
+            // HERMIA(2026-07-29): Sync the NORMALIZED per-base-unit price (same value
+            // written to the PO line), and keep a ratio tripwire as defence-in-depth in
+            // case normalization missed a unit conversion entirely.
             let skuBaseUpdated = false;
             let skuCostStatus: ReconciliationResult['skuCostUpdateStatus'] = 'skipped';
-            if (updateRes.supplierPartyUrl) {
-                skuBaseUpdated = await withToolAudit(
-                    "finale_update_product_supplier_price",
-                    auditCtx,
-                    { productId: pc.productId, supplierPartyUrl: updateRes.supplierPartyUrl, newPrice: pc.invoicePrice },
-                    () => client.updateProductSupplierPrice(pc.productId, updateRes.supplierPartyUrl!, pc.invoicePrice),
-                );
-                skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
-            } else {
-                // GAP 1 FIX: supplierPartyUrl is null — try to look it up from Finale product data
-                const supplierInfo = await client.getProductSupplierInfo(pc.productId);
-                if (supplierInfo && supplierInfo.supplierPartyUrl) {
-                    skuBaseUpdated = await withToolAudit(
-                        "finale_update_product_supplier_price",
-                        auditCtx,
-                        { productId: pc.productId, supplierPartyUrl: supplierInfo.supplierPartyUrl, newPrice: pc.invoicePrice },
-                        () => client.updateProductSupplierPrice(pc.productId, supplierInfo.supplierPartyUrl, pc.invoicePrice),
+
+            /**
+             * Decide whether the normalized price is safe to write as the SKU's
+             * supplier base cost. Blocks clean-integer-factor swings, which are
+             * almost always an unresolved each-vs-case mismatch rather than a
+             * genuine vendor price change.
+             */
+            const isUnitMismatch = (candidate: number, existing: number | null | undefined): boolean => {
+                if (!existing || existing <= 0 || candidate <= 0) return false;
+                const r = Math.max(candidate, existing) / Math.min(candidate, existing);
+                if (r <= 2.5) return false;
+                const nearest = Math.round(r);
+                return nearest >= 2 && Math.abs(r - nearest) / nearest < 0.12;
+            };
+
+            const resolvedSupplierUrl =
+                updateRes.supplierPartyUrl ??
+                (await client.getProductSupplierInfo(pc.productId))?.supplierPartyUrl ??
+                null;
+
+            if (resolvedSupplierUrl) {
+                try {
+                    const existingSupplierInfo = await client.getProductSupplierInfo(pc.productId);
+                    const existingPrice = existingSupplierInfo?.price;
+
+                    if (isUnitMismatch(priceToWrite, existingPrice)) {
+                        const ratio = Math.max(priceToWrite, existingPrice!) / Math.min(priceToWrite, existingPrice!);
+                        console.warn(
+                            `[reconciler] SKU cost sync BLOCKED for ${pc.productId}: ` +
+                            `normalized $${priceToWrite.toFixed(2)} vs existing supplier $${existingPrice!.toFixed(2)} ` +
+                            `(${ratio.toFixed(1)}x — likely unresolved each/case mismatch). ` +
+                            `PO price was $${pc.poPrice.toFixed(2)}. Manual review required.`
+                        );
+                        skuCostStatus = 'unit_mismatch_blocked';
+                    } else {
+                        skuBaseUpdated = await withToolAudit(
+                            "finale_update_product_supplier_price",
+                            auditCtx,
+                            { productId: pc.productId, supplierPartyUrl: resolvedSupplierUrl, newPrice: priceToWrite },
+                            () => client.updateProductSupplierPrice(pc.productId, resolvedSupplierUrl, priceToWrite),
+                        );
+                        skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
+                    }
+                } catch (guardErr: any) {
+                    // Guard could not run — do NOT blind-write. Skipping only affects
+                    // future-PO convenience pricing; a bad write corrupts real costing.
+                    console.warn(
+                        `[reconciler] SKU cost guard failed for ${pc.productId} — skipping sync:`,
+                        guardErr.message,
                     );
-                    skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
-                } else {
-                    // Could not determine supplier URL — log warning for dashboard visibility
-                    console.warn(`⚠️ [reconciler] SKU cost not updated for ${pc.productId}: no supplier info found in Finale`);
-                    skuCostStatus = 'not_found';
+                    skuCostStatus = 'skipped';
                 }
+            } else {
+                // GAP 1: no supplier link resolvable from either the price-update
+                // response or the product record — nothing to sync against.
+                console.warn(`⚠️ [reconciler] SKU cost not updated for ${pc.productId}: no supplier info found in Finale`);
+                skuCostStatus = 'not_found';
             }
-            // Store the per-product status; use the first one's status as the overall result status
-            if (!result.skuCostUpdateStatus || skuCostStatus === 'updated') {
+            // Store the per-product status; use the first non-skipped status as the overall result status
+            if (!result.skuCostUpdateStatus || result.skuCostUpdateStatus === 'skipped') {
                 result.skuCostUpdateStatus = skuCostStatus;
             }
 
-            applied.push(`${pc.productId}: $${pc.poPrice.toFixed(2)} â†’ $${pc.invoicePrice.toFixed(2)}${skuBaseUpdated ? " (SKU Cost Updated)" : ""}`);
+            applied.push(
+                `${pc.productId}: $${pc.poPrice.toFixed(2)} → $${priceToWrite.toFixed(2)}` +
+                (pc.packSource === "receipt_qty" || pc.packSource === "uom_string"
+                    ? ` [normalized ×${pc.packMultiplier} from ${pc.packSource}; invoice showed $${pc.invoicePrice.toFixed(2)}]`
+                    : "") +
+                (skuBaseUpdated ? " (SKU Cost Updated)" : "") +
+                (skuCostStatus === 'unit_mismatch_blocked' ? " (SKU cost sync BLOCKED — unit mismatch)" : "")
+            );
         } catch (err: any) {
             errors.push(`${pc.productId}: Failed â€” ${err.message}`);
         }
@@ -2659,6 +2863,12 @@ export function buildAuditMetadata(
             description: pc.description,
             from: pc.poPrice,
             to: pc.invoicePrice,
+            // HERMIA(2026-07-29): persist the normalized price + pack provenance so the
+            // auto-apply cron replays the SAME value that was verdicted, not the raw
+            // per-case invoice price.
+            effectivePrice: pc.effectivePrice,
+            packMultiplier: pc.packMultiplier,
+            packSource: pc.packSource,
             pct: parseFloat((pc.percentChange * 100).toFixed(2)),
             impact: parseFloat(pc.dollarImpact.toFixed(2)),
             verdict: pc.verdict,

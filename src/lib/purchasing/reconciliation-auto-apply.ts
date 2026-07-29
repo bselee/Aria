@@ -145,6 +145,9 @@ function normalisePriceChanges(
     description: string;
     poPrice: number;
     invoicePrice: number;
+    effectivePrice: number;
+    packMultiplier?: number;
+    packSource?: "receipt_qty" | "uom_string" | "none";
     quantity: number;
     dollarImpact: number;
     percentChange: number;
@@ -160,17 +163,26 @@ function normalisePriceChanges(
 
     if (isAuditFormat) {
         // Format A: buildAuditMetadata shape
-        return raw.map((pc: any) => ({
-            productId: pc.productId ?? "",
-            description: pc.description ?? "",
-            poPrice: pc.from ?? 0,
-            invoicePrice: pc.to ?? 0,
-            quantity: pc.quantity ?? 1,
-            dollarImpact: pc.impact ?? 0,
-            percentChange: (pc.pct ?? 0) / 100, // stored as percentage points
-            verdict: pc.verdict ?? "auto_approve",
-            reason: "",
-        }));
+        return raw.map((pc: any) => {
+            const invoicePrice = pc.to ?? 0;
+            return {
+                productId: pc.productId ?? "",
+                description: pc.description ?? "",
+                poPrice: pc.from ?? 0,
+                invoicePrice,
+                // HERMIA(2026-07-29): carry the normalized price through the cron
+                // replay path. Legacy rows have no effectivePrice — fall back to
+                // invoicePrice, which matches pre-fix behaviour for un-normalized lines.
+                effectivePrice: Number.isFinite(pc.effectivePrice) ? pc.effectivePrice : invoicePrice,
+                packMultiplier: pc.packMultiplier,
+                packSource: pc.packSource,
+                quantity: pc.quantity ?? 1,
+                dollarImpact: pc.impact ?? 0,
+                percentChange: (pc.pct ?? 0) / 100, // stored as percentage points
+                verdict: pc.verdict ?? "auto_approve",
+                reason: "",
+            };
+        });
     }
 
     // Format B: already in ReconciliationResult shape
@@ -179,6 +191,9 @@ function normalisePriceChanges(
         description: pc.description ?? "",
         poPrice: pc.poPrice ?? 0,
         invoicePrice: pc.invoicePrice ?? 0,
+        effectivePrice: Number.isFinite(pc.effectivePrice) ? pc.effectivePrice : (pc.invoicePrice ?? 0),
+        packMultiplier: pc.packMultiplier,
+        packSource: pc.packSource,
         quantity: pc.quantity ?? 1,
         dollarImpact: pc.dollarImpact ?? 0,
         percentChange: pc.percentChange ?? 0,

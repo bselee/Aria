@@ -18,6 +18,7 @@ const { createClientMock } = vi.hoisted(() => ({
 import {
     validateInvoiceBalance,
     normalizeLineTotal,
+    inferPackMultiplierFromReceipt,
     reconcileFees,
     reconcileInvoiceToPO,
     applyReconciliation,
@@ -1227,5 +1228,287 @@ describe("rejectPendingReconciliation", () => {
         const message = await rejectPendingReconciliation(id);
 
         expect(message).toMatch(/not found|expired|already/i);
+    });
+});
+
+
+// ────────────────────────────────────────────────────────────────────────────
+// HERMIA(2026-07-29): Case/each unit-conversion accounting safety.
+//
+// Bill: "We have had problems with case conversions and changing those prices.
+//        We have to be smart enough to recognize eaches no matter how they are
+//        purchased and vice versa."
+//
+// Root bug: the verdict was computed on the UOM-NORMALIZED price, but
+// applyReconciliation() wrote the RAW pc.invoicePrice to Finale. A $126/case
+// invoice against a $10/EA PO line verdicted as a clean 5% change, then wrote
+// $126 onto the EA line — a 12x overstatement of the PO's value.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("pack multiplier inference from receipt quantity", () => {
+    it("derives pack size from received base units instead of guessing from the UOM string", () => {
+        // 10 cases invoiced, 120 EA physically received => pack of 12, measured.
+        const result = inferPackMultiplierFromReceipt(10, 120, 120);
+        expect(result?.multiplier).toBe(12);
+        expect(result?.source).toBe("receipt_qty");
+    });
+
+    it("detects a 6-pack, which the hardcoded case=12 table would get wrong", () => {
+        expect(inferPackMultiplierFromReceipt(10, 60, 60)?.multiplier).toBe(6);
+    });
+
+    it("returns null at 1:1 so matching units are never rescaled", () => {
+        expect(inferPackMultiplierFromReceipt(120, 120, 120)).toBeNull();
+    });
+
+    it("does NOT mistake a short shipment for a unit conversion", () => {
+        // 100 invoiced, 74 received is a 0.74 ratio — a shortfall, not a pack size.
+        expect(inferPackMultiplierFromReceipt(100, 74, 100)).toBeNull();
+    });
+
+    it("falls back to ordered qty when nothing has been received yet", () => {
+        const result = inferPackMultiplierFromReceipt(10, 0, 120);
+        expect(result?.multiplier).toBe(12);
+    });
+
+    it("ignores non-integer ratios that carry no pack meaning", () => {
+        expect(inferPackMultiplierFromReceipt(10, 74, 74)).toBeNull();
+    });
+});
+
+describe("applyReconciliation writes UOM-normalized prices", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        createClientMock.mockReturnValue(null);
+    });
+
+    it("writes the normalized per-EA price, NOT the raw per-case invoice price", async () => {
+        const client = makeFinaleClientMock();
+
+        // Vendor billed 10 CASE @ $126.00. True per-EA cost is $10.50.
+        // PO line is 120 EA @ $10.00. Writing $126.00 would be a 12x error.
+        await applyReconciliation({
+            orderId: "PO-UOM-1",
+            invoiceNumber: "INV-UOM-1",
+            vendorName: "Case Vendor",
+            invoiceTotal: 1260,
+            priceChanges: [{
+                productId: "SKU-CASE",
+                description: "Widget",
+                poPrice: 10.0,
+                invoicePrice: 126.0,
+                effectivePrice: 10.5,
+                packMultiplier: 12,
+                packSource: "receipt_qty",
+                quantity: 10,
+                percentChange: 0.05,
+                dollarImpact: 60,
+                verdict: "auto_approve",
+                reason: "5% increase",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "",
+            totalDollarImpact: 60,
+            autoApplicable: true,
+            warnings: [],
+        } as unknown as ReconciliationResult, client);
+
+        expect(client.updateOrderItemPrice).toHaveBeenCalledWith("PO-UOM-1", "SKU-CASE", 10.5);
+        // The raw per-case price must never reach Finale.
+        expect(client.updateOrderItemPrice).not.toHaveBeenCalledWith("PO-UOM-1", "SKU-CASE", 126.0);
+    });
+
+    it("falls back to invoicePrice for legacy rows with no effectivePrice", async () => {
+        const client = makeFinaleClientMock();
+
+        await applyReconciliation({
+            orderId: "PO-LEGACY-1",
+            invoiceNumber: "INV-LEGACY-1",
+            vendorName: "Legacy Vendor",
+            invoiceTotal: 100,
+            priceChanges: [{
+                productId: "SKU-LEGACY",
+                description: "Widget",
+                poPrice: 10.0,
+                invoicePrice: 10.5,
+                quantity: 10,
+                percentChange: 0.05,
+                dollarImpact: 5,
+                verdict: "auto_approve",
+                reason: "5% increase",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "",
+            totalDollarImpact: 5,
+            autoApplicable: true,
+            warnings: [],
+        } as unknown as ReconciliationResult, client);
+
+        expect(client.updateOrderItemPrice).toHaveBeenCalledWith("PO-LEGACY-1", "SKU-LEGACY", 10.5);
+    });
+
+    it("syncs the SKU supplier cost with the normalized price, never the raw case price", async () => {
+        const client = makeFinaleClientMock();
+        client.updateOrderItemPrice.mockResolvedValue({ supplierPartyUrl: "/api/party/99" });
+        client.getProductSupplierInfo = vi.fn().mockResolvedValue({
+            supplierPartyUrl: "/api/party/99",
+            price: 10.0,
+        });
+        client.updateProductSupplierPrice = vi.fn().mockResolvedValue(true);
+
+        await applyReconciliation({
+            orderId: "PO-UOM-2",
+            invoiceNumber: "INV-UOM-2",
+            vendorName: "Case Vendor",
+            invoiceTotal: 1260,
+            priceChanges: [{
+                productId: "SKU-CASE",
+                description: "Widget",
+                poPrice: 10.0,
+                invoicePrice: 126.0,
+                effectivePrice: 10.5,
+                packMultiplier: 12,
+                packSource: "receipt_qty",
+                quantity: 10,
+                percentChange: 0.05,
+                dollarImpact: 60,
+                verdict: "auto_approve",
+                reason: "5% increase",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "",
+            totalDollarImpact: 60,
+            autoApplicable: true,
+            warnings: [],
+        } as unknown as ReconciliationResult, client);
+
+        expect(client.updateProductSupplierPrice).toHaveBeenCalledWith("SKU-CASE", "/api/party/99", 10.5);
+    });
+
+    it("blocks the SKU cost sync when the price still differs by a clean pack factor", async () => {
+        const client = makeFinaleClientMock();
+        client.updateOrderItemPrice.mockResolvedValue({ supplierPartyUrl: "/api/party/99" });
+        // Existing supplier cost $10/EA, incoming $120 — a 12x swing that survived
+        // normalization. Almost certainly an unresolved each/case mismatch.
+        client.getProductSupplierInfo = vi.fn().mockResolvedValue({
+            supplierPartyUrl: "/api/party/99",
+            price: 10.0,
+        });
+        client.updateProductSupplierPrice = vi.fn().mockResolvedValue(true);
+
+        const result = {
+            orderId: "PO-UOM-3",
+            invoiceNumber: "INV-UOM-3",
+            vendorName: "Sneaky Vendor",
+            invoiceTotal: 1200,
+            priceChanges: [{
+                productId: "SKU-MISMATCH",
+                description: "Widget",
+                poPrice: 120.0,
+                invoicePrice: 120.0,
+                effectivePrice: 120.0,
+                packSource: "none",
+                quantity: 10,
+                percentChange: 0,
+                dollarImpact: 0,
+                verdict: "auto_approve",
+                reason: "",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "",
+            totalDollarImpact: 0,
+            autoApplicable: true,
+            warnings: [],
+        } as unknown as ReconciliationResult;
+
+        await applyReconciliation(result, client);
+
+        expect(client.updateProductSupplierPrice).not.toHaveBeenCalled();
+        expect(result.skuCostUpdateStatus).toBe("unit_mismatch_blocked");
+    });
+
+    it("does NOT blind-write the supplier cost when the guard lookup throws", async () => {
+        const client = makeFinaleClientMock();
+        client.updateOrderItemPrice.mockResolvedValue({ supplierPartyUrl: "/api/party/99" });
+        client.getProductSupplierInfo = vi.fn().mockRejectedValue(new Error("Finale 503"));
+        client.updateProductSupplierPrice = vi.fn().mockResolvedValue(true);
+
+        await applyReconciliation({
+            orderId: "PO-UOM-4",
+            invoiceNumber: "INV-UOM-4",
+            vendorName: "Vendor",
+            invoiceTotal: 105,
+            priceChanges: [{
+                productId: "SKU-X",
+                description: "Widget",
+                poPrice: 10.0,
+                invoicePrice: 10.5,
+                effectivePrice: 10.5,
+                packSource: "none",
+                quantity: 10,
+                percentChange: 0.05,
+                dollarImpact: 5,
+                verdict: "auto_approve",
+                reason: "",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "",
+            totalDollarImpact: 5,
+            autoApplicable: true,
+            warnings: [],
+        } as unknown as ReconciliationResult, client);
+
+        // PO line price still applied; only the future-pricing convenience sync is skipped.
+        expect(client.updateOrderItemPrice).toHaveBeenCalledWith("PO-UOM-4", "SKU-X", 10.5);
+        expect(client.updateProductSupplierPrice).not.toHaveBeenCalled();
+    });
+});
+
+describe("buildAuditMetadata preserves normalized pricing for cron replay", () => {
+    it("persists effectivePrice and pack provenance alongside the raw invoice price", () => {
+        const meta = buildAuditMetadata({
+            orderId: "PO-META-1",
+            invoiceNumber: "INV-META-1",
+            vendorName: "Case Vendor",
+            invoiceTotal: 1260,
+            priceChanges: [{
+                productId: "SKU-CASE",
+                description: "Widget",
+                poPrice: 10.0,
+                invoicePrice: 126.0,
+                effectivePrice: 10.5,
+                packMultiplier: 12,
+                packSource: "receipt_qty",
+                quantity: 10,
+                percentChange: 0.05,
+                dollarImpact: 60,
+                verdict: "auto_approve",
+                reason: "",
+            }],
+            feeChanges: [],
+            trackingUpdate: null,
+            overallVerdict: "auto_approve",
+            summary: "",
+            totalDollarImpact: 60,
+            autoApplicable: true,
+            warnings: [],
+        } as unknown as ReconciliationResult, { applied: [], skipped: [], errors: [] }, "auto");
+
+        expect(meta.priceChanges[0]).toMatchObject({
+            to: 126.0,
+            effectivePrice: 10.5,
+            packMultiplier: 12,
+            packSource: "receipt_qty",
+        });
     });
 });
