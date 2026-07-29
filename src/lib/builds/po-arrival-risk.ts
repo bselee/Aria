@@ -302,6 +302,19 @@ export interface WriteAtRiskResult {
  * UTC day). On the second/third tick of the same day the metadata is
  * refreshed in place instead of producing a new row — keeps the feed clean.
  *
+ * HERMIA(2026-07-29): Duplicate-burst fix. Evidence showed PO 125126 generated
+ * 939 rows in ap_activity_log with median inter-row gap of 0.007s — 322/338
+ * sampled gaps under 60s. The dedup SELECT works correctly when replayed, but
+ * in rapid bursts the loop produced INSERTs for the same poId on every iteration
+ * because earlier-invocation rows were either not yet visible (PostgREST
+ * transaction boundaries) or `risks` contained duplicate poId entries.
+ *
+ * Fix applies TWO layers of defence:
+ *   1. Pre-dedup `risks` by poId — keeps the FIRST entry (most severe, since
+ *      detectAtRiskPOs sorts worst-first) so only one row per PO enters the loop.
+ *   2. In-loop `writtenPoIds` Set guard — if two entries for the same poId
+ *      somehow still reach the loop body, the second is silently skipped.
+ *
  * Returns counts so the cron can log a one-line summary.
  */
 export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteAtRiskResult> {
@@ -338,8 +351,37 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
         // best-effort — better to over-surface than to miss real risks
     }
 
+    // HERMIA(2026-07-29): Pre-dedup risks by poId — detectAtRiskPOs sorts
+    // worst-first, so keeping the first occurrence preserves the most severe
+    // assessment for each PO. This prevents duplicate INSERTs even when the
+    // upstream (activePOs or detectAtRiskPOs) somehow produces duplicates.
+    const seenPre = new Set<string>();
+    const dedupedRisks: AtRiskPO[] = [];
     for (const risk of risks) {
+        if (!seenPre.has(risk.poId)) {
+            seenPre.add(risk.poId);
+            dedupedRisks.push(risk);
+        }
+    }
+    if (dedupedRisks.length < risks.length) {
+        console.log(
+            `[po-arrival-risk] deduped ${risks.length - dedupedRisks.length} duplicate poId(s) ` +
+            `from risks array (${dedupedRisks.length} unique remain)`,
+        );
+    }
+
+    // HERMIA(2026-07-29): In-loop guard — tracks poIds already written so a
+    // second occurrence within the SAME invocation is silently skipped even if
+    // the pre-dedup missed it (e.g. from a different branch of a concurrent path).
+    const writtenPoIds = new Set<string>();
+
+    for (const risk of dedupedRisks) {
         if (snoozedPoIds.has(risk.poId)) continue;
+        // Defence-in-depth: already written this poId in this invocation
+        if (writtenPoIds.has(risk.poId)) {
+            console.log(`[po-arrival-risk] in-loop guard: skipping duplicate ${risk.poId}`);
+            continue;
+        }
         try {
             // Look for an existing row from today for this PO.
             const { data: existing } = await sb
@@ -383,6 +425,7 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
                     console.warn(`[po-arrival-risk] update ${risk.poId} failed: ${error.message}`);
                     failed++;
                 } else {
+                    writtenPoIds.add(risk.poId);
                     updated++;
                 }
             } else {
@@ -400,6 +443,7 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
                     console.warn(`[po-arrival-risk] insert ${risk.poId} failed: ${error.message}`);
                     failed++;
                 } else {
+                    writtenPoIds.add(risk.poId);
                     inserted++;
                 }
             }
