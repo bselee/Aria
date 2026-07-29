@@ -341,9 +341,19 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
             const foundETA = extractETADate(replyBody);
 
             try {
-                // Build update payload
+                // Use lifecycle state machine for canonical ACKNOWLEDGED transition
+                const { transitionLifecycleState } = await import("./po-lifecycle");
+                await transitionLifecycleState(send.po_number, "ACKNOWLEDGED", "po-reply-watcher", {
+                    replyFrom: fromHeader.value,
+                    replyAt: new Date(msgTime).toISOString(),
+                    replySnippet: snippet,
+                    threadId,
+                    gmailMessageId: msg.id,
+                    ...(foundTracking.length > 0 ? { trackingExtracted: foundTracking } : {}),
+                });
+
+                // Build update payload for non-lifecycle fields (not lifecycle_stage)
                 const updatePayload: Record<string, any> = {
-                    lifecycle_stage: "ACKNOWLEDGED",
                     vendor_acknowledged_at: new Date(msgTime).toISOString(),
                     human_reply_detected_at: new Date(msgTime).toISOString(),
                     last_movement_summary: snippet,
@@ -407,51 +417,8 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
                 console.warn(`[po-reply-watcher] Failed to update purchase_orders for ${send.po_number}:`, updErr.message);
             }
 
-            // ── Insert lifecycle transition (deduped) ─────────
-            try {
-                // Check if ACKNOWLEDGED transition already exists for this PO
-                const { data: existing } = await supabase
-                    .from("po_lifecycle_transitions")
-                    .select("id")
-                    .eq("po_number", send.po_number)
-                    .eq("to_state", "ACKNOWLEDGED")
-                    .eq("triggered_by", "po-reply-watcher")
-                    .maybeSingle();
-
-                if (!existing) {
-                    await supabase
-                        .from("po_lifecycle_transitions")
-                        .insert({
-                            po_number: send.po_number,
-                            from_state: "SENT",
-                            to_state: "ACKNOWLEDGED",
-                            transitioned_at: new Date().toISOString(),
-                            triggered_by: "po-reply-watcher",
-                            metadata: {
-                                replyFrom: fromHeader.value,
-                                replyAt: new Date(msgTime).toISOString(),
-                                replySnippet: snippet,
-                                threadId,
-                                gmailMessageId: msg.id,
-                                ...(foundTracking.length > 0 ? { trackingExtracted: foundTracking } : {}),
-                            },
-                        });
-                }
-            } catch (insErr: any) {
-                console.warn(`[po-reply-watcher] Failed to insert lifecycle transition for ${send.po_number}:`, insErr.message);
-            }
-
-            // Also update local SQLite cache for crash-safe recovery
-            try {
-                const { getLocalDb } = await import("@/lib/storage/local-db");
-                const db = getLocalDb();
-                db.prepare(
-                    `INSERT OR REPLACE INTO po_lifecycle_cache (po_number, lifecycle_state, last_transitioned_at, triggered_by)
-                     VALUES (?, 'ACKNOWLEDGED', ?, 'po-reply-watcher')`
-                ).run(send.po_number, new Date().toISOString());
-            } catch (localErr: any) {
-                // Best-effort — Supabase write already succeeded
-            }
+            // transitionLifecycleState already wrote the transition audit log
+            // and local SQLite cache above — no manual insert needed here.
 
             // ── Push latest ETA to Finale (fire-and-forget) ─────
             try {

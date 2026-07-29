@@ -26,12 +26,22 @@ export async function handleEscalationReplace(ctx: Context, poNumber: string): P
             return;
         }
 
-        // Mark PO for replacement and flag for human review
+        // Mark PO for replacement — transition lifecycle to CANCELLED
+        // (PO being replaced is effectively cancelled, preserved in metadata)
+        const { transitionLifecycleState } = await import("../../lib/purchasing/po-lifecycle");
         await db.from("purchase_orders").update({
-            lifecycle_stage: "pending_replacement",
             needs_human_review: true,
             updated_at: new Date().toISOString(),
         }).eq("po_number", poNumber);
+
+        try {
+            await transitionLifecycleState(poNumber, "CANCELLED", "escalation-actions", {
+                detail: "pending_replacement",
+                requestedAt: new Date().toISOString(),
+            });
+        } catch (tlErr: any) {
+            console.warn(`[escalation-actions] Lifecycle transition failed for ${poNumber}:`, tlErr.message);
+        }
 
         // Log the decision
         await db.from("ap_activity_log").insert({
@@ -73,11 +83,20 @@ export async function handleEscalationDraft(ctx: Context, poNumber: string): Pro
             return;
         }
 
-        // Mark for urgent follow-up
+        // Mark for urgent follow-up — transition lifecycle to SENT (flag, preserve in metadata)
+        const { transitionLifecycleState } = await import("../../lib/purchasing/po-lifecycle");
         await db.from("purchase_orders").update({
-            lifecycle_stage: "urgent_followup_requested",
             updated_at: new Date().toISOString(),
         }).eq("po_number", poNumber);
+
+        try {
+            await transitionLifecycleState(poNumber, "SENT", "escalation-actions", {
+                detail: "urgent_followup_requested",
+                requestedAt: new Date().toISOString(),
+            });
+        } catch (tlErr: any) {
+            console.warn(`[escalation-actions] Lifecycle transition failed for ${poNumber}:`, tlErr.message);
+        }
 
         // Log the request
         await db.from("ap_activity_log").insert({

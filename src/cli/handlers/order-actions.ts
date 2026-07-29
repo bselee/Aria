@@ -22,11 +22,22 @@ export async function handleOrderApprove(ctx: Context, poNumber: string): Promis
     }
 
     try {
+        const { transitionLifecycleState } = await import("../../lib/purchasing/po-lifecycle");
         await db.from("purchase_orders").update({
-            lifecycle_stage: "ordered_browser",
             po_order_placed_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
         }).eq("po_number", poNumber);
+
+        // Transition lifecycle: ordered_browser → SENT (flag, preserve in metadata)
+        try {
+            await transitionLifecycleState(poNumber, "SENT", "order-actions", {
+                detail: "ordered_browser",
+                source: "browser-automation",
+                approvedAt: new Date().toISOString(),
+            });
+        } catch (tlErr: any) {
+            console.warn(`[order-actions] Lifecycle transition failed for ${poNumber}:`, tlErr.message);
+        }
 
         await db.from("ap_activity_log").insert({
             email_from: "telegram-will",

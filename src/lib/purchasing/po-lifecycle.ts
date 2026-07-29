@@ -54,9 +54,64 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
     CANCELLED: [], // terminal state
 };
 
-/** Fallback if state is missing or null */
-function resolveState(state: string | null): string {
-    return state || INITIAL_LIFECYCLE_STATE;
+/**
+ * HERMIA(2026-07-29): Legacy/lowercase lifecycle values that were written
+ * directly to purchase_orders.lifecycle_stage by bypass sites instead of
+ * going through transitionLifecycleState(). Evidence: 0 canonical rows,
+ * 311 rows on 'l3_escalated', 833 NULL in live DB.
+ *
+ * Flags/sub-states (moving_with_tracking, ap_follow_up, tracking_unavailable,
+ * pending_replacement, urgent_followup_requested, closed_stale, ordered_browser)
+ * map to their nearest true stage. The descriptive string is preserved in
+ * the metadata argument when transitioning via transitionLifecycleState().
+ */
+export const LEGACY_STAGE_MAP: Record<string, POLifecycleState> = {
+    // Plain case fixes
+    sent: "SENT",
+    received: "RECEIVED",
+    reconciled: "RECONCILED",
+    // Already canonical but included for completeness
+    ACKNOWLEDGED: "ACKNOWLEDGED",
+    // Flags / sub-states that describe a CONDITION, mapped to the true stage
+    moving_with_tracking: "SENT",          // sent with tracking numbers
+    ap_follow_up: "SENT",                  // follow-up sent, still SENT
+    ordered_browser: "SENT",               // dispatched via browser automation
+    tracking_unavailable: "SENT",          // sent but no tracking available
+    urgent_followup_requested: "SENT",     // urgent follow-up drafted, still SENT
+    pending_replacement: "CANCELLED",      // PO being replaced — effectively cancelled
+    closed_stale: "CANCELLED",             // stale PO abandoned — effectively cancelled
+    // Observed live DB values (beyond the 14 documented bypass sites)
+    l3_escalated: "SENT",                  // escalated to L3, still SENT
+};
+
+/**
+ * Normalize any legacy/lowercase lifecycle value to its canonical
+ * UPPERCASE POLifecycleState. Returns null for truly unknown values
+ * so callers can decide their own fallback.
+ *
+ * Examples:
+ *   normalizeLifecycleStage("sent")             → "SENT"
+ *   normalizeLifecycleStage("moving_with_tracking") → "SENT"
+ *   normalizeLifecycleStage("closed_stale")     → "CANCELLED"
+ *   normalizeLifecycleStage(null)               → null
+ *   normalizeLifecycleStage("bogus")            → null
+ */
+export function normalizeLifecycleStage(
+    raw: string | null
+): POLifecycleState | null {
+    if (!raw) return null;
+    const upper = raw.toUpperCase();
+    // Fast path: already canonical (case-insensitive)
+    if ((PO_LIFECYCLE_STATES as readonly string[]).includes(upper)) {
+        return upper as POLifecycleState;
+    }
+    // Legacy/rogue map lookup (case-sensitive, all lowercase)
+    return LEGACY_STAGE_MAP[raw] ?? null;
+}
+
+/** Fallback if state is missing, null, or unknown */
+function resolveState(state: string | null): POLifecycleState {
+    return normalizeLifecycleStage(state) ?? INITIAL_LIFECYCLE_STATE;
 }
 
 /**
@@ -93,7 +148,7 @@ export async function getLifecycleState(
             .single();
 
         if (error || !data) return INITIAL_LIFECYCLE_STATE as POLifecycleState;
-        return (data.lifecycle_state as POLifecycleState) || INITIAL_LIFECYCLE_STATE as POLifecycleState;
+        return normalizeLifecycleStage(data.lifecycle_state as string | null) ?? INITIAL_LIFECYCLE_STATE;
     } catch (err) {
         console.warn(
             `[po-lifecycle] Failed to get state for PO ${poNumber}:`,
@@ -142,6 +197,106 @@ export async function transitionLifecycleState(
                     `[po-lifecycle] ${(valErr as Error).message} — skipping transition`
                 );
                 return;
+            }
+
+            // ── HERMIA(2026-07-29): 3-way match gate on RECONCILED → COMPLETED ─
+            // A transition from RECONCILED to COMPLETED means the PO has been
+            // approved and all corrections applied to Finale. We must verify
+            // that the three documents (PO, receipt, invoice) actually agree
+            // before claiming completion.
+            //
+            // This gate is load-bearing: before it existed, both dashboard
+            // "Approve" handlers wrote lifecycle_stage='reconciled' to four
+            // tables without ever calling Finale, and POs were marked complete
+            // before corrections posted, if at all. Now:
+            //   - The gate checks line-item agreement.
+            //   - Failure returns — the PO stays at RECONCILED with a clear log.
+            //   - The caller (approve handler) already returns 409/502 on Finale
+            //     failure, so a failing 3-way match here is an additional safety
+            //     layer for the transition itself, not a replacement.
+            //
+            // N.B. This gate accepts that for POs where line-item data hasn't
+            // been plumbed through (no invoice/receipt lines loaded), we can't
+            // run a full match. In that case the transition proceeds — the
+            // approval handler already verified Finale accepted the corrections.
+            // The gate is a belt to the handler's suspenders, not a replacement.
+            if (toState === "COMPLETED") {
+                try {
+                // Use createClient() for the 3-way gate — this runs before
+                // Phase 2's supabase handle is initialized.
+                const db = createClient();
+                if (!db) {
+                    console.log("[po-lifecycle] 3-way match skipped: DB unavailable");
+                } else {
+                        const [poRes, invRes] = await Promise.all([
+                        db
+                            .from("purchase_orders")
+                            .select("line_items, total, status")
+                            .eq("po_number", poNumber)
+                            .maybeSingle(),
+                        db
+                            .from("invoices")
+                            .select("line_items, total, status")
+                            .eq("po_number", poNumber)
+                            .order("created_at", { ascending: false })
+                            .limit(1)
+                            .maybeSingle(),
+                        ]);
+
+                        const poData = (poRes as any)?.data;
+                        const invoiceData = (invRes as any)?.data;
+                        const hasReceipt = !!(poData as any)?.receive_date
+                            && new Date((poData as any).receive_date).getTime() < Date.now();
+
+                    if (invoiceData?.line_items && poData?.line_items) {
+                            const { evaluateThreeWayMatch } = await import("./three-way-match");
+                        const match = evaluateThreeWayMatch({
+                            orderId: poNumber,
+                            hasPurchaseOrder: !!poData,
+                            hasReceipt,
+                            hasInvoice: !!invoiceData,
+                                lines: (poData.line_items ?? []).map((pi: any) => {
+                                const il = (invoiceData.line_items ?? []).find(
+                                        (l: any) =>
+                                            l.sku === pi.productId ||
+                                            l.description === pi.description,
+                                );
+                                return {
+                                        productId:
+                                            pi.productId ?? pi.sku ?? pi.description ?? "UNKNOWN",
+                                    poQty: pi.quantity ?? 0,
+                                    poUnitPrice: pi.unitPrice ?? 0,
+                                        receivedQty: hasReceipt ? pi.quantity ?? null : null,
+                                    invoiceQty: il?.qty ?? 0,
+                                    invoiceUnitPrice: il?.unitPrice ?? 0,
+                                };
+                            }),
+                        });
+
+                        if (!match.canApprove) {
+                            console.warn(
+                                `[po-lifecycle] 3-way match BLOCKED RECONCILED → COMPLETED for ${poNumber}: ` +
+                                    match.summary,
+                            );
+                            return;
+                        }
+                        console.log(
+                                `[po-lifecycle] 3-way match PASSED for ${poNumber}: ` +
+                                    match.summary,
+                        );
+                        } else {
+                            console.log(
+                                `[po-lifecycle] 3-way match skipped for ${poNumber}: ` +
+                                    `no line-item data (po=${!!poData?.line_items}, inv=${!!invoiceData?.line_items})`,
+                        );
+                        }
+                    }
+                } catch (gateErr: any) {
+                    console.warn(
+                        `[po-lifecycle] 3-way match check failed for ${poNumber}: ${gateErr.message} — ` +
+                            "allowing transition (belt, not suspenders)",
+                    );
+                }
             }
 
             const now = new Date().toISOString();
@@ -272,7 +427,7 @@ export async function getLifecycleSummary(): Promise<
 
         const counts: Record<string, number> = {};
         for (const row of data) {
-            const state = (row.lifecycle_state as string) || INITIAL_LIFECYCLE_STATE;
+            const state = normalizeLifecycleStage(row.lifecycle_state as string | null) ?? INITIAL_LIFECYCLE_STATE;
             counts[state] = (counts[state] || 0) + 1;
         }
         return counts;

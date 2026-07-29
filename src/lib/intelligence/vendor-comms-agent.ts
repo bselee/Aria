@@ -190,10 +190,21 @@ export class VendorCommsAgent {
         await db.from("purchase_orders").update({
             vendor_noncomm_at: now,
             tracking_unavailable_at: now,
-            lifecycle_stage: 'tracking_unavailable',
             needs_human_review: true,
             updated_at: now,
         }).eq("po_number", context.poNumber);
+
+        // Transition lifecycle: tracking_unavailable → SENT (flag, preserve in metadata)
+        try {
+            const { transitionLifecycleState } = await import("../purchasing/po-lifecycle");
+            await transitionLifecycleState(context.poNumber, "SENT", "vendor-comms-agent", {
+                detail: "tracking_unavailable",
+                vendorNoncomm: true,
+                markedAt: now,
+            });
+        } catch (tlErr: any) {
+            console.warn(`[vendor-comms] Lifecycle transition failed for ${context.poNumber}:`, tlErr.message);
+        }
 
         // Update vendor profile
         await db.from("vendor_profiles")

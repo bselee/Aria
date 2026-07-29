@@ -1046,7 +1046,6 @@ export async function retrySendEmail(
                     }
                     : {}),
                 po_email_message_id: gmailMessageId ?? finaleEmailActionUrl ?? null,
-                lifecycle_stage: 'sent',
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'po_number' }),
             db.from('po_sends').insert({
