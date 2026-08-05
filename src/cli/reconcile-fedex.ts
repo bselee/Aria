@@ -37,6 +37,11 @@ import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
 import { assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
+import {
+    findLatestFedexCsvCandidate,
+    archiveFedexCsvToAria,
+    getFedexStatementDir,
+} from '@/lib/statements/fedex-acquisition';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
@@ -394,22 +399,35 @@ async function main() {
         if (csvPath) {
             targetCsv = csvPath;
         } else {
-            if (!fs.existsSync(SANDBOX_DIR)) {
-                console.error('❌ Sandbox directory not found:', SANDBOX_DIR);
-                throw new Error('Sandbox directory not found');
+            const candidate = findLatestFedexCsvCandidate();
+            if (!candidate) {
+                console.error('❌ No FEDEX*.csv found in:');
+                console.error(`   ${getFedexStatementDir()}`);
+                console.error(`   ${path.join(os.homedir(), 'Downloads')}`);
+                console.error(`   ${SANDBOX_DIR}`);
+                console.error('   Run: node --env-file=.env.local --import tsx src/cli/fetch-fedex-csv.ts');
+                throw new Error('No FEDEX*.csv files found');
             }
-            const files = fs.readdirSync(SANDBOX_DIR)
-                .filter(f => f.startsWith('FEDEX') && f.endsWith('.csv'))
-                .sort()
-                .reverse();
-            if (files.length === 0) {
-                console.error('❌ No FEDEX*.csv files found in', SANDBOX_DIR);
-                throw new Error('No FEDEX*.csv files found in Sandbox');
+            targetCsv = candidate.fullPath;
+            console.log(`📂 Source: ${candidate.source} (${path.basename(candidate.fullPath)})`);
+            // Keep a stable copy under Aria statements + Sandbox FEDEX_ name for ops
+            try {
+                const archived = archiveFedexCsvToAria(targetCsv);
+                if (fs.existsSync(SANDBOX_DIR)) {
+                    const sandboxName = path.basename(archived).toUpperCase().startsWith('FEDEX')
+                        ? path.basename(archived)
+                        : `FEDEX_${path.basename(archived)}`;
+                    const sandboxPath = path.join(SANDBOX_DIR, sandboxName);
+                    if (path.resolve(archived) !== path.resolve(sandboxPath)) {
+                        fs.copyFileSync(archived, sandboxPath);
+                    }
+                }
+            } catch {
+                /* non-fatal */
             }
-            targetCsv = path.join(SANDBOX_DIR, files[0]);
         }
 
-        if (!fs.existsSync(targetCsv)) {
+        if (!targetCsv || !fs.existsSync(targetCsv)) {
             console.error('❌ CSV not found:', targetCsv);
             throw new Error('CSV file not found: ' + targetCsv);
         }

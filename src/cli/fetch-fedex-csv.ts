@@ -16,15 +16,18 @@ dotenv.config({ path: ".env.local" });
 import { chromium } from "playwright";
 import path from "path";
 import os from "os";
-import { execSync } from "child_process";
+import fs from "fs";
 import { pathToFileURL } from "url";
 import {
     ensureFedexStatementDir,
     writeFedexAcquisitionStatus,
 } from "@/lib/statements/fedex-acquisition";
 
+// NOTE: Never taskkill the user's Chrome. Use dedicated profile only.
+
 const FBO_URL = "https://www.fedex.com/en-us/billing-online.html";
-const CHROME_PROFILE_DIR = path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "User Data");
+/** Dedicated Playwright profile — do not use the live Chrome User Data (ProcessSingleton / instant close). */
+const CHROME_PROFILE_DIR = path.join(os.homedir(), "AppData", "Local", "Aria", "chrome-profiles", "fedex-billing");
 const FEDEX_STATEMENT_DIR = ensureFedexStatementDir();
 
 export interface FedexDownloadResult {
@@ -48,15 +51,10 @@ export async function runFedexCsvDownload(options?: { probeOnly?: boolean }): Pr
     console.log(" FedEx Billing Online CSV Downloader");
     console.log("===============================================\n");
     console.log(`FedEx statement folder: ${FEDEX_STATEMENT_DIR}`);
-    console.log("Phase 1: Launching Chrome with the persistent profile.");
-    console.log("Please ensure no other Chrome windows are open before we start.\n");
+    console.log(`Chrome profile (dedicated): ${CHROME_PROFILE_DIR}`);
+    console.log("Phase 1: Launching Chrome (dedicated profile — your daily Chrome can stay open).\n");
 
-    try {
-        execSync("taskkill /F /IM chrome.exe /T", { stdio: "ignore" });
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-    } catch {
-        // ignore
-    }
+    fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true });
 
     const context = await chromium.launchPersistentContext(CHROME_PROFILE_DIR, {
         headless: false,
