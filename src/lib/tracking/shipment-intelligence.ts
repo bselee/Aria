@@ -302,22 +302,42 @@ export function classifyShipmentEvidence(record: ShipmentRecord): ShipmentEviden
     );
     const hasStrongSource = sourceConfidence >= 0.85;
     const hasMultipleSources = new Set(sourceRefs.map((ref) => `${ref.source}:${ref.sourceRef || ""}`)).size >= 2;
+    const hasPoLink = (record.po_numbers || []).length > 0;
+
+    // Document sources produced by internal pipelines that already matched the
+    // PO (invoice OCR, BOL PDF, carrier API, reconciliation) — solid on their own.
     const hasExplicitDocumentSource = sourceRefs.some((ref) =>
         ["ap_invoice", "invoice_reconciliation", "bol_pdf", "carrier_api", "po_thread_sync"].includes(ref.source),
+    );
+
+    // Email ingest PDF/vision sources are solid only when the tracking is
+    // linked to a PO; without a PO link they stay candidate (orphan-style).
+    const hasEmailIngestDocumentSource = sourceRefs.some((ref) =>
+        ["email_ingest_pdf", "email_ingest_bol_vision"].includes(ref.source),
     );
 
     const hasCarrierOrDocumentSource = sourceRefs.some((ref) =>
         ["carrier_poll", "carrier_api", "ap_invoice", "invoice_reconciliation", "bol_pdf", "po_thread_sync"].includes(ref.source),
     );
 
-    if ((hasStrongSource || hasMultipleSources) && hasCarrierOrDocumentSource || hasExplicitDocumentSource) {
+    if (hasExplicitDocumentSource) {
         return {
             level: "confirmed",
-            reason: hasExplicitDocumentSource
-                ? "document evidence"
-                : hasCarrierOrDocumentSource
-                ? "carrier or document source"
-                : hasStrongSource
+            reason: "document evidence",
+        };
+    }
+
+    if (hasEmailIngestDocumentSource && hasPoLink) {
+        return {
+            level: "confirmed",
+            reason: "document evidence linked to PO",
+        };
+    }
+
+    if ((hasStrongSource || hasMultipleSources) && hasCarrierOrDocumentSource) {
+        return {
+            level: "confirmed",
+            reason: hasStrongSource
                 ? "strong source correlation"
                 : "multiple sources agree",
         };

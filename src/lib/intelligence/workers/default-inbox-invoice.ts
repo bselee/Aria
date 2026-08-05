@@ -616,6 +616,23 @@ export async function processDefaultInboxInvoice(
             } catch { /* dedup collision */ }
         }
 
+        // ── WS2 (2026-08-05): bridge invoice/email tracking → shipments ──
+        // Paid invoice success path — link any tracking numbers found in the
+        // email body/OCR text to the resolved PO. Best-effort only.
+        try {
+            const { bridgeInvoiceTrackingToShipments } = await import("../../tracking/invoice-tracking-bridge");
+            await bridgeInvoiceTrackingToShipments({
+                ocrText: bodyText,
+                poNumber: poSummary.orderId,
+                vendorName,
+                invoiceNumber,
+                source: "default_paid_invoice",
+                sourceRef: `default-inbox-${gmailMessageId}`,
+            });
+        } catch (bridgeErr: any) {
+            console.warn(`[default-inbox-invoice] invoice→shipment bridge failed: ${bridgeErr?.message || bridgeErr}`);
+        }
+
         // ── Write-back to Pinecone ────────────────────────────────────────────
         // Store what was learned about this vendor so future invoices get richer context.
         // Only write when Haiku produced a confident result with useful observations.

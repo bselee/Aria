@@ -1,43 +1,38 @@
 /**
  * @file    src/lib/tracking/delivery-receipt-prompt.ts
- * @purpose Finds delivered shipments (24-72h old) that haven't been
- *          confirmed as received in Finale. Sends Telegram prompts with
- *          inline buttons so Bill can one-tap confirm receipt.
+ * @purpose Flag POs that are carrier-delivered but not Finale-received past 24h,
+ *          escalate past 48h. Reception is owned by warehouse/others — Aria does
+ *          NOT auto-receive; we only notify so the lag is visible.
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/db, @/lib/intelligence/telegram-notify
+ * @updated 2026-08-05 — fix shipments table, 24/48h thresholds, no fake "confirm receive" ownership
+ * @deps    @/lib/db, @/lib/intelligence/telegram-notify, delivered-unreceived
  *
  * DESIGN:
- *   Runs as part of the po-receiving-watcher cron (every 30 min).
- *   Queries shipment_intelligence for delivered_at between 24-72h ago
- *   where the PO hasn't been received in Finale yet.
- *
- *   Dedup: module-level Set of prompted PO numbers. Persists across
- *   cron runs within PM2 process lifetime. Cross-restart dedup via
- *   ap_activity_log check with intent='RECEIPT_PROMPT'.
- *
- *   Action flow:
- *   1. Find delivered-but-unreceived POs
- *   2. Check dedup (skip if already prompted)
- *   3. Send Telegram with [✅ Confirm Received] [⏭ Skip] buttons
- *   4. Log prompt to ap_activity_log
- *   5. On confirm: call Finale receive endpoint (future)
- *   6. On skip: log skip, don't re-prompt for 7 days
+ *   Cron delivery-receipt-prompt (4x/day weekdays).
+ *   Queries shipments where status_category=delivered and delivered_at ≥ 24h ago.
+ *   Skips POs already received (purchase_orders status/lifecycle).
+ *   Telegram digest: flag (24–47h) + escalate (≥48h). Dedup via ap_activity_log.
  */
 
 import { createClient } from "@/lib/db";
-import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
+import { sendTelegramNotify } from "@/lib/intelligence/telegram-notify";
+import {
+    DELIVERED_ESCALATE_HOURS,
+    DELIVERED_FLAG_HOURS,
+    hoursSinceDelivered,
+    receiptLagLevel,
+} from "@/lib/tracking/delivered-unreceived";
 
-/** Prompt window: delivered between 24h and 72h ago */
-const PROMPT_MIN_HOURS = 24;
-const PROMPT_MAX_HOURS = 72;
+/** Look back this far for delivered shipments still open. */
+const LOOKBACK_HOURS = 14 * 24; // 14 days
 
 /** In-memory dedup: PO numbers already prompted this process lifetime */
 const promptedThisSession = new Set<string>();
 
-/** Skip cooldown: don't re-prompt for 7 days after skip */
-const SKIP_COOLDOWN_DAYS = 7;
+/** Don't re-alert the same PO more often than this. */
+const DEDUP_HOURS = 12;
 
 export interface DeliveryReceiptCandidate {
     poNumber: string;
@@ -46,6 +41,7 @@ export interface DeliveryReceiptCandidate {
     carrierName: string | null;
     deliveredAt: string;
     hoursSinceDelivery: number;
+    lag: "flag" | "escalate";
 }
 
 export interface ReceiptPromptResult {
@@ -56,8 +52,8 @@ export interface ReceiptPromptResult {
 }
 
 /**
- * Find delivered-but-unreceived shipments and send Telegram prompts.
- * Called from po-receiving-watcher cron.
+ * Find delivered-but-unreceived shipments past 24h and send a Telegram flag digest.
+ * Called from delivery-receipt-prompt cron.
  */
 export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
     const db = createClient();
@@ -66,46 +62,57 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
     }
 
     const now = new Date();
-    const minCutoff = new Date(now.getTime() - PROMPT_MAX_HOURS * 3600000).toISOString();
-    const maxCutoff = new Date(now.getTime() - PROMPT_MIN_HOURS * 3600000).toISOString();
+    const lookbackCutoff = new Date(now.getTime() - LOOKBACK_HOURS * 3600000).toISOString();
+    const flagCutoff = new Date(now.getTime() - DELIVERED_FLAG_HOURS * 3600000).toISOString();
 
-    // Step 1: Find delivered shipments in the prompt window
+    // Real table is `shipments` (shipment_intelligence was wrong and returned nothing)
     const { data: shipments, error } = await db
-        .from("shipment_intelligence")
+        .from("shipments")
         .select("tracking_number, po_numbers, vendor_names, carrier_name, delivered_at, status_category, active")
         .eq("status_category", "delivered")
         .eq("active", true)
-        .gte("delivered_at", minCutoff)
-        .lte("delivered_at", maxCutoff)
-        .limit(50);
+        .not("delivered_at", "is", null)
+        .lte("delivered_at", flagCutoff)
+        .gte("delivered_at", lookbackCutoff)
+        .limit(100);
 
     if (error || !shipments || shipments.length === 0) {
+        if (error) console.warn(`[receipt-prompt] shipments query: ${error.message}`);
         return { prompted: 0, skippedAlreadyPrompted: 0, skippedNoCandidates: true, candidates: [] };
     }
 
-    // Step 2: Get PO numbers that are already received in Finale
-    // Query purchase_orders for received/complete POs
-    const allPoNumbers = shipments.flatMap(s => (s.po_numbers || []) as string[]);
+    const allPoNumbers = [...new Set(shipments.flatMap((s: any) => (s.po_numbers || []) as string[]))];
     if (allPoNumbers.length === 0) {
         return { prompted: 0, skippedAlreadyPrompted: 0, skippedNoCandidates: true, candidates: [] };
     }
 
-    const { data: receivedPOs } = await db
+    // Treat lifecycle_stage RECEIVED or completion complete as already handled
+    const { data: poRows } = await db
         .from("purchase_orders")
-        .select("po_number, completion_state")
-        .in("po_number", allPoNumbers)
-        .in("completion_state", ["complete", "finale-received"]);
+        .select("po_number, lifecycle_stage, completion_state")
+        .in("po_number", allPoNumbers);
 
-    const receivedSet = new Set((receivedPOs || []).map(r => r.po_number));
+    const receivedSet = new Set<string>();
+    for (const row of poRows || []) {
+        const stage = String((row as any).lifecycle_stage || "").toLowerCase();
+        const completion = String((row as any).completion_state || "").toLowerCase();
+        if (
+            stage === "received"
+            || completion === "complete"
+            || completion === "finale-received"
+            || completion.startsWith("received_")
+        ) {
+            receivedSet.add((row as any).po_number);
+        }
+    }
 
-    // Step 3: Check ap_activity_log for recently prompted/skipped POs
-    const skipCutoff = new Date(now.getTime() - SKIP_COOLDOWN_DAYS * 86400000).toISOString();
+    const dedupCutoff = new Date(now.getTime() - DEDUP_HOURS * 3600000).toISOString();
     const { data: recentPrompts } = await db
         .from("ap_activity_log")
         .select("metadata")
-        .eq("intent", "RECEIPT_PROMPT")
-        .gte("created_at", skipCutoff)
-        .limit(200);
+        .eq("intent", "RECEIPT_LAG_FLAG")
+        .gte("created_at", dedupCutoff)
+        .limit(300);
 
     const dbPromptedPOs = new Set<string>();
     for (const row of (recentPrompts || []) as any[]) {
@@ -113,89 +120,102 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
         if (po) dbPromptedPOs.add(po);
     }
 
-    // Step 4: Build candidate list
     const candidates: DeliveryReceiptCandidate[] = [];
-    let prompted = 0;
     let skippedAlready = 0;
+    const seenPo = new Set<string>();
 
     for (const s of shipments as any[]) {
         const poNumbers: string[] = s.po_numbers || [];
         for (const poNumber of poNumbers) {
-            // Skip already received in Finale
+            if (seenPo.has(poNumber)) continue;
             if (receivedSet.has(poNumber)) continue;
 
-            // Skip already prompted (in-memory or DB)
             if (promptedThisSession.has(poNumber) || dbPromptedPOs.has(poNumber)) {
                 skippedAlready++;
                 continue;
             }
 
-            const hoursSince = Math.round(
-                (now.getTime() - new Date(s.delivered_at).getTime()) / 3600000
-            );
+            const hours = hoursSinceDelivered(s.delivered_at, now.getTime());
+            if (hours == null || hours < DELIVERED_FLAG_HOURS) continue;
+            const lag = receiptLagLevel(hours);
+            if (lag === "ok") continue;
 
+            seenPo.add(poNumber);
             candidates.push({
                 poNumber,
                 vendorName: (s.vendor_names || [])[0] || null,
                 trackingNumber: s.tracking_number,
                 carrierName: s.carrier_name,
                 deliveredAt: s.delivered_at,
-                hoursSinceDelivery: hoursSince,
+                hoursSinceDelivery: hours,
+                lag: lag === "escalate" ? "escalate" : "flag",
             });
         }
     }
 
-    // Step 5: Send Telegram prompts (batch up to 5 per run to avoid spam)
-    const toPrompt = candidates.slice(0, 5);
+    // Escalate first, then flag; cap digest size
+    candidates.sort((a, b) => {
+        if (a.lag !== b.lag) return a.lag === "escalate" ? -1 : 1;
+        return b.hoursSinceDelivery - a.hoursSinceDelivery;
+    });
+    const toPrompt = candidates.slice(0, 12);
 
     if (toPrompt.length > 0) {
+        const escalate = toPrompt.filter((c) => c.lag === "escalate");
+        const flag = toPrompt.filter((c) => c.lag === "flag");
+
         const lines: string[] = [];
-        lines.push(`📦 *Deliveries Awaiting Receipt Confirmation*`);
-        lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        lines.push(`Delivered · not received (warehouse)`);
+        lines.push(`Thresholds: flag ≥${DELIVERED_FLAG_HOURS}h · escalate ≥${DELIVERED_ESCALATE_HOURS}h`);
+        lines.push(`—`);
 
-        for (const c of toPrompt) {
-            const vendor = c.vendorName || "Unknown vendor";
-            const carrier = c.carrierName || "Carrier";
-            lines.push(`\n*PO ${c.poNumber}* — ${vendor}`);
-            lines.push(`🚚 ${carrier} #${c.trackingNumber}`);
-            lines.push(`📅 Delivered ${c.hoursSinceDelivery}h ago`);
+        if (escalate.length > 0) {
+            lines.push(`OVERDUE (≥${DELIVERED_ESCALATE_HOURS}h):`);
+            for (const c of escalate) {
+                lines.push(
+                    `PO ${c.poNumber} · ${c.vendorName || "?"} · ${c.hoursSinceDelivery}h · ${c.carrierName || "carrier"} ${c.trackingNumber}`,
+                );
+            }
         }
+        if (flag.length > 0) {
+            lines.push(`Flag (≥${DELIVERED_FLAG_HOURS}h):`);
+            for (const c of flag) {
+                lines.push(
+                    `PO ${c.poNumber} · ${c.vendorName || "?"} · ${c.hoursSinceDelivery}h · ${c.carrierName || "carrier"} ${c.trackingNumber}`,
+                );
+            }
+        }
+        lines.push(`—`);
+        lines.push(`Aria does not receive in Finale — flag for receiving team.`);
 
-        // Build inline keyboard: one row per PO with confirm/skip buttons
-        const buttons = toPrompt.map(c => [
-            { text: `✅ Receive ${c.poNumber}`, callback_data: `receipt_confirm_${c.poNumber}` },
-            { text: `⏭ Skip`, callback_data: `receipt_skip_${c.poNumber}` },
-        ]);
-
-        await sendTelegramNotifyWithButtons(lines.join("\n"), buttons);
+        await sendTelegramNotify(lines.join("\n"));
 
         for (const c of toPrompt) {
             promptedThisSession.add(c.poNumber);
-
-            // Log prompt to DB for cross-restart dedup
             try {
                 await db.from("ap_activity_log").insert({
                     email_from: c.vendorName || "unknown",
-                    email_subject: `Receipt prompt: PO ${c.poNumber}`,
-                    intent: "RECEIPT_PROMPT",
-                    action_taken: `Sent Telegram prompt for delivered PO (delivered ${c.hoursSinceDelivery}h ago)`,
+                    email_subject: `Receipt lag ${c.lag}: PO ${c.poNumber}`,
+                    intent: "RECEIPT_LAG_FLAG",
+                    action_taken: `Flagged delivered-unreceived PO (${c.hoursSinceDelivery}h, ${c.lag})`,
                     metadata: {
                         poNumber: c.poNumber,
                         vendorName: c.vendorName,
                         trackingNumber: c.trackingNumber,
                         deliveredAt: c.deliveredAt,
+                        hoursSinceDelivery: c.hoursSinceDelivery,
+                        lag: c.lag,
                         promptedAt: now.toISOString(),
                     },
                 });
             } catch { /* non-blocking */ }
         }
 
-        prompted = toPrompt.length;
-        console.log(`[receipt-prompt] Prompted for ${prompted} PO(s)`);
+        console.log(`[receipt-prompt] Flagged ${toPrompt.length} PO(s) (escalate=${escalate.length}, flag=${flag.length})`);
     }
 
     return {
-        prompted,
+        prompted: toPrompt.length,
         skippedAlreadyPrompted: skippedAlready,
         skippedNoCandidates: false,
         candidates,

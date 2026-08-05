@@ -1,6 +1,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../db";
+import { isObviousPromotionalEmail } from "../promotional-email";
 
 /**
  * @file email-ingestion.ts
@@ -8,7 +9,7 @@ import { createClient } from "../../db";
  *          inserts them into the Supabase `email_inbox_queue` so that downstream
  *          agents can process them without duplicate Gmail API calls or race conditions.
  * @author Antigravity
- * @updated 2026-03-13 — stores full body text + pdf filenames (PO #124462 fix)
+ * @updated 2026-08-05 — promo pre-mark + status vocabulary; avoid forever-unprocessed ads
  */
 /**
  * Decode base64url-encoded Gmail body data to UTF-8 string.
@@ -64,6 +65,7 @@ export class EmailIngestionWorker {
             }
 
             let insertedCount = 0;
+            let promoCount = 0;
 
             // Pre-filter against Supabase to avoid fetching full payloads for emails we already queued
             const messageIds = messages.map(m => m.id!);
@@ -71,7 +73,7 @@ export class EmailIngestionWorker {
                 .from('email_inbox_queue')
                 .select('gmail_message_id')
                 .in('gmail_message_id', messageIds);
-            
+
             const existingIds = new Set(existing?.map(e => e.gmail_message_id) || []);
             const newMessages = messages.filter(m => !existingIds.has(m.id!));
 
@@ -119,6 +121,14 @@ export class EmailIngestionWorker {
                 // that snippet truncation causes detection failures.
                 const bodyText = extractFullBodyText(payload);
 
+                // DECISION(2026-08-05): Pre-mark obvious promos so they never sit as
+                // unprocessed forever if ACK is delayed. Still inserts for audit.
+                const isPromo = isObviousPromotionalEmail({
+                    from: fromHeader,
+                    subject,
+                    snippet,
+                });
+
                 // Insert into Supabase Queue
                 const { error } = await db.from('email_inbox_queue').insert({
                     gmail_message_id: m.id!,
@@ -130,17 +140,32 @@ export class EmailIngestionWorker {
                     body_text: bodyText || null,
                     pdf_filenames: pdfFilenames.length > 0 ? pdfFilenames : null,
                     has_pdf: hasPdf,
-                    status: 'unprocessed',
+                    status: isPromo ? 'promotional' : 'unprocessed',
+                    processed_by_ack: isPromo,
+                    processed_by: isPromo ? 'email-ingestion-promo' : null,
                     source_inbox: this.tokenIdentifier
                 });
 
                 if (error && error.code !== '23505') { // Ignore unique violation if it sneaked in
                     console.error(`   ❌ Failed to insert ${m.id} to queue:`, error.message);
-                } else {
+                } else if (!error) {
                     insertedCount++;
+                    if (isPromo) {
+                        promoCount++;
+                        // Archive obvious ads out of inbox immediately
+                        try {
+                            await gmail.users.messages.modify({
+                                userId: "me",
+                                id: m.id!,
+                                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+                            });
+                        } catch { /* best effort */ }
+                    }
                 }
-            }            if (insertedCount > 0) {
-                console.log(`✅ [EmailIngestionWorker] Ingested ${insertedCount} new emails into the queue.`);
+            }
+
+            if (insertedCount > 0) {
+                console.log(`✅ [EmailIngestionWorker] Ingested ${insertedCount} new emails (${promoCount} promo pre-marked).`);
             }
 
         } catch (err: any) {

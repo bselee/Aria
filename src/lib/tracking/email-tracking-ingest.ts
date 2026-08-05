@@ -31,19 +31,36 @@ import {
     extractTrackingNumbers,
 } from "@/lib/carriers/tracking-service";
 import * as shipmentIntelligence from '@/lib/tracking/shipment-intelligence';
+import { extractBolText } from "./bol-ocr";
 import { createClient } from "@/lib/db";
 import { sendTelegramNotify } from "@/lib/intelligence/telegram-notify";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
-/** Gmail search query for shipping/tracking emails. */
+/** Gmail search query for shipping/tracking emails + BOLs + invoice-embedded tracking. */
 const SHIPPING_SEARCH_QUERY = [
     "newer_than:2d",
     "-from:buildasoil.com",
     "-from:finaleinventory.com",
-    "(shipped OR \"picked up\" OR tracking OR freight OR pallet OR PRO OR \"bill of lading\" OR BOL OR \"tracking number\"",
-    " OR \"ship date\" OR \"ship today\")"
+    "(",
+    "shipped OR \"picked up\" OR tracking OR freight OR pallet OR PRO OR \"bill of lading\" OR BOL",
+    " OR \"tracking number\" OR \"ship date\" OR \"ship today\" OR \"pro number\" OR \"pro #\"",
+    " OR \"trk#\" OR \"track your shipment\" OR waybill",
+    // Invoice-embedded tracking (AutoPot, Uline ship confirms, LTL invoices)
+    " OR (invoice AND (tracking OR ups OR fedex OR usps OR pro OR bol OR freight))",
+    ")",
 ].join(" ");
+
+/** Max PDF attachments to OCR per email (cost/latency bound). */
+const MAX_PDFS_PER_EMAIL = 3;
+/** Skip PDFs larger than this for tracking OCR. */
+const MAX_PDF_BYTES = 8 * 1024 * 1024;
+const PDF_OCR_TIMEOUT_MS = 20_000;
+/**
+ * Timeout for the scanned-BOL vision OCR path (extractPDF can chain multiple
+ * vision models + tesseract). One long-running email must not stall the run.
+ */
+const VISION_OCR_TIMEOUT_MS = 90_000;
 
 /**
  * Sender domains that send emails with shipping/tracking keywords but are
@@ -288,13 +305,25 @@ async function processMessage(
     // Extract plain text body
     const body = extractPlainText(msg.data.payload);
 
-    // Combine subject + body for extraction
-    const fullText = `${subject}\n${body}`;
+    // DECISION(2026-08-05): Also OCR PDF attachments (BOLs, invoices with embedded
+    // tracking). Biggest miss class: tracking lives in the PDF, not the email body.
+    // WS1 (2026-08-05): sparse scanned BOLs escalate to vision OCR via bol-ocr.ts,
+    // capped at 1 vision call per email; visionUsed tags source email_ingest_bol_vision.
+    const pdfResult = await extractPdfAttachmentText(
+        gmail,
+        msg.data.payload,
+        messageId,
+        `${subject}\n${from}\n${body}`,
+    );
+    const pdfText = pdfResult.text;
+
+    // Combine subject + body + PDF text for extraction
+    const fullText = `${subject}\n${body}\n${pdfText}`;
 
     // --- PO number extraction ---
     const poNumbers = extractPONumbersFromText(fullText);
 
-    // --- Tracking number extraction (canonical patterns) ---
+    // --- Tracking number extraction (canonical patterns, ranked) ---
     const extracted = extractTrackingNumbers(fullText);
 
     // Also try the LTL PRO suffix pattern (catches "AAA Cooper-71473626-1")
@@ -312,18 +341,8 @@ async function processMessage(
     // Priority: text context (detectLTLCarrier) wins for LTL names.
     // Then detectCarrier from number format (UPS, FedEx, etc.).
     const textCarrier = detectLTLCarrier(fullText);
-    const formatCarrier = extracted.length > 0
-        ? detectCarrier(extracted[0].trackingNumber)
-        : null;
-    const finalCarrier = textCarrier || formatCarrier;
 
-    // --- Build final tracking number (with carrier encoding for URLs) ---
-    const primaryTracking = extracted.length > 0
-        ? extracted[0]
-        : null;
-    const trackingNum = primaryTracking?.trackingNumber;
-
-    if (!trackingNum) {
+    if (extracted.length === 0) {
         return {
             messageId, subject, from,
             poNumbers,
@@ -335,17 +354,7 @@ async function processMessage(
         };
     }
 
-    // Encode for URL generation: "CarrierName:::TrackingNumber" format enables
-    // carrierUrl() to find the right LTL link.
-    const encodedTracking = finalCarrier
-        ? `${finalCarrier}:::${trackingNum}`
-        : trackingNum;
-    const trackingUrl = carrierUrl(encodedTracking);
-
-    // --- PO number inference fallback (port from tracking-agent.ts) ---
-    // When carrier auto-notification emails (FedEx/UPS/USPS) contain no PO
-    // number in their text, try to infer the PO by matching vendor name
-    // tokens against recent purchase orders. See inferPONumberFromRecentPOs().
+    // --- PO number inference fallback ---
     let inferredPO: string | null = null;
     if (poNumbers.length === 0) {
         try {
@@ -365,8 +374,8 @@ async function processMessage(
 
                 if (inferredPO) {
                     console.log(
-                        `[email-tracking-ingest] Inferred PO #${inferredPO} for tracking ${trackingNum} ` +
-                        `(no explicit PO in email text)`,
+                        `[email-tracking-ingest] Inferred PO #${inferredPO} for tracking ` +
+                        `(no explicit PO in email/PDF text)`,
                     );
                 }
             }
@@ -375,10 +384,6 @@ async function processMessage(
         }
     }
 
-    // --- Decide which PO numbers to upsert with ---
-    // - If PO found in text: use that (poNumbers > 0), confidence 0.90
-    // - If PO inferred from vendor match: use inferredPO, confidence 0.60
-    // - If no PO at all: upsert with null PO, confidence 0.80
     const upsertPOs: Array<{ po: string | null; inferred: boolean }> = [];
     if (poNumbers.length > 0) {
         upsertPOs.push(...poNumbers.map((p) => ({ po: p, inferred: false })));
@@ -388,62 +393,181 @@ async function processMessage(
         upsertPOs.push({ po: null, inferred: false });
     }
 
-    // --- Upsert to shipments table ---
-    for (const { po: poNum, inferred } of upsertPOs) {
-        try {
-          await shipmentIntelligence.upsertShipmentEvidence({
-                trackingNumber: encodedTracking,
-                poNumber: poNum,
-                vendorName: null, // Will be resolved by carrier-poll or manual
-                source: inferred ? "email_ingest_inferred" : "email_ingest",
-                sourceRef: `gmail:${accountId}:${messageId}`,
-                confidence: inferred ? 0.60 : (poNum ? 0.90 : 0.80),
-                statusCategory: "in_transit",
-                statusDisplay: inferred
-                    ? "Tracking extracted from email (PO inferred via vendor match)"
-                    : poNum
-                        ? "Tracking extracted from email"
-                        : "Tracking extracted from email (no PO found)",
-                publicTrackingUrl: trackingUrl,
-                active: true,
-            });
-        } catch (err: any) {
-            console.warn(
-                `[email-tracking-ingest] Upsert failed for ${trackingNum} PO ${poNum}: ${err.message}`,
-            );
-        }
-    }
+    // Upsert EVERY high-confidence tracking hit (multi-package shipments)
+    let anyUpserted = false;
+    let primaryUrl: string | null = null;
+    let primaryCarrier: string | null = textCarrier;
 
-    // If no PO number in email, still record the tracking with no PO link
-    if (poNumbers.length === 0 && !inferredPO) {
-        try {
-          await shipmentIntelligence.upsertShipmentEvidence({
-                trackingNumber: encodedTracking,
-                poNumber: null,
-                vendorName: null,
-                source: "email_ingest",
-                sourceRef: `gmail:${accountId}:${messageId}`,
-                confidence: 0.80, // lower confidence when no PO link
-                statusCategory: "in_transit",
-                statusDisplay: "Tracking extracted from email (no PO found)",
-                publicTrackingUrl: trackingUrl,
-                active: true,
-            });
-        } catch { /* best-effort */ }
+    for (const hit of extracted) {
+        const formatCarrier = detectCarrier(hit.trackingNumber);
+        const finalCarrier = textCarrier || formatCarrier || hit.carrier;
+        const trackingNum = hit.trackingNumber;
+        const encodedTracking = finalCarrier
+            ? `${finalCarrier}:::${trackingNum}`
+            : trackingNum;
+        const trackingUrl = carrierUrl(encodedTracking);
+        if (!primaryUrl) {
+            primaryUrl = trackingUrl;
+            primaryCarrier = finalCarrier;
+        }
+
+        for (const { po: poNum, inferred } of upsertPOs) {
+            try {
+                await shipmentIntelligence.upsertShipmentEvidence({
+                    trackingNumber: encodedTracking,
+                    poNumber: poNum,
+                    vendorName: null,
+                    source: inferred
+                        ? "email_ingest_inferred"
+                        : pdfResult.visionUsed
+                            ? "email_ingest_bol_vision"
+                            : pdfText
+                                ? "email_ingest_pdf"
+                                : "email_ingest",
+                    sourceRef: `gmail:${accountId}:${messageId}`,
+                    confidence: inferred ? 0.60 : (poNum ? 0.90 : 0.80),
+                    statusCategory: "in_transit",
+                    statusDisplay: inferred
+                        ? "Tracking from email/PDF (PO inferred)"
+                        : pdfResult.visionUsed
+                            ? "Tracking from scanned BOL (vision OCR)"
+                            : poNum
+                                ? (pdfText ? "Tracking from email/PDF attachment" : "Tracking extracted from email")
+                                : "Tracking extracted (no PO found)",
+                    publicTrackingUrl: trackingUrl,
+                    active: true,
+                });
+                anyUpserted = true;
+            } catch (err: any) {
+                console.warn(
+                    `[email-tracking-ingest] Upsert failed for ${trackingNum} PO ${poNum}: ${err.message}`,
+                );
+            }
+        }
     }
 
     return {
         messageId, subject, from,
-        poNumbers,
+        poNumbers: inferredPO && poNumbers.length === 0 ? [inferredPO] : poNumbers,
         trackingNumbers: extracted.map(e => ({ carrier: e.carrier, number: e.trackingNumber })),
         detectedCarrier: textCarrier,
-        finalCarrier,
-        trackingUrl,
-        action: "upserted",
+        finalCarrier: primaryCarrier,
+        trackingUrl: primaryUrl,
+        action: anyUpserted ? "upserted" : "error",
     };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Download PDF attachments and extract text via pdf-parse (fast path).
+ * Used so BOL / invoice PDFs contribute tracking numbers, not just body text.
+ *
+ * WS1 (2026-08-05): when pdf-parse returns sparse text (< 40 non-ws chars)
+ * and the attachment/email looks BOL-like (BOL filename, LTL carrier in the
+ * email context, or shipping keywords), escalate to vision OCR via bol-ocr.ts
+ * (extractPDF). Capped at 1 vision call per email. Returns { text, visionUsed }
+ * so the caller can tag shipments as email_ingest_bol_vision.
+ */
+async function extractPdfAttachmentText(
+    gmail: ReturnType<typeof GmailApi>,
+    payload: any,
+    messageId: string,
+    emailContext: string,
+): Promise<{ text: string; visionUsed: boolean }> {
+    const parts: Array<{ filename: string; attachmentId: string; inlineData?: string }> = [];
+
+    const walk = (part: any) => {
+        if (!part) return;
+        const mime = part.mimeType || "";
+        const filename = part.filename || "";
+        const isPdf = mime === "application/pdf" || filename.toLowerCase().endsWith(".pdf");
+        if (isPdf && filename) {
+            if (part.body?.attachmentId) {
+                parts.push({ filename, attachmentId: part.body.attachmentId });
+            } else if (part.body?.data) {
+                parts.push({ filename, attachmentId: "", inlineData: part.body.data });
+            }
+        }
+        if (part.parts) for (const p of part.parts) walk(p);
+    };
+    walk(payload);
+
+    if (parts.length === 0) return { text: "", visionUsed: false };
+
+    let pdfParse: any;
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        pdfParse = (await import("pdf-parse")).default || (await import("pdf-parse"));
+    } catch {
+        console.warn("[email-tracking-ingest] pdf-parse unavailable — skipping PDF OCR");
+        return { text: "", visionUsed: false };
+    }
+
+    const texts: string[] = [];
+    let visionUsed = false;
+    for (const part of parts.slice(0, MAX_PDFS_PER_EMAIL)) {
+        try {
+            let buf: Buffer;
+            if (part.inlineData) {
+                buf = Buffer.from(part.inlineData, "base64url");
+            } else {
+                const att = await gmail.users.messages.attachments.get({
+                    userId: "me",
+                    messageId,
+                    id: part.attachmentId,
+                });
+                const data = att.data?.data;
+                if (!data) continue;
+                buf = Buffer.from(data, "base64url");
+            }
+            if (buf.length === 0 || buf.length > MAX_PDF_BYTES) continue;
+
+            const parsed = await Promise.race([
+                pdfParse(buf, { max: 0 }),
+                new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error("pdf OCR timeout")), PDF_OCR_TIMEOUT_MS),
+                ),
+            ]);
+            const t = (parsed?.text || "").toString().trim();
+            if (t.length >= 20) {
+                texts.push(`\n--- PDF: ${part.filename} ---\n${t}`);
+                console.log(
+                    `[email-tracking-ingest] PDF OCR ${part.filename}: ${t.length} chars`,
+                );
+            }
+
+            // Scanned BOL fallback (WS1): sparse pdf-parse text + BOL-like signals
+            // → vision OCR via bol-ocr.ts. Max 1 vision call per email (cost bound).
+            if (!visionUsed) {
+                const bol = await Promise.race([
+                    extractBolText({
+                        buffer: buf,
+                        filename: part.filename,
+                        emailContext,
+                        pdfParseText: t,
+                        pageCount: parsed?.numpages ?? null,
+                    }),
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error("BOL vision OCR timeout")), VISION_OCR_TIMEOUT_MS),
+                    ),
+                ]);
+                if (bol.visionUsed) {
+                    visionUsed = true;
+                    texts.push(`\n--- PDF: ${part.filename} (vision OCR) ---\n${bol.text}`);
+                    console.log(
+                        `[email-tracking-ingest] BOL vision OCR ${part.filename}: ${bol.text.length} chars`,
+                    );
+                }
+            }
+        } catch (err: any) {
+            console.warn(
+                `[email-tracking-ingest] PDF OCR failed (${part.filename}): ${err.message}`,
+            );
+        }
+    }
+    return { text: texts.join("\n"), visionUsed };
+}
 
 /**
  * Extract plain text from a Gmail message payload.

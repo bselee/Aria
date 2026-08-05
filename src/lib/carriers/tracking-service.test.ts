@@ -356,6 +356,77 @@ describe('extractTrackingNumbers', () => {
         );
     });
 
+    it('extracts PRO NUMBER from BOL-style invoice text', () => {
+        const bolText = `
+BILL OF LADING
+Shipper: BuildASoil
+PRO NUMBER: 714736261
+Carrier: AAA Cooper Transport
+Freight collect
+PO #125100
+`;
+        const results = extractTrackingNumbers(bolText);
+        expect(results.some((r) => r.trackingNumber === '714736261' && (r.carrier === 'pro' || r.carrier === 'bol'))).toBe(true);
+        expect(detectLTLCarrier(bolText)).toBe('AAA Cooper');
+    });
+
+    // WS1 (2026-08-05) additions — LTL/FTL BOL extraction paths that scanned-BOL
+    // vision OCR feeds into. These are the shapes the Tracking Board needs to
+    // surface PRO numbers as `Carrier:::PRO` encoded rows.
+    it('extracts BOL number from "BILL OF LADING NUMBER:" label', () => {
+        const bolText = `
+BILL OF LADING NUMBER: 1234567890123
+Old Dominion Freight Line
+Shipper: BuildASoil
+`;
+        const results = extractTrackingNumbers(bolText);
+        expect(results.some((r) => r.trackingNumber === '1234567890123' && r.carrier === 'bol')).toBe(true);
+        expect(detectLTLCarrier(bolText)).toBe('Old Dominion');
+    });
+
+    it('extracts LTL PRO with account suffix (AAA Cooper-71473626-1 format)', () => {
+        const results = extractTrackingNumbers('AAA Cooper-71473626-1');
+        expect(results.some((r) => r.carrier === 'ltlPro' && r.trackingNumber === '71473626-1')).toBe(true);
+    });
+
+    it('extracts PRO# after an LTL carrier name (Estes)', () => {
+        const results = extractTrackingNumbers('Shipped via Estes PRO# 1234567890, 4 pallets, freight collect');
+        expect(results.some((r) => r.trackingNumber === '1234567890' && r.carrier === 'pro')).toBe(true);
+        expect(detectLTLCarrier('Shipped via Estes PRO# 1234567890')).toBe('Estes');
+    });
+
+    it('keeps a PRO number extracted from scanned-BOL vision text with its LTL carrier', () => {
+        // Simulates bol-ocr vision output: PRO + LTL carrier name both present,
+        // so the ingest encodes "AAA Cooper:::714736261" for the direct tracking URL.
+        const visionOcrText = `
+BILL OF LADING
+Shipper: BuildASoil
+PRO NUMBER: 714736261
+Carrier: AAA Cooper Transport
+`;
+        const results = extractTrackingNumbers(visionOcrText);
+        const proHit = results.find((r) => r.trackingNumber === '714736261');
+        expect(proHit).toBeDefined();
+        expect(proHit!.carrier === 'pro' || proHit!.carrier === 'bol').toBe(true);
+        expect(detectLTLCarrier(visionOcrText)).toBe('AAA Cooper');
+    });
+
+    it('does not treat bare invoice numbers as FedEx without shipping context', () => {
+        const invoiceOnly = `
+Invoice 123456789012
+Amount due $420.00
+Subtotal $400.00
+Qty 10 Unit price 40.00
+`;
+        const results = extractTrackingNumbers(invoiceOnly);
+        expect(results.every((r) => r.carrier !== 'fedex' || r.trackingNumber !== '123456789012')).toBe(true);
+    });
+
+    it('keeps bare FedEx digits when Track Your Shipment context is present', () => {
+        const results = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthFedexShipstation);
+        expect(results.some((r) => r.trackingNumber === '8051904063')).toBe(true);
+    });
+
     it('captures both real Thirsty Earth shipment variants from separate fulfillment emails', () => {
         const upsResults = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthUpsShipstation);
         const fedexResults = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthFedexShipstation);

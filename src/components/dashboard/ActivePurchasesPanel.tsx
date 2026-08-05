@@ -26,16 +26,17 @@ type ActivePurchase = {
     completionState: string;
     trackingNumbers?: string[];
     shipments?: Array<{
-        tracking_number: string;
-        public_tracking_url: string | null;
-        status_display: string | null;
-        estimated_delivery_at: string | null;
-        last_checked_at?: string | null;
-        last_source?: string | null;
-        source_confidence?: number | null;
-        evidenceLevel?: "confirmed" | "candidate";
-        evidenceReason?: string;
-    }>;
+            tracking_number: string;
+            public_tracking_url: string | null;
+            status_display: string | null;
+            status_category?: string | null;
+            estimated_delivery_at: string | null;
+            last_checked_at?: string | null;
+            last_source?: string | null;
+            source_confidence?: number | null;
+            evidenceLevel?: "confirmed" | "candidate";
+            evidenceReason?: string;
+        }>;
     lifecycleStage?: string;
     lifecycleSummary?: string;
     lastMovementSummary?: string | null;
@@ -61,6 +62,28 @@ type ActivePurchase = {
         invoiceStatus?: string;
                 invoiceId?: string;
                 hasDiscrepancies?: boolean;
+        movement?: {
+                    status: "none" | "candidate" | "in_transit" | "out_for_delivery" | "delivered" | "exception" | "stale";
+                    trackingNumbers: string[];
+                    primaryEta: string | null;
+                    primaryCarrier: string | null;
+                    primaryUrl: string | null;
+                    evidenceLevel: "confirmed" | "candidate" | "none";
+                    deliveredAt?: string | null;
+                    hoursSinceDelivered?: number | null;
+                    receiptLag?: "ok" | "flag" | "escalate";
+                    receiptLagLabel?: string | null;
+                    invoice: {
+                        state: "none" | "pending_ap" | "paid" | "matched" | "discrepancy";
+                        invoiceId?: string;
+                        hasTrackingFromInvoice: boolean;
+                    };
+                    correlation: {
+                        orphanTrackingCount: number;
+                        poLinkedShipmentCount: number;
+                        lastSource: string | null;
+                    };
+                };
             };
 
 type ApiResponse = {
@@ -139,8 +162,8 @@ type LifecycleStage = "SENT" | "IN_TRANSIT" | "DELIVERED" | "RECEIVED";
  * Stages — monotonic:
  *   SENT       → sentVerification.verified, no shipments yet
  *   IN_TRANSIT → shipments exist (confirmed), none fully delivered
- *   DELIVERED  → all confirmed shipments delivered, but isReceived=false
- *   RECEIVED   → isReceived=true
+ *   DELIVERED  → carrier says delivered, Finale not received yet (action: receive)
+ *   RECEIVED   → isReceived=true (Finale receipt) — usually drops off this list
  *
  * Edge cases handled:
  *   - PO with zero shipments + unverified send → null (no stage)
@@ -148,13 +171,27 @@ type LifecycleStage = "SENT" | "IN_TRANSIT" | "DELIVERED" | "RECEIVED";
  *     through to SENT (or null if send unverified)
  *   - PO with mixed delivered + in-transit → IN_TRANSIT (not all delivered)
  */
+function shipmentIsDelivered(s: {
+    status_category?: string | null;
+    status_display?: string | null;
+}): boolean {
+    const cat = (s.status_category || "").toLowerCase();
+    if (cat === "delivered") return true;
+    return (s.status_display || "").toLowerCase().includes("delivered");
+}
+
 function deriveStage(po: ActivePurchase): LifecycleStage | null {
     if (po.isReceived) return "RECEIVED";
+    // Prefer movement.status when API provided it (single source of truth)
+    if (po.movement?.status === "delivered") return "DELIVERED";
+    if (po.movement?.status === "out_for_delivery" || po.movement?.status === "in_transit" || po.movement?.status === "stale") {
+        return "IN_TRANSIT";
+    }
+    if (po.movement?.status === "exception") return "IN_TRANSIT"; // still active, exception flag separate
+
     const confirmed = (po.shipments || []).filter((s) => s.evidenceLevel === "confirmed");
     if (confirmed.length > 0) {
-        const allDelivered = confirmed.every((s) =>
-            s.status_display?.toLowerCase().includes("delivered")
-        );
+        const allDelivered = confirmed.every(shipmentIsDelivered);
         if (allDelivered) return "DELIVERED";
         return "IN_TRANSIT";
     }
@@ -172,6 +209,8 @@ function deriveStage(po: ActivePurchase): LifecycleStage | null {
  */
 function hasShipmentException(po: ActivePurchase): boolean {
     return (po.shipments || []).some((s) => {
+        const cat = (s.status_category || "").toLowerCase();
+        if (cat === "exception") return true;
         const st = (s.status_display || "").toLowerCase();
         return /exception|failed|return|held|delay/.test(st);
     });
@@ -180,15 +219,13 @@ function hasShipmentException(po: ActivePurchase): boolean {
 /**
  * Check if ALL of a PO's non-delivered shipments are stale (last_checked_at
  * > 24 hours ago). Delivered shipments are excluded from staleness check
- * since they're already terminal.
+ * since they're already terminal for carrier tracking.
  */
 function allShipmentsStale(po: ActivePurchase): boolean {
     const shipments = po.shipments || [];
     if (shipments.length === 0) return false;
     const now = Date.now();
-    const nonDelivered = shipments.filter(
-        (s) => !s.status_display?.toLowerCase().includes("delivered")
-    );
+    const nonDelivered = shipments.filter((s) => !shipmentIsDelivered(s));
     if (nonDelivered.length === 0) return false;
     return nonDelivered.every((s) => {
         if (!s.last_checked_at) return true; // never checked = stale
@@ -203,6 +240,163 @@ function freshnessLabel(minutes: number | null | undefined): string {
     if (minutes < 60) return `fresh ${minutes}m ago`;
     if (minutes < 24 * 60) return `fresh ${Math.round(minutes / 60)}h ago`;
     return `fresh ${Math.round(minutes / (24 * 60))}d ago`;
+}
+
+/**
+ * Compact per-PO correlation strip: TRACK · ETA · INV.
+ *
+ * Tells the PO-centric story at a glance — tracking evidence (confirmed vs
+ * candidate/amber), ETA, and invoice/AP state — without expanding the row.
+ * Links out to the carrier URL when a primary tracking number exists.
+ * Fail-open: renders nothing if the API didn't include `movement`.
+ */
+function MovementBadgeStrip({ po }: { po: ActivePurchase }) {
+    const movement = po.movement;
+    if (!movement) return null;
+
+    const badge = "text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 inline-flex items-center gap-1";
+
+    const track = movement.trackingNumbers[0] || null;
+    const trackShort = track
+        ? track.length > 14
+            ? `${track.slice(0, 4)}…${track.slice(-4)}`
+            : track
+        : null;
+    const trackUrl = movement.primaryUrl || (track ? carrierUrl(track) : null);
+
+    const etaIso = movement.primaryEta || po.etaProfile?.expectedDate || po.expectedDate || null;
+    const etaConfidence = po.etaProfile?.confidence ?? "low";
+    const etaTone = etaConfidence === "high"
+        ? "text-emerald-300 border-emerald-500/30 bg-emerald-500/10"
+        : etaConfidence === "medium"
+            ? "text-cyan-300 border-cyan-500/30 bg-cyan-500/10"
+            : "text-zinc-400 border-zinc-600/40 bg-zinc-700/20";
+
+    const invLabel = movement.invoice.state === "paid" ? "INV paid"
+        : movement.invoice.state === "matched" ? "INV matched"
+        : movement.invoice.state === "pending_ap" ? "INV AP"
+        : movement.invoice.state === "discrepancy" ? "INV ±"
+        : null;
+    const invTone = movement.invoice.state === "paid"
+        ? "text-emerald-300 border-emerald-500/30 bg-emerald-500/10"
+        : movement.invoice.state === "matched"
+            ? "text-cyan-300 border-cyan-500/30 bg-cyan-500/10"
+            : movement.invoice.state === "pending_ap"
+                ? "text-amber-300 border-amber-500/30 bg-amber-500/10"
+                : movement.invoice.state === "discrepancy"
+                    ? "text-rose-300 border-rose-500/40 bg-rose-500/10"
+                    : "text-zinc-500 border-zinc-700/50 bg-zinc-800/30";
+
+    return (
+        <div className="mt-1 flex items-center gap-1.5 flex-wrap" data-testid={`movement-strip-${po.orderId}`}>
+            {movement.evidenceLevel === "none" ? (
+                <span
+                    className={`${badge} text-zinc-500 border-zinc-700/60 bg-zinc-900/40 border-dashed`}
+                    title={po.typicalTrackingSource
+                        ? `No tracking evidence yet — ${po.typicalTrackingSource} is this vendor's typical source`
+                        : "No tracking evidence yet"}
+                >
+                    No tracking yet{po.typicalTrackingSource ? ` · ${po.typicalTrackingSource}` : ""}
+                </span>
+            ) : track && trackUrl ? (
+                movement.evidenceLevel === "confirmed" ? (
+                    <a
+                        href={trackUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className={`${badge} text-cyan-300 border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20`}
+                        title={`TRACK ${track} · ${movement.primaryCarrier || "carrier"} · confirmed evidence${movement.correlation.lastSource ? ` · src ${movement.correlation.lastSource}` : ""}`}
+                    >
+                        TRACK {trackShort} <ExternalLink className="w-2 h-2 opacity-60" />
+                    </a>
+                ) : (
+                    <a
+                        href={trackUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className={`${badge} text-amber-300 border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20`}
+                        title={`TRACK ${track} · unconfirmed (candidate evidence) — not driving ETA`}
+                    >
+                        TRACK {trackShort} <span className="text-[9px] uppercase tracking-wide opacity-80">unconfirmed</span>
+                    </a>
+                )
+            ) : null}
+
+            {etaIso && (
+                <span
+                    className={`${badge} ${etaTone}`}
+                    title={`ETA ${fmtDateTime(etaIso)} · ${po.etaProfile?.label || po.leadProvenance || ""}`}
+                >
+                    ETA {fmtDate(etaIso)}
+                </span>
+            )}
+
+            {invLabel && (
+                <span
+                    className={`${badge} ${invTone}`}
+                    title={movement.invoice.invoiceId
+                        ? `Invoice ${movement.invoice.invoiceId}${movement.invoice.hasTrackingFromInvoice ? " · tracking extracted from invoice" : ""}`
+                        : `Invoice state: ${movement.invoice.state}`}
+                >
+                    {invLabel}
+                </span>
+            )}
+
+            {/* Delivered by carrier but not received in Finale — flag at 24h, escalate at 48h */}
+                        {(movement.status === "delivered" || deriveStage(po) === "DELIVERED") && !po.isReceived && (() => {
+                            const lag = movement.receiptLag || "ok";
+                            const label = movement.receiptLagLabel
+                                || (movement.hoursSinceDelivered != null
+                                    ? `DELIVERED ${movement.hoursSinceDelivered}h · need receive`
+                                    : "DELIVERED · need receive");
+                            const tone = lag === "escalate"
+                                ? "text-rose-200 border-rose-500/50 bg-rose-500/20 font-semibold"
+                                : lag === "flag"
+                                    ? "text-amber-100 border-amber-500/50 bg-amber-500/20 font-semibold"
+                                    : "text-violet-200 border-violet-500/40 bg-violet-500/15 font-semibold";
+                            const title = lag === "escalate"
+                                ? `Carrier delivered ${movement.hoursSinceDelivered ?? "?"}h ago — still not received in Finale (past 48h). Escalate to receiving.`
+                                : lag === "flag"
+                                    ? `Carrier delivered ${movement.hoursSinceDelivered ?? "?"}h ago — not received yet (past 24h). Flag for receiving team.`
+                                    : "Carrier reports delivered. Waiting on warehouse Finale receipt (<24h).";
+                            return (
+                                <span
+                                    className={`${badge} ${tone}`}
+                                    title={title}
+                                    data-testid={`need-receive-${po.orderId}`}
+                                    data-receipt-lag={lag}
+                                >
+                                    {label}
+                                </span>
+                            );
+                        })()}
+                        {po.isReceived && (
+                            <span
+                                className={`${badge} text-emerald-200 border-emerald-500/40 bg-emerald-500/10`}
+                                title={po.receiveDate ? `Received ${po.receiveDate}` : "Received in Finale"}
+                            >
+                                RECEIVED
+                            </span>
+                        )}
+
+            {movement.invoice.hasTrackingFromInvoice && movement.correlation.poLinkedShipmentCount === 0 && (
+                <span
+                    className={`${badge} text-amber-200 border-amber-500/50 bg-amber-500/15`}
+                    title="Tracking was found in the invoice/BOL but no shipment row is linked to this PO yet"
+                >
+                    invoice tracking needs link
+                </span>
+            )}
+
+            {movement.correlation.lastSource && (
+                <span className="text-[9px] font-mono text-zinc-600 shrink-0" title="Most recent tracking evidence source">
+                    src:{movement.correlation.lastSource}
+                </span>
+            )}
+        </div>
+    );
 }
 
 export type ActivePurchasesPanelProps = {
@@ -619,26 +813,30 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
         .filter((po) => !filterOverdue || isOverdue(po))
         .filter((po) => !filterStage || deriveStage(po) === filterStage)
         .sort((a, b) => {
-            // Received → bottom (most recent at top of the received pile)
-            if (a.isReceived !== b.isReceived) return a.isReceived ? 1 : -1;
-            if (a.isReceived && b.isReceived) {
-                return (b.receiveDate || "").localeCompare(a.receiveDate || "");
-            }
-            // Overdue first — most-late at top
-            const aOv = isOverdue(a), bOv = isOverdue(b);
-            if (aOv !== bOv) return aOv ? -1 : 1;
-            if (aOv && bOv) {
-                const aExp = effectiveExpected(a) || "";
-                const bExp = effectiveExpected(b) || "";
-                return aExp.localeCompare(bExp); // earlier expected = more late
-            }
-            // Soonest expected next
-            const aExp = effectiveExpected(a) || "9999-12-31";
-            const bExp = effectiveExpected(b) || "9999-12-31";
-            if (aExp !== bExp) return aExp.localeCompare(bExp);
-            // Tiebreak: earliest order date
-            return (a.orderDate || "").localeCompare(b.orderDate || "");
-        });
+                    // Received → bottom (most recent at top of the received pile)
+                    if (a.isReceived !== b.isReceived) return a.isReceived ? 1 : -1;
+                    if (a.isReceived && b.isReceived) {
+                        return (b.receiveDate || "").localeCompare(a.receiveDate || "");
+                    }
+                    // Delivered by carrier, not yet Finale-received → top action queue
+                    const aNeedRcv = deriveStage(a) === "DELIVERED";
+                    const bNeedRcv = deriveStage(b) === "DELIVERED";
+                    if (aNeedRcv !== bNeedRcv) return aNeedRcv ? -1 : 1;
+                    // Overdue next — most-late at top
+                    const aOv = isOverdue(a), bOv = isOverdue(b);
+                    if (aOv !== bOv) return aOv ? -1 : 1;
+                    if (aOv && bOv) {
+                        const aExp = effectiveExpected(a) || "";
+                        const bExp = effectiveExpected(b) || "";
+                        return aExp.localeCompare(bExp); // earlier expected = more late
+                    }
+                    // Soonest expected next
+                    const aExp = effectiveExpected(a) || "9999-12-31";
+                    const bExp = effectiveExpected(b) || "9999-12-31";
+                    if (aExp !== bExp) return aExp.localeCompare(bExp);
+                    // Tiebreak: earliest order date
+                    return (a.orderDate || "").localeCompare(b.orderDate || "");
+                });
 
     // ── Aggregate stats for human-readable alert banner ──
     const aggTotal = visiblePurchases.length;
@@ -1038,6 +1236,9 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                             )}
                                             <ChevronDown className={`w-3 h-3 text-zinc-600 transition-transform shrink-0 ${expandedPOs.has(po.orderId) ? 'rotate-180' : ''}`} />
                                         </div>
+
+                                        {/* Line 1.5: Movement badge strip — PO → tracking → invoice story */}
+                                        <MovementBadgeStrip po={po} />
 
                                         {/* Detail section — hidden until expanded */}
                                         {expandedPOs.has(po.orderId) && (<>

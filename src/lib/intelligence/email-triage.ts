@@ -109,12 +109,16 @@ export async function buildEmailTriageReport(): Promise<EmailTriageReport> {
     try {
         const { data: inboxStats } = await db
             .from("email_inbox_queue")
-            .select("status, source_inbox, created_at")
+            .select("status, source_inbox, created_at, processed_by_ack")
             .gte("created_at", oneDayAgo);
 
         if (inboxStats) {
             for (const row of inboxStats as any[]) {
-                if (row.status === "unprocessed") {
+                // Truly pending = unprocessed AND not yet ack'd
+                const pending =
+                    (row.status === "unprocessed" || row.status === "processing")
+                    && !row.processed_by_ack;
+                if (pending) {
                     report.inboxQueue.unprocessed++;
                     const source = row.source_inbox || "unknown";
                     report.inboxQueue.bySource[source] = (report.inboxQueue.bySource[source] || 0) + 1;
@@ -339,11 +343,12 @@ export function formatEmailTriageReport(report: EmailTriageReport): string {
     }
 
     // Ack pipeline
-    lines.push(`💬 *Acknowledgements*`);
-    lines.push(`   Auto-replied (24h): ${report.acknowledgements.processedByAck}`);
+    lines.push(`💬 *Triage (default inbox)*`);
+    lines.push(`   Handled (24h): ${report.acknowledgements.processedByAck}`);
     if (report.acknowledgements.pendingUnack > 3) {
         lines.push(`   Pending triage: ${report.acknowledgements.pendingUnack}`);
     }
+    lines.push(`   _Draft-only replies — never auto-send. Paid PDFs → nightshift. Unpaid AP → Bill.com._`);
 
     // Stuck items
     if (report.apQueue.stuck.length > 0) {

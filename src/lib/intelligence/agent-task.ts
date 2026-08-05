@@ -35,7 +35,9 @@ export type AgentTaskType =
     | "cron_summary"
     | "cognitive_critical"
     | "drop_detect_report"
-    | "pattern_miner_insight";
+    | "pattern_miner_insight"
+    /** Vendor sales / sourcing email that needs a real business reply (not bare thanks). */
+    | "email_needs_response";
 
 export type AgentTaskStatus =
     | "PENDING"

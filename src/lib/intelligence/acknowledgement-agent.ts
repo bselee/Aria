@@ -5,29 +5,34 @@ import { createClient } from "../db";
 import { z } from "zod";
 import { recall } from "./memory";
 import { applyMessageLabelPolicy } from "./gmail-policy";
-import { recordHumanReviewRequired, recordSimpleAutoReply } from "./email-feedback";
+import { recordHumanReviewRequired, recordEmailDraftPrepared } from "./email-feedback";
 import { summarizeThreadCommunication, ThreadCommunicationSummary } from "./po-correlator";
+import { isObviousPromotionalEmail } from "./promotional-email";
+import { markEmailQueueOutcome, type EmailQueueStatus } from "./email-queue-status";
+import {
+    buildReplyDraftRaw,
+    composeOpportunityDraft,
+    detectVendorOpportunity,
+} from "./vendor-opportunity";
+import { notifyViaTask } from "./notify-via-task";
+import {
+    composeHumanEscalationDraftStub,
+    composeRoutineDraftBody,
+    resolveEmailResponsePolicy,
+} from "./email-response-policy";
 
 /**
  * @file acknowledgement-agent.ts
- * @purpose Scans inbox for routine informational emails (order confirmations, PO updates, tracking, invoices)
- *          that don't require human action, sends a polite "Thanks!" reply if applicable, and archives them.
+ * @purpose Triage bill.selee@ inbox from email_inbox_queue. DECISION(2026-08-05):
+ *          Never auto-send on reviewable mail — prepare Gmail drafts for Bill to
+ *          edit/send. Promos archive. Invoices → nightshift. Opportunities + human
+ *          questions escalate via email_needs_response tasks.
  * @author Antigravity
- * @updated 2026-03-13 — cost-data upgrade guard + full body text for inline invoices (PO #124462 fix)
+ * @updated 2026-08-05 — draft-only policy; BioChar-class opportunity path
  */
 export class AcknowledgementAgent {
     private tokenIdentifier: string;
     private labelCache = new Map<string, string>();
-
-    // Random variations for a natural feel
-    private responses = [
-        "Thanks! Appreciate the help!",
-        "Thanks!",
-        "Got it, thanks!",
-        "Received, thank you!",
-        "Perfect, thanks for the update!",
-        "Thanks for sending this over!"
-    ];
 
     constructor(tokenIdentifier: string = "default") {
         this.tokenIdentifier = tokenIdentifier;
@@ -217,7 +222,8 @@ export class AcknowledgementAgent {
                 "ROUTINE_INFO",
                 "REQUIRES_HUMAN",
                 "PROMOTIONAL",
-                "INLINE_INVOICE"
+                "INLINE_INVOICE",
+                "VENDOR_OPPORTUNITY",
             ]),
             reasoning: z.string().describe("Brief reason for classification")
         });
@@ -236,16 +242,18 @@ Snippet: ${snippet}
 ${memoryContext}
 
 Labels:
-ROUTINE_INFO - Standard vendor updates: order confirmations, tracking numbers, invoice deliveries, or PO acknowledgements. Contains NO questions or issues requiring human input.
+ROUTINE_INFO - Standard vendor updates: order confirmations, tracking numbers, invoice deliveries, or PO acknowledgements. Contains NO questions, NO pricing proposals, NO call offers.
 REQUIRES_HUMAN - The sender is asking a question, reporting a problem (backorder, price change, out of stock), requesting payment/approval, or needs dialogue.
-PROMOTIONAL - Marketing, spam, newsletters.
+VENDOR_OPPORTUNITY - Sales/sourcing reply: distributor pricing, quotes, tech sheets, product introductions, partnership pitches, or "schedule a call" after an inquiry. NEVER treat these as ROUTINE_INFO. Bare auto-thanks is wrong.
+PROMOTIONAL - Marketing, spam, newsletters, % off blasts.
 INLINE_INVOICE - The email body contains cost breakdowns, dollar amounts, totals, freight charges, or other invoice-like data but NO PDF is attached. This is a structured cost breakdown (not a casual price mention).
 
-NOTE: If you are even slightly unsure if human attention is needed, choose REQUIRES_HUMAN.`;
+NOTE: If you are even slightly unsure if human attention is needed, choose REQUIRES_HUMAN.
+NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
 
         try {
             const res = await unifiedObjectGeneration({
-                system: "You are an email triage assistant for a purchasing department. Use maximum caution: if an email might need human attention, flag it as REQUIRES_HUMAN.",
+                system: "You are an email triage assistant for a purchasing department. Use maximum caution: if an email might need human attention or is a vendor sales opportunity, do NOT choose ROUTINE_INFO.",
                 prompt,
                 schema,
                 schemaName: "EmailAcknowledgementIntent",
@@ -261,33 +269,173 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
         }
     }
 
-    private getRandomResponse(): string {
-        const index = Math.floor(Math.random() * this.responses.length);
-        return this.responses[index];
-    }
-
-    private createReplyRaw(to: string, from: string, originalSubject: string, messageId: string, threadId: string, bodyText: string): string {
-        // Ensure Subject has Re:
-        const subject = originalSubject.toLowerCase().startsWith("re:") ? originalSubject : `Re: ${originalSubject}`;
-
-        const messageParts = [
-            `To: ${to}`,
-            `From: ${from}`,
-            `Subject: ${subject}`,
-            `In-Reply-To: ${messageId}`,
-            `References: ${messageId}`,
-            `MIME-Version: 1.0`,
-            `Content-Type: text/plain; charset="UTF-8"`,
-            ``,
-            bodyText
-        ];
-
-        return Buffer.from(messageParts.join('\r\n')).toString("base64url");
+    /**
+     * Stamp queue status for triage / retention. processed_by_ack is set early
+     * as a lock; this finalizes the human-readable lifecycle status.
+     */
+    private async finalizeQueueStatus(
+        rowId: string,
+        status: EmailQueueStatus,
+        errorMessage?: string | null,
+    ): Promise<void> {
+        await markEmailQueueOutcome({
+            id: rowId,
+            status,
+            processedByAck: true,
+            processedBy: "acknowledgement-agent",
+            errorMessage,
+        });
     }
 
     /**
-     * Polls the Supabase email queue for unacknowledged emails, determines if they are routine, 
-     * and replies/archives them directly in Gmail.
+     * Vendor opportunity path: NEVER auto-send "Thanks!".
+     * Create a Gmail draft with business acumen + response-monitor task.
+     */
+    private async handleVendorOpportunity(args: {
+        gmail: any;
+        rowId: string;
+        gmailMessageId: string;
+        threadId: string;
+        rfcMessageId: string | null;
+        myEmail: string | null | undefined;
+        senderEmail: string;
+        subject: string;
+        snippet: string;
+        bodyText: string;
+        hasPdf: boolean;
+        pdfFilenames: string[] | null;
+    }): Promise<void> {
+        const {
+            gmail, rowId, gmailMessageId, threadId, rfcMessageId, myEmail,
+            senderEmail, subject, snippet, bodyText, hasPdf, pdfFilenames,
+        } = args;
+
+        const draft = await composeOpportunityDraft({
+            from: senderEmail,
+            subject,
+            snippet,
+            bodyText,
+            hasPdf,
+            pdfFilenames,
+        });
+
+        let draftId: string | null = null;
+        if (myEmail) {
+            try {
+                const raw = buildReplyDraftRaw({
+                    to: senderEmail,
+                    from: myEmail,
+                    subject,
+                    inReplyTo: rfcMessageId,
+                    bodyText: draft.draftBody,
+                });
+                const created = await gmail.users.drafts.create({
+                    userId: "me",
+                    requestBody: {
+                        message: {
+                            raw,
+                            threadId,
+                        },
+                    },
+                });
+                draftId = created.data?.id ?? null;
+                console.log(`     📝 Opportunity draft created${draftId ? ` (${draftId})` : ""}`);
+            } catch (err: any) {
+                console.error(`     ❌ Failed to create opportunity draft:`, err.message);
+            }
+        }
+
+        try {
+            await this.addMessageLabels(gmail, gmailMessageId, ["Needs Response", "Draft Ready"]);
+        } catch { /* best effort */ }
+
+        try {
+            await recordHumanReviewRequired({
+                gmailMessageId,
+                threadId,
+                fromEmail: senderEmail,
+                subject,
+                reason: "vendor_opportunity",
+            });
+        } catch { /* non-fatal */ }
+
+        try {
+            await recordEmailDraftPrepared({
+                gmailMessageId,
+                threadId,
+                fromEmail: senderEmail,
+                subject,
+                replyBody: draft.draftBody,
+                kind: "vendor_opportunity",
+                draftId,
+            });
+        } catch { /* non-fatal */ }
+
+        try {
+            await notifyViaTask({
+                sourceId: `email-opp:${gmailMessageId}`,
+                type: "email_needs_response",
+                goal: draft.summaryForBill,
+                owner: "will",
+                priority: 1,
+                summaryLabel: "Email needs real response",
+                inputs: {
+                    from: senderEmail,
+                    subject,
+                    nextAction: draft.nextAction,
+                    draftId,
+                    gmailMessageId,
+                    threadId,
+                    kind: "vendor_opportunity",
+                },
+            });
+        } catch (err: any) {
+            console.warn(`     ⚠️ notifyViaTask failed: ${err.message}`);
+        }
+
+        await this.finalizeQueueStatus(rowId, "needs_response", draft.nextAction);
+        console.log(`     🎯 VENDOR_OPPORTUNITY — draft ready, no auto-thanks. Next: ${draft.nextAction}`);
+    }
+
+    /**
+     * Create an in-thread Gmail draft. Never sends.
+     */
+    private async createReplyDraft(args: {
+        gmail: any;
+        to: string;
+        from: string;
+        subject: string;
+        inReplyTo?: string | null;
+        threadId: string;
+        bodyText: string;
+    }): Promise<string | null> {
+        try {
+            const raw = buildReplyDraftRaw({
+                to: args.to,
+                from: args.from,
+                subject: args.subject,
+                inReplyTo: args.inReplyTo,
+                bodyText: args.bodyText,
+            });
+            const created = await args.gmail.users.drafts.create({
+                userId: "me",
+                requestBody: {
+                    message: {
+                        raw,
+                        threadId: args.threadId,
+                    },
+                },
+            });
+            return created.data?.id ?? null;
+        } catch (err: any) {
+            console.error(`     ❌ Draft create failed:`, err.message);
+            return null;
+        }
+    }
+
+    /**
+     * Polls the Supabase email queue for unacknowledged emails and applies
+     * the draft-only response policy (never auto-sends reviewable mail).
      */
     async processUnreadEmails(maxResults: number = 20) {
         console.log(`🤖 [Acknowledgement-Agent] Checking email queue for routine emails...`);
@@ -336,275 +484,425 @@ NOTE: If you are even slightly unsure if human attention is needed, choose REQUI
             let processedCount = 0;
 
             for (const m of messages) {
-                // Lock row for ACK agent so we don't process it twice if the script restarts mid-loop
-                await db.from('email_inbox_queue')
-                    .update({ processed_by_ack: true })
-                    .eq('id', m.id);
+                            // Lock row for ACK agent so we don't process it twice if the script restarts mid-loop
+                            await db.from('email_inbox_queue')
+                                .update({ processed_by_ack: true, status: 'processing', updated_at: new Date().toISOString() })
+                                .eq('id', m.id);
 
-                const subject = m.subject || "No Subject";
-                const senderEmail = m.from_email || "Unknown Sender";
-                const snippet = m.body_snippet || "";
-                const bodyText = m.body_text || snippet;
-                const rfcMessageId = m.rfc_message_id;
-                const threadId = m.thread_id || m.gmail_message_id;
-                const gmailMessageId = m.gmail_message_id;
-                const hasPdf = m.has_pdf;
+                            const subject = m.subject || "No Subject";
+                            const senderEmail = m.from_email || "Unknown Sender";
+                            const snippet = m.body_snippet || "";
+                            const bodyText = m.body_text || snippet;
+                            const rfcMessageId = m.rfc_message_id;
+                            const threadId = m.thread_id || m.gmail_message_id;
+                            const gmailMessageId = m.gmail_message_id;
+                            const hasPdf = m.has_pdf;
+                            const pdfFilenames: string[] | null = Array.isArray(m.pdf_filenames)
+                                ? m.pdf_filenames
+                                : null;
 
-                // Guardrail 1: Do not process our own sent emails
-                if (senderEmail === myEmail || senderEmail.endsWith("@buildasoil.com")) {
-                    console.log(`     -> Skipping internal email (${subject}).`);
-                    continue;
-                }
-
-                // Guardrail 1b: Do not process system pipeline senders (e.g. Stockie alerts)
-                // These emails feed ARIA's internal systems and should never get auto-replies.
-                if (this.isSystemSender(senderEmail)) {
-                    console.log(`     -> Skipping system sender (${senderEmail}): ${subject}`);
-                    continue;
-                }
-
-                // Guardrail 1c: Do not process ARIA's own outbound reports
-                // (e.g. OOS Report emails sent to ourselves)
-                if (this.isSystemSubject(subject)) {
-                    console.log(`     -> Skipping system report email: ${subject}`);
-                    continue;
-                }
-
-                console.log(`   Evaluating: "${subject}" from ${senderEmail}`);
-
-                // Guardrail 2: REGEX FAST-PATH — skip LLM entirely for noreply/marketplace senders
-                // These are always PROMOTIONAL or routine status updates. No human action needed.
-                if (this.isNoReply(senderEmail)) {
-                    console.log(`     -> Fast-path PROMOTIONAL (noreply sender: ${senderEmail})`);
-                    try {
-                        await gmail.users.messages.modify({
-                            userId: "me", id: m.gmail_message_id,
-                            requestBody: { removeLabelIds: ["UNREAD"] }
-                        });
-                    } catch { /* best effort */ }
-                    continue;
-                }
-
-                if (this.isMarketplaceOrStatusSender(senderEmail, subject)) {
-                    console.log(`     -> Fast-path PROMOTIONAL (marketplace/status: ${senderEmail})`);
-                    try {
-                        await gmail.users.messages.modify({
-                            userId: "me", id: m.gmail_message_id,
-                            requestBody: { removeLabelIds: ["UNREAD"] }
-                        });
-                    } catch { /* best effort */ }
-                    continue;
-                }
-
-                // Guardrail 2c: Promotional subject fast-path — catches newsletters, ads, ESP blasts
-                // before the expensive LLM call. ~60% of incoming emails are clearly promotional.
-                if (this.isPromotionalFastPath(senderEmail, subject)) {
-                    console.log(`     -> Fast-path PROMOTIONAL (subject/sender match: ${subject.slice(0, 60)})`);
-                    try {
-                        await gmail.users.messages.modify({
-                            userId: "me", id: m.gmail_message_id,
-                            requestBody: { removeLabelIds: ["UNREAD"] }
-                        });
-                    } catch { /* best effort */ }
-                    continue;
-                }
-
-                // Guardrail 3: Classify intent (LLM call — expensive, only reached for real vendor emails)
-                let intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
-                let humanReviewReason = "llm_requires_human";
-                let activeThreadSummary: ThreadCommunicationSummary | null = null;
-
-                if (intent === "ROUTINE_INFO" && this.looksLikeConversationThread(subject, bodyText)) {
-                    // DECISION(2026-06-03): Ping-pong fix for active vendor confirmation threads.
-                    // Symptom: Bill received repeated "1 email needs response" pings about the
-                    // same vendor thread (e.g. "Re: Invico Worldwide PO 124392" from jade@invicoworldwide.com)
-                    // every 15 min. Root cause: Gmail hands out a fresh `gmail_message_id` for
-                    // every vendor reply, so the dedup-on-message_id never matches. Each new
-                    // vendor "Re:" was re-escalated from ROUTINE_INFO → REQUIRES_HUMAN here.
-                    //
-                    // Fix: peek at the thread. If BuildASoil has already replied at least once
-                    // in this thread, the conversation is active and Bill is aware — keep it
-                    // as ROUTINE_INFO so the auto-reply branch archives it normally (and the
-                    // extended `suppressAutoReply` below prevents sending a duplicate "Thanks!"
-                    // on top of our own existing reply).
-                    activeThreadSummary = await this.getThreadCommunicationSummary(gmail, threadId);
-                    if (activeThreadSummary?.buildasoilRepliedAfterVendor) {
-                        console.log(`     -> Suppressing REQUIRES_HUMAN upgrade (active thread — ${activeThreadSummary.buildasoilReplyCount} BuildASoil reply, last actor: ${activeThreadSummary.lastActor})`);
-                        // Keep intent as ROUTINE_INFO. Auto-reply will be suppressed below.
-                    } else {
-                        console.log(`     -> Upgrading ROUTINE_INFO → REQUIRES_HUMAN (conversation thread detected)`);
-                        intent = "REQUIRES_HUMAN";
-                        humanReviewReason = "conversation_thread";
-                    }
-                }
-
-                // DECISION(2026-03-13): Post-classification cost-data guard.
-                // PO #124462 showed that the LLM classified Ed's cost breakdown
-                // ("TOTAL $1140.77 BREAKDOWN...") as ROUTINE_INFO, which triggered an
-                // auto-reply instead of routing to InlineInvoiceHandler.
-                // If classified as ROUTINE_INFO but the email contains dollar amounts
-                // AND invoice-like keywords, upgrade to INLINE_INVOICE.
-                if (intent === "ROUTINE_INFO" && !hasPdf) {
-                    const checkText = (m.body_text || snippet).toLowerCase();
-                    const hasDollarAmount = /\$[\d,]+\.\d{2}/.test(checkText) || /\b\d{2,},?\d*\.\d{2}\b/.test(checkText);
-                    const hasInvoiceSignals = /\b(total|breakdown|subtotal|amount\s+due|freight|invoice|plus\b.*\$)/.test(checkText);
-                    if (hasDollarAmount && hasInvoiceSignals) {
-                        console.log(`     -> Upgrading ROUTINE_INFO → INLINE_INVOICE (cost data detected in body)`);
-                        intent = "INLINE_INVOICE";
-                    }
-                }
-
-                // DECISION(2026-03-23): Vendor-specific intent override.
-                // Credit-card-paid vendors (Colorful Packaging, Axiom Print) should
-                // NEVER go to Bill.com or the AP Agent. Force INLINE_INVOICE so the
-                // InlineInvoiceHandler processes them with vendor-specific logic.
-                // This applies regardless of PDF attachment status.
-                const creditCardVendorPatterns = [
-                    /colorfulpackaging\.com/i,
-                    /colorful\s*packaging/i,
-                    /axiomprint\.com/i,
-                    /axiom\s*print/i,
-                    /uline\.com/i,
-                    /uline/i,
-                ];
-                const senderAndBody = senderEmail + ' ' + subject + ' ' + (m.body_text || snippet);
-                const isCreditCardVendor = creditCardVendorPatterns.some(p => p.test(senderAndBody));
-
-                if (isCreditCardVendor && intent !== "INLINE_INVOICE") {
-                    console.log(`     -> Overriding ${intent} → INLINE_INVOICE (credit-card vendor, never Bill.com)`);
-                    intent = "INLINE_INVOICE";
-                }
-
-                if (intent === "ROUTINE_INFO") {
-                    // It's routine! Let's handle it.
-                    const isNoRep = this.isNoReply(senderEmail);
-                    const isMarketplaceStatus = this.isMarketplaceOrStatusSender(senderEmail, subject);
-                    const isPurchaseThread = this.looksLikePurchaseThread(subject, bodyText);
-                    // Reuse the thread summary we already fetched in the conversation-thread
-                    // upgrade above (when applicable) so we don't make a second Gmail API call.
-                    const threadSummary = activeThreadSummary
-                        ?? (isPurchaseThread
-                            ? await this.getThreadCommunicationSummary(gmail, threadId)
-                            : null);
-                    let replied = false;
-                    const isActiveConversationThread = activeThreadSummary?.buildasoilRepliedAfterVendor === true;
-                    // DECISION(2026-06-10): Check if we already auto-replied to this thread
-                    // in the current batch. Closes the race where Gmail API hasn't indexed
-                    // our just-sent reply yet, preventing double "Thanks!" pings.
-                    const alreadyRepliedThisBatch = repliedThreadIds.has(threadId);
-                    const suppressAutoReply = isMarketplaceStatus
-                        || alreadyRepliedThisBatch
-                        || (isPurchaseThread && (threadSummary?.vendorReplyCount || 0) > 0)
-                        || (isPurchaseThread && !!threadSummary?.buildasoilRepliedAfterVendor)
-                        // DECISION(2026-06-03): Don't send a "Thanks!" on top of our own
-                        // existing reply in an active vendor thread — we already replied,
-                        // the vendor is in conversation with us, no need to chime in again.
-                        || isActiveConversationThread;
-
-                    if (!suppressAutoReply && !isNoRep && rfcMessageId && myEmail) {
-                        try {
-                            // Send reply
-                            const replyBody = this.getRandomResponse();
-                            const rawMessage = this.createReplyRaw(senderEmail, myEmail, subject, rfcMessageId, threadId, replyBody);
-
-                            await gmail.users.messages.send({
-                                userId: "me",
-                                requestBody: {
-                                    raw: rawMessage,
-                                    threadId: threadId
-                                }
-                            });
-                            console.log(`     ✅ Sent reply: "${replyBody}"`);
-                            replied = true;
-                            repliedThreadIds.add(threadId);
-                            await recordSimpleAutoReply({
-                                gmailMessageId,
-                                threadId,
-                                fromEmail: senderEmail,
-                                subject,
-                                replyBody,
-                            });
-                        } catch (replyErr: any) {
-                            console.error(`     ❌ Failed to send reply:`, replyErr.message);
-                        }
-                    } else if (alreadyRepliedThisBatch) {
-                        console.log(`     -> Suppressing auto-reply (already replied to thread ${threadId} this batch).`);
-                    } else if (suppressAutoReply) {
-                        console.log(`     -> Suppressing auto-reply for marketplace/purchase thread.`);
-                    } else if (isNoRep) {
-                        console.log(`     -> Sender is no-reply, skipping response and leaving visible.`);
-                    }
-
-                    try {
-                        if (replied) {
-                            await this.addMessageLabels(gmail, gmailMessageId, ["Replied"]);
-                            console.log(`     🏷️ Added Replied label and kept email visible.`);
-                        } else if (hasPdf) {
-                            console.log(`     📄 Has PDF — left visible for invoice handling.`);
-                        } else {
-                            console.log(`     👀 Routine update left visible for review.`);
-                        }
-                        processedCount++;
-                    } catch (modErr: any) {
-                        console.error(`     ❌ Failed to modify message labels:`, modErr.message);
-                    }
-                } else if (intent === "PROMOTIONAL") {
-                    try {
-                        await gmail.users.messages.modify({
-                            userId: "me",
-                            id: gmailMessageId,
-                            requestBody: {
-                                removeLabelIds: ["INBOX", "UNREAD"]
+                            // Guardrail 1: Do not process our own sent emails
+                            if (senderEmail === myEmail || senderEmail.endsWith("@buildasoil.com")) {
+                                console.log(`     -> Skipping internal email (${subject}).`);
+                                await this.finalizeQueueStatus(m.id, "skipped");
+                                continue;
                             }
-                        });
-                        console.log(`     🗑️ Promoted/Spam archived.`);
-                    } catch (e) { /* ignore */ }
-                } else if (intent === "INLINE_INVOICE") {
-                    // DECISION(2026-03-25): All paid (credit-card) invoices from the default
-                    // inbox are enqueued to nightshift for overnight PO reconciliation.
-                    // Previously these went to InlineInvoiceHandler (synchronous, inline).
-                    //
-                    // Why nightshift?
-                    //   - These invoices are already paid — no urgency for immediate processing
-                    //   - Extraction requires Haiku (qwen3 unreliable for structured data)
-                    //   - The nightshift loop handles dedup, guardrails, Finale updates, and
-                    //     morning handoff reporting in one consistent pipeline
-                    //   - Guard 1 failures (no PO#) still fire Telegram alerts immediately
-                    //     from within the worker, so nothing time-sensitive is lost
-                    //
-                    // These emails should NEVER go to Bill.com — they are already paid.
-                    // Bill.com forwarding is exclusively the AP inbox's job.
-                    try {
-                        const { enqueueDefaultInboxInvoice } = await import('./nightshift-agent');
-                        await enqueueDefaultInboxInvoice(gmailMessageId, senderEmail, subject, bodyText);
-                        console.log(`     📥 Paid invoice queued for overnight reconciliation: "${subject}"`);
-                        processedCount++;
-                    } catch (err: any) {
-                        console.error(`     ❌ Failed to enqueue paid invoice:`, err.message);
-                    }
-                } else {
-                    // REQUIRES_HUMAN — Bill needs to respond to this email
-                    try {
-                        await recordHumanReviewRequired({
-                            gmailMessageId,
-                            threadId,
-                            fromEmail: senderEmail,
-                            subject,
-                            reason: humanReviewReason,
-                        });
-                    } catch (humanReviewErr: any) {
-                        console.error(`     ❌ Failed to record human review signal:`, humanReviewErr.message);
-                    }
 
-                    // Ninja surfacing: collect for batch notification
-                    requiresHumanBatch.push({
-                        from: senderEmail,
-                        subject,
-                        snippet: (snippet || "").slice(0, 120),
-                    });
-                    console.log(`     ⚠️ Requires human attention. Leaving in inbox.`);
-                }
-            }
+                            // Guardrail 1b: Do not process system pipeline senders (e.g. Stockie alerts)
+                            // These emails feed ARIA's internal systems and should never get auto-replies.
+                            if (this.isSystemSender(senderEmail)) {
+                                console.log(`     -> Skipping system sender (${senderEmail}): ${subject}`);
+                                await this.finalizeQueueStatus(m.id, "system_noise");
+                                continue;
+                            }
+
+                            // Guardrail 1c: Do not process ARIA's own outbound reports
+                            // (e.g. OOS Report emails sent to ourselves)
+                            if (this.isSystemSubject(subject)) {
+                                console.log(`     -> Skipping system report email: ${subject}`);
+                                await this.finalizeQueueStatus(m.id, "system_noise");
+                                continue;
+                            }
+
+                            console.log(`   Evaluating: "${subject}" from ${senderEmail}`);
+
+                            // Guardrail 2: REGEX FAST-PATH — skip LLM entirely for noreply/marketplace senders
+                            // These are always PROMOTIONAL or routine status updates. No human action needed.
+                            if (this.isNoReply(senderEmail)) {
+                                console.log(`     -> Fast-path PROMOTIONAL (noreply sender: ${senderEmail})`);
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me", id: m.gmail_message_id,
+                                        requestBody: { removeLabelIds: ["UNREAD"] }
+                                    });
+                                } catch { /* best effort */ }
+                                await this.finalizeQueueStatus(m.id, "system_noise");
+                                continue;
+                            }
+
+                            if (this.isMarketplaceOrStatusSender(senderEmail, subject)) {
+                                console.log(`     -> Fast-path PROMOTIONAL (marketplace/status: ${senderEmail})`);
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me", id: m.gmail_message_id,
+                                        requestBody: { removeLabelIds: ["UNREAD"] }
+                                    });
+                                } catch { /* best effort */ }
+                                await this.finalizeQueueStatus(m.id, "system_noise");
+                                continue;
+                            }
+
+                            // Guardrail 2c: Promotional subject fast-path — catches newsletters, ads, ESP blasts
+                            // before the expensive LLM call. ~60% of incoming emails are clearly promotional.
+                            // Also uses shared isObviousPromotionalEmail (Uline specials, Zoro, AeroPress, etc.).
+                            if (
+                                this.isPromotionalFastPath(senderEmail, subject)
+                                || isObviousPromotionalEmail({ from: senderEmail, subject, snippet })
+                            ) {
+                                console.log(`     -> Fast-path PROMOTIONAL (subject/sender match: ${subject.slice(0, 60)})`);
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me", id: m.gmail_message_id,
+                                        requestBody: { removeLabelIds: ["INBOX", "UNREAD"] }
+                                    });
+                                } catch { /* best effort */ }
+                                await this.finalizeQueueStatus(m.id, "promotional");
+                                continue;
+                            }
+
+                            // DECISION(2026-08-05): Vendor opportunity pre-check BEFORE LLM.
+                            // BioChar miss: Jessica sent tier-2 pricing + TDS + call offer; LLM/path
+                            // treated it as ROUTINE_INFO and auto-sent "Received, thank you!".
+                            // High-confidence commercial signals → draft + needs_response, never bare thanks.
+                            const opportunity = detectVendorOpportunity({
+                                from: senderEmail,
+                                subject,
+                                snippet,
+                                bodyText,
+                                hasPdf: !!hasPdf,
+                                pdfFilenames,
+                            });
+                            if (opportunity.isOpportunity && opportunity.highConfidence) {
+                                console.log(`     -> Fast-path VENDOR_OPPORTUNITY (${opportunity.reasons.slice(0, 4).join(", ")})`);
+                                await this.handleVendorOpportunity({
+                                    gmail,
+                                    rowId: m.id,
+                                    gmailMessageId,
+                                    threadId,
+                                    rfcMessageId,
+                                    myEmail,
+                                    senderEmail,
+                                    subject,
+                                    snippet,
+                                    bodyText,
+                                    hasPdf: !!hasPdf,
+                                    pdfFilenames,
+                                });
+                                processedCount++;
+                                continue;
+                            }
+
+                            // Guardrail 3: Classify intent (LLM call — expensive, only reached for real vendor emails)
+                            let intent = await this.classifyEmailIntent(subject, senderEmail, snippet);
+                            let humanReviewReason = "llm_requires_human";
+                            let activeThreadSummary: ThreadCommunicationSummary | null = null;
+
+                            // Soft opportunity signal can still upgrade LLM ROUTINE_INFO / PROMOTIONAL mistakes
+                            if (opportunity.isOpportunity && (intent === "ROUTINE_INFO" || intent === "PROMOTIONAL")) {
+                                console.log(`     -> Upgrading ${intent} → VENDOR_OPPORTUNITY (detector reasons: ${opportunity.reasons.slice(0, 3).join(", ")})`);
+                                intent = "VENDOR_OPPORTUNITY";
+                            }
+
+                            if (intent === "ROUTINE_INFO" && this.looksLikeConversationThread(subject, bodyText)) {
+                                // DECISION(2026-06-03): Ping-pong fix for active vendor confirmation threads.
+                                // Symptom: Bill received repeated "1 email needs response" pings about the
+                                // same vendor thread (e.g. "Re: Invico Worldwide PO 124392" from jade@invicoworldwide.com)
+                                // every 15 min. Root cause: Gmail hands out a fresh `gmail_message_id` for
+                                // every vendor reply, so the dedup-on-message_id never matches. Each new
+                                // vendor "Re:" was re-escalated from ROUTINE_INFO → REQUIRES_HUMAN here.
+                                //
+                                // Fix: peek at the thread. If BuildASoil has already replied at least once
+                                // in this thread, the conversation is active and Bill is aware — keep it
+                                // as ROUTINE_INFO so the auto-reply branch archives it normally (and the
+                                // extended `suppressAutoReply` below prevents sending a duplicate "Thanks!"
+                                // on top of our own existing reply).
+                                activeThreadSummary = await this.getThreadCommunicationSummary(gmail, threadId);
+                                if (activeThreadSummary?.buildasoilRepliedAfterVendor) {
+                                    console.log(`     -> Suppressing REQUIRES_HUMAN upgrade (active thread — ${activeThreadSummary.buildasoilReplyCount} BuildASoil reply, last actor: ${activeThreadSummary.lastActor})`);
+                                    // Keep intent as ROUTINE_INFO. Auto-reply will be suppressed below.
+                                } else {
+                                    console.log(`     -> Upgrading ROUTINE_INFO → REQUIRES_HUMAN (conversation thread detected)`);
+                                    intent = "REQUIRES_HUMAN";
+                                    humanReviewReason = "conversation_thread";
+                                }
+                            }
+
+                            // DECISION(2026-03-13): Post-classification cost-data guard.
+                                                            // PO #124462 showed that the LLM classified Ed's cost breakdown
+                                                            // ("TOTAL $1140.77 BREAKDOWN...") as ROUTINE_INFO, which triggered an
+                                                            // auto-reply instead of routing to InlineInvoiceHandler.
+                                                            // If classified as ROUTINE_INFO but the email contains dollar amounts
+                                                            // AND invoice-like keywords, upgrade to INLINE_INVOICE.
+                                                            if (intent === "ROUTINE_INFO" && !hasPdf) {
+                                                                const checkText = (m.body_text || snippet).toLowerCase();
+                                                                const hasDollarAmount = /\$[\d,]+\.\d{2}/.test(checkText) || /\b\d{2,}?,?\d*\.\d{2}\b/.test(checkText);
+                                                                const hasInvoiceSignals = /\b(total|breakdown|subtotal|amount\s+due|freight|invoice|plus\b.*\$)/.test(checkText);
+                                                                if (hasDollarAmount && hasInvoiceSignals) {
+                                                                    console.log(`     -> Upgrading ROUTINE_INFO → INLINE_INVOICE (cost data detected in body)`);
+                                                                    intent = "INLINE_INVOICE";
+                                                                }
+                                                            }
+
+                                                            // DECISION(2026-08-05): Default-inbox PDF invoices are ALREADY PAID (CC).
+                                                            // Draft-only policy must never swallow them — force nightshift reconciliation
+                                                            // so invoices hit vendor_invoices / Finale price updates and don't get
+                                                            // filed as a polite draft while money data is ignored.
+                                                            // AP inbox (Bill.com / unpaid) is handled separately by AP Identifier.
+                                                            if (
+                                                                this.tokenIdentifier === "default"
+                                                                && intent !== "INLINE_INVOICE"
+                                                                && intent !== "VENDOR_OPPORTUNITY"
+                                                                && intent !== "PROMOTIONAL"
+                                                                && !!hasPdf
+                                                            ) {
+                                                                const invHay = `${subject}\n${bodyText}\n${(pdfFilenames || []).join(" ")}`.toLowerCase();
+                                                                const looksInvoicePdf =
+                                                                    /\binvoice\b/.test(invHay)
+                                                                    || /\binv[#\s-]?\d/.test(invHay)
+                                                                    || (pdfFilenames || []).some((f) => /inv|invoice|receipt|bill/i.test(f));
+                                                                if (looksInvoicePdf) {
+                                                                    console.log(`     -> Upgrading ${intent} → INLINE_INVOICE (default-inbox paid PDF invoice)`);
+                                                                    intent = "INLINE_INVOICE";
+                                                                }
+                                                            }
+
+                                                            // DECISION(2026-03-23): Vendor-specific intent override.
+                                                            // Credit-card-paid vendors (Colorful Packaging, Axiom Print) should
+                                                            // NEVER go to Bill.com or the AP Agent. Force INLINE_INVOICE so the
+                                                            // InlineInvoiceHandler processes them with vendor-specific logic.
+                                                            // This applies regardless of PDF attachment status.
+                                                            // Exception: pure marketing from those domains stays promotional (already filtered).
+                                                            const creditCardVendorPatterns = [
+                                                                /colorfulpackaging\.com/i,
+                                                                /colorful\s*packaging/i,
+                                                                /axiomprint\.com/i,
+                                                                /axiom\s*print/i,
+                                                                /uline\.com/i,
+                                                                /uline/i,
+                                                            ];
+                                                            const senderAndBody = senderEmail + ' ' + subject + ' ' + (m.body_text || snippet);
+                                                            const isCreditCardVendor = creditCardVendorPatterns.some(p => p.test(senderAndBody));
+                                                            const looksLikePaidInvoice =
+                                                                hasPdf
+                                                                || /\binvoice\b/i.test(subject + " " + bodyText)
+                                                                || /\$[\d,]+\.\d{2}/.test(bodyText);
+
+                                                            if (
+                                                                isCreditCardVendor
+                                                                && looksLikePaidInvoice
+                                                                && intent !== "INLINE_INVOICE"
+                                                                && intent !== "VENDOR_OPPORTUNITY"
+                                                            ) {
+                                                                console.log(`     -> Overriding ${intent} → INLINE_INVOICE (credit-card vendor, never Bill.com)`);
+                                                                intent = "INLINE_INVOICE";
+                                                            }
+
+                            if (intent === "VENDOR_OPPORTUNITY") {
+                                await this.handleVendorOpportunity({
+                                    gmail,
+                                    rowId: m.id,
+                                    gmailMessageId,
+                                    threadId,
+                                    rfcMessageId,
+                                    myEmail,
+                                    senderEmail,
+                                    subject,
+                                    snippet,
+                                    bodyText,
+                                    hasPdf: !!hasPdf,
+                                    pdfFilenames,
+                                });
+                                processedCount++;
+                            } else if (intent === "ROUTINE_INFO") {
+                                // DECISION(2026-08-05): Draft-only for PO/tracking/routine.
+                                // Never auto-send — Bill reviews drafts before anything goes out.
+                                const isNoRep = this.isNoReply(senderEmail);
+                                const isMarketplaceStatus = this.isMarketplaceOrStatusSender(senderEmail, subject);
+                                const isPurchaseThread = this.looksLikePurchaseThread(subject, bodyText);
+                                const threadSummary = activeThreadSummary
+                                    ?? (isPurchaseThread
+                                        ? await this.getThreadCommunicationSummary(gmail, threadId)
+                                        : null);
+                                const isActiveConversationThread = activeThreadSummary?.buildasoilRepliedAfterVendor === true;
+                                const alreadyRepliedThisBatch = repliedThreadIds.has(threadId);
+
+                                const policy = resolveEmailResponsePolicy({
+                                    intent: "ROUTINE_INFO",
+                                    isNoReply: isNoRep,
+                                    isMarketplace: isMarketplaceStatus,
+                                    isPurchaseThread,
+                                    alreadyRepliedThisBatch,
+                                    buildasoilAlreadyRepliedInThread: !!threadSummary?.buildasoilRepliedAfterVendor,
+                                    isActiveConversation: isActiveConversationThread,
+                                });
+
+                                // Hard guard — policy must never allow auto-send on routine mail
+                                if (policy.allowAutoSend) {
+                                    console.error("     ❌ Policy violation: allowAutoSend on ROUTINE_INFO blocked");
+                                }
+
+                                if (policy.createDraft && myEmail && rfcMessageId) {
+                                    const draftBody = composeRoutineDraftBody({
+                                        from: senderEmail,
+                                        subject,
+                                        bodyText,
+                                    });
+                                    const draftId = await this.createReplyDraft({
+                                        gmail,
+                                        to: senderEmail,
+                                        from: myEmail,
+                                        subject,
+                                        inReplyTo: rfcMessageId,
+                                        threadId,
+                                        bodyText: draftBody,
+                                    });
+                                    if (draftId) {
+                                        repliedThreadIds.add(threadId);
+                                        console.log(`     📝 Routine draft ready (${draftId}) — not sent`);
+                                        try {
+                                            await recordEmailDraftPrepared({
+                                                gmailMessageId,
+                                                threadId,
+                                                fromEmail: senderEmail,
+                                                subject,
+                                                replyBody: draftBody,
+                                                kind: "routine",
+                                                draftId,
+                                            });
+                                        } catch { /* non-fatal */ }
+                                    }
+                                } else if (policy.action === "SILENT") {
+                                    console.log(`     -> Silent (${policy.reason}) — no draft/send.`);
+                                }
+
+                                try {
+                                    if (policy.labels.length > 0) {
+                                        await this.addMessageLabels(gmail, gmailMessageId, policy.labels);
+                                        console.log(`     🏷️ Labels: ${policy.labels.join(", ")}`);
+                                    } else if (hasPdf) {
+                                        console.log(`     📄 Has PDF — left visible.`);
+                                    } else {
+                                        console.log(`     👀 Routine left visible for review.`);
+                                    }
+                                    processedCount++;
+                                } catch (modErr: any) {
+                                    console.error(`     ❌ Failed to modify message labels:`, modErr.message);
+                                }
+                                await this.finalizeQueueStatus(m.id, "completed", policy.reason);
+                            } else if (intent === "PROMOTIONAL") {
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me",
+                                        id: gmailMessageId,
+                                        requestBody: {
+                                            removeLabelIds: ["INBOX", "UNREAD"]
+                                        }
+                                    });
+                                    console.log(`     🗑️ Promoted/Spam archived.`);
+                                } catch (e) { /* ignore */ }
+                                await this.finalizeQueueStatus(m.id, "promotional");
+                            } else if (intent === "INLINE_INVOICE") {
+                                // DECISION(2026-03-25): All paid (credit-card) invoices from the default
+                                // inbox are enqueued to nightshift for overnight PO reconciliation.
+                                try {
+                                    const { enqueueDefaultInboxInvoice } = await import('./nightshift-agent');
+                                    await enqueueDefaultInboxInvoice(gmailMessageId, senderEmail, subject, bodyText);
+                                    console.log(`     📥 Paid invoice queued for overnight reconciliation: "${subject}"`);
+                                    processedCount++;
+                                    await this.finalizeQueueStatus(m.id, "invoice_queued");
+                                } catch (err: any) {
+                                    console.error(`     ❌ Failed to enqueue paid invoice:`, err.message);
+                                    await this.finalizeQueueStatus(m.id, "failed", err.message);
+                                }
+                            } else {
+                                // REQUIRES_HUMAN — draft stub + escalate. Never auto-send.
+                                const policy = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
+
+                                if (policy.createDraft && myEmail && rfcMessageId) {
+                                    const stub = composeHumanEscalationDraftStub({
+                                        from: senderEmail,
+                                        subject,
+                                    });
+                                    const draftId = await this.createReplyDraft({
+                                        gmail,
+                                        to: senderEmail,
+                                        from: myEmail,
+                                        subject,
+                                        inReplyTo: rfcMessageId,
+                                        threadId,
+                                        bodyText: stub,
+                                    });
+                                    if (draftId) {
+                                        console.log(`     📝 Human-escalation draft stub (${draftId}) — not sent`);
+                                        try {
+                                            await recordEmailDraftPrepared({
+                                                gmailMessageId,
+                                                threadId,
+                                                fromEmail: senderEmail,
+                                                subject,
+                                                replyBody: stub,
+                                                kind: "human_escalation",
+                                                draftId,
+                                            });
+                                        } catch { /* non-fatal */ }
+                                    }
+                                }
+
+                                try {
+                                    await recordHumanReviewRequired({
+                                        gmailMessageId,
+                                        threadId,
+                                        fromEmail: senderEmail,
+                                        subject,
+                                        reason: humanReviewReason,
+                                    });
+                                } catch (humanReviewErr: any) {
+                                    console.error(`     ❌ Failed to record human review signal:`, humanReviewErr.message);
+                                }
+
+                                try {
+                                    await this.addMessageLabels(gmail, gmailMessageId, policy.labels.length ? policy.labels : ["Needs Response", "Draft Ready"]);
+                                } catch { /* best effort */ }
+
+                                try {
+                                    await notifyViaTask({
+                                        sourceId: `email-human:${gmailMessageId}`,
+                                        type: "email_needs_response",
+                                        goal: `${senderEmail}: ${subject.slice(0, 80)}`,
+                                        owner: "will",
+                                        priority: 1,
+                                        summaryLabel: "Email needs real response",
+                                        inputs: {
+                                            from: senderEmail,
+                                            subject,
+                                            reason: humanReviewReason,
+                                            gmailMessageId,
+                                            threadId,
+                                            kind: "requires_human",
+                                            snippet: (snippet || "").slice(0, 120),
+                                        },
+                                    });
+                                } catch { /* non-fatal */ }
+
+                                requiresHumanBatch.push({
+                                    from: senderEmail,
+                                    subject,
+                                    snippet: (snippet || "").slice(0, 120),
+                                });
+                                console.log(`     ⚠️ Requires human attention — draft stub + task. Leaving in inbox.`);
+                                await this.finalizeQueueStatus(m.id, "needs_response", humanReviewReason);
+                            }
+                        }
 
             // ── Batch REQUIRES_HUMAN notification ──────────────────────────
             // Single digest message to Bill rather than spamming per-email.

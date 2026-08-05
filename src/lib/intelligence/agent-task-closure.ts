@@ -93,6 +93,10 @@ export function closesWhenFor(args: {
     if (args.type === "cron_summary") {
         return { kind: "deadline", max_age_hours: 24 };
     }
+    // Vendor opportunity / human-response emails: auto-close after 7d if Bill didn't
+    if (args.type === "email_needs_response") {
+        return { kind: "deadline", max_age_hours: 168 };
+    }
     return null;
 }
 

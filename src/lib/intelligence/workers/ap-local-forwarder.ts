@@ -125,6 +125,11 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     ) {
         return true;
     }
+    // AAA Cooper Transportation — individual Pro# invoices left for manual review
+    // Subject pattern: "Invoice Stmt - Cust 0001159492 Pro#: 64471684"
+    if (subjectLower.includes("invoice stmt - cust 0001159492 pro#")) {
+        return true;
+    }
     return false;
 }
 
@@ -331,6 +336,25 @@ async function enrichInvoiceForPoMatch(args: {
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
         if (m) norm.poNumber = m[1].padStart(5, "0");
+    }
+
+    // ── WS2 (2026-08-05): bridge invoice tracking → shipments ──
+    // Best-effort: never breaks the Bill.com forward path. Invoices stay the
+    // money ledger; shipments (movement ledger) get tracking linked to the PO.
+    // Paid-blocked invoices never reach here — see the blocked branch in
+    // runLocalApForward for their bridge call.
+    try {
+        const { bridgeInvoiceTrackingToShipments } = await import("@/lib/tracking/invoice-tracking-bridge");
+        await bridgeInvoiceTrackingToShipments({
+            ocrText: rawText,
+            poNumber: norm.poNumber,
+            vendorName: norm.vendorName,
+            invoiceNumber: norm.invoiceNumber,
+            source: "ap_invoice",
+            sourceRef: args.gmailMessageId,
+        });
+    } catch (bridgeErr: any) {
+        console.warn(`   [AP-Local] invoice→shipment bridge failed: ${bridgeErr?.message || bridgeErr}`);
     }
 
     // ── SQLite permanent log on ap_local_forwards (always, even if PostgREST down) ──
@@ -1215,6 +1239,26 @@ export async function runLocalApForward(): Promise<{
                 if (paidCheck.blocked) {
                     recordError(gmailMessageId, from, subject, pdfFilename, pdfHash,
                         `BLOCKED: ${paidCheck.reason}`);
+                    // WS2 (2026-08-05): paid-blocked invoices never reach Bill.com
+                    // but their OCR text may still hold tracking → link to shipments.
+                    // Best-effort; never blocks the forward pipeline.
+                    if (paidCheck.rawText && paidCheck.rawText.trim().length >= 5) {
+                        try {
+                            const { bridgeInvoiceTrackingToShipments } = await import("@/lib/tracking/invoice-tracking-bridge");
+                            await bridgeInvoiceTrackingToShipments({
+                                ocrText: paidCheck.rawText,
+                                poNumber: null, // invoice not parsed — bridge falls back to OCR PO extraction
+                                vendorName: null,
+                                invoiceNumber: null,
+                                source: "ap_invoice",
+                                sourceRef: gmailMessageId,
+                            });
+                        } catch (bridgeErr: any) {
+                            console.warn(
+                                `   [AP-Local] invoice→shipment bridge (blocked) failed: ${bridgeErr?.message || bridgeErr}`,
+                            );
+                        }
+                    }
                     summary.skipped++;
                     continue;
                 }

@@ -120,6 +120,87 @@ describe("classifyShipmentEvidence", () => {
             reason: expect.stringContaining("carrier"),
         });
     });
+
+    it("confirms email_ingest_pdf evidence when the tracking is PO-linked", () => {
+        expect(classifyShipmentEvidence(makeShipment({
+            status_category: null,
+            status_display: null,
+            last_checked_at: null,
+            source_confidence: 0.6,
+            source_refs: [
+                {
+                    source: "email_ingest_pdf",
+                    sourceRef: "gmail:pdf-1",
+                    seenAt: "2026-04-02T13:00:00.000Z",
+                    confidence: 0.6,
+                },
+            ],
+        }))).toMatchObject({
+            level: "confirmed",
+            reason: expect.stringContaining("document evidence"),
+        });
+    });
+
+    it("keeps email_ingest_pdf without a PO link as a candidate (orphan-style)", () => {
+        expect(classifyShipmentEvidence(makeShipment({
+            po_numbers: [],
+            status_category: null,
+            status_display: null,
+            last_checked_at: null,
+            source_confidence: 0.6,
+            source_refs: [
+                {
+                    source: "email_ingest_pdf",
+                    sourceRef: "gmail:pdf-orphan",
+                    seenAt: "2026-04-02T13:00:00.000Z",
+                    confidence: 0.6,
+                },
+            ],
+        }))).toMatchObject({
+            level: "candidate",
+            reason: expect.stringContaining("weak"),
+        });
+    });
+
+    it("confirms email_ingest_bol_vision when the tracking is PO-linked", () => {
+        expect(classifyShipmentEvidence(makeShipment({
+            status_category: null,
+            status_display: null,
+            last_checked_at: null,
+            source_confidence: 0.5,
+            source_refs: [
+                {
+                    source: "email_ingest_bol_vision",
+                    sourceRef: "gmail:bol-1",
+                    seenAt: "2026-04-02T13:00:00.000Z",
+                    confidence: 0.5,
+                },
+            ],
+        }))).toMatchObject({
+            level: "confirmed",
+        });
+    });
+
+    it("keeps ap_invoice evidence confirmed even without an explicit PO link", () => {
+        expect(classifyShipmentEvidence(makeShipment({
+            po_numbers: [],
+            status_category: null,
+            status_display: null,
+            last_checked_at: null,
+            source_confidence: 0.5,
+            source_refs: [
+                {
+                    source: "ap_invoice",
+                    sourceRef: "inv:9001",
+                    seenAt: "2026-04-02T13:00:00.000Z",
+                    confidence: 0.5,
+                },
+            ],
+        }))).toMatchObject({
+            level: "confirmed",
+            reason: "document evidence",
+        });
+    });
 });
 
 describe("getShipmentBoardBuckets", () => {

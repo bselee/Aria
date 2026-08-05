@@ -48,8 +48,9 @@ export const TRACKING_PATTERNS = {
     // keyword is non-capturing (?:...) so match[1] is always the tracking number
     generic: /\b(?:tracking|track(?:\s+your)?\s+shipment|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/i,
     // LTL freight identifiers — whitespace required after keyword
-    pro: /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/i,
-    bol: /\b(?:BOL[\s\-]+#?\s*|Bill\s+of\s+Lading\s+#?\s*)([0-9][0-9A-Z]{5,24})\b/i,
+    // DECISION(2026-08-05): Also match "PRO NUMBER:", "PRO No.", "PRO#" on BOLs/invoices
+    pro: /\bPRO(?:\s*(?:NUMBER|NO\.?|#))?\s*[#:\-.]?\s*([0-9]{7,15})\b/i,
+    bol: /\b(?:BOL|B\/L|Bill\s+of\s+Lading)(?:\s*(?:NUMBER|NO\.?|#))?\s*[#:\-.]?\s*([0-9][0-9A-Z]{5,24})\b/i,
     // Oak Harbor explicitly
     // DECISION(2026-05-21): Refined oakharbor regex prefix to be strictly mandatory, preventing
     // raw 8-12 digit numbers from matching as Oak Harbor tracking numbers. Added support for OAKH abbreviation.
@@ -156,24 +157,82 @@ export function detectCarrier(trackingNumber: string): string | null {
 
 /**
  * Extract tracking numbers from free text using all known patterns.
- * Returns an array of { carrier, trackingNumber } objects.
+ * Returns an array of { carrier, trackingNumber } objects, ranked best-first.
+ *
+ * DECISION(2026-08-05): Harden precision —
+ *  - Prefer structured carriers (UPS/USPS/DHL/PRO/BOL/TRK) over bare FedEx digits
+ *  - Bare 12/15-digit FedEx only kept when shipping context is nearby
+ *  - Drop invoice-looking digits with no shipping keywords nearby
+ *  - Dedup by tracking number (keep highest-priority carrier label)
  */
 export function extractTrackingNumbers(text: string): Array<{ carrier: string; trackingNumber: string }> {
-    const results: Array<{ carrier: string; trackingNumber: string }> = [];
+    if (!text) return [];
+
+    type Hit = { carrier: string; trackingNumber: string; score: number; index: number };
+    const hits: Hit[] = [];
+
+    const CARRIER_BASE: Record<string, number> = {
+        ups: 100,
+        usps: 95,
+        dhl: 90,
+        oakharbor: 88,
+        pro: 85,
+        bol: 80,
+        ltlPro: 82,
+        trk: 75,
+        generic: 65,
+        fedex: 50,
+    };
 
     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
-        const matches = text.matchAll(new RegExp(regex, 'gi'));
-        for (const match of matches) {
-            // For generic/pro/bol patterns, the number is in capture group 1
-            const trackingNumber = match[1] || match[0];
-            // Avoid duplicate entries
-            if (!results.some(r => r.trackingNumber === trackingNumber)) {
-                results.push({ carrier, trackingNumber });
+        const re = new RegExp(regex.source, regex.flags.includes("g") ? regex.flags : `${regex.flags}g`);
+        for (const match of text.matchAll(re)) {
+            const trackingNumber = (match[1] || match[0] || "").trim();
+            if (!trackingNumber || trackingNumber.length < 8) continue;
+
+            const index = match.index ?? 0;
+            let score = CARRIER_BASE[carrier] ?? 40;
+
+            // Context window boosts / penalties
+            const ctx = text.slice(Math.max(0, index - 100), Math.min(text.length, index + trackingNumber.length + 100));
+            const ctxLower = ctx.toLowerCase();
+            const hasShipCtx = /\b(track|tracking|shipment|shipped|ship\s+date|pro\b|bol\b|freight|ups|fedex|usps|dhl|deliver|pallet|waybill|carrier|ltl|bill of lading)\b/i.test(ctxLower);
+            const hasInvoiceNoise = /\b(invoice|inv\s*#|amount due|subtotal|balance|qty|quantity|unit price)\b/i.test(ctxLower)
+                && !hasShipCtx;
+
+            if (hasShipCtx) score += 15;
+            if (hasInvoiceNoise) score -= 40;
+
+            // Bare FedEx digit patterns are high false-positive on invoice #s / amounts
+            if (carrier === "fedex") {
+                const bare = /^\d{12}$|^\d{15}$/.test(trackingNumber);
+                const smartPost = /^96\d{18}$/.test(trackingNumber);
+                if (bare && !hasShipCtx) continue; // drop uncontextual 12/15 digit
+                if (smartPost) score += 10;
+                if (bare && hasShipCtx) score += 5;
             }
+
+            // Generic/PRO/BOL without ship context still ok if keyword is in the match itself
+            if ((carrier === "generic" || carrier === "pro" || carrier === "bol" || carrier === "trk") && !hasShipCtx) {
+                // pattern already requires keyword — keep at base
+            }
+
+            hits.push({ carrier, trackingNumber, score, index });
         }
     }
 
-    return results;
+    // Dedup by tracking number — keep highest score
+    const best = new Map<string, Hit>();
+    for (const h of hits) {
+        const key = h.trackingNumber.toUpperCase();
+        const prev = best.get(key);
+        if (!prev || h.score > prev.score) best.set(key, h);
+    }
+
+    return Array.from(best.values())
+        .filter((h) => h.score >= 45)
+        .sort((a, b) => b.score - a.score || a.index - b.index)
+        .map(({ carrier, trackingNumber }) => ({ carrier, trackingNumber }));
 }
 
 /**

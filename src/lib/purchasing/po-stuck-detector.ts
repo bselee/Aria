@@ -7,7 +7,7 @@
  * Stages and thresholds:
  *   acked_no_tracking       acked ≥ 7d ago, no tracking_numbers, not received
  *   tracking_stale          most-recent shipment update ≥ 5d, not delivered
- *   delivered_no_receipt    carrier delivered ≥ 24h, no Finale receive_date
+ *   delivered_no_receipt    carrier delivered ≥ 24h, no Finale receive (escalate note ≥48h)
  *   received_no_invoice     receive_date ≥ 14d, no matched invoice
  *   invoice_unreconciled    invoice present ≥ 7d, unreconciled
  *
@@ -15,6 +15,10 @@
  * mix in production.
  */
 import { createClient } from "@/lib/db";
+import {
+    DELIVERED_ESCALATE_HOURS,
+    DELIVERED_FLAG_HOURS,
+} from "@/lib/tracking/delivered-unreceived";
 
 export type StuckStage =
     | 'acked_no_tracking'
@@ -34,7 +38,7 @@ export interface StuckPO {
 
 const ACKED_NO_TRACKING_DAYS = 7;
 const TRACKING_STALE_DAYS = 5;
-const DELIVERED_NO_RECEIPT_HOURS = 24;
+const DELIVERED_NO_RECEIPT_HOURS = DELIVERED_FLAG_HOURS;
 const INVOICE_UNRECONCILED_DAYS = 7;
 
 function ageDays(iso: string | null | undefined): number | null {
@@ -116,12 +120,15 @@ export async function detectStuckPOs(): Promise<StuckPO[]> {
             const deliveredAt = anyDelivered.delivered_at ?? anyDelivered.updated_at;
             const hrs = ageHours(deliveredAt);
             if (hrs != null && hrs >= DELIVERED_NO_RECEIPT_HOURS) {
+                const escalate = hrs >= DELIVERED_ESCALATE_HOURS;
                 stuck.push({
                     poNumber: po.po_number,
                     vendorName: po.vendor_name,
                     stage: 'delivered_no_receipt',
                     daysStuck: Math.floor(hrs / 24),
-                    summary: `carrier says delivered ${Math.floor(hrs / 24)}d ago, no Finale receipt`,
+                    summary: escalate
+                        ? `carrier delivered ${hrs}h ago (≥${DELIVERED_ESCALATE_HOURS}h) — OVERDUE Finale receipt`
+                        : `carrier delivered ${hrs}h ago (≥${DELIVERED_FLAG_HOURS}h) — no Finale receipt`,
                     detail: anyDelivered.status_display ?? 'Delivered',
                     stageSinceISO: deliveredAt!,
                 });

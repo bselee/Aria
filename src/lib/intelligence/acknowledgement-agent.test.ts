@@ -6,12 +6,15 @@ const {
     gmailThreadsGetMock,
     gmailLabelsListMock,
     gmailLabelsCreateMock,
+    gmailDraftsCreateMock,
     getProfileMock,
     unifiedObjectGenerationMock,
     recallMock,
     enqueueDefaultInboxInvoiceMock,
     recordSimpleAutoReplyMock,
     recordHumanReviewRequiredMock,
+    recordEmailDraftPreparedMock,
+    notifyViaTaskMock,
     queueState,
 } = vi.hoisted(() => ({
     gmailSendMock: vi.fn(),
@@ -19,12 +22,15 @@ const {
     gmailThreadsGetMock: vi.fn(),
     gmailLabelsListMock: vi.fn(),
     gmailLabelsCreateMock: vi.fn(),
+    gmailDraftsCreateMock: vi.fn(),
     getProfileMock: vi.fn(),
     unifiedObjectGenerationMock: vi.fn(),
     recallMock: vi.fn(),
     enqueueDefaultInboxInvoiceMock: vi.fn(),
     recordSimpleAutoReplyMock: vi.fn(),
     recordHumanReviewRequiredMock: vi.fn(),
+    recordEmailDraftPreparedMock: vi.fn(),
+    notifyViaTaskMock: vi.fn(),
     queueState: {
         messages: [] as Array<Record<string, any>>,
         processedUpdates: [] as Array<Record<string, any>>,
@@ -50,6 +56,9 @@ vi.mock("@googleapis/gmail", () => ({
                 list: gmailLabelsListMock,
                 create: gmailLabelsCreateMock,
             },
+            drafts: {
+                create: gmailDraftsCreateMock,
+            },
         },
     })),
 }));
@@ -69,6 +78,11 @@ vi.mock("./nightshift-agent", () => ({
 vi.mock("./email-feedback", () => ({
     recordSimpleAutoReply: recordSimpleAutoReplyMock,
     recordHumanReviewRequired: recordHumanReviewRequiredMock,
+    recordEmailDraftPrepared: recordEmailDraftPreparedMock,
+}));
+
+vi.mock("./notify-via-task", () => ({
+    notifyViaTask: notifyViaTaskMock,
 }));
 
 vi.mock("../db", () => ({
@@ -113,6 +127,7 @@ describe("AcknowledgementAgent", () => {
         gmailLabelsCreateMock.mockImplementation(async ({ requestBody }: { requestBody: { name: string } }) => ({
             data: { id: `${requestBody.name.toLowerCase().replace(/\s+/g, "-")}-label` },
         }));
+        gmailDraftsCreateMock.mockResolvedValue({ data: { id: "draft-opp-1" } });
         unifiedObjectGenerationMock.mockResolvedValue({
             intent: "ROUTINE_INFO",
             reasoning: "routine update",
@@ -121,9 +136,11 @@ describe("AcknowledgementAgent", () => {
         enqueueDefaultInboxInvoiceMock.mockResolvedValue(undefined);
         recordSimpleAutoReplyMock.mockResolvedValue(undefined);
         recordHumanReviewRequiredMock.mockResolvedValue(undefined);
+        recordEmailDraftPreparedMock.mockResolvedValue(undefined);
+        notifyViaTaskMock.mockResolvedValue("task-1");
     });
 
-    it("adds the Replied label and keeps a routine reply visible in inbox", async () => {
+    it("prepares a routine draft and NEVER auto-sends", async () => {
         queueState.messages = [
             {
                 id: 1,
@@ -142,21 +159,22 @@ describe("AcknowledgementAgent", () => {
 
         await new AcknowledgementAgent("default").processUnreadEmails();
 
-        expect(gmailSendMock).toHaveBeenCalledTimes(1);
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
         expect(gmailModifyMock).toHaveBeenCalledWith({
             userId: "me",
             id: "gmail-1",
             requestBody: {
-                addLabelIds: ["replied-label"],
+                addLabelIds: ["draft-ready-label"],
             },
         });
-        expect(recordSimpleAutoReplyMock).toHaveBeenCalledWith({
-            gmailMessageId: "gmail-1",
-            threadId: "thread-1",
-            fromEmail: "vendor@example.com",
-            subject: "Tracking update",
-            replyBody: expect.any(String),
-        });
+        expect(recordEmailDraftPreparedMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                gmailMessageId: "gmail-1",
+                kind: "routine",
+            }),
+        );
+        expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
     });
 
     it("does not auto-reply to marketplace shipping notices", async () => {
@@ -190,7 +208,7 @@ describe("AcknowledgementAgent", () => {
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("does not send a second thank-you on vendor PO threads that already have a buildasoil reply", async () => {
+    it("does not draft or send on vendor PO threads that already have a buildasoil reply", async () => {
         queueState.messages = [
             {
                 id: 12,
@@ -231,12 +249,13 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("forces multi-turn conversation threads into human review without adding an extra label", async () => {
+    it("forces multi-turn conversation threads into human review with draft stub + labels", async () => {
         queueState.messages = [
             {
                 id: 2,
@@ -256,7 +275,14 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
+        expect(gmailModifyMock).toHaveBeenCalledWith({
+            userId: "me",
+            id: "gmail-2",
+            requestBody: {
+                addLabelIds: expect.arrayContaining(["needs-response-label", "draft-ready-label"]),
+            },
+        });
         expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith({
             gmailMessageId: "gmail-2",
             threadId: "thread-2",
@@ -264,6 +290,7 @@ describe("AcknowledgementAgent", () => {
             subject: "RE: Packaging update",
             reason: "conversation_thread",
         });
+        expect(queueState.processedUpdates.some((u) => u.values.status === "needs_response")).toBe(true);
     });
 
     it("does NOT escalate active conversation threads where BuildASoil has already replied", async () => {
@@ -352,5 +379,119 @@ describe("AcknowledgementAgent", () => {
             "PO #124541\nSubtotal $100.00\nFreight $20.00\nTotal $120.00",
         );
         expect(gmailModifyMock).not.toHaveBeenCalled();
+        expect(queueState.processedUpdates.some((u) => u.values.status === "invoice_queued")).toBe(true);
+    });
+
+    it("never auto-thanks vendor opportunity emails — drafts + needs_response (BioChar class)", async () => {
+        queueState.messages = [
+            {
+                id: 40,
+                gmail_message_id: "gmail-biochar",
+                thread_id: "thread-biochar",
+                rfc_message_id: "<msg-biochar>",
+                from_email: "jessica@ambiochar.com",
+                subject: "response to your BioChar inquiry",
+                body_snippet: "I have attached our tier 2 distributor pricing schedule",
+                body_text: [
+                    "Hi Bill,",
+                    "Thank you so much for reaching out. I have attached our tier 2 distributor pricing schedule",
+                    "including NAKED Char and NAKED Char 5M tech sheets.",
+                    "Our BioChar is IBI certified, OMRI listed, and USDA Bio-preferred.",
+                    "I would love to schedule a call to address any additional questions.",
+                    "Jessica Kusmiz",
+                ].join("\n"),
+                has_pdf: true,
+                pdf_filenames: [
+                    "2026 tier 2 distributor pricing.pdf",
+                    "NAKED Char tds.pdf",
+                    "NAKED Char 5M tds.pdf",
+                ],
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+
+        // Even if LLM wrongly says ROUTINE_INFO, detector must win.
+        unifiedObjectGenerationMock.mockResolvedValue({
+            intent: "ROUTINE_INFO",
+            reasoning: "acknowledgement",
+        });
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
+        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
+        expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                gmailMessageId: "gmail-biochar",
+                reason: "vendor_opportunity",
+            }),
+        );
+        expect(notifyViaTaskMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: "email_needs_response",
+                sourceId: "email-opp:gmail-biochar",
+            }),
+        );
+        expect(queueState.processedUpdates.some((u) => u.values.status === "needs_response")).toBe(true);
+    });
+
+    it("queues default-inbox paid PDF invoices to nightshift even if LLM says ROUTINE", async () => {
+        queueState.messages = [
+            {
+                id: 60,
+                gmail_message_id: "gmail-paid-pdf",
+                thread_id: "thread-paid-pdf",
+                rfc_message_id: "<msg-paid-pdf>",
+                from_email: "billing@randomvendor.com",
+                subject: "Invoice 99122 for your order",
+                body_snippet: "Please find your paid invoice attached",
+                body_text: "Invoice 99122 attached. Total $240.00 already charged to card.",
+                has_pdf: true,
+                pdf_filenames: ["Invoice-99122.pdf"],
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+        unifiedObjectGenerationMock.mockResolvedValue({
+            intent: "ROUTINE_INFO",
+            reasoning: "order update",
+        });
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(enqueueDefaultInboxInvoiceMock).toHaveBeenCalledWith(
+            "gmail-paid-pdf",
+            "billing@randomvendor.com",
+            "Invoice 99122 for your order",
+            expect.stringContaining("Invoice 99122"),
+        );
+        expect(queueState.processedUpdates.some((u) => u.values.status === "invoice_queued")).toBe(true);
+    });
+
+    it("marks obvious promotional mail promotional in the queue status", async () => {
+        queueState.messages = [
+            {
+                id: 50,
+                gmail_message_id: "gmail-promo",
+                thread_id: "thread-promo",
+                rfc_message_id: "<msg-promo>",
+                from_email: "zoro@e.zoro.com",
+                subject: "Time to restock. Get all of your essentials at Zoro",
+                body_snippet: "Shop now and save. Unsubscribe",
+                body_text: "Shop now and save. Unsubscribe",
+                has_pdf: false,
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(unifiedObjectGenerationMock).not.toHaveBeenCalled();
+        expect(queueState.processedUpdates.some((u) => u.values.status === "promotional")).toBe(true);
     });
 });

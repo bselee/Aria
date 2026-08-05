@@ -49,6 +49,32 @@ export async function recordSimpleAutoReply(event: AutoReplyEvent): Promise<void
     });
 }
 
+/** Draft prepared for Bill to review/edit/send — not auto-sent. */
+export async function recordEmailDraftPrepared(event: AutoReplyEvent & { kind: string; draftId?: string | null }): Promise<void> {
+    await recordFeedback({
+        category: "engagement",
+        eventType: "email_draft_prepared",
+        agentSource: "acknowledgement-agent",
+        subjectType: "message",
+        subjectId: event.gmailMessageId,
+        prediction: {
+            action: "draft",
+            kind: event.kind,
+            threadId: event.threadId ?? null,
+            replyBody: event.replyBody,
+            draftId: event.draftId ?? null,
+        },
+        actualOutcome: {
+            fromEmail: event.fromEmail,
+            subject: event.subject,
+        },
+        contextData: {
+            inbox: "default",
+            autoSend: false,
+        },
+    });
+}
+
 export async function recordHumanReviewRequired(event: HumanReviewEvent): Promise<void> {
     await recordFeedback({
         category: "correction",

@@ -12,6 +12,7 @@ import type { FinaleClient, FullPO } from "../finale/client";
 import { createClient, probePostgrest } from "../db";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
+import { derivePurchaseMovement, type PurchaseMovement } from "./active-purchases-movement";
 import { classifyShipmentEvidence, listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
 import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
 import { derivePOSentVerification, type POSentVerification } from "./po-sent-verification";
@@ -41,6 +42,12 @@ export interface ActivePurchase extends FullPO {
     invoiceStatus?: string;
     invoiceId?: string;
     hasDiscrepancies?: boolean;
+    /**
+     * PO-centric correlation story: tracking status/ETA/carrier + invoice state
+     * + PO↔tracking↔invoice correlation counts. Computed from local
+     * enrichment; degrades gracefully when shipments/invoices are missing.
+     */
+    movement: PurchaseMovement;
 }
 
 function addDays(dateStr: string, days: number): string {
@@ -351,6 +358,26 @@ export async function loadActivePurchases(
         const vendorProfile = vendorMap.get(po.vendorName?.toLowerCase());
         const invoiceInfo = invoiceMap.get(po.orderId);
 
+        const movement = derivePurchaseMovement({
+                    shipments: shipments.map((shipment) => ({
+                        tracking_number: shipment.tracking_number,
+                        public_tracking_url: shipment.public_tracking_url,
+                        carrier_name: shipment.carrier_name,
+                        status_category: shipment.status_category,
+                        estimated_delivery_at: shipment.estimated_delivery_at,
+                        delivered_at: shipment.delivered_at,
+                        last_checked_at: shipment.last_checked_at,
+                        last_source: shipment.last_source,
+                        source_refs: shipment.source_refs,
+                        evidenceLevel: shipment.evidenceLevel,
+                    })),
+                    legacyTrackingNumbers: trackingMap.get(po.orderId) || [],
+                    invoiceStatus: invoiceInfo?.status,
+                    invoiceId: invoiceInfo?.id,
+                    hasDiscrepancies: invoiceInfo?.hasDiscrepancies,
+                    isReceived,
+                });
+
         activePos.push({
             ...po,
             receiveDate: resolvedReceiveDate,
@@ -376,6 +403,7 @@ export async function loadActivePurchases(
             invoiceStatus: invoiceInfo?.status || undefined,
             invoiceId: invoiceInfo?.id || undefined,
             hasDiscrepancies: invoiceInfo?.hasDiscrepancies || false,
+            movement,
         });
     }
 

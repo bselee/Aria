@@ -30,7 +30,8 @@ defineJob({
     name: "ap-polling",
     schedule: "0 8,12,17 * * *",
     onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
-    description: "Poll ap@buildasoil.com for new invoices, then PO-sweep post-pass.",
+    description:
+        "Poll bill.selee@ + ap@ : ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
     handler: async () => {
         // HERMIA(2026-06-18): Local-first forwarding — scans Gmail directly, forwards
         // invoice PDFs to Bill.com, tracks dedup in local SQLite. Zero Supabase
@@ -516,19 +517,18 @@ defineJob({
         }
     },
 });
-// HERMIA(2026-05-28): Prompt Bill to confirm receipt of delivered POs.
-// Runs 4x/day during business hours. Finds delivered 24-72h ago, not yet
-// received in Finale. Sends Telegram with inline buttons.
+// HERMIA(2026-05-28): Flag delivered POs still unreceived past 24h / escalate 48h.
+// Warehouse owns Finale receive — Aria only surfaces lag. 4x/day weekdays.
 defineJob({
     name: "delivery-receipt-prompt",
-    schedule: "0 9,12,15,17 * * 1-5",  // KAIZEN #7: 18 → 17 (no 6 PM messages)
+    schedule: "0 9,12,15,17 * * 1-5",
     onFail: "log",
-    description: "Prompt Bill to confirm receipt of delivered POs (4x/day weekdays).",
+    description: "Flag carrier-delivered POs still unreceived ≥24h (escalate ≥48h). No auto-receive.",
     handler: async () => {
         const { promptDeliveredReceipts } = await import("@/lib/tracking/delivery-receipt-prompt");
         const result = await promptDeliveredReceipts();
         if (result.prompted > 0) {
-            console.log(`[delivery-receipt-prompt] Prompted ${result.prompted} PO(s), ${result.skippedAlreadyPrompted} skipped`);
+            console.log(`[delivery-receipt-prompt] Flagged ${result.prompted} PO(s), ${result.skippedAlreadyPrompted} skipped`);
         }
     },
 });
@@ -1253,18 +1253,27 @@ defineJob({
 // layers in ap-identifier.ts: message_id, cross-inbox, PDF content hash).
 //
 // ─────────────────────────────────────────────────────────────────────────────
-
-// HERMIA(2026-07-01): Weekly bill.com reference data refresh.
-// Step 1: Download AllBillsPage.csv from bill.com (via Playwright + running Chrome
-// or saved cookie profile). If Chrome is unavailable (e.g. weekend server), logs
-// a warning and re-imports the last downloaded CSV instead.
+// ─────────────────────────────────────────────────────────────────────────────
+// HERMIA(2026-07-30): Daily bill.com reference data refresh.
+// Step 1: Download AllBillsPage.csv from bill.com via Playwright with persistent
+//         browser profile. If Chrome is unavailable or login fails, logs a
+//         warning and re-imports the last downloaded CSV instead.
 // Step 2: Import the CSV into SQLite billcom_bills_ref table.
-// Runs Sunday 7 AM — before business hours but after any weekend batch.
+//
+// Runs daily at 7 AM MT. This keeps the dedup check in ap-single-forward.ts
+// (isAlreadyClaimedOrForwarded → billcom_bills_ref lookup) current within
+// ~24 hours, reducing duplicate Bill.com forwards when bills are manually
+// uploaded outside of Aria's pipeline.
+//
+// First-time setup: run `npx tsx src/cli/download-billcom-ref.ts --headed`
+// once to establish the persistent browser profile + log into bill.com.
+// Subsequent headless runs will reuse the session cookies.
+// ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "billcom-ref-import",
-    schedule: "0 7 * * 0",  // Sunday 7 AM
+    schedule: "0 7 * * *",  // Daily 7 AM
     onFail: "log",
-    description: "Sunday 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
+    description: "Daily 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
     handler: async () => {
         try {
             // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)
