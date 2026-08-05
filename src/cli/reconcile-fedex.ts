@@ -1,9 +1,12 @@
 /**
  * @file    reconcile-fedex.ts
  * @purpose Reconcile FedEx billing CSV against Finale POs — identify and add missing freight charges.
- *          Parses FedEx Billing Online CSV exports, matches entries to Finale POs by PO reference,
- *          uses FedEx Track API to resolve unmatched COLLECT entries by origin city, and adds
- *          missing COLLECT freight charges.
+ *          Parses FedEx Billing Online CSV exports, matches entries to Finale POs by PO reference
+ *          (primary — Uline puts PO# on the order so it lands on the FedEx bill), uses FedEx Track
+ *          API for unmatched COLLECT by shipper name/origin city, and adds missing COLLECT freight.
+ *          Uline ~$1.50 in-house charge is not carrier freight and does not block apply.
+ *          Rootwise: multi-delivery via FedEx; each receive gets its own freight line.
+ *          Non-FedEx Uline shipping is on the Uline invoice — manual.
  * @author  Will / Antigravity
  * @created 2026-03-16
  * @updated 2026-04-23  — reverted to CSV parsing (FedEx Invoice Billing API does not exist)
@@ -62,13 +65,109 @@ const FINALE_PO_RE = /\b(\d{6})\b/;
 // Vendors to exclude from freight matching (special shipping arrangements)
 const EXCLUDE_VENDORS = ['grokashi'];
 
-// DECISION(2026-03-16): Known vendor → origin city/state mapping for FedEx Track matching.
-// Built from analysis of actual FedEx shipments. Add new vendors as identified.
+/**
+ * Uline adds a fixed ~$1.50 in-house charge on every order (not carrier freight).
+ * That line must not count as "already has freight" and must not block FedEx COLLECT.
+ * Real truck $ is bas_freight via FedEx (PO# is entered on the Uline order → appears
+ * on the FedEx bill). Non-FedEx Uline shipping is on the Uline invoice — manual.
+ */
+const ULINE_HOUSE_CHARGE_MAX = 2.5;
+
+// DECISION(2026-03-16): Known origin city/state → Finale vendor (Track API fallback).
+// Vendor strings must match Finale supplier names (plain — no invented labels).
+// Primary Uline join is PO# on the FedEx entry; cities below are Track fallback only.
 const VENDOR_ORIGIN_MAP: Record<string, { city: string; state: string; vendor: string }> = {
     'evergreen_co': { city: 'EVERGREEN', state: 'CO', vendor: 'Rootwise Soil Dynamics' },
     'laytonville_ca': { city: 'LAYTONVILLE', state: 'CA', vendor: 'Grokashi' },
     'missoula_mt': { city: 'MISSOULA', state: 'MT', vendor: 'Granite Mill' },
+    // Uline branch cities (https://www.uline.com/Corporate/About_Locations) — Track fallback
+    'pleasant_prairie_wi': { city: 'PLEASANT PRAIRIE', state: 'WI', vendor: 'ULINE' },
+    'kenosha_wi': { city: 'KENOSHA', state: 'WI', vendor: 'ULINE' },
+    'braselton_ga': { city: 'BRASELTON', state: 'GA', vendor: 'ULINE' },
+    'etna_oh': { city: 'ETNA', state: 'OH', vendor: 'ULINE' },
+    'allentown_pa': { city: 'ALLENTOWN', state: 'PA', vendor: 'ULINE' },
+    'breinigsville_pa': { city: 'BREINIGSVILLE', state: 'PA', vendor: 'ULINE' },
+    'reno_nv': { city: 'RENO', state: 'NV', vendor: 'ULINE' },
+    'dallas_tx': { city: 'DALLAS', state: 'TX', vendor: 'ULINE' },
+    'arlington_tx': { city: 'ARLINGTON', state: 'TX', vendor: 'ULINE' },
+    'ontario_ca': { city: 'ONTARIO', state: 'CA', vendor: 'ULINE' },
+    'city_of_industry_ca': { city: 'CITY OF INDUSTRY', state: 'CA', vendor: 'ULINE' },
+    'lacey_wa': { city: 'LACEY', state: 'WA', vendor: 'ULINE' },
+    'minneapolis_mn': { city: 'MINNEAPOLIS', state: 'MN', vendor: 'ULINE' },
+    'coppell_tx': { city: 'COPPELL', state: 'TX', vendor: 'ULINE' },
+    'hudson_wi': { city: 'HUDSON', state: 'WI', vendor: 'ULINE' },
 };
+
+/** Shipper company / CSV ship-from text → Finale vendor (plain names only). */
+function matchVendorFromShipperText(text: string): string | null {
+    const t = (text || '').toUpperCase().replace(/[^A-Z0-9\s]/g, ' ');
+    if (/\bULINE\b|\bU[\s-]?LINE\b/.test(t)) return 'ULINE';
+    if (/\bROOTWISE\b/.test(t)) return 'Rootwise Soil Dynamics';
+    if (/\bGRANITE\s*MILL\b/.test(t)) return 'Granite Mill';
+    return null;
+}
+
+/**
+ * Resolve vendor from Track result: company name first, then origin city map.
+ */
+function matchVendorFromTrack(track: {
+    shipperCity: string;
+    shipperState: string;
+    shipperCompany: string;
+}): string | null {
+    const byName = matchVendorFromShipperText(track.shipperCompany);
+    if (byName) return byName;
+    const city = (track.shipperCity || '').toUpperCase();
+    const state = (track.shipperState || '').toUpperCase();
+    const key = `${city.toLowerCase().replace(/\s+/g, '_')}_${state.toLowerCase()}`;
+    return VENDOR_ORIGIN_MAP[key]?.vendor || null;
+}
+
+function matchVendorFromCsvShipFrom(entry: {
+    shipFrom: string;
+    shipFromZip: string;
+}): string | null {
+    return matchVendorFromShipperText(entry.shipFrom) || matchVendorFromShipperText(entry.shipFromZip);
+}
+
+function isUlineVendor(name: string): boolean {
+    return /\buline\b/i.test(name || '');
+}
+
+/**
+ * True if this adjustment is already the FedEx charge for this invoice/tracking.
+ * Ignores Uline's ~$1.50 in-house charge (not carrier freight).
+ */
+function adjIsThisFedExInvoice(adj: { description?: string; amount?: number }, invoiceNumber: string): boolean {
+    const desc = (adj.description || '').toLowerCase();
+    const inv = (invoiceNumber || '').toLowerCase();
+    if (!inv) return false;
+    return desc.includes(inv);
+}
+
+/**
+ * True if PO already has real carrier freight (not only Uline's house charge).
+ */
+function poHasRealCarrierFreight(
+    adjustments: Array<{ description?: string; amount?: number; productPromoUrl?: string }>,
+): boolean {
+    return adjustments.some((a) => {
+        const desc = (a.description || '').toLowerCase();
+        const amt = Number(a.amount) || 0;
+        if (amt > 0 && amt <= ULINE_HOUSE_CHARGE_MAX) return false; // Uline house charge
+        if (desc.includes('freight') || (a.productPromoUrl || '').includes('/10007')) {
+            return amt > ULINE_HOUSE_CHARGE_MAX;
+        }
+        return false;
+    });
+}
+
+/** Simple Finale note — amount is the $ field. No product/system branding. */
+function buildFedExFreightLabel(fedex: FedExEntry): string {
+    const inv = (fedex.invoiceNumber || '').trim();
+    if (inv) return `Freight ${inv}`;
+    return 'Freight';
+}
 
 // ── CLI Args ──────────────────────────────────────────────────────────────────
 
@@ -220,8 +319,12 @@ async function trackShipment(token: string, trackingNumber: string): Promise<Tra
 
     const city = (track.shipperInformation?.address?.city || '').toUpperCase();
     const state = (track.shipperInformation?.address?.stateOrProvinceCode || '').toUpperCase();
-    const key = `${city.toLowerCase().replace(/\s+/g, '_')}_${state.toLowerCase()}`;
-    const matchedVendor = VENDOR_ORIGIN_MAP[key]?.vendor || null;
+    const shipperCompany = track.shipperInformation?.contact?.companyName || '';
+    const matchedVendor = matchVendorFromTrack({
+        shipperCity: city,
+        shipperState: state,
+        shipperCompany,
+    });
 
     const weight = track.packageDetails?.weightAndDimensions?.weight?.[0];
     const delDate = track.dateAndTimes?.find((d: any) => d.type === 'ACTUAL_DELIVERY')?.dateTime || '';
@@ -230,7 +333,7 @@ async function trackShipment(token: string, trackingNumber: string): Promise<Tra
         trackingNumber,
         shipperCity: city,
         shipperState: state,
-        shipperCompany: track.shipperInformation?.contact?.companyName || '',
+        shipperCompany,
         recipientCity: track.recipientInformation?.address?.city || '',
         recipientState: track.recipientInformation?.address?.stateOrProvinceCode || '',
         weight: weight?.value || 0,
@@ -420,29 +523,17 @@ async function main() {
 
                 const existingAdj = po.orderAdjustmentList || [];
                 const existingThisInv = existingAdj.filter(
-                    (a: any) => (a.description || '').includes(fedex.invoiceNumber)
-                );
-                const existingFreight = existingAdj.filter(
-                    (a: any) => (a.description || '').toLowerCase().includes('freight')
+                    (a: any) => adjIsThisFedExInvoice(a, fedex.invoiceNumber)
                 );
 
                 if (existingThisInv.length > 0) {
                     result.freightAlreadyOnPO = true;
-                    const existingAmt = existingFreight.reduce(
-                        (s: number, a: any) => s + (a.amount || 0), 0
-                    );
                     console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | Already has this freight | ${vendor}`);
                 } else if (REPORT_ONLY || DRY_RUN) {
+                    // Uline $1.50 house charge is fine to leave; we add real FedEx COLLECT next to it
                     console.log(`🔵 PO ${poId} | $${fedex.amtDue.toFixed(2)} | ${DRY_RUN ? 'WOULD ADD' : 'NEEDS'} freight | ${vendor} | FedEx ${fedex.invoiceNumber}`);
                 } else {
-                    let memo = '';
-                    const cachedPo = allPOs.find((p: any) => p.orderId === poId);
-                    if (cachedPo) {
-                        const corr = findCorrelatedReception(cachedPo, fedex.shipDate);
-                        if (corr) memo = ` — ${corr}`;
-                    }
-
-                    const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
+                    const label = buildFedExFreightLabel(fedex);
 
                     // Phase 1: collect change instead of applying
                     changes.push({
@@ -456,7 +547,7 @@ async function main() {
                     poFreightMap[poId].push({ fedex, label });
 
                     result.freightAdded = true;
-                    console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}${memo ? ` | ${memo}` : ''}`);
+                    console.log(`✅ PO ${poId} | $${fedex.amtDue.toFixed(2)} | ADDED freight | ${vendor} | FedEx ${fedex.invoiceNumber}`);
                 }
             } catch (err: any) {
                 result.error = err.message;
@@ -500,21 +591,31 @@ async function main() {
                     const track = await trackShipment(token, fedex.invoiceNumber);
                     result.trackInfo = track;
 
-                    const vendorName = track.matchedVendor;
+                    // Company name (ULINE) first, then city map; CSV ship-from as extra hint
+                    const vendorName =
+                        track.matchedVendor ||
+                        matchVendorFromCsvShipFrom(fedex);
                     const originLabel = `${track.shipperCity}, ${track.shipperState}`;
 
                     if (vendorName) {
                         result.matchSource = 'track_api';
 
-                        const delDate = new Date(track.deliveryDate);
+                        const delDate = new Date(track.deliveryDate || fedex.shipDate);
+                        const vendorKey = vendorName.split(' ')[0].toLowerCase();
                         const vendorPOs = allPOs.filter(po => {
-                            if (!po.vendorName.toLowerCase().includes(vendorName.split(' ')[0].toLowerCase())) return false;
+                            const vn = (po.vendorName || '').toLowerCase();
+                            if (!vn.includes(vendorKey) && !(isUlineVendor(vendorName) && isUlineVendor(po.vendorName))) {
+                                return false;
+                            }
+                            // Dropship never
+                            if (/dropship/i.test(po.orderId || '')) return false;
 
                             if (po.shipments && po.shipments.length > 0) {
                                 for (const shipment of po.shipments) {
                                     if (shipment.receiveDate) {
                                         const recDate = new Date(shipment.receiveDate);
                                         const recDiff = Math.abs((delDate.getTime() - recDate.getTime()) / 86400000);
+                                        // Uline: one ship per date; Rootwise multi-delivery noted on receiving
                                         if (recDiff <= 7) return true;
                                     }
                                 }
@@ -526,8 +627,8 @@ async function main() {
                         });
 
                         vendorPOs.sort((a, b) => {
-                            const aCorr = findCorrelatedReception(a, track.deliveryDate);
-                            const bCorr = findCorrelatedReception(b, track.deliveryDate);
+                            const aCorr = findCorrelatedReception(a, track.deliveryDate || fedex.shipDate);
+                            const bCorr = findCorrelatedReception(b, track.deliveryDate || fedex.shipDate);
                             if (aCorr && !bCorr) return -1;
                             if (!aCorr && bCorr) return 1;
 
@@ -546,7 +647,7 @@ async function main() {
                                 try {
                                     const details = await finale.getOrderDetails(po.orderId);
                                     const adj = details.orderAdjustmentList || [];
-                                    const hasThisInv = adj.some((a: any) => (a.description || '').includes(fedex.invoiceNumber));
+                                    const hasThisInv = adj.some((a: any) => adjIsThisFedExInvoice(a, fedex.invoiceNumber));
 
                                     if (hasThisInv) {
                                         result.finalePoId = po.orderId;
@@ -556,19 +657,21 @@ async function main() {
                                         break;
                                     }
 
-                                    const hasAnyFreight = adj.some((a: any) =>
-                                        (a.description || '').toLowerCase().includes('freight')
-                                    );
-
-                                    const corr = findCorrelatedReception(po, track.deliveryDate);
-                                    let isValidCandidate = !hasAnyFreight;
-
+                                    const corr = findCorrelatedReception(po, track.deliveryDate || fedex.shipDate);
+                                    // Rootwise / Granite: multi-delivery — require receive correlation
                                     const isMultiRecVendor = ['rootwise', 'granite', 'grokashi', 'gro kashi'].some(v =>
                                         vendorName.toLowerCase().includes(v)
                                     );
-
+                                    // Uline: one FedEx per date; $1.50 house charge must NOT block
+                                    const isUline = isUlineVendor(vendorName);
+                                    let isValidCandidate: boolean;
                                     if (isMultiRecVendor) {
                                         isValidCandidate = !!corr;
+                                    } else if (isUline) {
+                                        // Prefer same-date receive; allow if no real carrier freight yet
+                                        isValidCandidate = !!corr || !poHasRealCarrierFreight(adj);
+                                    } else {
+                                        isValidCandidate = !poHasRealCarrierFreight(adj);
                                     }
 
                                     if (isValidCandidate) {
@@ -577,11 +680,7 @@ async function main() {
                                         if (REPORT_ONLY || DRY_RUN) {
                                             console.log(`🔵 FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ${DRY_RUN ? 'WOULD ADD' : 'NEEDS freight'}`);
                                         } else {
-                                            let memo = '';
-                                            const corr = findCorrelatedReception(po, track.deliveryDate);
-                                            if (corr) memo = ` — ${corr}`;
-
-                                            const label = `FedEx Collect Freight — Inv ${fedex.invoiceNumber} (${fedex.shipDate})${memo}`;
+                                            const label = buildFedExFreightLabel(fedex);
 
                                             changes.push({
                                                 type: 'freight_add',
@@ -594,7 +693,7 @@ async function main() {
                                             poFreightMap[po.orderId].push({ fedex, label });
 
                                             result.freightAdded = true;
-                                            console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight${memo ? ` | ${memo}` : ''}`);
+                                            console.log(`✅ FedEx ${fedex.invoiceNumber} | $${fedex.amtDue.toFixed(2)} | ${originLabel} → ${vendorName} | PO ${po.orderId} | ADDED freight`);
                                         }
                                         matched = true;
                                         break;

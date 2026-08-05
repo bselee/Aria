@@ -76,8 +76,8 @@ export const VENDOR_PATTERN_OVERRIDES: Array<{
     { match: "miles",          pattern: "no_freight",     note: "Will-confirmed: never has freight" },
     { match: "thrive",         pattern: "no_freight",     note: "Will-confirmed: never has freight" },
     { match: "colorado worm",  pattern: "no_freight",     note: "Will-confirmed: never has freight" },
-    { match: "rootwise",       pattern: "bas_freight",    note: "Will-confirmed: we schedule FedEx; vendor invoice has no freight" },
-    { match: "uline",          pattern: "bas_freight",    note: "Will-confirmed: we schedule FedEx; vendor invoice has no freight" },
+    { match: "rootwise",       pattern: "bas_freight",    note: "FedEx COLLECT multi-delivery; each receive noted on receiving; one FREIGHT line per PRO/invoice via reconcile-fedex / ltlselect" },
+    { match: "uline",          pattern: "bas_freight",    note: "FedEx COLLECT via reconcile-fedex (PO# on FedEx bill). Uline $1.50 = their in-house charge, not carrier freight. Non-FedEx ship methods noted on Uline invoice — manual." },
     // Colorful Packaging (China) — DDP shipping included on their invoice as a separate line.
     // Freight value extracted by inline-invoice-handler and reconciled to a FREIGHT adjustment on the PO.
     { match: "colorful",       pattern: "vendor_freight", note: "Will-confirmed: overseas DDP, vendor includes freight on their CC invoice" },
