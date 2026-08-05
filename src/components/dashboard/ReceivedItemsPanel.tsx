@@ -7,6 +7,7 @@ import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import POFlowStepper from "./POFlowStepper";
 import type { POFlowStep } from "./POFlowStepper";
+import InvoicePOMatcher from "./InvoicePOMatcher";
 
 type ReceivedPO = {
     orderId: string;
@@ -242,6 +243,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const [unmatchedLoading, setUnmatchedLoading] = useState(false);
     /** Show all received POs toggle (default: only exceptions) */
     const [showAllReceived, setShowAllReceived] = useState(false);
+    /** Collapse received PO list when there are invoices to match. */
+    const [showReceivedPOs, setShowReceivedPOs] = useState(false);
     const [showCompleted, setShowCompleted] = useState(false);
     const [recentAutoCompletions, setRecentAutoCompletions] = useState<Array<{
         intent: string; poNumber?: string; invoiceNumber?: string; vendorName?: string; createdAt: string;
@@ -253,6 +256,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     }).length;
     /** Manual match state: invoiceId → manual PO input */
     const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
+
+    /** Update manual PO input for a given invoice. */
+    function handleManualInputChange(invoiceId: string, value: string) {
+        setManuallyMatching(prev => {
+            const next = new Map(prev);
+            const existing = next.get(invoiceId);
+            next.set(invoiceId, { poNumber: value, loading: existing?.loading ?? false });
+            return next;
+        });
+    }
 
     async function handleMatchInvoice(invoiceId: string, poNumber: string) {
         try {
@@ -804,120 +817,35 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 </div>
                             )}
 
-                            {/* ── Match Suggestions: unmatched invoices with PO candidates ── */}
-                            {matchSuggestions.length > 0 && (
-                                <div className="border-b border-amber-500/20 bg-amber-500/5">
-                                    <div className="px-4 py-2 flex items-center gap-2">
-                                        <span className="text-[11px] font-mono uppercase tracking-[0.18em] text-amber-300/80">
-                                            Needs PO Match
-                                        </span>
-                                        <span className="text-[10px] font-mono text-amber-500/60">
-                                            {matchSuggestions.length} invoice{matchSuggestions.length > 1 ? "s" : ""}
-                                        </span>
-                                    </div>
-                                    {matchSuggestions
-                                        .map((s) => ({
-                                            ...s,
-                                            candidates: (s.candidates || []).filter(
-                                                (c) => !/DropshipPO/i.test(String(c.orderId || "")),
-                                            ),
-                                        }))
-                                        // Hide rows whose only candidates were dropships
-                                        .filter((s) => {
-                                            // Keep no-candidate rows (manual match) unless invoice itself is dropship-only noise
-                                            return true;
-                                        })
-                                        .map(s => {
-                                        const best = s.candidates[0];
-                                        const mm = manuallyMatching.get(s.invoiceId);
-                                        const hasCandidates = s.candidates.length > 0;
-                                        return (
-                                            <div key={s.invoiceId} className="px-4 py-2 border-t border-amber-500/10 hover:bg-amber-500/5 transition-colors">
-                                                <div className="flex items-center gap-2">
-                                                    <span className="text-xs font-mono text-zinc-200 font-semibold">{s.invoiceNumber}</span>
-                                                    <span className="text-[10px] font-mono text-zinc-500">{s.vendorName}</span>
-                                                    {s.invoiceDate && <span className="text-[9px] font-mono text-zinc-600">{s.invoiceDate}</span>}
-                                                    <span className="text-[10px] font-mono text-zinc-400 ml-auto">
-                                                        ${Number(s.invoiceTotal).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                                                    </span>
-                                                </div>
+                            {/* ── Split-panel Invoice → PO Matcher ── */}
+                            <InvoicePOMatcher
+                                suggestions={matchSuggestions.filter(s =>
+                                    s.candidates.every(c => !/DropshipPO/i.test(String(c.orderId || "")))
+                                )}
+                                receivedPOs={pos}
+                                onMatch={handleMatchInvoice}
+                                onManualMatch={handleManualMatch}
+                                onApproveReconciliation={approveReconciliation}
+                                approvingReconcile={approvingReconcile}
+                                manuallyMatching={manuallyMatching}
+                                onManualInputChange={handleManualInputChange}
+                            />
 
-                                                {hasCandidates && s.autoMatched ? (
-                                                    /* ── Auto-matched → awaiting human completion ── */
-                                                    <div className="mt-1.5 flex items-center gap-2 flex-wrap">
-                                                        <span className="text-[10px] font-mono text-emerald-400">✓ Auto-matched</span>
-                                                        <span className="text-[10px] font-mono text-zinc-300">→ PO {best.orderId}</span>
-                                                        <span className="text-[9px] font-mono text-zinc-600">{best.reasons.slice(0, 2).join(" · ")}</span>
-                                                        <div className="flex-1" />
-                                                        <button
-                                                            onClick={(e) => { e.stopPropagation(); approveReconciliation(best.orderId, s.invoiceId); }}
-                                                            disabled={approvingReconcile.has(best.orderId)}
-                                                            className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors font-semibold ${approvingReconcile.has(best.orderId) ? 'opacity-50 cursor-wait bg-zinc-800/40 border-zinc-700/40 text-zinc-500' : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'}`}
-                                                        >
-                                                            Review & Complete PO
-                                                        </button>
-                                                    </div>
-                                                ) : hasCandidates ? (
-                                                    <div className="mt-1.5 flex items-center gap-2 flex-wrap">
-                                                        {(() => {
-                                                            const scoreColor = best.score >= 80 ? "text-emerald-400" : best.score >= 60 ? "text-amber-400" : "text-zinc-400";
-                                                            return (
-                                                                <>
-                                                                    <span className={`text-[10px] font-mono ${scoreColor}`}>
-                                                                        {best.score}% → PO {best.orderId}
-                                                                    </span>
-                                                                    <span className="text-[9px] font-mono text-zinc-600">
-                                                                        {best.reasons.slice(0, 2).join(" · ")}
-                                                                    </span>
-                                                                    <div className="flex-1" />
-                                                                    <button
-                                                                        onClick={(e) => { e.stopPropagation(); handleMatchInvoice(s.invoiceId, best.orderId); }}
-                                                                        className="text-[10px] font-mono px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 transition-colors"
-                                                                    >
-                                                                        Match
-                                                                    </button>
-                                                                    {s.candidates.length > 1 && (
-                                                                        <span className="text-[9px] font-mono text-zinc-600">
-                                                                            +{s.candidates.length - 1} alt
-                                                                        </span>
-                                                                    )}
-                                                                </>
-                                                            );
-                                                        })()}
-                                                    </div>
-                                                ) : (
-                                                    /* ── No auto-match found → manual matching ── */
-                                                    <div className="mt-1.5 flex items-center gap-2">
-                                                        <span className="text-[10px] font-mono text-zinc-500">No auto-match found —</span>
-                                                        <input
-                                                            type="text"
-                                                            placeholder="Enter PO #..."
-                                                            value={mm?.poNumber || ""}
-                                                            onChange={(e) => {
-                                                                const val = e.target.value;
-                                                                setManuallyMatching(prev => {
-                                                                    const next = new Map(prev);
-                                                                    next.set(s.invoiceId, { poNumber: val, loading: false });
-                                                                    return next;
-                                                                });
-                                                            }}
-                                                            onClick={e => e.stopPropagation()}
-                                                            className="w-28 px-1.5 py-0.5 rounded text-[10px] font-mono bg-zinc-800/60 border border-zinc-700/50 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500/50"
-                                                        />
-                                                        <button
-                                                            onClick={(e) => { e.stopPropagation(); handleManualMatch(s.invoiceId); }}
-                                                            disabled={!mm?.poNumber.trim() || mm?.loading}
-                                                            className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors ${mm?.loading ? "opacity-50 cursor-wait" : ""} border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20`}
-                                                        >
-                                                            {mm?.loading ? "Matching..." : "Manual Match"}
-                                                        </button>
-                                                    </div>
-                                                )}
-                                            </div>
-                                        );
-                                    })}
-                                </div>
+                            {/* ── Received POs toggle ── */}
+                            {matchSuggestions.length > 0 && (
+                                <button
+                                    onClick={() => setShowReceivedPOs(!showReceivedPOs)}
+                                    className="w-full px-4 py-1.5 text-[10px] font-mono text-zinc-500 hover:text-zinc-300 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1.5"
+                                >
+                                    <span>{showReceivedPOs ? "▼" : "▶"}</span>
+                                    <span>Received POs ({pos.length})</span>
+                                    {needsReviewCount > 0 && (
+                                        <span className="text-rose-400/70">· {needsReviewCount} need review</span>
+                                    )}
+                                </button>
                             )}
+                            {(!matchSuggestions.length || showReceivedPOs) && (
+                            <div>
 
                             {/* ── Unmatched POs Check ── */}
                             <div className="border-b border-zinc-800/40">
@@ -1519,6 +1447,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         <div onMouseDown={startResize}
                             className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
                     )}
+                            </div>
+                            )}
                 </div>
             )}
         </div>

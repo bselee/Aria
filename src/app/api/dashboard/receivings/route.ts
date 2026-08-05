@@ -60,6 +60,33 @@ export function getDenverWeekStart(date: Date): string {
     return denverNow.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 }
 
+/** Extract line items from a vendor_invoices row's raw_data or cached line_items. */
+function extractLineItems(inv: any): Array<{ sku?: string; qty?: number; description?: string }> | null {
+    // Try raw_data.lineItems first (OCR extraction)
+    const rd = inv.raw_data as Record<string, unknown> | null;
+    if (rd?.lineItems && Array.isArray(rd.lineItems) && rd.lineItems.length > 0) {
+        return (rd.lineItems as any[]).map((li: any) => ({
+            sku: li.sku || li.productId || li.partNumber || undefined,
+            qty: li.qty ?? li.quantity ?? undefined,
+            description: li.description || undefined,
+        }));
+    }
+    // Fall back to cached line_items JSON string (from invoice_cache)
+    if (inv.line_items) {
+        try {
+            const parsed = typeof inv.line_items === 'string' ? JSON.parse(inv.line_items) : inv.line_items;
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                return parsed.map((li: any) => ({
+                    sku: li.sku || li.productId || undefined,
+                    qty: li.qty ?? li.quantity ?? undefined,
+                    description: li.description || undefined,
+                }));
+            }
+        } catch { /* not JSON */ }
+    }
+    return null;
+}
+
 export async function GET(req: NextRequest) {
     // ── Outer guard: the route MUST NEVER hang the socket ──
     // If the handler doesn't resolve within 45s (including Finale timeout),
@@ -330,6 +357,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     }],
                                     autoApplyReady: false,
                                     fromCache: true,
+                                    invoiceLineItems: extractLineItems(inv),
                                 },
                             };
                         }
@@ -383,6 +411,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 autoApplyReady: false,
                                 fromCache: !!inv._fromCache,
                                 timedOut: true,
+                                invoiceLineItems: extractLineItems(inv),
                             });
                             continue;
                         }
@@ -407,6 +436,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 candidates: [],
                                 autoApplyReady: false,
                                 fromCache: !!inv._fromCache,
+                                invoiceLineItems: extractLineItems(inv),
                             });
                             continue;
                         }
@@ -570,6 +600,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     candidates: result.candidates.slice(0, 5),
                                     autoApplyReady: true,
                                     autoMatched: true,  // flag: auto-matched, needs human completion
+                                    invoiceLineItems: extractLineItems(inv),
                                 });
                             } else {
                                 // Needs human attention: show in suggestions
@@ -582,6 +613,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     candidates: result.candidates.slice(0, 5),
                                     autoApplyReady: result.autoApplyReady ?? false,
                                     fromCache: !!inv._fromCache,
+                                    invoiceLineItems: extractLineItems(inv),
                                 });
                             }
                         } catch (matchErr: any) {
