@@ -202,7 +202,8 @@ Vendor-specific reconcilers match external invoices to Finale POs, apply correct
 | Vendor | Script | Fetch Method | Key Challenge |
 |--------|--------|-------------|---------------|
 | ULINE | `reconcile-uline.ts` | Playwright persistent Chrome | Bot detection; box→unit UOM conversion |
-| FedEx | `reconcile-fedex.ts` | CSV download (Billing API spike — endpoint does not exist) | Origin city → vendor name mapping; FedEx billing API verified non-functional (2026-04-23) |
+| FedEx CSV | `reconcile-fedex.ts` | CSV download | Origin city → vendor; COLLECT FREIGHT on PO |
+| **LTL Select** | `reconcile-ltlselect.ts` | Auth0 API Invoice Center | COLLECT inbound; multi-delivery receive ≤10 biz d; **`--live` high confidence only**; label `Freight BOL …` |
 | TeraGanix | `reconcile-teraganix.ts` | Gmail email parse (Shopify) | Case multipliers (e.g. EM102×12) |
 | Axiom Print | `reconcile-axiom.ts` | REST API (newapi.axiomprint.com) | Split invoices; 2-pass date+SKU matching |
 

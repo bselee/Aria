@@ -181,3 +181,6 @@ src/cli/check-S4551-detail.ts
 src/cli/check-ULS455-stock.ts
 src/cli/forecast-ULS455-S12610.ts
 src/cli/surepack-all-range.ts
+
+# LTL Select probe scratch (may contain tokens)
+.tmp-ltl/

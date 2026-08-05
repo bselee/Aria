@@ -267,6 +267,7 @@ const correlateCommand: BotCommand = {
              uline:     { script: 'src/cli/order-uline.ts',          label: 'ULINE' },
              axiom:     { script: 'src/cli/reconcile-axiom.ts',      label: 'Axiom Print', needsChrome: true },
              fedex:     { script: 'src/cli/reconcile-fedex.ts',       label: 'FedEx', needsCsv: true },
+             ltlselect: { script: 'src/cli/reconcile-ltlselect.ts',   label: 'LTL Select' },
              teraganix: { script: 'src/cli/reconcile-teraganix.ts',   label: 'TeraGanix' },
              aaa:       { script: 'src/cli/reconcile-aaa.ts',         label: 'AAA Cooper' },
          };
@@ -275,6 +276,7 @@ const correlateCommand: BotCommand = {
              uline:     '--dry-run --scrape-only --update-only --po <id>',
              axiom:     '--dry-run --scrape-only --update-only --po <id>',
              fedex:     '--dry-run --csv <path>',
+             ltlselect: '--days <N> --include-excluded --apply-medium (live=high only)',
              teraganix: '--dry-run',
              aaa:       '--dry-run --scrape-only --limit <N>',
          };
@@ -325,7 +327,7 @@ const correlateCommand: BotCommand = {
 
          // Build flags list per vendor
          const extraFlags: string[] = [];
-         if (dryRun && ['uline', 'axiom', 'fedex', 'teraganix', 'aaa'].includes(key)) extraFlags.push('--dry-run');
+         if (dryRun && ['uline', 'axiom', 'fedex', 'teraganix', 'aaa', 'ltlselect'].includes(key)) extraFlags.push('--dry-run');
          if (scrapeOnly && ['uline', 'axiom', 'aaa'].includes(key)) extraFlags.push('--scrape-only');
          if (updateOnly && ['uline', 'axiom'].includes(key)) extraFlags.push('--update-only');
          if (poFlag && ['uline', 'axiom'].includes(key)) extraFlags.push('--po', poFlag);
