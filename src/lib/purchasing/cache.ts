@@ -190,6 +190,14 @@ export async function prewarmPurchasingCaches(): Promise<void> {
             console.warn('[purchasing/prewarm] lead-time dist warmup failed (non-fatal):', err?.message || err),
         );
 
+        // KAIZEN(2026-08-04): Populate receiving_cache before the scan so
+        // coverageStockOnOrder can distinguish fully-received single-shipment
+        // POs from partially-received blanket POs.
+        const { refreshReceivingCache } = await import('./receiving-cache');
+        await refreshReceivingCache().catch((err: any) =>
+            console.warn('[purchasing/prewarm] receiving-cache refresh failed (non-fatal):', err?.message || err),
+        );
+
         const { prewarmForwardDemand } = await import('./forward-demand');
         // HERMIA(2026-06-19): Run resale first, then BOM — NOT concurrently.
         // Both share the same FinaleCoreClient rate limiter (500ms between ALL

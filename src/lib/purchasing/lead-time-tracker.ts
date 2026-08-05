@@ -80,7 +80,8 @@ const MIN_AUTO_UPDATE_SPREAD_DAYS = 90;
 const MAX_OVERRIDE_CHANGE_DAYS = 15;
 const MAX_OVERRIDE_CHANGE_PCT = 0.20;
 const ABSOLUTE_MIN_OVERRIDE = 7;
-const ABSOLUTE_MAX_OVERRIDE = 90;
+/** Raised 90→180 (2026-07-29): OA powder MTO is 100–120d; 90d cap blocked learning/storage. */
+const ABSOLUTE_MAX_OVERRIDE = 180;
 const MIN_DAYS_BETWEEN_UPDATES = 30;
 
 // Layer 2 alert thresholds
@@ -230,6 +231,12 @@ async function autoUpdateOverrides(
 
         // Gate 1: Must be opted in
         if (!policy.auto_update_override) continue;
+
+        // Gate 1b: Manual MTO / long-lead notes — never auto-clobber
+        const notes = String(policy.notes || "").toLowerCase();
+        if (notes.includes("mto") || notes.includes("make-to-order") || notes.includes("make to order")) {
+            continue;
+        }
 
         // Gate 2: Current override must exist
         const currentOverride = policy.lead_time_override_days;

@@ -255,69 +255,70 @@ async function findMostRecentCRPo(): Promise<string> {
 // ── Email: Forward Benny scan to Bill.com ───────────────────────────────────
 
 /**
- * Email a Benny scan PDF to buildasoilap@bill.com.
- * Uses the "ap" Gmail token (ap@buildasoil.com) to send,
- * matching the existing AP pipeline forward pattern.
+ * Vendor name detection from filename prefix.
+ * Expand this map as new vendors are added to the scans-watcher.
+ */
+function detectVendorFromFilename(pdfFilename: string): string | undefined {
+    const upper = pdfFilename.toUpperCase();
+    if (upper.startsWith("BENNY_") || upper.startsWith("BENNY")) {
+        return "Benny Martinez Trucking";
+    }
+    return undefined;
+}
+
+/**
+ * Email a Benny scan PDF to buildasoilap@bill.com via the single-forward gate.
+ *
+ * HERMIA(2026-07-30): Replaced raw Gmail MIME send with forwardInvoiceOnce().
+ * This routes through the canonical single-forward gate, which provides:
+ *   - SHA-256 content-hash dedup (same PDF never forwarded twice)
+ *   - billcom_bills_ref vendor+invoice# check (catches manually uploaded bills)
+ *   - ap_local_forwards logging (audit trail, OCR enrichment, PO matching)
+ *
+ * The gmailMessageId is derived from the filename so it's stable across cron
+ * runs — the hash-based dedup will block re-forwarding even if the state file
+ * resets.
  */
 async function emailBennyToBillCom(pdfPath: string, pdfFilename: string): Promise<void> {
-    let apGmail: ReturnType<typeof GmailApi> | null = null;
+    const pdfBuffer = fs.readFileSync(pdfPath);
+    const vendorName = detectVendorFromFilename(pdfFilename);
 
-    try {
-        const auth = await getAuthenticatedClient("ap");
-        apGmail = GmailApi({ version: "v1", auth });
-    } catch (err) {
-        console.warn(`[scans-watcher] AP Gmail auth failed, trying default: ${(err as Error).message}`);
-        try {
-            const auth = await getAuthenticatedClient("default");
-            apGmail = GmailApi({ version: "v1", auth });
-        } catch (err2) {
-            console.error(`[scans-watcher] Gmail auth completely failed: ${(err2 as Error).message}`);
-            return;
-        }
-    }
+    // Dynamic import to avoid circular dependency at module load time.
+    const { forwardInvoiceOnce } = await import("@/lib/intelligence/ap-single-forward");
 
-    try {
-        const pdfBuffer = fs.readFileSync(pdfPath);
+    const result = await forwardInvoiceOnce({
+        gmailMessageId: `scans:${pdfFilename}`,
+        emailFrom: "scans-watcher@aria.local",
+        emailSubject: `Scanned Invoice: ${pdfFilename}`,
+        pdfFilename,
+        pdfBuffer,
+        source: "scans-watcher",
+        vendorName,
+    });
 
-        const boundary = `----=_AriaScan_${Date.now()}`;
-        const subject = `Scanned Invoice: ${pdfFilename}`;
-        const body = `Scanned invoice from Benny — ${pdfFilename}\n\nForwarded by Aria Scans Watcher.`;
-
-        const lines = [
-            `To: buildasoilap@bill.com`,
-            `Subject: ${subject}`,
-            "MIME-Version: 1.0",
-            `Content-Type: multipart/mixed; boundary="${boundary}"`,
-            "",
-            `--${boundary}`,
-            'Content-Type: text/plain; charset="UTF-8"',
-            "Content-Transfer-Encoding: 7bit",
-            "",
-            body,
-            "",
-            `--${boundary}`,
-            `Content-Type: application/pdf; name="${pdfFilename}"`,
-            `Content-Disposition: attachment; filename="${pdfFilename}"`,
-            "Content-Transfer-Encoding: base64",
-            "",
-            pdfBuffer.toString("base64"),
-            `--${boundary}--`,
-        ];
-
-        const raw = Buffer.from(lines.join("\r\n"))
-            .toString("base64")
-            .replace(/\+/g, "-")
-            .replace(/\//g, "_")
-            .replace(/=+$/, "");
-
-        await apGmail.users.messages.send({
-            userId: "me",
-            requestBody: { raw },
-        });
-
-        console.log(`[scans-watcher] ✓ Emailed ${pdfFilename} to buildasoilap@bill.com`);
-    } catch (err) {
-        console.error(`[scans-watcher] Failed to email ${pdfFilename} to Bill.com: ${(err as Error).message}`);
+    switch (result.status) {
+        case "forwarded":
+            console.log(
+                `[scans-watcher] ✓ Forwarded ${pdfFilename} to Bill.com ` +
+                `(hash=${result.pdfContentHash.slice(0, 12)}, claim=${result.claimId})`,
+            );
+            break;
+        case "already_forwarded":
+            console.log(
+                `[scans-watcher] ⏭️ Skipped ${pdfFilename} — already forwarded ` +
+                `(${result.reason})`,
+            );
+            break;
+        case "blocked":
+            console.log(
+                `[scans-watcher] 🚫 Blocked ${pdfFilename} — ${result.reason}`,
+            );
+            break;
+        case "error":
+            console.error(
+                `[scans-watcher] ❌ Failed to forward ${pdfFilename}: ${result.reason}`,
+            );
+            break;
     }
 }
 

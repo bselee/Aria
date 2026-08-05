@@ -32,12 +32,13 @@ export function buildPurchasingCandidate(
     const directDemand = context.directDemand ?? (knownDemand > 0 ? knownDemand : Math.max(item.salesVelocity, 0));
     const bomDemand = context.bomDemand ?? Math.max(knownDemand - directDemand, 0);
 
-    // HERMIA(2026-07-10): openPOs can lead Finale stockOnOrder (label/print POs
-    // often show on the ribbon while Finale stock-on-order still reads 0). Use
-    // the higher of the two so policy hold fires and Ordering stops offering
-    // another Order when a live PO already covers the SKU.
+    // KAIZEN(2026-08-04): Trust the recommender's corrected stockOnOrder.
+    // Previously Math.max() with openPoQty overrode the correction, so
+    // delivered POs still inflated stockOnOrder in the policy engine.
+    // The recommender already credits all open (non-delivered) PO quantities
+    // via coverageStockOnOrder — double-counting here causes false HOLDs.
     const openPoQty = (item.openPOs ?? []).reduce((sum, po) => sum + Math.max(0, po.quantity || 0), 0);
-    const stockOnOrder = Math.max(item.stockOnOrder ?? 0, openPoQty);
+    const stockOnOrder = Math.max(item.stockOnOrder ?? 0, 0);
     const dailyForRunway = Math.max(item.dailyRate ?? 0, directDemand + bomDemand, 0.0001);
     const stockOnHand = item.stockOnHand ?? 0;
     let adjustedRunwayDays: number | null = Number.isFinite(item.adjustedRunwayDays)

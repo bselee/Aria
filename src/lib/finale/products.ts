@@ -1138,7 +1138,14 @@ export class FinaleProductsClient extends FinaleCoreClient {
             hasBOM,
             doNotReorder: FinaleProductsClient.isDoNotReorder(data),
             reorderMethod: normalizeFinaleReorderMethod(data),
-            orderIncrementQuantity: data.orderIncrementQuantity != null ? Number(data.orderIncrementQuantity) : null,
+            // FIX(2026-07-30): Finale dropped `orderIncrementQuantity` from BOTH the
+            // GraphQL product type and the REST product payload. Fall back through the
+            // surviving equivalents so PO qty snapping keeps working; null means
+            // "no rounding", which is the safe default.
+            orderIncrementQuantity:
+                data.orderIncrementQuantity != null ? Number(data.orderIncrementQuantity)
+                : data.stdPackingUnitsPerCase != null ? Number(data.stdPackingUnitsPerCase)
+                : null,
             finaleUrl: data.productUrl || "",
             openPOs: [],  // Populated later by lookupProduct()
         };

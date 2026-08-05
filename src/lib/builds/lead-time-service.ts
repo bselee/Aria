@@ -7,17 +7,13 @@
  *            0. Policy override — vendor_reorder_policies.lead_time_override_days
  *               (highest priority; authoritative manual value for pre-PO production
  *               vendors such as Colorful Packaging where Finale only measures
- *               post-PO receipt time)
- *            1. Vendor median — last 90 days of completed POs (≥3 data points required)
+ *               post-PO receipt time). Powder MTO also forced in oag-powder-policy.
+ *            0b. SKU observed — Finale send→receive samples for this SKU (p90 if n≥3)
+ *            1. Vendor median — last 90 days of completed POs (≥2 data points)
  *            2. SKU product lead time — Finale product REST (if sku provided)
  *            3. 21-day global default
  *
- *          Cache TTL: 4 hours (same as calendar sync cron interval).
- *          One Finale GraphQL call + one Supabase query fills everything.
- * @author  Hermia
- * @created 2026-06-10
- * @updated 2026-06-15 — Added policy override as priority 0 to fix Colorful-style
- *          mismatches where observed median (post-PO) was overriding manual 60d value.
+ * @updated 2026-07-29 — SKU observed lead from same PO history query (ordering feed).
  * @deps    finale/client, supabase
  * @env     none
  */
@@ -33,7 +29,7 @@ import { DEFAULT_LEAD_TIME_DAYS } from '../constants';
 
 export interface LeadTimeResult {
     days: number;
-    provenance: 'policy_override' | 'vendor_median' | 'sku_product' | 'default';
+    provenance: 'policy_override' | 'sku_observed' | 'vendor_median' | 'sku_product' | 'default';
     label: string; // e.g. "60d policy override" | "13d median · vendor history" | "7d (Finale)" | "21d default"
 }
 
@@ -41,6 +37,25 @@ export interface LeadTimeDistribution {
     p50: number;
     p90: number;
     sampleCount: number;
+}
+
+// ──────────────────────────────────────────────────
+// VENDOR MINIMUM LEAD TIME FLOORS
+// ──────────────────────────────────────────────────
+
+/** Vendors where Finale's product-level lead time is too optimistic.
+ *  Floor ensures realistic ordering windows. Case-insensitive partial match. */
+const VENDOR_MIN_LEAD_TIME_DAYS: Record<string, number> = {
+    "sustainable village": 14,  // 2 weeks working days minimum
+};
+
+function resolveVendorLeadTimeFloor(vendorName: string): number | null {
+    if (!vendorName) return null;
+    const key = vendorName.trim().toLowerCase();
+    for (const [pattern, days] of Object.entries(VENDOR_MIN_LEAD_TIME_DAYS)) {
+        if (key.includes(pattern) || pattern.includes(key)) return days;
+    }
+    return null;
 }
 
 // ──────────────────────────────────────────────────
@@ -140,42 +155,60 @@ export class LeadTimeService {
         if (!this.cache) await this.warmCache();
         if (!this.policyCache) await this.loadPolicyOverrides();
 
+        let result: LeadTimeResult | null = null;
+
         // 0. Policy override (highest — manual authoritative value)
         if (this.policyCache && vendorName) {
             const key = vendorName.trim().toLowerCase();
             for (const [cacheKey, days] of this.policyCache.entries()) {
                 if (cacheKey === key || cacheKey.includes(key) || key.includes(cacheKey)) {
-                    return {
+                    result = {
                         days,
                         provenance: 'policy_override',
                         label: `${days}d policy override`,
                     };
+                    break;
                 }
             }
         }
 
+        // 0b. SKU observed send→receive
+        if (!result && sku) {
+            try {
+                const { getObservedSkuLeadDays } = await import('../purchasing/sku-lead-time');
+                const obs = getObservedSkuLeadDays(sku);
+                if (obs) {
+                    result = {
+                        days: obs.days,
+                        provenance: 'sku_observed',
+                        label: obs.provenance,
+                    };
+                }
+            } catch { /* fall through */ }
+        }
+
         // 1. Vendor history median
-        if (this.cache && vendorName) {
+        if (!result && this.cache && vendorName) {
             const key = vendorName.trim().toLowerCase();
-            // Try exact match first, then partial match
             for (const [cacheKey, days] of this.cache.entries()) {
                 if (cacheKey === key || cacheKey.includes(key) || key.includes(cacheKey)) {
-                    return {
+                    result = {
                         days,
                         provenance: 'vendor_median',
                         label: `${days}d median · vendor history`,
                     };
+                    break;
                 }
             }
         }
 
         // 2. SKU product-level lead time from Finale REST
-        if (sku) {
+        if (!result && sku) {
             try {
                 const finale = finaleClient;
                 const skuDays = await finale.getLeadTime(sku);
                 if (skuDays !== null) {
-                    return {
+                    result = {
                         days: skuDays,
                         provenance: 'sku_product',
                         label: `${skuDays}d (Finale)`,
@@ -185,11 +218,27 @@ export class LeadTimeService {
         }
 
         // 3. Global default
-        return {
-            days: DEFAULT_LEAD_TIME_DAYS,
-            provenance: 'default',
-            label: `${DEFAULT_LEAD_TIME_DAYS}d default`,
-        };
+        if (!result) {
+            result = {
+                days: DEFAULT_LEAD_TIME_DAYS,
+                provenance: 'default',
+                label: `${DEFAULT_LEAD_TIME_DAYS}d default`,
+            };
+        }
+
+        // KAIZEN(2026-08-04): Apply vendor minimum lead time floor.
+        // Some vendors (e.g. Sustainable Village) have Finale product-level
+        // lead times as low as 3d that don't reflect real working-day order cycles.
+        const floor = resolveVendorLeadTimeFloor(vendorName);
+        if (floor !== null && result.days < floor) {
+            return {
+                days: floor,
+                provenance: 'default',
+                label: `${floor}d vendor floor (Finale said ${result.days}d)`,
+            };
+        }
+
+        return result;
     }
 
     /**

@@ -10,6 +10,13 @@ import { applySmartMOQTopUp } from "@/lib/purchasing/moq-topup";
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
 import { DEFAULT_LEAD_TIME_DAYS } from "@/lib/constants";
 import {
+    getOagPowderLeadOverrideDays,
+    isOagFpfRawDnrSku,
+    resolveLeadTimeDays,
+    OAG_POWDER_FAVORITE_BATCHES,
+} from "@/lib/purchasing/oag-powder-policy";
+import { getObservedSkuLeadDays, setSkuLeadTimeSamples, type SkuLeadSample } from "@/lib/purchasing/sku-lead-time";
+import {
     loadActiveReservations,
     loadAllVendorReorderPolicies,
     loadCalibrationStats,
@@ -67,6 +74,17 @@ const VENDOR_LEAD_TIME_RAW_TTL = 4 * 60 * 60 * 1000;
 let _vendorOnTimeRateCache: Map<string, number> = new Map();
 let _vendorOnTimeRateCacheAt = 0;
 const MAX_VENDOR_LEAD_TIME_DAYS = 90;
+
+/**
+ * Sanity gate for getPurchasingIntelligence. If more than this share of scanned
+ * items come back with null stockOnHand, the upstream Finale fetch is broken
+ * (schema change, auth failure, rate limit) and the whole result is untrustworthy —
+ * null stock reads as runway 0, which flags everything critical.
+ * See the abort block at the end of getPurchasingIntelligence.
+ */
+const MAX_MISSING_STOCK_RATIO = 0.5;
+/** Below this item count the ratio is too noisy to act on. */
+const MIN_ITEMS_FOR_STOCK_SANITY_CHECK = 20;
 
 /**
  * Parallel vendor party-ID cache. Populated by getVendorLeadTimeHistory() from
@@ -1232,6 +1250,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                                     orderDate
                                     receiveDate
                                     supplier { name partyUrl }
+                                    itemList(first: 80) {
+                                        edges { node { product { productId } } }
+                                    }
                                 }
                             }
                         }
@@ -1257,6 +1278,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             const byVendor = new Map<string, number[]>();
             const partyIds = new Map<string, string>(); // vendor name → party ID (from same query, zero extra calls)
             const dateEntries = new Map<string, LeadTimePOEntry[]>(); // vendor name → dated PO entries (temporal analysis)
+            const bySku = new Map<string, SkuLeadSample[]>();
             for (const edge of edges) {
                 const po = edge.node;
                 if (po.status !== 'Completed') continue;
@@ -1282,6 +1304,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 // Capture dated entry for temporal analysis (spread_days, dates, recent-30d trend)
                 if (!dateEntries.has(vendor)) dateEntries.set(vendor, []);
                 dateEntries.get(vendor)!.push({ receiveDate: po.receiveDate, days });
+                // SKU grain: dated samples for time-weighted / trend-aware planning
+                const lineSkus = (po.itemList?.edges || [])
+                    .map((ie: any) => String(ie?.node?.product?.productId || "").trim().toUpperCase())
+                    .filter(Boolean);
+                const receiveDateStr = String(po.receiveDate).slice(0, 10);
+                for (const sku of lineSkus) {
+                    if (!bySku.has(sku)) bySku.set(sku, []);
+                    bySku.get(sku)!.push({ days, receiveDate: receiveDateStr });
+                }
             }
 
             // Compute median for vendors with ≥ 2 data points (was 3; monthly-cadence
@@ -1312,6 +1343,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             _vendorPartyIdCache = partyIds;
             _vendorLeadTimeDateCache = dateEntries;
             _vendorLeadTimeDateCacheAt = Date.now();
+            // SKU-level samples for ordering (same GraphQL call — zero extra Finale hits)
+            setSkuLeadTimeSamples(bySku);
             return result2;
         } catch (err: any) {
             console.error('[finale] getVendorLeadTimeHistory error:', err.message);
@@ -1473,6 +1506,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     if (FinaleProductsClient.isDoNotReorder(prod)) {
                         continue;
                     }
+                    // OAG228 RAW FPF — CYC fills finished FPF; never buy 50gal raw.
+                    if (isOagFpfRawDnrSku(item.productId)) {
+                        continue;
+                    }
 
                     const partyId = mainSupplier.supplierPartyUrl.split('/').pop();
                     const party = await resolveParty(partyId);
@@ -1485,9 +1522,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         isManufactured: party.isManufactured,
                         isDropship: party.isDropship,
                         // DECISION(2026-03-04): Extract order increment qty from REST product data.
-                        // Finale stores this as "orderIncrementQuantity" — the "Std reorder in qty of" field.
-                        // Falls back to null if not set, meaning no rounding is applied.
-                        orderIncrementQty: this.parseFinaleNum(prod.orderIncrementQuantity),
+                        // FIX(2026-07-30): Finale removed `orderIncrementQuantity` from both
+                        // GraphQL and REST. `stdPackingUnitsPerCase` is the surviving
+                        // "Std reorder in qty of" field. Null = no rounding applied.
+                        orderIncrementQty: this.parseFinaleNum(prod.orderIncrementQuantity)
+                            ?? this.parseFinaleNum(prod.stdPackingUnitsPerCase),
                         isBulkDelivery: FinaleProductsClient.isBulkDelivery(prod),
                     });
                 } catch {
@@ -1635,12 +1674,36 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         }
 
         // ── Step 1: Snap quantities to order increments ──────────────────────
+        // Belt-and-suspenders: if any item is missing orderIncrementQty,
+        // do a last-resort batch lookup against the persistent SKU cache.
+        // The dashboard normally passes this field, but this guards against
+        // stale caches or direct API callers that omit it.
+        const missingIncrement = items.filter(i => i.orderIncrementQty == null || i.orderIncrementQty <= 0);
+        const incrementFallback = new Map<string, number>();
+        if (missingIncrement.length > 0) {
+            try {
+                const rows = await getFreshCachedSkus(missingIncrement.map(i => i.productId));
+                for (const item of missingIncrement) {
+                    const row = rows.get(item.productId);
+                    const rd = row?.raw_detail;
+                    if (rd?.orderIncrementQuantity != null && rd.orderIncrementQuantity > 0) {
+                        incrementFallback.set(item.productId, rd.orderIncrementQuantity);
+                        console.log(`[finale] PO qty snap fallback: ${item.productId} cache has increment ${rd.orderIncrementQuantity}`);
+                    }
+                }
+            } catch (e: any) {
+                console.warn('[finale] createDraftPurchaseOrder: increment fallback lookup failed (non-blocking):', e?.message || e);
+            }
+        }
+
         const adjustedItems = items.map(item => {
             const rawQty = item.quantity;
-            const snapped = FinaleProductsClient.snapToIncrement(rawQty, item.orderIncrementQty ?? null);
+            const effectiveIncrement = item.orderIncrementQty ?? incrementFallback.get(item.productId) ?? null;
+            const snapped = FinaleProductsClient.snapToIncrement(rawQty, effectiveIncrement);
 
             if (snapped !== rawQty) {
-                console.log(`[finale] PO qty snap: ${item.productId}: ${rawQty} → ${snapped} (increment: ${item.orderIncrementQty})`);
+                const source = item.orderIncrementQty != null ? 'passed' : 'cache-fallback';
+                console.log(`[finale] PO qty snap: ${item.productId}: ${rawQty} → ${snapped} (increment: ${effectiveIncrement}, source: ${source})`);
             }
 
             return {
@@ -1836,6 +1899,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         openPOs: Array<{ orderId: string; quantity: number; orderDate: string; dueDate: string | null }>;
         stockOnHand: number | null;
         stockAvailable: number | null;
+        orderIncrementQty: number | null;
         lastPurchaseDate: string | null;
         firstPurchaseDate: string | null;
         purchaseCount: number;
@@ -1901,6 +1965,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         stockOnHand
                         stockAvailable
                         unitsInStock
+                        stdPackingUnitsPerCase
                     }}
                 }
             }`
@@ -1973,12 +2038,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             const stockNode = data?.stockInfo?.edges?.[0]?.node;
             const stockOnHand = this.parseFinaleNum(stockNode?.stockOnHand)
                 ?? this.parseFinaleNum(stockNode?.unitsInStock);
+            // FIX(2026-07-30): Finale removed `orderIncrementQuantity` from the GraphQL
+            // product type. The whole getProductActivity query was erroring, so EVERY SKU
+            // came back with null stock → runway 0 → 282 items flagged critical / $1.2M
+            // of bogus recommendations. `stdPackingUnitsPerCase` is the surviving
+            // "Std reorder in qty of" field. Verified against schema introspection.
+            const orderIncrementQty = this.parseFinaleNum(stockNode?.stdPackingUnitsPerCase);
             return {
                 purchasedQty,
                 soldQty,
                 openPOs,
                 stockOnHand,
                 stockAvailable: this.parseFinaleNum(stockNode?.stockAvailable),
+                orderIncrementQty,
                 lastPurchaseDate,
                 firstPurchaseDate,
                 purchaseCount,
@@ -1987,7 +2059,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             };
         } catch (err: any) {
             console.error(`[finale] getProductActivity error for ${sku}:`, err.message);
-            return { purchasedQty: 0, soldQty: 0, openPOs: [] as Array<{ orderId: string; quantity: number; orderDate: string; dueDate: string | null }>, stockOnHand: null, stockAvailable: null, lastPurchaseDate: null, firstPurchaseDate: null, purchaseCount: 0, purchaseDates: [], purchaseQtys: [] };
+            return { purchasedQty: 0, soldQty: 0, openPOs: [] as Array<{ orderId: string; quantity: number; orderDate: string; dueDate: string | null }>, stockOnHand: null, stockAvailable: null, orderIncrementQty: null, lastPurchaseDate: null, firstPurchaseDate: null, purchaseCount: 0, purchaseDates: [], purchaseQtys: [] };
         }
     }
 
@@ -2157,6 +2229,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         this.getProductActivity(compSku, daysBack),
                     ]);
                     if (FinaleProductsClient.isDoNotReorder(prodData)) continue;
+                    if (isOagFpfRawDnrSku(compSku)) continue;
 
                     const suppliers: any[] = prodData.supplierList || [];
                     const mainSupplier = suppliers.find((s: any) =>
@@ -2199,6 +2272,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     // HERMIA(2026-06-10): Enrich open POs with delivery reliability data.
                     // Stuck/unacknowledged/overdue POs don't count toward on-order coverage.
+                    // KAIZEN(2026-08-04): Inject vendorPartyId for blanket-PO detection.
+                    for (const po of compActivity.openPOs) { (po as any).vendorPartyId = partyId; }
                     const bomEnrichedPOs: OpenPOReliable[] = compActivity.openPOs.length > 0
                         ? await enrichOpenPOs(compActivity.openPOs)
                         : [];
@@ -2218,12 +2293,21 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const priorStockouts = stockoutCounts.get(compSku)?.eventCount ?? 0;
                     const stockoutMultiplier = leadTimeMultiplierFromStockouts(priorStockouts);
                     const leadTimeDays = Math.ceil(baseLeadTimeDays * stockoutMultiplier);
-                    // Policy override: take explicit Will-set lead time over Finale's
-                    // lead-time service. Stockout multiplier NOT applied to overrides —
-                    // the override is the ground-truth build/ship time Bill knows.
-                    const effectiveLeadTimeDays = bomPolicy?.leadTimeOverrideDays ?? leadTimeDays;
-                    const leadTimeProvenance = bomPolicy?.leadTimeOverrideDays
+                    // Policy override: powder MTO SKU (120d) > vendor_reorder_policies > Finale.
+                    // Stockout multiplier NOT applied to overrides — they are ground truth.
+                    const skuObsBom = getObservedSkuLeadDays(compSku);
+                    const resolvedLead = resolveLeadTimeDays({
+                        productId: compSku,
+                        vendorPolicyLeadDays: bomPolicy?.leadTimeOverrideDays,
+                        skuObservedLeadDays: skuObsBom?.days ?? null,
+                        skuObservedProvenance: skuObsBom?.provenance ?? null,
+                        baseLeadDays: leadTimeDays,
+                    });
+                    const effectiveLeadTimeDays = resolvedLead.days;
+                    const leadTimeProvenance = bomPolicy?.leadTimeOverrideDays && !getOagPowderLeadOverrideDays(compSku)
                         ? `${effectiveLeadTimeDays}d vendor policy override (was ${leadTimeDays}d ${lt.label})`
+                        : getOagPowderLeadOverrideDays(compSku)
+                            ? resolvedLead.provenance
                         : priorStockouts > 0
                             ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
                             : lt.label;
@@ -2400,7 +2484,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             `BOM component — ${sourceLabel}. ${Math.round(runwayDays)}d runway across ` +
                             `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}${forwardLabel}`,
                         suggestedQty,
-                        orderIncrementQty: prodData.orderIncrementQuantity ?? null,
+                        orderIncrementQty: (prodData.orderIncrementQuantity ?? prodData.stdPackingUnitsPerCase ?? compActivity.orderIncrementQty ?? null),
                         isBulkDelivery: true, // BOM materials route to production facility
                         finaleReorderQty: null,
                         finaleStockoutDays: null,
@@ -2757,6 +2841,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     // Skip products flagged "Do not reorder" in Finale
                     if (_cachedCtx ? _cachedCtx.doNotReorder : FinaleProductsClient.isDoNotReorder(prodData)) { if (['RMC102','DASH101','BLM212'].includes(sku)) console.log(`[debug/${sku}] SKIP: DNR`); continue; }
+                    // OAG228 RAW FPF — never reorder (CYC finished path only)
+                    if (isOagFpfRawDnrSku(sku)) continue;
 
                     // Step C: Single combined GraphQL request — purchase history + sales history + open POs
                     const activity = await this.getProductActivity(sku, daysBack);
@@ -2777,9 +2863,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const restStock = this.parseFinaleNum(prodData.quantityOnHand ?? prodData.stockLevel ?? null);
                     const stockOnHand = activity.stockOnHand ?? restStock;
 
-                    // HERMIA(2026-06-10): Enrich open POs with Supabase lifecycle data so
+                    // HERMIA(2026-06-10): Enrich open POs with lifecycle data so
                     // we can distinguish "in transit" POs from stuck/unacknowledged ones.
                     // Only DELIVERABLE POs should remove a SKU from Ordering.
+                    // KAIZEN(2026-08-04): Inject vendorPartyId for blanket-PO detection.
+                    for (const po of activity.openPOs) { (po as any).vendorPartyId = partyId; }
                     const enrichedOpenPOs: OpenPOReliable[] = activity.openPOs.length > 0
                         ? await enrichOpenPOs(activity.openPOs)
                         : [];
@@ -2812,6 +2900,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // DECISION(2026-03-31): Prefer demandVelocity over purchaseVelocity.
                     // We fall back to purchaseVelocity via chooseVelocitySignal BOM→receipts fallback
                     // (handles items where Finale doesn't track BOM consumption in demandVelocity).
+                    //
+                    // DECISION(2026-07-30 — Bill): do NOT let receipts override demand.
+                    // Receipt velocity measures what we BOUGHT, not what we need. Using
+                    // purchases to justify more purchases is circular and produces dead cash.
+                    // FG demand is the constraint: if finished goods aren't moving, MFG won't
+                    // pack, and the RAW isn't consumed regardless of receipt history.
                     const chosenVelocity = chooseVelocitySignal({
                         reorderMethod,
                         demandVelocity,
@@ -2884,7 +2978,24 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         console.warn(`[finale] getPurchasingIntelligence: no stock data for ${sku} (reorderQty=${candidate.finaleReorderQty}), using 0 — item kept in pipeline`);
                     }
 
-                    const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity);
+                    const orderIncrementQty = this.parseFinaleNum(prodData.orderIncrementQuantity)
+                        ?? this.parseFinaleNum(prodData.stdPackingUnitsPerCase)
+                        ?? activity.orderIncrementQty
+                        ?? null;
+
+                    // Cache self-healing: if GraphQL has orderIncrementQuantity the REST
+                    // product API doesn't expose, repair the persistent cache so future
+                    // cache hits don't need the fallback. Only fires on cache-hit path
+                    // (_cachedCtx is the FinaleProductDetail from the cache row).
+                    if (
+                        orderIncrementQty != null
+                        && (prodData.orderIncrementQuantity == null)
+                        && _cachedCtx
+                        && _cachedCtx.orderIncrementQuantity == null
+                    ) {
+                        _cachedCtx.orderIncrementQuantity = orderIncrementQty;
+                        void upsertSkuCache(sku, _cachedCtx);
+                    }
 
                     // ── Phase 2/3/v2.2 lookups: calibration, MOQ, vendor policy, recent line qtys ──
                     if (!seenVendorIds.has(partyId)) {
@@ -2914,11 +3025,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const distribution = await leadTimeService.getDistribution(party.groupName);
                     const forward = forwardDemand.get(sku);
 
-                    // v2.1 — vendor policy lead-time override flows through both the
-                    // recommender input AND the surfaced item.leadTimeProvenance so the
-                    // dashboard "Why X?" drawer reflects what the recommender actually used.
-                    const effectiveLeadTimeDays = reorderPolicy?.leadTimeOverrideDays ?? leadTimeDays;
-                    const effectiveLeadTimeProvenance = reorderPolicy?.leadTimeOverrideDays
+                    // v2.1 — vendor policy lead-time override; powder MTO SKU wins (120d).
+                    const skuObs = getObservedSkuLeadDays(sku);
+                    const resolvedLead = resolveLeadTimeDays({
+                        productId: sku,
+                        vendorPolicyLeadDays: reorderPolicy?.leadTimeOverrideDays,
+                        skuObservedLeadDays: skuObs?.days ?? null,
+                        skuObservedProvenance: skuObs?.provenance ?? null,
+                        baseLeadDays: leadTimeDays,
+                    });
+                    const effectiveLeadTimeDays = resolvedLead.days;
+                    const effectiveLeadTimeProvenance = getOagPowderLeadOverrideDays(sku)
+                        ? resolvedLead.provenance
+                        : reorderPolicy?.leadTimeOverrideDays
                         ? `${reorderPolicy.leadTimeOverrideDays}d vendor policy override`
                         : leadTimeProvenance;
                     // DECISION(2026-05-21): Leg-aware stock-on-order for bulk vendors.
@@ -2927,7 +3046,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // PO quantity. This prevents the recommender from believing 120,000 units
                     // of CWP101 (Covico) are all available tomorrow when they arrive in 3 trucks
                     // over 90 days. For non-bulk vendors, behavior is identical to before.
-                    const horizonDays = (reorderPolicy?.leadTimeOverrideDays ?? leadTimeDays) + 60;
+                    const horizonDays = effectiveLeadTimeDays + 60;
                     const horizonDate = new Date(Date.now() + horizonDays * 86400000).toISOString().slice(0, 10);
                     const vendorPoLegs = vendorLegsCache.get(partyId);
 
@@ -2985,15 +3104,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         minimumOrderEaches: moq?.minimumOrderEaches ?? null,
                         minimumOrderDollars: moq?.minimumOrderDollars ?? null,
                         unitPrice,
-                        // v2.1 — vendor policy
-                        leadTimeOverrideDays: reorderPolicy?.leadTimeOverrideDays ?? null,
+                        // v2.1 — vendor policy (powder MTO SKU override wins)
+                        leadTimeOverrideDays:
+                            getOagPowderLeadOverrideDays(sku) ?? reorderPolicy?.leadTimeOverrideDays ?? null,
                         targetCoverDays: reorderPolicy?.targetCoverDays ?? null,
                         moqMode: reorderPolicy?.moqMode ?? "enforce",
                         overbuyReviewPct: reorderPolicy?.overbuyReviewPct ?? 50,
                         overbuyReviewDollars: reorderPolicy?.overbuyReviewDollars ?? 1000,
-                        // v2.2 — cognitive rounding inputs
+                        // v2.2 — cognitive rounding inputs (124788 lots for powder)
                         historicalLineQtys: recentLineQtysCache.get(partyId) ?? [],
-                        favoriteBatches: reorderPolicy?.favoriteBatches ?? null,
+                        favoriteBatches: reorderPolicy?.favoriteBatches
+                            ?? (getOagPowderLeadOverrideDays(sku)
+                                ? [...OAG_POWDER_FAVORITE_BATCHES]
+                                : null),
                         // v2.4 — actual quantity ordered last time for exact SKU deviation check
                         lastPurchaseQty: activity.purchaseQtys[0] ?? null,
                         // v2.6 — full SKU purchase history for consistent-pattern floor detection
@@ -3088,7 +3211,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         purchaseVelocity,
                         salesVelocity,
                         demandVelocity,
-                        dailyRate,
+                        dailyRate: rec.dailyRate,
                         runwayDays,
                         adjustedRunwayDays,
                         leadTimeDays: effectiveLeadTimeDays,
@@ -3249,6 +3372,30 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
         groups.sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency]);
         console.log(`[finale] getPurchasingIntelligence: ${items.length} items across ${groups.length} vendors`);
+
+        // ── Sanity gate (2026-07-30) ─────────────────────────────────────────
+        // Finale silently removed `orderIncrementQuantity` from its GraphQL schema,
+        // which made every getProductActivity call throw. Every SKU came back with
+        // null stock -> runway 0 -> 282/303 items flagged "critical" and ~$1.2M of
+        // bogus order recommendations were surfaced to the dashboard.
+        //
+        // A healthy scan has stock for the vast majority of items. If most items
+        // are missing stock, the upstream fetch is broken — refuse to return the
+        // result so SWR keeps serving the last good snapshot instead of poisoning
+        // the Ordering screen. Better a stale-but-sane list than a confident wrong one.
+        if (items.length >= MIN_ITEMS_FOR_STOCK_SANITY_CHECK) {
+            const missingStock = items.filter(i => i.stockOnHand == null).length;
+            const missingPct = missingStock / items.length;
+            if (missingPct > MAX_MISSING_STOCK_RATIO) {
+                const msg =
+                    `[finale] getPurchasingIntelligence: ABORTING — ${missingStock}/${items.length} ` +
+                    `items (${(missingPct * 100).toFixed(0)}%) have null stockOnHand. ` +
+                    `Upstream Finale fetch is likely broken (schema change or auth). ` +
+                    `Refusing to publish; serving previous snapshot.`;
+                console.error(msg);
+                throw new Error(msg);
+            }
+        }
 
         // Persist recommendation snapshots — best-effort, non-blocking. Each row is
         // the input -> output that the receive hook will calibrate against.

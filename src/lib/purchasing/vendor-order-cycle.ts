@@ -4,15 +4,16 @@
  *          orders by detecting whether a vendor already has an active
  *          committed/open PO within the current 30-day cycle.
  *
- *          Uses Finale PO history as source of truth. Canceled and dropship
- *          POs do not count — they don't lock the cycle.
+ *          Uses Finale PO history as source of truth. Canceled, dropship,
+ *          and CYC FPF-only POs (OAG218/219) do not count — they don't lock
+ *          the powder/raw cycle (Bill 2026-07-29: FPF is separate co-pack fill).
  *
  *          Exception path: proven sale/surge/build-critical demand can
  *          bypass the routine cadence lock with evidence attached.
  *
  * @author  Hermia
  * @created 2026-05-28
- * @deps    @/lib/finale/purchasing
+ * @deps    @/lib/finale/client, ./oag-powder-policy
  *
  * BACKGROUND:
  *   Fragmentation patterns observed at Grassroots (14 POs/year, 2 committed
@@ -28,6 +29,7 @@
  */
 
 import { FinaleClient } from "@/lib/finale/client";
+import { isFpfCycOnlyPo } from "@/lib/purchasing/oag-powder-policy";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,8 @@ export interface VendorCycleResult {
     };
     ignoredCanceled: number;
     ignoredDropship: number;
+    /** CYC FPF-only POs (OAG218/219) that did not lock the cycle. */
+    ignoredCopack: number;
 }
 
 export interface VendorCycleCheck {
@@ -64,6 +68,17 @@ export interface VendorCycleCheck {
     vendorName: string;
     exceptionReason?: VendorCycleResult["exceptionEvidence"];
 }
+
+export type VendorCyclePoInput = {
+    orderId: string;
+    orderDate: string | null;
+    status: string;
+    supplier: string;
+    isDropship?: boolean;
+    isCanceled?: boolean;
+    /** Line product IDs when known — used to ignore FPF CYC-only POs. */
+    productIds?: string[];
+};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -110,20 +125,20 @@ export function normalizeStatus(status: string): string {
  * @returns VendorCycleResult with decision and blocking PO details
  */
 export function evaluateVendorCycle(
-    pos: Array<{
-        orderId: string;
-        orderDate: string | null;
-        status: string;
-        supplier: string;
-        isDropship?: boolean;
-        isCanceled?: boolean;
-    }>,
+    pos: VendorCyclePoInput[],
     check: VendorCycleCheck,
 ): VendorCycleResult {
     // Guard: Finale API or upstream transform may produce non-array data
     // under error conditions, causing "a is not iterable" in for-of below.
     if (!Array.isArray(pos)) {
-        return { decision: "clear", blockingPOs: [], ignoredCanceled: 0, ignoredDropship: 0 };
+        return {
+            decision: "clear",
+            blockingPOs: [],
+            blockingPO: null,
+            ignoredCanceled: 0,
+            ignoredDropship: 0,
+            ignoredCopack: 0,
+        };
     }
 
     const now = Date.now();
@@ -132,6 +147,7 @@ export function evaluateVendorCycle(
     const blockingPOs: VendorCycleResult["blockingPOs"] = [];
     let ignoredCanceled = 0;
     let ignoredDropship = 0;
+    let ignoredCopack = 0;
 
     for (const po of pos) {
         const orderDate = po.orderDate ? new Date(po.orderDate).getTime() : 0;
@@ -147,6 +163,12 @@ export function evaluateVendorCycle(
         // Dropship POs don't lock the cycle
         if (po.isDropship) {
             ignoredDropship++;
+            continue;
+        }
+
+        // CYC FPF finished-only POs (OAG218/219) don't lock powder/raw cycle
+        if (isFpfCycOnlyPo(po.productIds)) {
+            ignoredCopack++;
             continue;
         }
 
@@ -170,7 +192,14 @@ export function evaluateVendorCycle(
 
     // No blocking POs → clear to proceed
     if (blockingPOs.length === 0) {
-        return { decision: "clear", blockingPOs: [], blockingPO: null, ignoredCanceled, ignoredDropship };
+        return {
+            decision: "clear",
+            blockingPOs: [],
+            blockingPO: null,
+            ignoredCanceled,
+            ignoredDropship,
+            ignoredCopack,
+        };
     }
 
     // Exception evidence overrides the cycle lock
@@ -190,6 +219,7 @@ export function evaluateVendorCycle(
                 exceptionEvidence: check.exceptionReason,
                 ignoredCanceled,
                 ignoredDropship,
+                ignoredCopack,
             };
         }
     }
@@ -201,6 +231,7 @@ export function evaluateVendorCycle(
         blockingPO: primaryBlockingPO,
         ignoredCanceled,
         ignoredDropship,
+        ignoredCopack,
     };
 }
 
@@ -255,36 +286,40 @@ export function formatCycleResult(result: VendorCycleResult): string {
  * Map raw PO records into the shape expected by evaluateVendorCycle.
  * Thin adapter used by the purchasing dashboard API route.
  */
-export function mapRecentPOsToVendorCyclePOs(recentPOs: Array<{
-    orderId: string;
-    orderDate: string | null;
-    status: string;
-    supplier: string;
-    isDropship?: boolean;
-    isCanceled?: boolean;
-}>): Array<{
-    orderId: string;
-    orderDate: string | null;
-    status: string;
-    supplier: string;
-    isDropship?: boolean;
-    isCanceled?: boolean;
-}> {
-    return recentPOs;
+function extractPoProductIds(po: any): string[] {
+    const fromField = Array.isArray(po?.productIds) ? po.productIds : [];
+    const fromItems = Array.isArray(po?.items)
+        ? po.items.map((i: any) => i?.productId).filter(Boolean)
+        : [];
+    const fromLines = Array.isArray(po?.line_items)
+        ? po.line_items.map((i: any) => i?.productId).filter(Boolean)
+        : [];
+    return [...fromField, ...fromItems, ...fromLines].map((p: any) => String(p));
+}
+
+export function mapRecentPOsToVendorCyclePOs(recentPOs: any[]): VendorCyclePoInput[] {
+    return (recentPOs || []).map((po) => ({
+        orderId: po.orderId || po.po_number || "",
+        orderDate: po.orderDate ?? po.issue_date ?? null,
+        status: po.status || po.statusId || "",
+        supplier: po.supplier || po.vendorName || po.vendor_name || "",
+        isDropship: po.isDropship || false,
+        isCanceled: po.isCanceled || po.status === "ORDER_CANCELED" || false,
+        productIds: extractPoProductIds(po),
+        vendorName: po.vendorName || po.vendor_name,
+        vendorPartyId: po.vendorPartyId || po.vendor_party_id,
+    })) as VendorCyclePoInput[];
 }
 
 export function classifyVendorOrderCycle(params: {
     vendorPartyId: string;
     vendorName: string;
-    recentPOs: Array<{
-        orderId: string;
-        orderDate: string | null;
-        status: string;
-        supplier: string;
+    recentPOs: Array<VendorCyclePoInput & {
         vendorName?: string;
         vendorPartyId?: string;
-        isDropship?: boolean;
-        isCanceled?: boolean;
+        items?: Array<{ productId?: string }>;
+        line_items?: Array<{ productId?: string }>;
+        productIds?: string[];
     }>;
 }): VendorCycleResult & { summary: string } {
     const matchingPOs = params.recentPOs.filter(po => {
@@ -292,7 +327,15 @@ export function classifyVendorOrderCycle(params: {
         const poSupplier = (po.supplier || po.vendorName || "").toLowerCase().trim();
         const groupName = params.vendorName.toLowerCase().trim();
         return poSupplier.includes(groupName) || groupName.includes(poSupplier);
-    });
+    }).map((po) => ({
+        orderId: po.orderId,
+        orderDate: po.orderDate,
+        status: po.status,
+        supplier: po.supplier,
+        isDropship: po.isDropship,
+        isCanceled: po.isCanceled,
+        productIds: po.productIds?.length ? po.productIds : extractPoProductIds(po),
+    }));
 
     const result = evaluateVendorCycle(matchingPOs, {
         vendorPartyId: params.vendorPartyId,
@@ -326,6 +369,7 @@ export function buildVendorCycleMapForGroups(
             supplier: po.supplier || po.vendorName || "",
             isDropship: po.isDropship || false,
             isCanceled: po.isCanceled || po.status === "ORDER_CANCELED" || false,
+            productIds: extractPoProductIds(po),
         }));
 
         // Try to find if any item in the group items has zero runway or is build critical to pass as exceptionReason

@@ -38,6 +38,54 @@ describe("snapToIncrement", () => {
     it("returns exact multiples unchanged", () => {
         expect(snapToIncrement(48, 12)).toBe(48);
     });
+
+    // ── Case qty / pack rounding compliance ────────────────────────────
+    // These encode the specific failure mode discovered 2026-07-29:
+    //   ORS101 has orderIncrementQty=12 (cases of 12).
+    //   Recommender suggested 30 — should have been snapped to 36.
+    //   Root cause: REST product API didn't expose orderIncrementQuantity
+    //   (only GraphQL productViewConnection does). Fixed with GraphQL fallback.
+    describe("case quantity / pack increment adherence", () => {
+        it("snaps 30 to 36 when pack increment is 12 (ORS101-like)", () => {
+            expect(snapToIncrement(30, 12)).toBe(36);
+        });
+
+        it("snaps 28 to 36 (not 24 — always round UP to full case)", () => {
+            expect(snapToIncrement(28, 12)).toBe(36);
+        });
+
+        it("snaps 24 to 24 (already a full case)", () => {
+            expect(snapToIncrement(24, 12)).toBe(24);
+        });
+
+        it("snaps 1 to 12 (minimum one full case)", () => {
+            expect(snapToIncrement(1, 12)).toBe(12);
+        });
+
+        it("handles common case quantities: 6, 10, 12, 25, 50, 100", () => {
+            // Case of 6
+            expect(snapToIncrement(10, 6)).toBe(12);
+            expect(snapToIncrement(12, 6)).toBe(12);
+            // Case of 10
+            expect(snapToIncrement(33, 10)).toBe(40);
+            expect(snapToIncrement(30, 10)).toBe(30);
+            // Case of 25
+            expect(snapToIncrement(30, 25)).toBe(50);
+            expect(snapToIncrement(50, 25)).toBe(50);
+            // Case of 50
+            expect(snapToIncrement(80, 50)).toBe(100);
+            // Case of 100
+            expect(snapToIncrement(250, 100)).toBe(300);
+        });
+
+        it("never snaps to a value below one full pack", () => {
+            for (const inc of [6, 10, 12, 25, 50, 100]) {
+                for (const qty of [1, 2, 3]) {
+                    expect(snapToIncrement(qty, inc)).toBeGreaterThanOrEqual(inc);
+                }
+            }
+        });
+    });
 });
 
 describe("recommendQty — basic math", () => {
@@ -584,6 +632,60 @@ describe("recommendQty — cognitive rounding integration", () => {
         }));
         expect(result.roundingAlternatives).toBeDefined();
         expect(result.roundingAlternatives!.length).toBeGreaterThan(0);
+    });
+
+    // ── Case qty / pack increment adherence ────────────────────────────────
+    // ORS101: orderIncrementQty=12. Raw need 30 → must snap to 36 (3 cases),
+    // never 30 (non-case qty) or 24 (rounding down violates the minimum).
+    it("pack increment snaps before cognitive rounding — ORS101 case", () => {
+        // Simulate ORS101: dailyRate ~1/d, stock ~0, 14d lead → raw need ~28-30
+        const result = recommendQty(baseInput({
+            dailyRate: 1,
+            stockOnHand: 10,
+            stockOnOrder: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 30,  // 1/d × 44d = 44 target − 10 stock = 34 raw
+            orderIncrementQty: 12, // Std reorder in qty of = 12 (case of 12)
+        }));
+        // Step 7 snaps 34 → 36. Cognitive ladder sees 36 (tier 30-99, step 10),
+        // snaps to 40. honorPack(40, 12, 34) → lower=36, upper=48 → 36.
+        // Result MUST be a multiple of 12.
+        expect(result.suggestedQty).toBe(36);
+        expect(result.suggestedQty % 12).toBe(0);
+        // Provenance must show pack_round step with the 12-pack reference
+        const pack = result.provenance.find(p => p.step === "pack_round");
+        expect(pack).toBeDefined();
+        expect(pack?.detail).toContain("12-pack");
+    });
+
+    it("pack increment forces ordering in full cases when raw need < 1 case", () => {
+        const result = recommendQty(baseInput({
+            dailyRate: 0.2,
+            stockOnHand: 5,
+            leadTimeDays: 14,
+            coverBufferDays: 30,  // 0.2 × 44 = 8.8 target − 5 stock = 4 raw
+            orderIncrementQty: 12,
+        }));
+        // 4 < 12 → snaps to 12 (minimum 1 full case)
+        expect(result.suggestedQty).toBe(12);
+        expect(result.suggestedQty % 12).toBe(0);
+    });
+
+    it("suggestedQty is always a multiple of orderIncrementQty when set", () => {
+        for (const inc of [6, 10, 12, 25, 50]) {
+            for (const raw of [5, 11, 30, 47, 99]) {
+                const result = recommendQty(baseInput({
+                    dailyRate: raw / 44,
+                    stockOnHand: 0,
+                    leadTimeDays: 14,
+                    coverBufferDays: 30,
+                    orderIncrementQty: inc,
+                }));
+                if (result.suggestedQty > 0) {
+                    expect(result.suggestedQty % inc).toBe(0);
+                }
+            }
+        }
     });
 });
 
