@@ -62,6 +62,18 @@ describe("composeRoutineDraftBody", () => {
         });
         expect(body.toLowerCase()).not.toMatch(/^received, thank you/);
         expect(body).toMatch(/Cooper/);
-        expect(body).toMatch(/ship|timing|PO|tracking|update/i);
+        expect(body).toMatch(/ship|thanks/i);
+        expect(body).not.toMatch(/BuildASoil Purchasing/);
+    });
+
+    it("simple restock confirm is just Thanks! style", () => {
+        const body = composeRoutineDraftBody({
+            from: "cs@herbsnow.com",
+            subject: "Re: order",
+            bodyText: "Sounds good! I'll send over an invoice as soon as we're restocked.\n\nBest regards,\nCari",
+        });
+        expect(body.toLowerCase()).toMatch(/thanks/);
+        expect(body.toLowerCase()).not.toMatch(/looking into/);
+        expect(body).not.toMatch(/BuildASoil Purchasing/);
     });
 });

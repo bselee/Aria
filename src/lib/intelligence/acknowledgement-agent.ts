@@ -17,6 +17,7 @@ import {
 import { notifyViaTask } from "./notify-via-task";
 import {
     composeHumanEscalationDraftStub,
+    isSimpleVendorConfirmation,
     composeRoutineDraftBody,
     resolveEmailResponsePolicy,
 } from "./email-response-policy";
@@ -707,6 +708,18 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                                                 intent = "INLINE_INVOICE";
                                                             }
 
+                            // Simple vendor confirms ("Sounds good — invoice when restocked") must never
+                            // become the human-escalation stub ("looking into this" / Hi cs,).
+                            if (
+                                intent !== "PROMOTIONAL"
+                                && intent !== "INLINE_INVOICE"
+                                && intent !== "VENDOR_OPPORTUNITY"
+                                && isSimpleVendorConfirmation({ subject, bodyText })
+                            ) {
+                                console.log(`     -> Simple vendor confirmation — Thanks! draft only`);
+                                intent = "ROUTINE_INFO";
+                            }
+
                             if (intent === "VENDOR_OPPORTUNITY") {
                                 await this.handleVendorOpportunity({
                                     gmail,
@@ -832,6 +845,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     const stub = composeHumanEscalationDraftStub({
                                         from: senderEmail,
                                         subject,
+                                        bodyText,
                                     });
                                     const draftId = await this.createReplyDraft({
                                         gmail,

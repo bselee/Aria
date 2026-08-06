@@ -21,7 +21,15 @@
  * @created 2026-08-05
  */
 
-import { extractReplyFirstName, formatSignedDraft } from "./email-draft-voice";
+import {
+    composeSimpleThanks,
+    extractReplyFirstName,
+    formatSignedDraft,
+    isSimpleVendorConfirmation,
+} from "./email-draft-voice";
+
+// Re-export for acknowledgement-agent and tests
+export { isSimpleVendorConfirmation, composeSimpleThanks };
 
 export type EmailResponseAction =
     | "ARCHIVE"
@@ -157,32 +165,41 @@ export function composeRoutineDraftBody(args: {
     subject: string;
     bodyText?: string;
 }): string {
-    const first = extractReplyFirstName(args.from);
+    // Light vendor confirms → Bill-style "Thanks!" only
+    if (isSimpleVendorConfirmation({ subject: args.subject, bodyText: args.bodyText })) {
+        return composeSimpleThanks({ from: args.from, bodyText: args.bodyText });
+    }
+
+    const first = extractReplyFirstName(args.from, args.bodyText);
     const text = `${args.subject}
 ${args.bodyText || ""}`.toLowerCase();
 
-    let core = "Thanks for the update — noted on our end.";
+    let core = "Thanks for the update.";
     if (/eta|ship(?:ping|s|ped)?|deliver/i.test(text)) {
-        core = "Thanks for the shipping update — timing noted.";
+        core = "Thanks for the shipping update.";
     } else if (/po|purchase order|order conf?irm/i.test(text)) {
-        core = "Thanks for confirming — we have this against the PO.";
+        core = "Thanks for confirming.";
     } else if (/tracking|pro\s*#|bol/i.test(text)) {
-        core = "Thanks for the tracking info — appreciated.";
+        core = "Thanks for the tracking info.";
     }
 
     return formatSignedDraft(first, [core]);
 }
 
 /**
- * Cautious stub when human must answer a question — never pretends to resolve it.
+ * Only when we truly owe a human answer. Still no Gmail-duplicate signature.
+ * Prefer "Thanks!" if the inbound was just a confirmation (misclassified).
  */
 export function composeHumanEscalationDraftStub(args: {
     from: string;
     subject: string;
+    bodyText?: string;
 }): string {
-    const first = extractReplyFirstName(args.from);
-    return formatSignedDraft(first, [
-        "Thanks for flagging this — looking into it on our side and will follow up shortly.",
-    ]);
+    if (isSimpleVendorConfirmation({ subject: args.subject, bodyText: args.bodyText })) {
+        return composeSimpleThanks({ from: args.from, bodyText: args.bodyText });
+    }
+    const first = extractReplyFirstName(args.from, args.bodyText);
+    // Bill often just says thanks and handles offline — avoid fake "looking into this"
+    // when we don't know the question. Keep it open and short.
+    return formatSignedDraft(first, ["Thanks — I'll follow up shortly."]);
 }
-
