@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+    BILL_VENDOR_REPLY_VOICE,
     composeSimpleThanks,
     extractNameFromSignOff,
     extractReplyFirstName,
@@ -187,5 +188,19 @@ describe("templateWarmVendorReply — Megan kelp", () => {
             bodyText: MEGAN_BODY,
         });
         expect(opp.draftBody).toBe(body);
+    });
+});
+
+describe("BILL_VENDOR_REPLY_VOICE few-shot examples", () => {
+    it("includes example keywords", () => {
+        expect(BILL_VENDOR_REPLY_VOICE).toMatch(/example/i);
+        expect(BILL_VENDOR_REPLY_VOICE).toMatch(/Megan/i);
+        expect(BILL_VENDOR_REPLY_VOICE).toMatch(/Thanks/i);
+    });
+
+    it("examples don't contradict rules", () => {
+        const examples = BILL_VENDOR_REPLY_VOICE.split("EXAMPLES")[1] || "";
+        expect(examples).not.toMatch(/BuildASoil Purchasing/);
+        expect(examples).not.toMatch(/follow up if useful/i);
     });
 });

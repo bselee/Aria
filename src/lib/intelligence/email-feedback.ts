@@ -27,6 +27,16 @@ interface DefaultInboxInvoiceEvent {
     priceUpdates: number;
 }
 
+interface DraftGradeFailureEvent {
+    gmailMessageId: string;
+    fromEmail: string;
+    subject: string;
+    score: number;
+    failures: string[];
+    rejectedDraft: string;
+    reason: string;
+}
+
 export async function recordSimpleAutoReply(event: AutoReplyEvent): Promise<void> {
     await recordFeedback({
         category: "engagement",
@@ -116,6 +126,35 @@ export async function recordDefaultInboxInvoiceOutcome(event: DefaultInboxInvoic
         contextData: {
             fromEmail: event.fromEmail,
             subject: event.subject,
+        },
+    });
+}
+
+/**
+ * A drafted vendor reply failed the grade gate and was replaced by the warm
+ * template. Log the failure details + the rejected draft so bad drafts are
+ * queryable in feedback_events instead of vanishing silently.
+ */
+export async function recordDraftGradeFailure(event: DraftGradeFailureEvent): Promise<void> {
+    await recordFeedback({
+        category: "correction",
+        eventType: "email_draft_grade_failed",
+        agentSource: "vendor-opportunity",
+        subjectType: "message",
+        subjectId: event.gmailMessageId,
+        prediction: {
+            action: "draft",
+            score: event.score,
+            failures: event.failures,
+            rejectedDraft: event.rejectedDraft,
+        },
+        actualOutcome: {
+            fromEmail: event.fromEmail,
+            subject: event.subject,
+        },
+        contextData: {
+            inbox: "default",
+            reason: event.reason,
         },
     });
 }

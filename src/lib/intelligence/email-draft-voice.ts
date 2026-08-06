@@ -49,6 +49,21 @@ FORMAT — CRITICAL
 
 - For very short vendor confirmations ("Sounds good", "I'll send the invoice"), the entire draft may be just:
   Thanks!
+
+EXAMPLES (Bill's real style — follow these patterns exactly):
+
+Example 1 — Megan: traceability + videos + sample offer, no COA.
+"Hi Megan,
+Thanks for the traceability detail and videos — helpful. Noted on the COA. A sample would be welcome if you can send one.
+Thanks!"
+
+Example 2 — Cari: "I'll send the invoice as soon as we're restocked."
+"Thanks Cari — appreciated."
+
+Example 3 — Jessica: pricing + tech sheets.
+"Hi Jessica,
+Thanks — pricing and TDS received. We'll compare with current supply and follow up.
+Thanks!"
 `;
 
 /** @deprecated Kept empty — Bill's Gmail signature is the only sign-off. */

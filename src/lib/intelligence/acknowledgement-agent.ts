@@ -318,6 +318,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
             bodyText,
             hasPdf,
             pdfFilenames,
+            gmailMessageId,
         });
 
         let draftId: string | null = null;

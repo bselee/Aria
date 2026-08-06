@@ -29,6 +29,8 @@ export interface VendorOpportunityInput {
     bodyText?: string | null;
     hasPdf?: boolean;
     pdfFilenames?: string[] | null;
+    /** Gmail message id of the inbound email — enables feedback-loop attribution. */
+    gmailMessageId?: string | null;
 }
 
 export interface VendorOpportunitySignal {
@@ -185,7 +187,7 @@ Return JSON:
 Be factually accurate to the email. Do not invent a COA or certs.`,
             schema: DraftSchema,
             schemaName: "VendorOpportunityDraft",
-            tier: "free",
+            tier: "paid",
             maxTokens: 400,
         });
 
@@ -201,6 +203,17 @@ Be factually accurate to the email. Do not invent a COA or certs.`,
             console.warn(
                 `[vendor-opportunity] Draft failed grade score=${grade.score} failures=${grade.failures.join(",") || "—"} → warm template`,
             );
+            // Dynamic import avoids a circular dependency (email-feedback → feedback-loop).
+            const { recordDraftGradeFailure } = await import("./email-feedback");
+            await recordDraftGradeFailure({
+                gmailMessageId: input.gmailMessageId ?? "unknown",
+                fromEmail: from,
+                subject,
+                score: grade.score,
+                failures: grade.failures,
+                rejectedDraft: parsed.draftBody,
+                reason: "grade_gate_failed_warm_template_fallback",
+            });
             return templateOpportunityDraft(input);
         }
 
