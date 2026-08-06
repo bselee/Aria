@@ -1379,3 +1379,96 @@ defineJob({
     budget: { durationMs: 120_000 },
 });
 
+// DECISION(2026-08-05): Weekly LTL Select COLLECT freight → Finale PO reconcile.
+// Runs Monday 9 AM Denver — high-confidence only (multi-delivery receive ≤10 biz d).
+// Covers Rootwise, Granite, Seaforth, Concentrates, Molasses, Diamond K, AMS, etc.
+// Uline is NOT on LTL Select (they call FedEx → general FBO).
+defineJob({
+    name: "ltlselect-freight-reconcile",
+    schedule: "0 9 * * 1",
+    onFail: "telegram-will",
+    description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
+    handler: async () => {
+        const { execFileSync } = await import("child_process");
+        console.log("[ltlselect-freight] Running weekly LTL Select reconcile (--live, --days 7)...");
+        try {
+            const stdout = execFileSync(
+                process.execPath,
+                [
+                    "--import", "tsx",
+                    `${process.cwd()}/src/cli/reconcile-ltlselect.ts`,
+                    "--live",
+                    "--days", "7",
+                ],
+                { encoding: "utf8", timeout: 300_000, env: process.env },
+            );
+            console.log(stdout);
+
+            const applied = (stdout.match(/Applied this run:\s+(\d+)/) || [])[1] || "0";
+            const totalMatch = stdout.match(/HIGH \(may apply\):\s+(\d+)\s+\(\$([\d,]+\.\d{2})\)/);
+            const held = (stdout.match(/MEDIUM \(hold\):\s+(\d+)/) || [])[1] || "0";
+            const unmatched = (stdout.match(/Unmatched:\s+(\d+)/) || [])[1] || "0";
+
+            const message =
+                `📦 LTL Select weekly: ${applied} applied` +
+                (totalMatch ? ` | $${totalMatch[2]}` : "") +
+                ` | held: ${held} | unmatched: ${unmatched}`;
+
+            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            await sendTelegramNotify(message).catch(() => {});
+        } catch (err: any) {
+            console.error(`[ltlselect-freight] Failed: ${err?.message ?? err}`);
+            if (err?.stdout) console.error(err.stdout);
+            if (err?.stderr) console.error(err.stderr);
+            throw err;
+        }
+    },
+    budget: { durationMs: 300_000 },
+});
+
+// HERMIA(2026-08-06): Daily (8am Mon-Fri) — harvest gold voice samples from
+// threads where Aria drafted a reply and Bill later sent. These samples feed
+// the few-shot voice prompt and future fine-tuning. Runs after Bill's morning
+// draft-review window so yesterday's drafts have settled.
+defineJob({
+    name: "gold-sample-collection",
+    schedule: "0 8 * * 1-5",
+    onFail: "log",
+    description:
+        "Daily: check threads Aria drafted into → find Bill's sent reply → log gold voice samples.",
+    handler: async () => {
+        try {
+            const { getAuthenticatedClient } = await import(
+                "@/lib/gmail/auth"
+            );
+            const { GmailApi } = await import("@googleapis/gmail");
+            const { collectGoldSamples } = await import(
+                "@/lib/intelligence/gold-sample-collector"
+            );
+
+            const auth = await getAuthenticatedClient("default");
+            const gmail = GmailApi({ version: "v1", auth });
+
+            const result = await collectGoldSamples(
+                gmail,
+                "bill.selee@buildasoil.com",
+            );
+
+            if (result.goldCollected > 0) {
+                console.log(
+                    `[gold-sample-collection] ${result.goldCollected} gold sample(s) collected out of ${result.scanned} drafts`,
+                );
+            } else {
+                console.log(
+                    `[gold-sample-collection] No new gold samples (scanned ${result.scanned}, ${result.noReplyYet} awaiting reply)`,
+                );
+            }
+        } catch (err: any) {
+            console.error(
+                `[gold-sample-collection] Failed: ${err?.message ?? err}`,
+            );
+            throw err;
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
