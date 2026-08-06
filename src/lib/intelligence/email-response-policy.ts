@@ -21,6 +21,8 @@
  * @created 2026-08-05
  */
 
+import { extractReplyFirstName, formatSignedDraft } from "./email-draft-voice";
+
 export type EmailResponseAction =
     | "ARCHIVE"
     | "SILENT"
@@ -155,19 +157,20 @@ export function composeRoutineDraftBody(args: {
     subject: string;
     bodyText?: string;
 }): string {
-    const first = extractFirstName(args.from);
-    const text = `${args.subject}\n${args.bodyText || ""}`.toLowerCase();
+    const first = extractReplyFirstName(args.from);
+    const text = `${args.subject}
+${args.bodyText || ""}`.toLowerCase();
 
-    let core = "Thanks for the update — noted.";
-    if (/\beta\b|ship(?:ping|s|ped)?\b|deliver/i.test(text)) {
-        core = "Thanks — shipping timing noted.";
-    } else if (/\bpo\b|purchase order|order conf?irm/i.test(text)) {
-        core = "Thanks — PO confirmation logged.";
-    } else if (/\btracking\b|pro\s*#|bol\b/i.test(text)) {
-        core = "Thanks — tracking noted.";
+    let core = "Thanks for the update — noted on our end.";
+    if (/eta|ship(?:ping|s|ped)?|deliver/i.test(text)) {
+        core = "Thanks for the shipping update — timing noted.";
+    } else if (/po|purchase order|order conf?irm/i.test(text)) {
+        core = "Thanks for confirming — we have this against the PO.";
+    } else if (/tracking|pro\s*#|bol/i.test(text)) {
+        core = "Thanks for the tracking info — appreciated.";
     }
 
-    return [`Hi ${first},`, "", core, "", "Bill", "BuildASoil Purchasing"].join("\n");
+    return formatSignedDraft(first, [core]);
 }
 
 /**
@@ -177,28 +180,9 @@ export function composeHumanEscalationDraftStub(args: {
     from: string;
     subject: string;
 }): string {
-    const first = extractFirstName(args.from);
-    return [
-        `Hi ${first},`,
-        "",
-        "Thanks — looking into this and will follow up shortly.",
-        "",
-        "Bill",
-        "BuildASoil Purchasing",
-    ].join("\n");
+    const first = extractReplyFirstName(args.from);
+    return formatSignedDraft(first, [
+        "Thanks for flagging this — looking into it on our side and will follow up shortly.",
+    ]);
 }
 
-function extractFirstName(from: string): string {
-    const named = from.match(/^"?([A-Za-z]+)/);
-    if (named && !["info", "sales", "orders", "support", "hello", "contact"].includes(named[1].toLowerCase())) {
-        return named[1];
-    }
-    const local = from.match(/([a-zA-Z]+)@/);
-    if (local) {
-        const part = local[1].split(/[._-]/)[0];
-        if (part && part.length > 1) {
-            return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
-        }
-    }
-    return "there";
-}

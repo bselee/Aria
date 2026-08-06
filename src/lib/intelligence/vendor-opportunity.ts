@@ -9,11 +9,18 @@
  *
  * @author  Hermia
  * @created 2026-08-05
- * @deps    @googleapis/gmail, ./llm, ./notify-via-task, ./email-feedback
+ * @deps    ./llm, ./email-draft-voice
+ * @updated 2026-08-06 — Bill voice + draft grade gate (Megan kelp incident)
  */
 
 import { z } from "zod";
 import { unifiedObjectGeneration } from "./llm";
+import {
+    BILL_VENDOR_REPLY_VOICE,
+    extractReplyFirstName,
+    gradeVendorReplyDraft,
+    templateWarmVendorReply,
+} from "./email-draft-voice";
 
 export interface VendorOpportunityInput {
     from: string;
@@ -145,89 +152,97 @@ const DraftSchema = z.object({
 export type OpportunityDraft = z.infer<typeof DraftSchema>;
 
 /**
- * Build a business-acumen draft reply. LLM first; template fallback.
+ * Build a business-acumen draft reply. LLM first; grade gate; template fallback.
  * Never auto-sends — caller creates a Gmail draft for Bill to edit/send.
+ *
+ * DECISION(2026-08-06): Brevity-only prompts produced cold wrong drafts
+ * (e.g. "COA received" when vendor said no COA). Grade + warm template.
  */
 export async function composeOpportunityDraft(input: VendorOpportunityInput): Promise<OpportunityDraft> {
     const from = input.from;
     const subject = input.subject;
     const body = (input.bodyText || input.snippet || "").slice(0, 4000);
     const pdfs = (input.pdfFilenames || []).join(", ");
+    const inboundBody = input.bodyText || input.snippet || "";
 
     try {
         const res = await unifiedObjectGeneration({
-            system: `You draft SHORT professional vendor replies for Bill Selee at BuildASoil.
-Rules:
-- Max 2 short sentences + sign-off. Prefer under 45 words total body.
-- Sound like a buyer, not a chatbot. No fluff, no restating their whole email.
-- Acknowledge the substance in 3-8 words (e.g. "tier-2 pricing and TDS received").
-- Do NOT commit to buy, MOQ, volumes, certifications praise monologue, or a call time.
-- Do NOT say only "Received, thank you".
-- Soft close: we'll review / compare and follow up if useful.
-- Plain text. Sign: Bill / BuildASoil Purchasing
-- summaryForBill: one tight line (who + what they sent + decision).
-- nextAction: imperative next step for Bill.`,
-            prompt: `From: ${from}
+            system: BILL_VENDOR_REPLY_VOICE,
+            prompt: `Draft a reply to this vendor email.
+
+From: ${from}
 Subject: ${subject}
 Attachments: ${pdfs || "(none listed)"}
 
 Email:
 ${body}
 
-Return JSON only. Keep draftBody brief.`,
+Return JSON:
+- draftBody: full plain-text reply including Hi/Name and Bill sign-off on separate lines
+- summaryForBill: one line for Bill's task hub
+- nextAction: imperative next step for Bill
+
+Be factually accurate to the email. Do not invent a COA or certs.`,
             schema: DraftSchema,
             schemaName: "VendorOpportunityDraft",
             tier: "free",
-            maxTokens: 280,
+            maxTokens: 400,
         });
 
-        // Guard: LLM/mock may return a non-draft shape — never trust cast alone.
-        return DraftSchema.parse(res);
-    } catch {
+        const parsed = DraftSchema.parse(res);
+        const grade = gradeVendorReplyDraft({
+            draftBody: parsed.draftBody,
+            inboundFrom: from,
+            inboundSubject: subject,
+            inboundBody,
+        });
+
+        if (!grade.pass) {
+            console.warn(
+                `[vendor-opportunity] Draft failed grade score=${grade.score} failures=${grade.failures.join(",") || "—"} → warm template`,
+            );
+            return templateOpportunityDraft(input);
+        }
+
+        if (grade.warnings.length > 0) {
+            console.log(`[vendor-opportunity] Draft grade=${grade.score} warnings=${grade.warnings.join(",")}`);
+        }
+
+        return parsed;
+    } catch (err: any) {
+        console.warn(`[vendor-opportunity] compose failed: ${err?.message || err} → warm template`);
         return templateOpportunityDraft(input);
     }
 }
 
-/** Deterministic fallback when LLM is down — keep it short. */
+/** Deterministic warm fallback — accurate, human, Bill-shaped. */
 export function templateOpportunityDraft(input: VendorOpportunityInput): OpportunityDraft {
-    const firstName = extractFirstName(input.from);
+    const draftBody = templateWarmVendorReply({
+        from: input.from,
+        subject: input.subject,
+        bodyText: input.bodyText || undefined,
+        snippet: input.snippet || undefined,
+        pdfFilenames: input.pdfFilenames || undefined,
+    });
+
     const hay = `${input.subject}\n${input.bodyText || input.snippet || ""}`;
     const bits: string[] = [];
     if (/pric|tier\s*\d|quote/i.test(hay)) bits.push("pricing");
     if (/tech\s*sheet|tds|spec/i.test(hay)) bits.push("tech sheets");
-    if (/omri|ibi|cert/i.test(hay)) bits.push("certs");
-    const what = bits.length > 0 ? bits.join(" + ") : "your materials";
-
-    const draftBody = [
-        `Hi ${firstName},`,
-        "",
-        `Thanks — ${what} received. We'll review against our current supply and follow up if we need anything.`,
-        "",
-        "Bill",
-        "BuildASoil Purchasing",
-    ].join("\n");
+    if (/traceab|lot number|lot system/i.test(hay)) bits.push("traceability");
+    if (/video|youtube/i.test(hay)) bits.push("videos");
+    if (/sample/i.test(hay)) bits.push("sample offer");
+    if (/prior testing|test results|lab results/i.test(hay)) bits.push("test results");
+    if (/omri|ibi|cert/i.test(hay) && !/do not typically offer/i.test(hay)) bits.push("certs");
+    const what = bits.length > 0 ? bits.join(" + ") : "vendor materials";
 
     return {
         draftBody,
-        summaryForBill: `${input.from} — ${what} on "${input.subject.slice(0, 60)}"`,
-        nextAction: "Compare pricing/specs vs current supplier, then send or edit draft.",
+        summaryForBill: `${extractReplyFirstName(input.from)} (${input.from}) — ${what} on "${input.subject.slice(0, 55)}"`,
+        nextAction: bits.includes("sample offer")
+            ? "Review draft, confirm sample request OK, then send."
+            : "Review draft vs current supplier, edit if needed, send.",
     };
-}
-
-function extractFirstName(from: string): string {
-    // "Jessica Kusmiz <jessica@...>" → Jessica
-    const named = from.match(/^"?([A-Za-z]+)/);
-    if (named && !["info", "sales", "orders", "support", "hello", "contact"].includes(named[1].toLowerCase())) {
-        return named[1];
-    }
-    const local = from.match(/([a-zA-Z]+)@/);
-    if (local) {
-        const part = local[1].split(/[._-]/)[0];
-        if (part && part.length > 1) {
-            return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
-        }
-    }
-    return "there";
 }
 
 /**
