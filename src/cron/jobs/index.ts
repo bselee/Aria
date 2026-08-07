@@ -748,7 +748,7 @@ defineJob({
     description: "Sync Finale PO data into local SQLite cache (every 15min).",
     handler: async () => {
         const { default: PQueue } = await import("p-queue");
-        const { upsertPOCache, getPurchasingCacheStats } = await import("@/lib/storage/purchasing-cache");
+        const { upsertPOCache, getPOCache, getPurchasingCacheStats } = await import("@/lib/storage/purchasing-cache");
         const { FinaleClient } = await import("@/lib/finale/client");
         const { enqueueSync } = await import("@/lib/storage/sync-queue");
 
@@ -764,23 +764,51 @@ defineJob({
         }
 
         let synced = 0;
+        let enqueued = 0;
+        let unchanged = 0;
         for (const po of recentPOs) {
             queue.add(async () => {
                 try {
+                    const poNumber = po.orderId || po.po_number;
+                    const incomingStatus = po.status ?? null;
+                    const incomingTotal = po.total_amount ?? 0;
+                    const incomingLineItems = JSON.stringify(po.items || po.lineItems || []);
+                    const incomingLifecycle = po.lifecycle_state ?? null;
+                    const incomingEta = po.estimated_delivery_date || po.estimated_eta || null;
+                    const incomingUpdatedAt = po.updated_at || po.updatedAt || null;
+
+                    // Check if anything actually changed before re-enqueuing.
+                    // Every enqueueSync call costs a sync-queue cycle (20/tick),
+                    // and blindly re-enqueuing 180 unchanged POs every 15 min
+                    // starves the event loop for sparse cron jobs like ap-polling.
+                    const existing = getPOCache(poNumber);
+                    const changed =
+                        !existing ||
+                        existing.status !== incomingStatus ||
+                        existing.total_amount !== incomingTotal ||
+                        existing.line_items !== incomingLineItems ||
+                        existing.lifecycle_state !== incomingLifecycle ||
+                        existing.estimated_eta !== incomingEta ||
+                        existing.updated_at !== incomingUpdatedAt;
+
                     upsertPOCache({
-                        po_number: po.orderId || po.po_number,
+                        po_number: poNumber,
                         vendor_name: po.supplier || po.vendor_name || "",
-                        status: po.status,
-                        total_amount: po.total_amount || 0,
-                        line_items: JSON.stringify(po.items || po.lineItems || []),
-                        lifecycle_state: po.lifecycle_state || null,
-                        estimated_eta: po.estimated_delivery_date || po.estimated_eta || null,
+                        status: incomingStatus,
+                        total_amount: incomingTotal,
+                        line_items: incomingLineItems,
+                        lifecycle_state: incomingLifecycle,
+                        estimated_eta: incomingEta,
                         created_at: po.created_at || po.createdAt || null,
-                        updated_at: po.updated_at || po.updatedAt || null,
+                        updated_at: incomingUpdatedAt,
                     });
 
-                    // Also enqueue for async PostgREST sync
-                    await enqueueSync("purchase_orders", po.orderId || po.po_number, "upsert");
+                    if (changed) {
+                        await enqueueSync("purchase_orders", poNumber, "upsert");
+                        enqueued++;
+                    } else {
+                        unchanged++;
+                    }
                     synced++;
                 } catch (err: any) {
                     console.warn(`[po-finale-sync] Failed to sync PO ${po.orderId}: ${err.message}`);
@@ -789,7 +817,10 @@ defineJob({
         }
 
         await queue.onIdle();
-        console.log(`[po-finale-sync] Synced ${synced}/${recentPOs.length} POs to local cache`);
+        console.log(
+            `[po-finale-sync] Synced ${synced}/${recentPOs.length} POs to local cache` +
+            (unchanged > 0 ? ` (${unchanged} unchanged, ${enqueued} enqueued for sync)` : "")
+        );
     },
 });
 
