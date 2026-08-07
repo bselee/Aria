@@ -165,9 +165,9 @@ local.db
 local/storage/INVOICE/
 local/storage/ap_invoices/
 local/storage/statement_artifacts/
-# Label/credit-app PDFs and audit renders dropped in by the desktop UI.
-.hermes/desktop-attachments/*.pdf
-.hermes/desktop-attachments/*.png
+# Desktop/research drops — never commit (pitch decks, vendor PDFs, OCR pages, etc.)
+# Whole tree: subdirs like ferticell-*-pages/ were leaking past *.png globs.
+.hermes/desktop-attachments/
 # Split-commit scratch dir
 .tmp-split/
 # One-off SKU/stock probe scripts from ad-hoc investigations. Kept on disk for
@@ -187,11 +187,6 @@ src/cli/surepack-all-range.ts
 
 
 # ─── 2026-08-06 dirty-tree triage ─────────────────
-# Desktop drops (xlsx/csv). pdf/png already ignored above.
-.hermes/desktop-attachments/*.xlsx
-.hermes/desktop-attachments/*.csv
-.hermes/desktop-attachments/*.XLSX
-.hermes/desktop-attachments/*.CSV
 # Local plans scratch (tracked plans stay tracked; only untracked stay out)
 # Root/runtime junk — never source
 nul
