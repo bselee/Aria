@@ -10,6 +10,7 @@ vi.mock("./feedback-loop", () => ({
 
 import {
     recordDefaultInboxInvoiceOutcome,
+    recordDraftGradeFailure,
     recordHumanReviewRequired,
     recordSimpleAutoReply,
 } from "./email-feedback";
@@ -110,6 +111,40 @@ describe("email feedback helpers", () => {
             contextData: {
                 fromEmail: "orders@uline.com",
                 subject: "PO #124541 paid invoice",
+            },
+        });
+    });
+
+    it("records a draft grade failure as a correction with the rejected draft", async () => {
+        await recordDraftGradeFailure({
+            gmailMessageId: "gmail-4",
+            fromEmail: "jessica@ambiochar.com",
+            subject: "response to your BioChar inquiry",
+            score: 2,
+            failures: ["invented_coa", "stuffy_tone"],
+            rejectedDraft: "Hi Jessica,\nCOA received. We'll review.\nThanks!",
+            reason: "grade_gate_failed_warm_template_fallback",
+        });
+
+        expect(recordFeedbackMock).toHaveBeenCalledWith({
+            category: "correction",
+            eventType: "email_draft_grade_failed",
+            agentSource: "vendor-opportunity",
+            subjectType: "message",
+            subjectId: "gmail-4",
+            prediction: {
+                action: "draft",
+                score: 2,
+                failures: ["invented_coa", "stuffy_tone"],
+                rejectedDraft: "Hi Jessica,\nCOA received. We'll review.\nThanks!",
+            },
+            actualOutcome: {
+                fromEmail: "jessica@ambiochar.com",
+                subject: "response to your BioChar inquiry",
+            },
+            contextData: {
+                inbox: "default",
+                reason: "grade_gate_failed_warm_template_fallback",
             },
         });
     });

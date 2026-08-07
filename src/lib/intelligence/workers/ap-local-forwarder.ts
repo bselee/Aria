@@ -19,6 +19,8 @@
  *     (b) pdf-parse + reconciliation handoff can populate vendor_invoices for PO match.
  *   Exceptions: internal emails, Bill.com self-notifications, FedEx past-due, Amazon tracking.
  *   Dropship vendors still forward but skip PO reconciliation (no Finale PO exists).
+ *   FedEx Billing Online packets (12.99999.*.pdf): forward FULL multi-page PDF, no trim,
+ *   skip product-PO / Uline bas_freight (pay-path carrier bill only).
  *
  * FLOW:
  *   1. Scan Gmail for unread emails in the ap@ inbox (max 20 per cycle)
@@ -39,6 +41,11 @@ import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
+import {
+    FEDEX_CARRIER_BILL_ACTION,
+    buildFedExBillComFilename,
+    classifyFedExBillingAttachment,
+} from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
@@ -50,7 +57,6 @@ import {
 import * as crypto from "crypto";
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
-
 const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 const MAX_EMAILS_PER_CYCLE = 20;
 const OCR_TIMEOUT_MS = 30_000; // 30s timeout for pdf-parse on corrupted/large PDFs
@@ -816,6 +822,8 @@ export async function checkForBounces(gmail: any): Promise<string[]> {
  *
  * Lifecycle: FORWARDED → RECONCILED → COMPLETE
  * - Dropship invoices (vendor_routing_action = 'dropship') auto-complete (no PO to match).
+ * - FedEx carrier bills (vendor_routing_action = 'carrier_bill') auto-complete
+ *   (pay-path only — Bill.com; never product-PO / Uline bas_freight).
  * - For other invoices, extract PO number from email subject and verify in Finale.
  * - If a PO is found, mark RECONCILED.
  * - If no PO reference in subject, leave as FORWARDED for manual matching.
@@ -888,12 +896,28 @@ export async function runReconciliationHandoff(): Promise<{
                 continue;
             }
 
+            // FedEx Billing Online packets: pay Bill.com only — never product-PO match.
+            if (inv.vendor_routing_action === "carrier_bill") {
+                db.prepare(
+                    `UPDATE ap_local_forwards
+                     SET reconciliation_status = 'COMPLETE',
+                         reconciliation_notes = 'FedEx carrier bill - pay path only, no product PO match',
+                         reconciled_at = datetime('now'),
+                         completed_at = datetime('now')
+                     WHERE id = ?`
+                ).run(inv.id);
+                summary.autoCompleted++;
+                console.log(
+                    `   [AP-Reconcile] 📦 carrier_bill complete (no PO): ${inv.pdf_filename}`,
+                );
+                continue;
+            }
+
             if (inv.reconciliation_verdict) {
                 if (inv.reconciliation_verdict === "auto_applicable") summary.reconciled++;
                 else summary.pending++;
                 continue;
             }
-
             const poMatch = inv.email_subject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
             if (!poMatch) {
                 // Bill rule: notify ONLY when we cannot match invoice → PO
@@ -1223,6 +1247,21 @@ export async function runLocalApForward(): Promise<{
 
                 const pdfHash = crypto.createHash("sha256").update(pdfBuffer).digest("hex");
 
+                // FedEx Billing Online packets: full PDF, clean name, no product-PO match.
+                const fedexPacket = classifyFedExBillingAttachment({
+                    from,
+                    subject,
+                    filename: pdfFilename,
+                    pdfTextPreview: undefined,
+                });
+                const isFedExCarrierBill = fedexPacket.isPacket;
+                if (isFedExCarrierBill) {
+                    pdfFilename = buildFedExBillComFilename(fedexPacket, pdfFilename);
+                    console.log(
+                        `   [AP-Local] 📦 FedEx carrier bill FULL packet → ${pdfFilename} (no trim, skip PO match)`,
+                    );
+                }
+
                 // Dedup: hash / message+file / vendor+inv — log, never re-send
                 if (isDuplicate(gmailMessageId, pdfFilename, pdfHash) || isAlreadyForwarded(gmailMessageId, pdfFilename, pdfHash)) {
                     console.log(`   [AP-Local] ⏭️ Already logged/forwarded (dedup): ${pdfFilename} (msg ${gmailMessageId})`);
@@ -1235,6 +1274,8 @@ export async function runLocalApForward(): Promise<{
                 // Paid invoices (receipts, $0.00 balance, "Do Not Pay") should
                 // never reach Bill.com. Safe default: forward if OCR fails.
                 // Scanned/photo PDFs often yield little text — do not block those.
+                // FedEx multi-page packets: still run block check on extractable text
+                // but never trim pages before send.
                 const paidCheck = await checkPaidInvoiceBlock(pdfBuffer);
                 if (paidCheck.blocked) {
                     recordError(gmailMessageId, from, subject, pdfFilename, pdfHash,
@@ -1263,6 +1304,19 @@ export async function runLocalApForward(): Promise<{
                     continue;
                 }
 
+                // Re-classify with OCR text for service hint / invoice # when available.
+                const fedexMeta = isFedExCarrierBill
+                    ? classifyFedExBillingAttachment({
+                        from,
+                        subject,
+                        filename: att.filename,
+                        pdfTextPreview: paidCheck.rawText,
+                    })
+                    : fedexPacket;
+                if (isFedExCarrierBill) {
+                    pdfFilename = buildFedExBillComFilename(fedexMeta, att.filename);
+                }
+
                 // Forward to Bill.com — ONLY via single-forward gate (DB claim first).
                 // Gate records FORWARDED/ERROR itself — do not write a second ERROR row
                 // with a different filename (that used to UNIQUE-block retries forever).
@@ -1276,10 +1330,16 @@ export async function runLocalApForward(): Promise<{
                         source: "local-forwarder",
                         gmail,
                         ocrRawText: paidCheck.rawText,
-                        vendorRoutingAction: skipReconciliation ? "dropship" : undefined,
-                        vendorName: /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
-                            ? "Down to Earth Worms"
-                            : undefined,
+                        vendorRoutingAction: isFedExCarrierBill
+                            ? FEDEX_CARRIER_BILL_ACTION
+                            : skipReconciliation
+                              ? "dropship"
+                              : undefined,
+                        vendorName: isFedExCarrierBill
+                            ? "FedEx"
+                            : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
+                              ? "Down to Earth Worms"
+                              : undefined,
                     });
                     if (once.status === "already_forwarded") {
                         console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);
@@ -1304,21 +1364,28 @@ export async function runLocalApForward(): Promise<{
                     // Vision/OCR + vendor_invoices so Receivings can PO-match.
                     // Photo invoices need LLM OCR (pdf-parse returns ~0 text).
                     // Non-fatal: Bill.com already has the bill.
-                    try {
-                        await enrichInvoiceForPoMatch({
-                            gmailMessageId,
-                            emailFrom: from,
-                            emailSubject: subject,
-                            pdfFilename,
-                            pdfBuffer,
-                            ocrHint: paidCheck.rawText,
-                            vendorHint: /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
-                                ? "Down to Earth Worms"
-                                : undefined,
-                        });
-                    } catch (enrichErr: any) {
-                        console.warn(
-                            `   [AP-Local] PO-match enrich failed for ${pdfFilename}: ${enrichErr?.message || enrichErr}`,
+                    // FedEx carrier bills: skip product-PO enrich (wrong product).
+                    if (!isFedExCarrierBill && !skipReconciliation) {
+                        try {
+                            await enrichInvoiceForPoMatch({
+                                gmailMessageId,
+                                emailFrom: from,
+                                emailSubject: subject,
+                                pdfFilename,
+                                pdfBuffer,
+                                ocrHint: paidCheck.rawText,
+                                vendorHint: /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
+                                    ? "Down to Earth Worms"
+                                    : undefined,
+                            });
+                        } catch (enrichErr: any) {
+                            console.warn(
+                                `   [AP-Local] PO-match enrich failed for ${pdfFilename}: ${enrichErr?.message || enrichErr}`,
+                            );
+                        }
+                    } else if (isFedExCarrierBill) {
+                        console.log(
+                            `   [AP-Local] ⏭️ FedEx carrier bill — skipped product-PO enrich (${pdfFilename})`,
                         );
                     }
                 } catch (e: any) {

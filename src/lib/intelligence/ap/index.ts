@@ -40,3 +40,21 @@ export {
     detectAutopay,
     type AutopayDetectionResult,
 } from './autopay-detector';
+
+// ── FedEx Billing Online packets (full PDF, pay-path only) ──────────────────
+export {
+    FEDEX_CARRIER_BILL_ACTION,
+    FEDEX_BILLING_PACKET_FILENAME_RE,
+    isFedExBillingOnlineEmail,
+    isFedExBillingPacketFilename,
+    isFedExCarrierBillExtractedJson,
+    classifyFedExBillingAttachment,
+    buildFedExBillComFilename,
+    buildFedExCarrierBillQueueFields,
+    extractInvoiceDigitsFromFedExFilename,
+    formatFedExInvoiceDisplay,
+    extractFedExInvoiceNumberFromText,
+    detectFedExBillingServiceHint,
+    type FedExBillingPacketMeta,
+    type FedExBillingServiceHint,
+} from './fedex-billing-packet';

@@ -44,7 +44,12 @@ import {
 import { pickPrimaryInvoicePage } from "./invoice-page-selector";
 import { businessHoursAlert } from "../alert-gate";
 import { matchVendorRouting } from "../ap/vendor-router";
-
+import {
+    buildFedExBillComFilename,
+    buildFedExCarrierBillQueueFields,
+    classifyFedExBillingAttachment,
+    isFedExBillingOnlineEmail,
+} from "../ap/fedex-billing-packet";
 const supabase = createClient();
 const db = supabase;
 
@@ -268,13 +273,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
         snippet: string,
         pdfFilenames: string[],
     ): boolean {
-        if (!/fedex/i.test(from)) return false;
-
-        return (
-            /\binvoice\b/i.test(subject)
-            || /\binvoice\b/i.test(snippet)
-            || pdfFilenames.some((filename) => /\b(invoice|bill)\b/i.test(filename))
-        );
+        return isFedExBillingOnlineEmail(from, subject, snippet, pdfFilenames);
     }
 
     private async selectPrimaryInvoicePageNumber(
@@ -1023,84 +1022,75 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                             let queueBuffer = buffer;
                             const queueMetadata: Record<string, unknown> = {};
-                            if (extractedPdf) {
+                            let queueFilename = capturedFilename;
+
+                            // DECISION(2026-08-05): FedEx Billing Online packets
+                            // (12.99999.*.pdf — Express ~40pp + Ground ~100–150pp).
+                            // Forward FULL PDF to Bill.com. Never single-page-trim.
+                            // Pay-path only — skip product-PO match / Uline bas_freight.
+                            const fedexPacket = classifyFedExBillingAttachment({
+                                from,
+                                subject,
+                                snippet,
+                                filename: capturedFilename,
+                                pdfTextPreview,
+                            });
+
+                            if (fedexPacket.isPacket || isFedExInvoice) {
+                                Object.assign(queueMetadata, buildFedExCarrierBillQueueFields(fedexPacket));
+                                queueMetadata.original_pdf_filename = capturedFilename;
+                                queueMetadata.forwarded_page_count =
+                                    extractedPdf?.metadata?.pageCount
+                                    ?? extractedPdf?.pages?.length
+                                    ?? null;
+                                queueMetadata.fedex_full_packet = true;
+                                queueFilename = buildFedExBillComFilename(
+                                    fedexPacket,
+                                    capturedFilename,
+                                );
+                                console.log(
+                                    `     📦 FedEx carrier bill FULL packet (${queueMetadata.forwarded_page_count ?? "?"}pp) → ${queueFilename} (no trim, no PO freight)`,
+                                );
+                            } else if (extractedPdf) {
+                                // Non-FedEx: optional single-page pick for Bill.com OCR.
                                 // KAIZEN(2026-07-22): Removed AAA Cooper forced-page-1 override.
-                                // AAA Cooper page 1 is always a STATEMENT SUMMARY cover sheet
-                                // (hits "statement" negative rule, scores ~-2). Page 2 is the
-                                // actual invoice (hits "invoice_heading" + "amount_due", scores
-                                // ~9). Forcing page 1 sent the cover sheet to Bill.com, which
-                                // picked up the customer number instead of the PRO/BOL number.
-                                // The page selector correctly identifies page 2 as the invoice.
-                                const pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                let pageSelection = await this.selectPrimaryInvoicePageNumber(
                                     buffer,
                                     extractedPdf.pages,
                                     extractedPdf.metadata?.pageCount,
                                 );
 
-                                const multiPagePacket = (extractedPdf.metadata?.pageCount ?? 1) > 1;
-                                const needsFedExOcrRetry = isFedExInvoice
-                                    && multiPagePacket
-                                    && extractedPdf.ocrStrategy === "pdf-parse"
-                                    && pageSelection.confidence !== "strong";
-
-                                if (needsFedExOcrRetry) {
-                                    try {
-                                        const { extractPDFWithLLM } = await import("../../pdf/extractor");
-                                        const retriedExtraction = await extractPDFWithLLM(buffer);
-                                        const retriedSelection = await this.selectPrimaryInvoicePageNumber(
-                                            buffer,
-                                            retriedExtraction.pages,
-                                            retriedExtraction.metadata?.pageCount,
-                                        );
-                                        queueMetadata.invoice_page_ocr_retry_used = true;
-                                        queueMetadata.invoice_page_ocr_retry_strategy = retriedExtraction.ocrStrategy ?? "unknown";
-                                        extractedPdf = retriedExtraction;
-                                        pageSelection = retriedSelection;
-                                    } catch (retryErr: any) {
-                                        queueMetadata.invoice_page_ocr_retry_used = true;
-                                        queueMetadata.invoice_page_ocr_retry_error = retryErr.message;
-                                    }
-                                }
-
-                                if (isFedExInvoice && multiPagePacket && pageSelection.confidence !== "strong") {
-                                    manualReviewReason = `Ambiguous FedEx invoice packet (${capturedFilename}) - unable to isolate a single invoice page`;
-                                    console.log(`     ⚠️ ${manualReviewReason}`);
-                                    await this.logActivity(db, from, subject, "AMBIGUOUS_INVOICE_PACKET", manualReviewReason, {
-                                        reasonCode: "ambiguous_invoice_packet",
-                                        sourceInbox,
-                                        gmailMessageId: m.gmail_message_id,
-                                        pdfFilename: capturedFilename,
-                                        invoicePageSelectionConfidence: pageSelection.confidence,
-                                        invoicePageSelectionReason: pageSelection.reason,
-                                        ocrRetryUsed: Boolean(queueMetadata.invoice_page_ocr_retry_used),
-                                        ocrRetryStrategy: queueMetadata.invoice_page_ocr_retry_strategy ?? null,
-                                    });
-                                    attachmentIndex++;
-                                    continue;
-                                }
-
                                 if (pageSelection.pageNumber) {
                                     try {
-                                        queueBuffer = await this.extractSinglePagePdf(buffer, pageSelection.pageNumber);
+                                        queueBuffer = await this.extractSinglePagePdf(
+                                            buffer,
+                                            pageSelection.pageNumber,
+                                        );
                                         queueMetadata.selected_invoice_page = pageSelection.pageNumber;
-                                        queueMetadata.invoice_page_selection_confidence = pageSelection.confidence;
-                                        queueMetadata.invoice_page_selection_reason = pageSelection.reason;
+                                        queueMetadata.invoice_page_selection_confidence =
+                                            pageSelection.confidence;
+                                        queueMetadata.invoice_page_selection_reason =
+                                            pageSelection.reason;
                                         queueMetadata.forwarded_page_count = 1;
-                                        console.log(`     ✂️ Trimmed ${capturedFilename} to invoice page ${pageSelection.pageNumber}`);
+                                        console.log(
+                                            `     ✂️ Trimmed ${capturedFilename} to invoice page ${pageSelection.pageNumber}`,
+                                        );
                                     } catch (pageErr: any) {
-                                        console.warn(`     ⚠️ Failed to trim ${capturedFilename} to invoice page: ${pageErr.message}`);
+                                        console.warn(
+                                            `     ⚠️ Failed to trim ${capturedFilename} to invoice page: ${pageErr.message}`,
+                                        );
                                     }
                                 }
                             }
 
                             // Upload to local filesystem storage
-                            const storagePath = `${m.gmail_message_id}/${Date.now()}_${capturedFilename}`;
+                            const storagePath = `${m.gmail_message_id}/${Date.now()}_${queueFilename}`;
                             const { uploadPDF } = await import("../../storage/supabase-storage");
                             const localPath = await uploadPDF(queueBuffer, {
                                 type: "ap_invoices",
-                                vendor: m.vendor_name || "unknown",
+                                vendor: m.vendor_name || (fedexPacket.isPacket || isFedExInvoice ? "FedEx" : "unknown"),
                                 date: new Date().toISOString().split("T")[0],
-                                filename: capturedFilename,
+                                filename: queueFilename,
                             });
 
                             if (!localPath) {
@@ -1121,7 +1111,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 email_subject: subject,
                                 intent: intent,
                                 pdf_path: localPath,
-                                pdf_filename: capturedFilename,
+                                pdf_filename: queueFilename,
                                 status: queueStatus,
                                 source_inbox: sourceInbox,
                                 pdf_content_hash: pdfHash,
@@ -1139,7 +1129,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                                 throw new Error(`Queue insert failed: ${insertError.message}`);
                             }
 
-                            console.log(`     ✅ Queued ${capturedFilename} → ${queueStatus} (ready for Bill.com)`);
+                            console.log(`     ✅ Queued ${queueFilename} → ${queueStatus} (ready for Bill.com)`);
                             processedAnyPDF = true;
                             attachmentIndex++;
 
