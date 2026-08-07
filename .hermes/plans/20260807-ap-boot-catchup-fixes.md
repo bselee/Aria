@@ -2,7 +2,7 @@
 
 Follow-up review of commit `1c20ef2` ("fix(ops): AP boot catch-up, po-cache
 enqueue lock, stale_cron boot-grace"). Two real defects found in the shipped
-boot wiring. Both fixed in the working tree — **uncommitted**.
+boot wiring. Both fixed and shipped in `9b8445d`.
 
 ---
 
@@ -112,65 +112,40 @@ second layer. Safe.
 
 ---
 
-## Current state
+## Current state (updated after ship)
 
 | Item | State |
 |------|-------|
-| `1c20ef2` | pushed to `origin/main` |
+| `1c20ef2` | base feature on `origin/main` |
+| `9b8445d` | **this fix** pushed + bot restarted |
 | Migration (AP 25 m → 20 h) | applied to local Postgres, verified `20:00:00` in view |
-| `src/cli/start-bot.ts` | **modified, uncommitted** — both fixes above |
-| Tests | 41/41 pass (`po-cache-change`, `ap-boot-catchup`, `control-plane`, `cron/jobs`, `cron/runner`) |
-| Running `aria-bot` | still on `1c20ef2` code — does NOT have these two fixes |
+| Live boot order (out log) | heartbeat → Cron schedules → shutdown guard → catch-up skip ✅ |
+| Miss path (window_missed) | still unproven live (today’s 8am already covered) |
 
-`npm run typecheck` was not completed — it OOMs / runs long on this repo. The
-edit is a code-move plus one deleted line inside an already-typechecked block,
-so risk is low, but it is **unverified by tsc**.
+Live proof excerpt (aria-bot-out.log, latest boot):
+```
+[boot] Startup heartbeat written.
+📅 Cron schedules registered:
+[boot] Graceful shutdown guard installed (chatHistory will persist on exit)
+[boot] Checking AP sparse-window catch-up...
+[boot] AP catch-up skipped (window_already_covered).
+```
 
 ---
 
-## Next steps (in order)
+## Remaining optional verification
 
-1. **Commit the fix**
-
-   ```bash
-   git add src/cli/start-bot.ts
-   git commit -m "fix(ops): defer AP boot catch-up, drop false skip-path heartbeat"
-   git push origin main
-   ```
-
-2. **Restart and confirm ordering**
+1. **Prove the miss path (still unproven)** — quiet evening after 17:00:
 
    ```bash
-   pm2 restart aria-bot
-   sleep 20 && pm2 logs aria-bot --lines 60 --nostream | grep -E '\[boot\]'
-   ```
-
-   Expect `📅 Cron schedules registered` **before**
-   `[boot] Checking AP sparse-window catch-up...` — that ordering is the proof
-   Defect 1 is fixed.
-
-3. **Prove the miss path (still unproven)**
-
-   Only the *covered* branch has run live. To prove the real path, on a quiet
-   evening after 17:00:
-
-   ```bash
-   # delete today's 17:00 cron_runs row on a throwaway basis, or simply restart
-   # after 17:05 having stopped the bot before 17:00
    pm2 stop aria-bot     # before 17:00
    # ...wait past 17:00...
    pm2 start aria-bot
-   pm2 logs aria-bot --lines 80 --nostream | grep -E 'AP catch-up|AP-Local'
+   # want: AP catch-up ran (... window_missed ...) then [AP-Local]
    ```
 
-   Want: `[boot] AP catch-up ran (... reason=window_missed ...)` followed by
-   `[AP-Local]` output.
-
-4. **DST edge (low priority)**
-
-   `denverLocalToUtc` uses iterative offset resolution and is only tested in
-   August (MDT). Add a November (MST) case to `ap-boot-catchup.test.ts` before
-   the next time change.
+2. **DST edge (low priority)** — add a November (MST) case to
+   `ap-boot-catchup.test.ts` before the next time change.
 
 ---
 
