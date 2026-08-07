@@ -184,3 +184,45 @@ src/cli/surepack-all-range.ts
 
 # LTL Select probe scratch (may contain tokens)
 .tmp-ltl/
+
+
+# ─── 2026-08-06 dirty-tree triage ─────────────────
+# Desktop drops (xlsx/csv). pdf/png already ignored above.
+.hermes/desktop-attachments/*.xlsx
+.hermes/desktop-attachments/*.csv
+.hermes/desktop-attachments/*.XLSX
+.hermes/desktop-attachments/*.CSV
+# Local plans scratch (tracked plans stay tracked; only untracked stay out)
+# Root/runtime junk — never source
+nul
+backups-archive-*.tar.gz
+OA-Assessment-*.pdf
+public/OA-Assessment-*.pdf
+# Runtime data not covered by earlier data/* rules
+data/billcom-error.png
+data/billcom-profile/
+# logs: only .log was ignored; pid/reaps are runtime too
+logs/*.pid
+logs/*.reaps.json
+# Sandbox drops under local/storage
+local/storage/SANDBOX/
+# Ad-hoc box/SP/Uline forecast probes (hardcoded Downloads paths)
+src/cli/black-friday-forecast.ts
+src/cli/two-week-S4796.ts
+src/cli/scan-close-calls.ts
+src/cli/boxes-incoming.ts
+src/cli/boxes-on-order.ts
+src/cli/check-sp12126.ts
+src/cli/check-sp-variants.ts
+src/cli/check-stock-level.ts
+src/cli/find-sp-po.ts
+src/cli/sp-old-vs-new.ts
+src/cli/sp-sku-po-audit.ts
+src/cli/verify-sp-skus.ts
+src/cli/verify-po-lines.ts
+# One-off probe scripts
+scripts/_precision_check_ap.ts
+scripts/_probe-gmail.ts
+scripts/_probe-gmail-deep.ts
+# Duplicate of tracked scripts/warm-purchasing-cache-cron.mts
+scripts/warm-purchasing-cache.mjs
