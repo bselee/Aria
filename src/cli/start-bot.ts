@@ -566,12 +566,9 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     // ── End orchestrator wiring ─────────────────────────────────────────
 
     // ── Boot-time warmup ────────────────────────────────────────────
-    // (a) Sparse ap-polling (8/12/17 Denver) can miss a window when boot
-    //     takes >4 min or the process was down at :00. Catch up with one
-    //     idempotent runJobOnce("ap-polling") when the window is uncovered.
-    //     Do NOT call deprecated pollAPInbox alone — that skips the local
-    //     forwarder (see ap-pipeline-reliability skill).
-    // (b) Startup heartbeat so control-plane doesn't see a cold bot.
+    // (a) Startup heartbeat so control-plane doesn't see a cold bot.
+    // (b) AP sparse-window catch-up is deliberately NOT awaited here —
+    //     see the deferred kick after command registration below.
     // (c) Nightshift queue backlog — intentionally NOT suppressed.
 
     try {
@@ -580,23 +577,6 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.log('[boot] Startup heartbeat written.');
     } catch (e: any) {
         console.warn(`[boot] startup heartbeat failed (non-fatal): ${e.message}`);
-    }
-
-    try {
-        const { runApBootCatchup } = await import("../lib/ops/ap-boot-catchup");
-        console.log('[boot] Checking AP sparse-window catch-up...');
-        const catchup = await runApBootCatchup();
-        if (catchup.ran) {
-            console.log(
-                `[boot] AP catch-up ran (window=${catchup.windowAt}, reason=${catchup.reason}, status=${catchup.jobStatus})`,
-            );
-        } else {
-            console.log(`[boot] AP catch-up skipped (${catchup.reason}).`);
-            // Still refresh heartbeat marker so dense-threshold views settle.
-            await ops.cronHookSuccess("ap-polling").catch(() => undefined);
-        }
-    } catch (e: any) {
-        console.warn(`[boot] AP catch-up failed (non-fatal): ${e.message}`);
     }
 
     // ── End boot-time warmup
@@ -612,6 +592,38 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     };
     registerAllCommands(bot, botDeps);
     startBotControlPlane(ops);
+
+    // ── AP sparse-window catch-up (deferred, non-blocking) ──────────────
+    // ap-polling fires only at 8/12/17 Denver. A restart spanning :00 (or a
+    // slow boot) loses the window entirely — next chance is 4-5h later. Run
+    // ONE idempotent runJobOnce("ap-polling") when the current window has no
+    // cron_runs row.
+    //
+    // Deliberately fire-and-forget AFTER commands register: the handler walks
+    // Gmail + PO sweep + freight backfill (budget 180s). Awaiting it inline
+    // would delay Telegram readiness and the shutdown-guard install.
+    //
+    // Do NOT substitute ops.pollAPInbox() — deprecated path, skips
+    // runLocalApForward (see ap-pipeline-reliability skill).
+    setTimeout(() => {
+        void (async () => {
+            try {
+                const { runApBootCatchup } = await import('../lib/ops/ap-boot-catchup');
+                console.log('[boot] Checking AP sparse-window catch-up...');
+                const catchup = await runApBootCatchup();
+                if (catchup.ran) {
+                    console.log(
+                        `[boot] AP catch-up ran (window=${catchup.windowAt}, ` +
+                        `reason=${catchup.reason}, status=${catchup.jobStatus})`,
+                    );
+                } else {
+                    console.log(`[boot] AP catch-up skipped (${catchup.reason}).`);
+                }
+            } catch (e: any) {
+                console.warn(`[boot] AP catch-up failed (non-fatal): ${e.message}`);
+            }
+        })();
+    }, 5_000);
 
     console.log('📅 Cron schedules registered:');
     console.log('   🐨 Build Risk Report:  8:00 AM MT (Weekdays)');
