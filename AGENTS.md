@@ -51,6 +51,7 @@ pm2 restart aria-dashboard
 - **Autonomous Workflows**: PO escalation, delivery exceptions, vendor coordination run automatically
 - **Browser Automation**: Playwright-based cart filling for Uline/Axiom (headful mode for visibility)
 - **No cloud Supabase** — all DB traffic is local PostgREST/Postgres
+- **Chat attachments**: always `skill_view('ingest-triage')` before archiving — never bulk Downloads→vault; classify A/B/C (Honcho / vault note+path / session only)
 
 ## Common Tasks
 1. Add new cron job: Edit `src/cron/jobs/index.ts`, add `defineJob(...)` block

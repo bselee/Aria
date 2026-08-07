@@ -198,18 +198,24 @@ export async function evaluateCurrentOpsHealth(logger: LoggerLike = console) {
     }
     if (!summary) return null;
 
-    const decision = buildOpsHealthDecision({
-        projectStatus,
-        staleCrons: summary.stale_crons || [],
-        botHeartbeatAgeMinutes: summary.bot_heartbeat_age_minutes,
-        apQueueBacklogAgeMinutes: summary.ap_queue_backlog_age_minutes,
-        apProcessingStuckCount: summary.ap_processing_stuck_count || 0,
-        nightshiftBacklogAgeMinutes: summary.nightshift_queue_backlog_age_minutes,
-        nightshiftProcessingStuckCount: summary.nightshift_processing_stuck_count || 0,
-        pendingExceptionCount: summary.pending_exception_count || 0,
-        lastApForwardAgeMinutes: summary.last_ap_forward_age_minutes,
-        lastNightshiftCompletionAgeMinutes: summary.last_nightshift_completion_age_minutes,
-    });
+    const decision = buildOpsHealthDecision(
+        {
+            projectStatus,
+            staleCrons: summary.stale_crons || [],
+            botHeartbeatAgeMinutes: summary.bot_heartbeat_age_minutes,
+            apQueueBacklogAgeMinutes: summary.ap_queue_backlog_age_minutes,
+            apProcessingStuckCount: summary.ap_processing_stuck_count || 0,
+            nightshiftBacklogAgeMinutes: summary.nightshift_queue_backlog_age_minutes,
+            nightshiftProcessingStuckCount: summary.nightshift_processing_stuck_count || 0,
+            pendingExceptionCount: summary.pending_exception_count || 0,
+            lastApForwardAgeMinutes: summary.last_ap_forward_age_minutes,
+            lastNightshiftCompletionAgeMinutes: summary.last_nightshift_completion_age_minutes,
+        },
+        {
+            // Suppress stale_cron panic for first 15m of process life.
+            botUptimeMinutes: process.uptime() / 60,
+        },
+    );
 
     if (decision.degraded) {
         logger.warn(

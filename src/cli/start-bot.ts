@@ -566,14 +566,13 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     // ── End orchestrator wiring ─────────────────────────────────────────
 
     // ── Boot-time warmup ────────────────────────────────────────────
-    // (a) Fix: AP polling shows "stale" after every PM2 restart because
-    //     the cron scheduler waits for the first */15 tick. Fire immediately
-    //     so ops_health_summary doesn't flag it.
-    // (b) Fix: Bot heartbeat starts at "stale" (0 min = 10 min stale threshold)
-    //     because heartbeats only fire after cron hook success. Register
-    //     a startup heartbeat so control-plane doesn't trigger a restart alert.
-    // (c) Nightshift queue backlog — intentionally NOT suppressed. It's
-    //     expected during dev iteration and clears itself within a few hours.
+    // (a) Sparse ap-polling (8/12/17 Denver) can miss a window when boot
+    //     takes >4 min or the process was down at :00. Catch up with one
+    //     idempotent runJobOnce("ap-polling") when the window is uncovered.
+    //     Do NOT call deprecated pollAPInbox alone — that skips the local
+    //     forwarder (see ap-pipeline-reliability skill).
+    // (b) Startup heartbeat so control-plane doesn't see a cold bot.
+    // (c) Nightshift queue backlog — intentionally NOT suppressed.
 
     try {
         // Startup heartbeat (writes to agent_heartbeats via oversightAgent)
@@ -584,15 +583,20 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     }
 
     try {
-        // Fire AP polling immediately so it's not "stale" until the next */15 tick
-        console.log('[boot] Firing immediate AP poll...');
-        await ops.pollAPInbox().catch((e: any) => {
-            console.warn(`[boot] immediate AP poll failed (non-fatal): ${e.message}`);
-        });
-        await ops.cronHookSuccess("ap-polling");
-        console.log('[boot] AP polling boot run complete.');
+        const { runApBootCatchup } = await import("../lib/ops/ap-boot-catchup");
+        console.log('[boot] Checking AP sparse-window catch-up...');
+        const catchup = await runApBootCatchup();
+        if (catchup.ran) {
+            console.log(
+                `[boot] AP catch-up ran (window=${catchup.windowAt}, reason=${catchup.reason}, status=${catchup.jobStatus})`,
+            );
+        } else {
+            console.log(`[boot] AP catch-up skipped (${catchup.reason}).`);
+            // Still refresh heartbeat marker so dense-threshold views settle.
+            await ops.cronHookSuccess("ap-polling").catch(() => undefined);
+        }
     } catch (e: any) {
-        console.warn(`[boot] AP polling boot run failed (non-fatal): ${e.message}`);
+        console.warn(`[boot] AP catch-up failed (non-fatal): ${e.message}`);
     }
 
     // ── End boot-time warmup
@@ -652,9 +656,12 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     }, 30 * 60 * 1000);
 
     // ── GATED: Cron health watchdog only during business hours ──
+    // Boot grace: skip stale_cron panics for the first 15 minutes after start.
+    // ap-polling is sparse (8/12/17 Denver) — threshold must cover multi-hour gaps.
     const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000;
+    const CRON_WATCHDOG_BOOT_GRACE_MS = 15 * 60 * 1000;
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
-        { name: 'ap-polling', maxStaleMin: 25 },
+        { name: 'ap-polling', maxStaleMin: 20 * 60 }, // sparse 3x/day; match heartbeat probe
         { name: 'po-sync', maxStaleMin: 6 * 60 },
         { name: 'build-completion-watcher', maxStaleMin: 45 },
         { name: 'po-receiving-watcher', maxStaleMin: 45 },
@@ -662,6 +669,9 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     let lastCronWatchdogAlert = 0;
     setInterval(async () => {
         try {
+            if (Date.now() - BOT_START_TIME.getTime() < CRON_WATCHDOG_BOOT_GRACE_MS) {
+                return; // boot-grace: false stale_cron red after restart
+            }
             const { createClient } = await import('../lib/supabase');
             const db = createClient();
             if (!db) return;

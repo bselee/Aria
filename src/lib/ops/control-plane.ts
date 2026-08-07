@@ -26,6 +26,14 @@ export interface OpsDecisionOptions {
     heartbeatStaleMinutes?: number;
     apBacklogAlertMinutes?: number;
     nightshiftBacklogAlertMinutes?: number;
+    /**
+     * Process uptime in minutes. When below bootGraceMinutes, stale_cron
+     * reasons are suppressed (false panic after PM2 restart while dense
+     * jobs have not ticked yet).
+     */
+    botUptimeMinutes?: number;
+    /** Default 15. Pair with botUptimeMinutes. */
+    bootGraceMinutes?: number;
 }
 
 export interface OpsHealthDecision {
@@ -99,6 +107,8 @@ export function buildHeartbeatRecord(opts: {
     };
 }
 
+const DEFAULT_BOOT_GRACE_MINUTES = 15;
+
 export function buildOpsHealthDecision(
     snapshot: OpsHealthSnapshot,
     options: OpsDecisionOptions = {},
@@ -107,14 +117,20 @@ export function buildOpsHealthDecision(
     const heartbeatStaleMinutes = options.heartbeatStaleMinutes ?? DEFAULT_HEARTBEAT_STALE_MINUTES;
     const apBacklogAlertMinutes = options.apBacklogAlertMinutes ?? DEFAULT_AP_BACKLOG_ALERT_MINUTES;
     const nightshiftBacklogAlertMinutes = options.nightshiftBacklogAlertMinutes ?? DEFAULT_NIGHTSHIFT_BACKLOG_ALERT_MINUTES;
+    const bootGraceMinutes = options.bootGraceMinutes ?? DEFAULT_BOOT_GRACE_MINUTES;
+    const inBootGrace =
+        options.botUptimeMinutes != null && options.botUptimeMinutes < bootGraceMinutes;
 
     const projectStatus = normalizeProjectStatus(snapshot.projectStatus);
     if (!isSupabaseProjectReady(projectStatus)) {
         reasons.push(`project_not_ready:${projectStatus}`);
     }
 
-    for (const staleCron of snapshot.staleCrons) {
-        reasons.push(`stale_cron:${staleCron}`);
+    // Boot grace: suppress stale_cron false-red right after restart.
+    if (!inBootGrace) {
+        for (const staleCron of snapshot.staleCrons) {
+            reasons.push(`stale_cron:${staleCron}`);
+        }
     }
 
     if ((snapshot.botHeartbeatAgeMinutes ?? Infinity) > heartbeatStaleMinutes) {

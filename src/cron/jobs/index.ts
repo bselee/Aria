@@ -749,6 +749,7 @@ defineJob({
     handler: async () => {
         const { default: PQueue } = await import("p-queue");
         const { upsertPOCache, getPOCache, getPurchasingCacheStats } = await import("@/lib/storage/purchasing-cache");
+        const { poCacheNeedsEnqueue } = await import("@/lib/storage/po-cache-change");
         const { FinaleClient } = await import("@/lib/finale/client");
         const { enqueueSync } = await import("@/lib/storage/sync-queue");
 
@@ -777,19 +778,19 @@ defineJob({
                     const incomingEta = po.estimated_delivery_date || po.estimated_eta || null;
                     const incomingUpdatedAt = po.updated_at || po.updatedAt || null;
 
-                    // Check if anything actually changed before re-enqueuing.
-                    // Every enqueueSync call costs a sync-queue cycle (20/tick),
-                    // and blindly re-enqueuing 180 unchanged POs every 15 min
-                    // starves the event loop for sparse cron jobs like ap-polling.
+                    // Change detection before re-enqueuing (see po-cache-change.ts).
+                    // Blind re-enqueue of ~180 POs every 15m starved the event loop
+                    // and caused sparse ap-polling windows to miss.
                     const existing = getPOCache(poNumber);
-                    const changed =
-                        !existing ||
-                        existing.status !== incomingStatus ||
-                        existing.total_amount !== incomingTotal ||
-                        existing.line_items !== incomingLineItems ||
-                        existing.lifecycle_state !== incomingLifecycle ||
-                        existing.estimated_eta !== incomingEta ||
-                        existing.updated_at !== incomingUpdatedAt;
+                    const incomingFields = {
+                        status: incomingStatus,
+                        total_amount: incomingTotal,
+                        line_items: incomingLineItems,
+                        lifecycle_state: incomingLifecycle,
+                        estimated_eta: incomingEta,
+                        updated_at: incomingUpdatedAt,
+                    };
+                    const changed = poCacheNeedsEnqueue(existing, incomingFields);
 
                     upsertPOCache({
                         po_number: poNumber,

@@ -127,4 +127,31 @@ describe("buildOpsHealthDecision", () => {
         expect(decision.shouldRestart).toBe(false);
         expect(decision.reasons).toContain("project_not_ready:COMING_UP");
     });
+
+    it("boot-grace: suppresses stale_cron false panic while uptime is low", () => {
+        const decision = buildOpsHealthDecision(
+            makeSnapshot({
+                staleCrons: ["ap-polling", "build-completion-watcher"],
+            }),
+            { botUptimeMinutes: 3, bootGraceMinutes: 15 },
+        );
+
+        expect(decision.reasons.some((r) => r.startsWith("stale_cron:"))).toBe(false);
+        expect(decision.shouldRestart).toBe(false);
+        // No other faults → not degraded during pure boot-grace stale suppression
+        expect(decision.degraded).toBe(false);
+        expect(decision.shouldAlert).toBe(false);
+    });
+
+    it("after boot-grace, stale_cron still counts", () => {
+        const decision = buildOpsHealthDecision(
+            makeSnapshot({
+                staleCrons: ["ap-polling"],
+            }),
+            { botUptimeMinutes: 20, bootGraceMinutes: 15 },
+        );
+
+        expect(decision.reasons).toContain("stale_cron:ap-polling");
+        expect(decision.degraded).toBe(true);
+    });
 });
