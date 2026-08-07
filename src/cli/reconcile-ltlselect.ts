@@ -139,17 +139,19 @@ interface FinaleWriteSurface {
 // ── Apply (live only) ────────────────────────────────────────────────────────
 
 /**
- * Add one FREIGHT adjustment to a Finale PO (GET → unlock → append → POST →
+ * Add one FREIGHT adjustment to a Finale PO (GET → unlock → append/replace → POST →
  * restore), mirroring reconcile-fedex Phase 2.
  *
- * A lone $0 freight placeholder is replaced in place; otherwise the adjustment
- * is appended so multi-delivery vendors keep one line per PRO/BOL.
+ * Single-delivery vendors: replace any existing freight (not just $0).
+ * Multi-delivery vendors: append — each PRO/BOL gets its own line.
+ * A lone $0 placeholder is replaced in place regardless.
  */
 async function applyFreightToPo(
     finale: FinaleWriteSurface,
     poId: string,
     amount: number,
     label: string,
+    isMultiDelivery: boolean,
 ): Promise<void> {
     const po = await finale.getOrderDetails(poId);
     const originalStatus = await finale.unlockForEditing(po, poId);
@@ -159,9 +161,19 @@ async function applyFreightToPo(
         (a) => (a.productPromoUrl ?? "").includes("/10007") && Number(a.amount) === 0,
     );
     const replacement = { amount, description: label, productPromoUrl: FINALE_FREIGHT_PROMO_URL };
+
     if (zeroFreightIdx >= 0 && adjustments.length === 1) {
+        // Replace lone $0 placeholder
         adjustments[zeroFreightIdx] = replacement;
+    } else if (!isMultiDelivery) {
+        // Single-delivery: remove ALL existing freight lines, keep only the new one
+        const nonFreight = adjustments.filter(
+            (a) => !(a.productPromoUrl ?? "").includes("/10007"),
+        );
+        adjustments.length = 0;
+        adjustments.push(...nonFreight, replacement);
     } else {
+        // Multi-delivery: append — each PRO/BOL gets its own line
         adjustments.push(replacement);
     }
 
@@ -303,7 +315,7 @@ async function main(): Promise<void> {
 
         // ── Step 3: match every COLLECT entry ──────────────────────────────
         const results: LtlMatchResult[] = [];
-        const toApply: Array<{ poId: string; entry: CollectEntry; label: string }> = [];
+        const toApply: Array<{ poId: string; entry: CollectEntry; label: string; vendor: string }> = [];
 
         const scoreAndMaybeQueue = (base: LtlMatchResult, receiveDiffDays: number | null) => {
             base.receiveDiffDays = receiveDiffDays;
@@ -323,7 +335,7 @@ async function main(): Promise<void> {
             base.confidenceReasons = score.reasons;
             base.mayApply = score.mayApply || (APPLY_MEDIUM && score.confidence === "medium" && !!base.finalePoId && !base.freightAlreadyOnPO && !base.error && base.matchSource !== "excluded" && base.matchSource !== "unmatched");
             if (base.wouldAdd && base.mayApply && base.finalePoId) {
-                toApply.push({ poId: base.finalePoId, entry: base.entry, label: base.label });
+                toApply.push({ poId: base.finalePoId, entry: base.entry, label: base.label, vendor: base.vendor ?? "" });
             }
             results.push(base);
         };
@@ -484,9 +496,9 @@ async function main(): Promise<void> {
         // ── Step 6: apply freight (live only) ──────────────────────────────
         if (LIVE && toApply.length > 0) {
             console.log(`PHASE 2: Applying ${toApply.length} high-confidence freight adjustment(s)\n`);
-            for (const { poId, entry, label } of toApply) {
+            for (const { poId, entry, label, vendor } of toApply) {
                 try {
-                    await applyFreightToPo(finale, poId, entry.amount, label);
+                    await applyFreightToPo(finale, poId, entry.amount, label, isMultiDeliveryVendor(vendor));
                     run.recordFreight(Math.round(entry.amount * 100));
                     run.recordPoUpdated(poId);
                     const row = results.find((r) => r.entry === entry);

@@ -1,0 +1,351 @@
+/**
+ * @file    src/cli/import-billcom-ref.ts
+ * @purpose Import the AllBillsPage.csv export from bill.com into the
+ *          billcom_bills_ref SQLite table. UPSERTs on (vendor_name, invoice_number)
+ *          so re-running is idempotent.
+ *
+ *          The billcom_bills_ref table feeds the dedup check in
+ *          ap-single-forward.ts → isAlreadyClaimedOrForwarded() — if a
+ *          vendor+invoice# already exists in Bill.com, Aria skips forwarding.
+ *
+ * @author  Hermia
+ * @created 2026-07-30
+ * @updated 2026-07-30 — Initial implementation; replaces placeholder cron ref.
+ * @deps    better-sqlite3 (via local-db)
+ *
+ * Usage:
+ *   npx tsx src/cli/import-billcom-ref.ts
+ *   npx tsx src/cli/import-billcom-ref.ts --csv=path/to/custom.csv
+ */
+
+import { getLocalDb } from "@/lib/storage/local-db";
+import fs from "fs";
+import path from "path";
+
+const DEFAULT_CSV = path.resolve(process.cwd(), "data", "AllBillsPage.csv");
+
+// ── CSV Column Mapping ───────────────────────────────────────────────────────
+// Bill.com "All Bills" CSV → billcom_bills_ref columns.
+// Column names are matched case-insensitively on the header row prefix.
+
+interface ColumnMap {
+  invoiceNumber: string[];
+  vendorName: string[];
+  invoiceAmount: string[];
+  invoiceDate: string[];
+  dueDate: string[];
+  poNumber: string[];
+  chartOfAccount: string[];
+  billType: string[];
+  paymentStatus: string[];
+  currency: string[];
+}
+
+const COLUMN_MAP: ColumnMap = {
+  invoiceNumber: ["invoice #", "invoice number", "inv #", "invoice#", "number", "inv num"],
+  vendorName: ["vendor", "vendor name", "supplier", "payee", "from"],
+  invoiceAmount: ["amount", "total", "invoice amount", "bill amount", "total amount", "amt"],
+  invoiceDate: ["invoice date", "date", "inv date", "bill date", "issued"],
+  dueDate: ["due date", "due", "payment due", "pay by"],
+  poNumber: ["po #", "po number", "purchase order", "po#", "reference"],
+  chartOfAccount: ["chart of account", "category", "account", "gl account", "coa"],
+  billType: ["bill type", "type", "entry type", "source", "origin"],
+  paymentStatus: ["payment status", "status", "pay status", "state"],
+  currency: ["currency", "curr"],
+};
+
+// ── Parsing ──────────────────────────────────────────────────────────────────
+
+interface ParsedRow {
+  invoice_number: string;
+  vendor_name: string;
+  invoice_amount: number | null;
+  invoice_date: string | null;
+  due_date: string | null;
+  po_number: string | null;
+  chart_of_account: string | null;
+  bill_type: string | null;
+  payment_status: string | null;
+  currency: string | null;
+}
+
+/**
+ * Find a column index by matching header text against known names.
+ */
+function findColumn(headers: string[], names: string[]): number {
+  const lowerNames = names.map((n) => n.toLowerCase().trim());
+  for (let i = 0; i < headers.length; i++) {
+    const h = (headers[i] || "").toLowerCase().trim();
+    if (lowerNames.some((n) => h === n || h.startsWith(n) || h.includes(n))) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Parse a single CSV line respecting quoted fields.
+ */
+function parseCSVLine(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < line.length && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ",") {
+        fields.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+  }
+  fields.push(current.trim());
+  return fields;
+}
+
+/**
+ * Safely parse a dollar amount string to a number.
+ */
+function parseAmount(raw: string): number | null {
+  if (!raw) return null;
+  // Remove currency symbols, commas, spaces
+  const cleaned = raw.replace(/[$£€,\s]/g, "").trim();
+  const num = parseFloat(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * Safely parse a date string. Returns ISO format (YYYY-MM-DD) or null.
+ */
+function parseDate(raw: string): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+
+  // MM/DD/YYYY or M/D/YYYY
+  const slashMatch = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    const [, m, d, y] = slashMatch;
+    return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+
+  // YYYY-MM-DD
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) return trimmed;
+
+  // Month DD, YYYY
+  const months: Record<string, string> = {
+    jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+    jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+  };
+  const longMatch = trimmed.match(/^([a-z]{3,9})\s+(\d{1,2}),?\s*(\d{4})$/i);
+  if (longMatch) {
+    const [, mon, d, y] = longMatch;
+    const mm = months[mon.toLowerCase().slice(0, 3)];
+    if (mm) return `${y}-${mm}-${d.padStart(2, "0")}`;
+  }
+
+  return null;
+}
+
+/**
+ * Parse the entire CSV file into structured rows.
+ */
+function parseCSV(filePath: string): ParsedRow[] {
+  const raw = fs.readFileSync(filePath, "utf-8");
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+
+  if (lines.length < 2) {
+    console.warn("[billcom-import] CSV has fewer than 2 lines — nothing to import");
+    return [];
+  }
+
+  const headerLine = lines[0];
+  const headers = parseCSVLine(headerLine);
+
+  console.log(`[billcom-import] CSV headers: ${headers.join(", ")}`);
+
+  // Map column indices
+  const colIdx: Record<string, number> = {};
+  for (const [key, names] of Object.entries(COLUMN_MAP)) {
+    colIdx[key] = findColumn(headers, names);
+  }
+
+  // Log which columns were found
+  for (const [key, idx] of Object.entries(colIdx)) {
+    if (idx >= 0) {
+      console.log(`[billcom-import]   ${key} → column "${headers[idx]}" (idx ${idx})`);
+    } else {
+      console.log(`[billcom-import]   ${key} → NOT FOUND`);
+    }
+  }
+
+  if (colIdx.invoiceNumber < 0 || colIdx.vendorName < 0) {
+    throw new Error(
+      "CSV must have 'Invoice #' and 'Vendor' columns. " +
+      `Found headers: ${headers.join(", ")}`,
+    );
+  }
+
+  // Parse data rows
+  const rows: ParsedRow[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const fields = parseCSVLine(lines[i]);
+
+    const invoiceNumber = (fields[colIdx.invoiceNumber] || "").trim();
+    const vendorName = (fields[colIdx.vendorName] || "").trim();
+
+    // Skip rows with empty required fields
+    if (!invoiceNumber || !vendorName) continue;
+    // Skip header-like rows that might appear mid-file
+    if (invoiceNumber.toLowerCase() === "invoice #") continue;
+
+    rows.push({
+      invoice_number: invoiceNumber,
+      vendor_name: vendorName,
+      invoice_amount: parseAmount(fields[colIdx.invoiceAmount] || ""),
+      invoice_date: parseDate(fields[colIdx.invoiceDate] || ""),
+      due_date: parseDate(fields[colIdx.dueDate] || ""),
+      po_number: (fields[colIdx.poNumber] || "").trim() || null,
+      chart_of_account: (fields[colIdx.chartOfAccount] || "").trim() || null,
+      bill_type: (fields[colIdx.billType] || "").trim() || null,
+      payment_status: (fields[colIdx.paymentStatus] || "").trim() || null,
+      currency: (fields[colIdx.currency] || "").trim() || null,
+    });
+  }
+
+  return rows;
+}
+
+// ── Import ───────────────────────────────────────────────────────────────────
+
+/**
+ * UPSERT parsed rows into billcom_bills_ref.
+ * Uses INSERT OR REPLACE on the UNIQUE(vendor_name, invoice_number) constraint.
+ */
+function importRows(rows: ParsedRow[]): { inserted: number; updated: number; errors: number } {
+  const db = getLocalDb();
+  let inserted = 0;
+  let updated = 0;
+  let errors = 0;
+
+  const upsert = db.prepare(`
+    INSERT INTO billcom_bills_ref (
+      invoice_number, vendor_name, invoice_amount, invoice_date, due_date,
+      po_number, chart_of_account, bill_type, payment_status, currency,
+      imported_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(invoice_number, vendor_name) DO UPDATE SET
+      invoice_amount = excluded.invoice_amount,
+      invoice_date = excluded.invoice_date,
+      due_date = excluded.due_date,
+      po_number = excluded.po_number,
+      chart_of_account = excluded.chart_of_account,
+      bill_type = excluded.bill_type,
+      payment_status = excluded.payment_status,
+      currency = excluded.currency,
+      imported_at = datetime('now')
+  `);
+
+  const insertAll = db.transaction(() => {
+    for (const row of rows) {
+      try {
+        const result = upsert.run(
+          row.invoice_number,
+          row.vendor_name,
+          row.invoice_amount,
+          row.invoice_date,
+          row.due_date,
+          row.po_number,
+          row.chart_of_account,
+          row.bill_type,
+          row.payment_status,
+          row.currency,
+        );
+        // SQLite's changes() counts both inserts and updates
+        if (result.changes > 0) inserted++;
+        // We can't easily distinguish insert vs update without last_insert_rowid
+        // tracking, but the total changes tell us rows were written
+      } catch (err: any) {
+        console.warn(
+          `[billcom-import] Failed to upsert ${row.vendor_name} #${row.invoice_number}: ${err.message}`,
+        );
+        errors++;
+      }
+    }
+  });
+
+  insertAll();
+  return { inserted, updated, errors };
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+export async function main(): Promise<void> {
+  // Allow custom CSV path via --csv= argument
+  const csvArg = process.argv.find((a) => a.startsWith("--csv="));
+  const csvPath = csvArg ? csvArg.split("=")[1] : DEFAULT_CSV;
+
+  console.log(`[billcom-import] Importing Bill.com reference data...`);
+  console.log(`[billcom-import] CSV: ${csvPath}`);
+
+  if (!fs.existsSync(csvPath)) {
+    console.error(`[billcom-import] CSV not found at ${csvPath}`);
+    console.error("[billcom-import] Run download-billcom-ref.ts first, or provide --csv=path/to/file.csv");
+    process.exitCode = 1;
+    return;
+  }
+
+  const stats = fs.statSync(csvPath);
+  console.log(`[billcom-import] File size: ${(stats.size / 1024).toFixed(1)} KB`);
+
+  let rows: ParsedRow[];
+  try {
+    rows = parseCSV(csvPath);
+  } catch (err: any) {
+    console.error(`[billcom-import] Parse error: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`[billcom-import] Parsed ${rows.length} rows`);
+
+  if (rows.length === 0) {
+    console.warn("[billcom-import] No rows to import — CSV may be empty or malformed.");
+    return;
+  }
+
+  const result = importRows(rows);
+
+  // Count total rows in table for reporting
+  const db = getLocalDb();
+  const total = (db.prepare("SELECT COUNT(*) AS cnt FROM billcom_bills_ref").get() as { cnt: number }).cnt;
+
+  console.log(
+    `[billcom-import] ✓ Imported: ${result.inserted + result.updated} rows written ` +
+    `(${result.errors} errors). Table total: ${total} rows.`,
+  );
+}
+
+// CLI entry point
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("[billcom-import] Unhandled:", err);
+    process.exit(1);
+  });
+}
