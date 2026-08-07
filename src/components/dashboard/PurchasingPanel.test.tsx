@@ -583,19 +583,18 @@ describe("PurchasingPanel - draft PO state", () => {
         await waitFor(() => expect(fetch).toHaveBeenCalled());
 
         // Expand so the Order button is draft-only (inspected path).
-        // NOTE(2026-07-28): button label is "Order" (was "Draft PO (N)");
-        // commit modal / Keep Draft is no longer auto-opened after create
-        // (Bill rule 2026-06-23: one click → one draft). Completed vendors
-        // drop from the needing list after a 2s success flash.
-        fireEvent.click(await screen.findByText("▾"));
-        await waitFor(() => expect(screen.getByText(/Colorful printed label/i)).toBeTruthy());
-        fireEvent.click(screen.getByText(/^Order$/i));
+                // NOTE(2026-07-28): button label is "Order" (was "Draft PO (N)");
+                // commit modal / Keep Draft is no longer auto-opened after create
+                // (Bill rule 2026-06-23: one click → one draft).
+                // HERMIA(2026-08-06): vendor leaves Ordering immediately on draft —
+                // no 2s PO# flash (Bill: once PO is generated it must disappear).
+                fireEvent.click(await screen.findByText("▾"));
+                await waitFor(() => expect(screen.getByText(/Colorful printed label/i)).toBeTruthy());
+                fireEvent.click(screen.getByText(/^Order$/i));
 
-        await waitFor(() => expect(screen.getAllByText(/PO #124790/i).length).toBeGreaterThan(0));
-        // Vendor is marked completed after the 2s flash and leaves activeGroups.
-        await waitFor(
-            () => expect(screen.queryByText(/Colorful printed label/i)).toBeNull(),
-            { timeout: 4000 },
-        );
-    });
-});
+                await waitFor(
+                    () => expect(screen.queryByText(/Colorful printed label/i)).toBeNull(),
+                    { timeout: 3000 },
+                );
+            });
+        });

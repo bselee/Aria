@@ -607,52 +607,66 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     }, []);
 
     const fetchReceivings = useCallback(async (silent = false) => {
-            // HERMIA(2026-07-28): Never blank painted rows. Skeleton only on first paint
-            // (no rows yet). Background / interval / post-action reloads use the spinner
-            // flag only — previous POs stay visible until the new payload lands.
-            const hasRows = posRef.current.length > 0;
-            if (silent || hasRows) setRefreshing(true);
-            else setLoading(true);
-            setError(null);
-            try {
-                const [receivingsRes, trackingRes] = await Promise.all([
-                    fetch('/api/dashboard/receivings'),
-                    fetch('/api/dashboard/tracking'),
-                ]);
-
-                if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
-                const data = await receivingsRes.json();
-                if (data.error) throw new Error(data.error);
-                const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
-
-                // Notify Ordering when new receipt IDs appear so purchasing cache busts.
-                const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
-                const prev = knownReceiptIdsRef.current;
-                if (prev.size > 0) {
-                    const fresh = nextIds.filter((id: string) => !prev.has(id));
-                    if (fresh.length > 0) {
-                        notifyReceiptRef.current(fresh);
+                // HERMIA(2026-07-28): Never blank painted rows. Skeleton only on first paint
+                // (no rows yet). Background / interval / post-action reloads use the spinner
+                // flag only — previous POs stay visible until the new payload lands.
+                const hasRows = posRef.current.length > 0;
+                if (silent || hasRows) setRefreshing(true);
+                else setLoading(true);
+                setError(null);
+                try {
+                    // HERMIA(2026-08-06): Abort after 18s so the panel cannot spin forever.
+                    // API has its own 20s guard + 3min cache; client must not hang longer.
+                    const ctrl = new AbortController();
+                    const kill = setTimeout(() => ctrl.abort(), 18_000);
+                    let receivingsRes: Response;
+                    let trackingRes: Response | null = null;
+                    try {
+                        [receivingsRes, trackingRes] = await Promise.all([
+                            fetch('/api/dashboard/receivings', { signal: ctrl.signal }),
+                            fetch('/api/dashboard/tracking', { signal: ctrl.signal }).catch(() => null),
+                        ]);
+                    } finally {
+                        clearTimeout(kill);
                     }
-                }
-                knownReceiptIdsRef.current = new Set(nextIds);
-                setPos(sorted);
-                setMatchSuggestions(data.matchSuggestions || []);
-                setRecentAutoCompletions(data.recentAutoCompletions || []);
-                setFreightClasses(data.freightClasses || {});
 
-                if (trackingRes.ok) {
-                    const trackingData = await trackingRes.json();
-                    setTodaySummary(trackingData.todaySummary || null);
-                } else {
-                    setTodaySummary(null);
+                    if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
+                    const data = await receivingsRes.json();
+                    if (data.error && !(data.received?.length)) throw new Error(data.error);
+                    const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
+
+                    // Notify Ordering when new receipt IDs appear so purchasing cache busts.
+                    const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
+                    const prev = knownReceiptIdsRef.current;
+                    if (prev.size > 0) {
+                        const fresh = nextIds.filter((id: string) => !prev.has(id));
+                        if (fresh.length > 0) {
+                            notifyReceiptRef.current(fresh);
+                        }
+                    }
+                    knownReceiptIdsRef.current = new Set(nextIds);
+                    setPos(sorted);
+                    setMatchSuggestions(data.matchSuggestions || []);
+                    setRecentAutoCompletions(data.recentAutoCompletions || []);
+                    setFreightClasses(data.freightClasses || {});
+
+                    if (trackingRes && trackingRes.ok) {
+                        const trackingData = await trackingRes.json();
+                        setTodaySummary(trackingData.todaySummary || null);
+                    } else if (!hasRows) {
+                        setTodaySummary(null);
+                    }
+                } catch (e: any) {
+                    // Keep painted rows on timeout/abort — only surface error when empty
+                    if (!posRef.current.length) {
+                        const msg = e?.name === 'AbortError' ? 'Receivings timed out — retry' : e.message;
+                        setError(msg);
+                    }
+                } finally {
+                    setLoading(false);
+                    setRefreshing(false);
                 }
-            } catch (e: any) {
-                setError(e.message);
-            } finally {
-                setLoading(false);
-                setRefreshing(false);
-            }
-        }, []);
+            }, []);
 
         useEffect(() => {
             fetchReceivings();

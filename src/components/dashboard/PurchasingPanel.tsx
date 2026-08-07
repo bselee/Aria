@@ -192,10 +192,42 @@ type OpenPODetail = {
 const SNOOZE_LS = "aria-dash-purchasing-snooze";
 const FOCUS_FILTER_LS = "aria-dash-purchasing-focus";
 const LIFECYCLE_FILTER_LS = "aria-dash-purchasing-lifecycle";
+/** Session-scoped: vendors just ordered stay off Ordering until Finale recent-PO overlay catches up. */
+const ORDERED_VENDORS_LS = "aria-dash-purchasing-ordered-vendors";
+const ORDERED_VENDOR_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
+type OrderedVendorEntry = { at: number; orderId?: string };
+
+function readOrderedVendors(): Record<string, OrderedVendorEntry> {
+    try {
+        const raw = sessionStorage.getItem(ORDERED_VENDORS_LS);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw) as Record<string, OrderedVendorEntry>;
+        const now = Date.now();
+        const keep: Record<string, OrderedVendorEntry> = {};
+        for (const [pid, entry] of Object.entries(parsed || {})) {
+            if (entry?.at && now - entry.at < ORDERED_VENDOR_TTL_MS) keep[pid] = entry;
+        }
+        return keep;
+    } catch {
+        return {};
+    }
+}
+
+function writeOrderedVendor(vendorPartyId: string, orderId?: string): void {
+    try {
+        const next = readOrderedVendors();
+        next[vendorPartyId] = { at: Date.now(), orderId };
+        sessionStorage.setItem(ORDERED_VENDORS_LS, JSON.stringify(next));
+    } catch { /* ignore */ }
+}
 function lifecycleBucket(item: PurchasingItem): LifecycleBucket {
     const reasons = item.assessment?.reasonCodes ?? [];
-    if (reasons.includes("on_order_already_covers_need")) return "on_order";
+    // Draft or committed open-PO coverage — Ordering only keeps need/topping.
+    if (reasons.includes("on_order_already_covers_need") || reasons.includes("recent_draft_exists")) {
+        return "on_order";
+    }
+    if (item.draftPO) return "on_order";
     const decision = item.assessment?.decision;
     if (decision === "order") return item.stockOnOrder > 0 ? "topping" : "need";
     return "other"; // hold (other reasons), manual_review, reduce
@@ -387,20 +419,48 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
-    // Vendors that have been drafted — they disappear from the list after a 2s confirmation flash.
-    const [completedVendors, setCompletedVendors] = useState<Set<string>>(new Set());
-    // Full POResult per vendor (for verification + ETA display on the success pill).
-    const [createdPODetails, setCreatedPODetails] = useState<Record<string, POResult>>({});
-    // Per-modal step state for the Commit & Send flow.
-    const [sendSteps, setSendSteps] = useState<SendSteps>({});
-    const [commitIssues, setCommitIssues] = useState<string[]>([]);
+    // Vendors that have been drafted/committed — disappear from Ordering immediately.
+        // Seeded from sessionStorage so a hard refresh within 6h doesn't resurrect them
+        // before the fresh recent-PO coverage overlay lands on GET.
+        const [completedVendors, setCompletedVendors] = useState<Set<string>>(() => {
+            if (typeof window === "undefined") return new Set();
+            return new Set(Object.keys(readOrderedVendors()));
+        });
+        // Full POResult per vendor (for verification + ETA display on the success pill).
+        const [createdPODetails, setCreatedPODetails] = useState<Record<string, POResult>>({});
+        // Per-modal step state for the Commit & Send flow.
+        const [sendSteps, setSendSteps] = useState<SendSteps>({});
+        const [commitIssues, setCommitIssues] = useState<string[]>([]);
 
-    // commit & send modal
-    const [commitModal, setCommitModal] = useState<CommitReview | null>(null);
-    const [commitLoading, setCommitLoading] = useState<string | null>(null); // orderId being reviewed
-    const [sendingPO, setSendingPO] = useState(false);
-    const [sentPOs, setSentPOs] = useState<Set<string>>(new Set()); // orderId → sent
-    const [canRetryEmail, setCanRetryEmail] = useState(false);
+        // commit & send modal
+        const [commitModal, setCommitModal] = useState<CommitReview | null>(null);
+        const [commitLoading, setCommitLoading] = useState<string | null>(null); // orderId being reviewed
+        const [sendingPO, setSendingPO] = useState(false);
+        const [sentPOs, setSentPOs] = useState<Set<string>>(new Set()); // orderId → sent
+        const [canRetryEmail, setCanRetryEmail] = useState(false);
+
+        /**
+         * Immediately drop a vendor from Ordering after draft/commit.
+         * Persists to sessionStorage so remounts stay clean until Finale recent-PO
+         * overlay (GET) is the durable source of truth.
+         */
+        function markVendorOrdered(vendorPartyId: string, orderId?: string) {
+            writeOrderedVendor(vendorPartyId, orderId);
+            setCompletedVendors(p => new Set(p).add(vendorPartyId));
+            setData(prev => prev
+                ? { ...prev, groups: prev.groups.filter(g => g.vendorPartyId !== vendorPartyId) }
+                : prev);
+            setCreatedPOs(prev => {
+                const next = { ...prev };
+                delete next[vendorPartyId];
+                return next;
+            });
+            setCreatedPODetails(prev => {
+                const next = { ...prev };
+                delete next[vendorPartyId];
+                return next;
+            });
+        }
 
     // validation modal for PO quantity and case rounding guardrails
     const [validationModal, setValidationModal] = useState<any | null>(null);
@@ -732,9 +792,26 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                 setScanning(Boolean(json.refreshing && !hasGroups));
 
                                 setData(json);
-                                setLoading(false);
+                                                                setLoading(false);
 
-                // Init checkboxes/qtys for new groups
+                                                // Keep just-ordered vendors out of the painted list even when SWR
+                                                // still returns pre-order need math (full rescan is 12–15 min).
+                                                // Server recent-PO overlay is the durable fix; this is the paint guard.
+                                                const orderedIds = new Set([
+                                                    ...completedVendors,
+                                                    ...Object.keys(readOrderedVendors()),
+                                                ]);
+                                                if (orderedIds.size > 0) {
+                                                    setCompletedVendors(orderedIds);
+                                                    setData(prev => prev
+                                                        ? {
+                                                            ...prev,
+                                                            groups: prev.groups.filter(g => !orderedIds.has(g.vendorPartyId)),
+                                                        }
+                                                        : prev);
+                                                }
+
+                                                // Init checkboxes/qtys for new groups
                 setChecked(prev => {
                     const next: Record<string, Record<string, boolean>> = { ...prev };
                     for (const g of json.groups) {
@@ -862,19 +939,17 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             try {
                 const result = await createVendorPO(group, true);
                 if (result?.orderId) {
-                    setCreatedPOs(p => ({ ...p, [pid]: result }));
-                    const res = await fetch('/api/dashboard/purchasing/commit', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                    });
-                    if (res.ok) {
-                        setSentPOs(p => new Set(p).add(result.orderId!));
-                        setCompletedVendors(p => new Set(p).add(pid));
-                    } else {
-                        setCompletedVendors(p => new Set(p).add(pid));
-                    }
-                }
+                                    setCreatedPOs(p => ({ ...p, [pid]: result }));
+                                    const res = await fetch('/api/dashboard/purchasing/commit', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
+                                    });
+                                    // Draft (and usually commit) landed in Finale — leave Ordering now.
+                                    // Email failure must not keep the vendor on the board.
+                                    if (res.ok) setSentPOs(p => new Set(p).add(result.orderId!));
+                                    markVendorOrdered(pid, result.orderId);
+                                }
             } catch (e: any) {
                 console.error(`[order-all] ${group.vendorName}:`, e.message);
             } finally {
@@ -898,25 +973,22 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         try {
             const result = await createVendorPO(group, true); // bypass all server guards
             if (result) {
-                const poId = result.orderId || "pending";
-                // Brief success flash, then poof after 2s
-                setCreatedPOs(p => ({ ...p, [pid]: result }));
-                setCreatedPODetails(p => ({ ...p, [pid]: result }));
-                setTimeout(() => {
-                    setCompletedVendors(p => new Set(p).add(pid));
-                }, 2000);
-                const selItems = selectedItems;
-                const totalUnits = selItems.reduce((s, i) => s + (qtys[pid]?.[i.productId] ?? i.assessment?.recommendedQty ?? i.suggestedQty), 0);
-                lifecycle.notifyDraft({
-                    vendorName: group.vendorName,
-                    orderId: result.orderId || "pending",
-                    itemCount: selItems.length || group.items.length,
-                    totalUnits,
-                });
-                await load(true);
-                // DO NOT auto-transition to handleReviewAndSend — send function needs fix
-            }
-            await load(true);
+                            // Draft created in Finale — leave Ordering immediately (Active POs owns it).
+                            setCreatedPOs(p => ({ ...p, [pid]: result }));
+                            setCreatedPODetails(p => ({ ...p, [pid]: result }));
+                            markVendorOrdered(pid, result.orderId);
+                            const selItems = selectedItems;
+                            const totalUnits = selItems.reduce((s, i) => s + (qtys[pid]?.[i.productId] ?? i.assessment?.recommendedQty ?? i.suggestedQty), 0);
+                            lifecycle.notifyDraft({
+                                vendorName: group.vendorName,
+                                orderId: result.orderId || "pending",
+                                itemCount: selItems.length || group.items.length,
+                                totalUnits,
+                            });
+                            await load(true);
+                            // DO NOT auto-transition to handleReviewAndSend — send function needs fix
+                        }
+                        await load(true);
         } catch (e: any) {
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
@@ -987,42 +1059,33 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 return;
             }
             const details = json.details ?? {};
-            if (details.finaleEmailSent || emailSent) {
-                setSentPOs(p => new Set(p).add(commitModal.review.orderId));
-                // Bridge: re-notify Purchases pane that PO is now committed (not just drafted)
-                lifecycle.notifyDraft({
-                    vendorName: commitModal.review.vendorName,
-                    orderId: commitModal.review.orderId,
-                    itemCount: commitModal.review.items.length,
-                    totalUnits: commitModal.review.items.reduce((s, i) => s + i.quantity, 0),
-                });
-            }
-            setCreatedPOs(prev => {
-                const next = { ...prev };
-                delete next[commitModal.review.vendorPartyId];
-                return next;
-            });
-            setCreatedPODetails(prev => {
-                const next = { ...prev };
-                delete next[commitModal.review.vendorPartyId];
-                return next;
-            });
-            setData(prev => prev
-                ? { ...prev, groups: prev.groups.filter(g => g.vendorPartyId !== commitModal.review.vendorPartyId) }
-                : prev);
+                        // Notify Active POs when committed (email optional — native send often fails).
+                        if (committed || details.finaleEmailSent || emailSent) {
+                            if (details.finaleEmailSent || emailSent) {
+                                setSentPOs(p => new Set(p).add(commitModal.review.orderId));
+                            }
+                            lifecycle.notifyDraft({
+                                vendorName: commitModal.review.vendorName,
+                                orderId: commitModal.review.orderId,
+                                itemCount: commitModal.review.items.length,
+                                totalUnits: commitModal.review.items.reduce((s, i) => s + i.quantity, 0),
+                            });
+                        }
+                        // Bill: once PO is generated/committed, leave Ordering immediately.
+                        markVendorOrdered(commitModal.review.vendorPartyId, commitModal.review.orderId);
 
-            // Auto-close only on a fully-clean result; otherwise leave modal open so
-            // Will can see which step failed.
-            const allClean = committed && (skipEmail || (emailSent && emailVerified)) && !(v?.issues?.length);
-            if (allClean) setCommitModal(null);
+                        // Auto-close only on a fully-clean result; otherwise leave modal open so
+                        // Will can see which step failed.
+                        const allClean = committed && (skipEmail || (emailSent && emailVerified)) && !(v?.issues?.length);
+                        if (allClean) setCommitModal(null);
 
-            if (json.status === 'partial_success') {
-                setError(json.userMessage || 'PO committed in Finale, but the vendor email still needs review.');
-                setCanRetryEmail(Boolean(json.details?.retryable));
-            } else {
-                setCanRetryEmail(false);
-            }
-            await load(true);
+                        if (json.status === 'partial_success') {
+                            setError(json.userMessage || 'PO committed in Finale, but the vendor email still needs review.');
+                            setCanRetryEmail(Boolean(json.details?.retryable));
+                        } else {
+                            setCanRetryEmail(false);
+                        }
+                        await load(true);
         } catch (e: any) {
             setSendSteps({ commit: 'fail', email: 'fail', verify: 'fail' });
             setError(`Send failed: ${e.message}`);
@@ -2196,21 +2259,23 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                 </span>
                                                                 <button
                                                                     onClick={async () => {
-                                                                        const poId = createdPOs[pid].orderId;
-                                                                        if (!poId) return;
-                                                                        const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                            method: 'POST',
-                                                                            headers: { 'Content-Type': 'application/json' },
-                                                                            body: JSON.stringify({ action: 'send-direct', orderId: poId, vendorPartyId: pid }),
-                                                                        });
-                                                                        if (res.ok) {
-                                                                            setSentPOs(p => new Set(p).add(poId));
-                                                                            setCompletedVendors(p => new Set(p).add(pid));
-                                                                        } else {
-                                                                            const json = await res.json();
-                                                                            setError(`Send failed: ${json.error || 'Unknown'}`);
-                                                                        }
-                                                                    }}
+                                                                                                                                            const poId = createdPOs[pid].orderId;
+                                                                                                                                            if (!poId) return;
+                                                                                                                                            const res = await fetch('/api/dashboard/purchasing/commit', {
+                                                                                                                                                method: 'POST',
+                                                                                                                                                headers: { 'Content-Type': 'application/json' },
+                                                                                                                                                body: JSON.stringify({ action: 'send-direct', orderId: poId, vendorPartyId: pid }),
+                                                                                                                                            });
+                                                                                                                                            if (res.ok) {
+                                                                                                                                                setSentPOs(p => new Set(p).add(poId));
+                                                                                                                                                markVendorOrdered(pid, poId);
+                                                                                                                                            } else {
+                                                                                                                                                // Draft already exists — still leave Ordering; retry email from Purchases/Finale.
+                                                                                                                                                markVendorOrdered(pid, poId);
+                                                                                                                                                const json = await res.json().catch(() => ({}));
+                                                                                                                                                setError(`Send failed: ${(json as any).error || 'Unknown'} — PO stays in Finale`);
+                                                                                                                                            }
+                                                                                                                                        }}
                                                                     className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-amber-500 bg-amber-600/30 hover:bg-amber-500/40 text-amber-200 transition-colors"
                                                                 >Send</button>
                                                             </div>
@@ -2246,26 +2311,26 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                                         } else {
                                                                                                                             // You trust it — draft + commit + send
                                                                                                                             try {
-                                                                                                                                const result = await createVendorPO(group, true);
-                                                                                                                                if (result?.orderId) {
-                                                                                                                                    setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                                                                                                                    const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                        method: 'POST',
-                                                                                                                                        headers: { 'Content-Type': 'application/json' },
-                                                                                                                                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                                                                                                                    });
-                                                                                                                                    if (res.ok) {
-                                                                                                                                        setSentPOs(p => new Set(p).add(result.orderId!));
-                                                                                                                                        setCompletedVendors(p => new Set(p).add(pid));
-                                                                                                                                    } else {
-                                                                                                                                        setCompletedVendors(p => new Set(p).add(pid));
-                                                                                                                                        setError('Draft created — send failed. Click Send to retry.');
-                                                                                                                                    }
-                                                                                                                                    await load(true);
-                                                                                                                                } else {
-                                                                                                                                    setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
-                                                                                                                                }
-                                                                                                                            } catch (e: any) { setError(e.message); }
+                                                                                                                                                                                                                                                            const result = await createVendorPO(group, true);
+                                                                                                                                                                                                                                                            if (result?.orderId) {
+                                                                                                                                                                                                                                                                setCreatedPOs(p => ({ ...p, [pid]: result }));
+                                                                                                                                                                                                                                                                const res = await fetch('/api/dashboard/purchasing/commit', {
+                                                                                                                                                                                                                                                                    method: 'POST',
+                                                                                                                                                                                                                                                                    headers: { 'Content-Type': 'application/json' },
+                                                                                                                                                                                                                                                                    body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
+                                                                                                                                                                                                                                                                });
+                                                                                                                                                                                                                                                                if (res.ok) {
+                                                                                                                                                                                                                                                                    setSentPOs(p => new Set(p).add(result.orderId!));
+                                                                                                                                                                                                                                                                } else {
+                                                                                                                                                                                                                                                                    setError('Draft created — send failed. PO is in Finale; email may need manual send.');
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                // PO exists in Finale — leave Ordering regardless of email path.
+                                                                                                                                                                                                                                                                markVendorOrdered(pid, result.orderId);
+                                                                                                                                                                                                                                                                await load(true);
+                                                                                                                                                                                                                                                            } else {
+                                                                                                                                                                                                                                                                setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
+                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                        } catch (e: any) { setError(e.message); }
                                                                                                                         }
                                                                                                                     }}
                                                                                                                     disabled={anyCreating}

@@ -110,6 +110,19 @@ export default function InvoicePOMatcher({
         const autoMatched: MatchSuggestion[] = [];
 
         for (const s of suggestions) {
+            // HERMIA(2026-08-06): Drop junk OCR rows — $0/$7 invoices with no
+            // usable total must never land in Review (Grassroots noise).
+            const total = Number(s.invoiceTotal || 0);
+            const invNo = String(s.invoiceNumber || "").trim();
+            if (total < 1 && (!invNo || invNo === "—" || invNo === "-")) continue;
+            if (total < 1 && s.candidates.every((c) => Math.abs(Number(c.total || 0) - total) > 50)) continue;
+            // Amount mismatch > 80% of PO total with near-zero invoice → noise
+            const bestCand = s.candidates[0];
+            if (bestCand && total > 0 && bestCand.total > 0) {
+                const ratio = total / bestCand.total;
+                if (ratio < 0.05 && bestCand.total >= 100) continue; // e.g. $7 vs $3966
+            }
+
             if (s.autoMatched) {
                 autoMatched.push(s);
             } else {

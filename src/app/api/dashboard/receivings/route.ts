@@ -23,6 +23,25 @@ import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconcil
 // attempt to auto-reconcile the same PO simultaneously.
 // The Set is module-scoped so it resets on server restart / HMR.
 const _reconcilingPOs = new Set<string>();
+
+// ── GET response cache (paint-first) ─────────────────────────────────────
+// HERMIA(2026-08-06): Panel timed out because every GET ran Finale GraphQL
+// + up to 12× findPOCandidates + auto-reconcile Finale writes. Cache the
+// full JSON for 3 minutes so lifecycle paint is ~ms; bust=1 forces rebuild.
+type ReceivingsPayload = {
+    received: any[];
+    days: number;
+    range: string;
+    startDate: string;
+    asOf: string;
+    matchSuggestions: any[];
+    freightClasses: Record<string, any>;
+    recentAutoCompletions?: any[];
+    cachedAt?: string;
+    cacheAgeMs?: number;
+};
+let _getCache: { at: number; key: string; payload: ReceivingsPayload } | null = null;
+const GET_CACHE_TTL_MS = 3 * 60 * 1000;
 // ────────────────────────────────────────────────────────────────────────────
 
 // ── Concurrency-limited async map ────────────────────────────────────────
@@ -89,9 +108,9 @@ function extractLineItems(inv: any): Array<{ sku?: string; qty?: number; descrip
 
 export async function GET(req: NextRequest) {
     // ── Outer guard: the route MUST NEVER hang the socket ──
-    // If the handler doesn't resolve within 45s (including Finale timeout),
-    // return a graceful error payload instead of a hung connection.
-    const ROUTE_TIMEOUT_MS = 45_000;
+    // HERMIA(2026-08-06): Dropped 45s → 20s. Panel paint budget is ~5–8s;
+    // anything longer feels like a timeout. Prefer cached payload over hang.
+    const ROUTE_TIMEOUT_MS = 20_000;
     try {
         const payload = await Promise.race([
             handleGET(req),
@@ -102,6 +121,16 @@ export async function GET(req: NextRequest) {
         return payload;
     } catch (outerErr: any) {
         console.warn('[receivings] Route guard caught hang — returning graceful error:', outerErr?.message || outerErr);
+        // Serve stale cache if we have one rather than empty skeleton
+        if (_getCache?.payload?.received?.length) {
+            const age = Date.now() - _getCache.at;
+            return NextResponse.json({
+                ..._getCache.payload,
+                stale: true,
+                cacheAgeMs: age,
+                message: 'Serving cached receivings after timeout',
+            }, { headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'stale-on-timeout' } });
+        }
         return NextResponse.json({
             error: 'finale_timeout',
             message: 'Receivings data temporarily unavailable — Finale rate-limited',
@@ -122,6 +151,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
         const { searchParams } = new URL(req.url);
         const daysParam = searchParams.get('days');
         const matchInvoiceId = searchParams.get('match_invoice');
+        const bust = searchParams.has('bust');
 
         const now = new Date();
         const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
@@ -140,6 +170,15 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 return start.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
             })();
 
+        const cacheKey = `${startStr}|${todayStr}|${matchInvoiceId || ''}`;
+        if (!bust && _getCache && _getCache.key === cacheKey && (Date.now() - _getCache.at) < GET_CACHE_TTL_MS) {
+            const age = Date.now() - _getCache.at;
+            return NextResponse.json(
+                { ..._getCache.payload, cachedAt: new Date(_getCache.at).toISOString(), cacheAgeMs: age },
+                { headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'hit' } },
+            );
+        }
+
         const tomorrow = new Date(now);
         tomorrow.setDate(tomorrow.getDate() + 1);
         const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
@@ -154,14 +193,21 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
         // rate-limited, and there is no enrichment race left to tune here.
         let received: any[] = [];
         try {
-            // NOTE(2026-07-27): No inner timeout here — the request path in
-            // getTodaysReceivedPOs performs no shipment network I/O, so it cannot
-            // stall on Finale rate limiting. The outer route guard (45s) remains the
-            // sole backstop for a genuinely hung connection.
-            received = await finale.getTodaysReceivedPOs(startStr, tomorrowStr);
+            // Soft budget: GraphQL must not eat the whole route timeout.
+            received = await Promise.race([
+                finale.getTodaysReceivedPOs(startStr, tomorrowStr),
+                new Promise<any[]>((_, reject) =>
+                    setTimeout(() => reject(new Error('getTodaysReceivedPOs soft budget 12s')), 12_000),
+                ),
+            ]);
         } catch (finaleErr: any) {
             console.warn('[receivings] Finale getTodaysReceivedPOs failed/timeout:', finaleErr?.message || finaleErr);
-            received = [];
+            // Prefer stale received list over empty if cache has one
+            if (_getCache?.payload?.received?.length) {
+                received = _getCache.payload.received;
+            } else {
+                received = [];
+            }
         }
 
         // Enrich with reconciliation data from local Postgres
@@ -310,318 +356,151 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
-                    // Hard cap — findPOCandidates hits PostgREST; unbounded loops hang the panel
-                    const toScore = unmatchedInvoices.slice(0, 12);
-                    // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
-                    const { classifyInvoice } = await import('@/config/invoice-classification');
-                    const filteredToScore = toScore.filter((inv: any) => {
-                        const cls = classifyInvoice({
-                            vendorName: inv.vendor_name,
-                            poNumber: inv.raw_data?.ocrPoCandidate || inv.po_number || null,
-                        });
-                        return cls.classification !== 'dropship_flow_through';
-                    });
-                    // Prefer filtered list
-                    const scoreList = filteredToScore; // always use filtered (may be empty)
-
-                    // ── Phase A: score all invoices in parallel (read-only, concurrency 4) ──
-                    // DECISION(2026-07-27): Previously this loop scored up to 12 invoices
-                    // sequentially against 4s findPOCandidates timeouts (~48s worst case).
-                    // Now scoring runs in parallel at concurrency 4. The write/auto-apply
-                    // phase (Phase B) remains strictly sequential — financial writes must
-                    // never overlap. These are local PostgREST calls, NOT subject to the
-                    // Finale 500ms global queue.
-                    // Dropship POs/invoices are excluded before scoring (scoreList).
-                    const scoredResults = await mapConcurrent(scoreList, 4, async (inv) => {
-                        // OCR short-circuit: no DB call needed — still never offer dropship POs
-                        const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
-                        if (inv._fromCache && ocrPo && !/DropshipPO/i.test(String(ocrPo))) {
-                            return {
-                                inv,
-                                status: 'ocr' as const,
-                                ocrSuggestion: {
-                                    invoiceId: inv.id,
-                                    invoiceNumber: inv.invoice_number,
-                                    vendorName: inv.vendor_name,
-                                    invoiceDate: inv.invoice_date,
-                                    invoiceTotal: inv.total,
-                                    candidates: [{
-                                        orderId: String(ocrPo),
-                                        vendorName: inv.vendor_name,
-                                        orderDate: inv.invoice_date || '',
-                                        total: Number(inv.total || 0),
-                                        status: 'ocr_candidate',
-                                        score: 70,
-                                        reasons: ['OCR PO# candidate'],
-                                        isOpen: true,
-                                    }],
-                                    autoApplyReady: false,
-                                    fromCache: true,
-                                    invoiceLineItems: extractLineItems(inv),
-                                },
-                            };
-                        }
-                        try {
-                            const scorePromise = findPOCandidates({
-                                id: inv.id,
-                                invoiceNumber: inv.invoice_number,
-                                vendorName: inv.vendor_name,
-                                invoiceDate: inv.invoice_date,
-                                subtotal: Number(inv.subtotal || 0),
-                                freight: Number(inv.freight || 0),
-                                tax: Number(inv.tax || 0),
-                                total: Number(inv.total || 0),
-                                lineItems: inv.raw_data?.lineItems || [],
-                                ocrPoCandidate: inv.raw_data?.ocrPoCandidate || inv.raw_data?.poNumber || null,
-                                ocrOrderCandidate: inv.raw_data?.orderNumber || null,
-                            });
-                            const result = await Promise.race([
-                                scorePromise,
-                                new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
-                            ]);
-                            if (!result) {
-                                return { inv, status: 'timed_out' as const };
-                            }
-                            return { inv, status: 'scored' as const, result };
-                        } catch (err: any) {
-                            return { inv, status: 'error' as const, err };
-                        }
-                    });
-
-                    // ── Phase B: process scored results sequentially (side-effect-safe) ──
-                    for (const sr of scoredResults) {
-                        const { inv } = sr;
-                        if (sr.status === 'ocr' && sr.ocrSuggestion) {
-                            // Never offer dropship POs as OCR match targets
-                            const ocrCands = (sr.ocrSuggestion.candidates || []).filter(
-                                (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
-                            );
-                            if (ocrCands.length === 0) continue;
-                            matchSuggestions.push({ ...sr.ocrSuggestion, candidates: ocrCands });
-                            continue;
-                        }
-                        if (sr.status === 'timed_out') {
-                            matchSuggestions.push({
-                                invoiceId: inv.id,
-                                invoiceNumber: inv.invoice_number,
-                                vendorName: inv.vendor_name,
-                                invoiceDate: inv.invoice_date,
-                                invoiceTotal: inv.total,
-                                candidates: [],
-                                autoApplyReady: false,
-                                fromCache: !!inv._fromCache,
-                                timedOut: true,
-                                invoiceLineItems: extractLineItems(inv),
-                            });
-                            continue;
-                        }
-                        if (sr.status === 'error') {
-                            console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
-                            continue;
-                        }
-
-                        // Scored successfully — execute side effects
-                        const result = sr.result!;
-                        // Strip dropship POs from candidates — never match those
-                        result.candidates = (result.candidates || []).filter(
-                            (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
-                        );
-                        if (result.candidates.length === 0) {
-                            matchSuggestions.push({
-                                invoiceId: inv.id,
-                                invoiceNumber: inv.invoice_number,
-                                vendorName: inv.vendor_name,
-                                invoiceDate: inv.invoice_date,
-                                invoiceTotal: inv.total,
-                                candidates: [],
-                                autoApplyReady: false,
-                                fromCache: !!inv._fromCache,
-                                invoiceLineItems: extractLineItems(inv),
-                            });
-                            continue;
-                        }
-                        // Recompute best after filter
-                        result.bestMatch = result.candidates[0] || null;
-                        if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
-                            result.autoApplyReady = false;
-                        }
-                        try {
-                            // Auto-apply high-confidence matches: score ≥80 and autoApplyReady
-                            // Never auto-apply cache-only rows against PostgREST (id may be local)
-                            // Never auto-apply dropship POs
-                            const best = result.candidates[0];
-                            const shouldAutoApply =
-                                best &&
-                                best.score >= 80 &&
-                                result.autoApplyReady &&
-                                !inv._fromCache &&
-                                !/DropshipPO/i.test(String(best.orderId || ''));
-
-                            if (shouldAutoApply) {
-                                // Auto-match: link invoice to PO, but DON'T complete PO in Finale
-                                // Human must review and click Complete PO to finalize
-                                try {
-                                    await sb
-                                        .from('vendor_invoices')
-                                        .update({ po_number: best.orderId, status: 'matched', updated_at: new Date().toISOString() })
-                                        .eq('id', inv.id);
-
-                                    await transitionLifecycleState(
-                                        best.orderId,
-                                        'INVOICED',
-                                        'receivings-auto-match',
-                                        {
-                                            invoiceId: inv.id,
-                                            invoiceNumber: inv.invoice_number,
-                                            score: best.score,
-                                            reasons: best.reasons,
-                                        }
-                                    );
-
-                                    // Route through reconciler — single source of truth for freight/fees.
-                                    // Uses delta-based freight, duplicate detection, disproportion guards.
-                                    // Skip if this PO is already being reconciled by another request.
-                                    if (_reconcilingPOs.has(best.orderId)) {
-                                        console.log(
-                                            `[receivings] Skipping PO ${best.orderId} — reconciliation already in-flight`,
-                                        );
-                                    } else {
-                                        // Only trust raw_data if it has the InvoiceData shape.
-                                        // Modules / raw email payloads stored as raw_data lack the
-                                        // required fields and would pass nulls into the reconciler.
-                                        const rawData = inv.raw_data as Record<string, unknown> | undefined;
-                                        const hasValidRawData =
-                                            rawData &&
-                                            typeof rawData.vendorName === 'string' &&
-                                            typeof rawData.invoiceNumber === 'string' &&
-                                            typeof rawData.total === 'number';
-
-                                        const invoiceData = hasValidRawData ? rawData : {
-                                            vendorName: inv.vendor_name,
-                                            invoiceNumber: inv.invoice_number,
-                                            invoiceDate: inv.invoice_date,
-                                            dueDate: null,
-                                            total: Number(inv.total || 0),
-                                            amountDue: Number(inv.total || 0),
-                                            subtotal: Number(inv.subtotal || 0),
-                                            freight: Number(inv.freight || 0),
-                                            tax: Number(inv.tax || 0),
-                                            poNumber: best.orderId,
-                                            lineItems: inv.raw_data?.lineItems || [],
-                                            confidence: "medium" as const,
-                                        };
-
-                                        _reconcilingPOs.add(best.orderId);
-                                        try {
-                                            const reconResult = await reconcileInvoiceToPO(
-                                                invoiceData as any,
-                                                best.orderId,
-                                                finale,
-                                                'receivings-auto-match',
-                                            );
-
-                                            if (reconResult.overallVerdict === 'auto_approve') {
-                                                await applyReconciliation(reconResult, finale);
-                                            }
-
-                                            // Log the auto-match event
-                                            await sb.from('ap_activity_log').insert({
-                                                intent: 'RECONCILIATION_AUTO_APPLIED',
-                                                action_taken: `Auto-matched to PO ${best.orderId} — recon verdict=${reconResult.overallVerdict}`,
-                                                metadata: {
-                                                    invoiceNumber: inv.invoice_number,
-                                                    poNumber: best.orderId,
-                                                    vendorName: inv.vendor_name,
-                                                    score: best.score,
-                                                    reasons: best.reasons,
-                                                    status: 'needs_review',
-                                                    reconVerdict: reconResult.overallVerdict,
-                                                },
-                                                email_from: inv.vendor_name || '',
-                                                email_subject: `Invoice ${inv.invoice_number} auto-matched`,
-                                            });
-                                        } catch (reconErr: any) {
-                                            console.warn(
-                                                `[receivings] Reconciliation failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${reconErr?.message || reconErr}`,
-                                            );
-                                            // Log the failure
-                                            try {
-                                                await sb.from('ap_activity_log').insert({
-                                                    intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
-                                                    action_taken: `Auto-apply failed for ${inv.invoice_number} → PO ${best.orderId}`,
-                                                    metadata: {
-                                                        invoiceNumber: inv.invoice_number,
-                                                        poNumber: best.orderId,
-                                                        vendorName: inv.vendor_name,
-                                                        score: best.score,
-                                                        error: reconErr?.message || String(reconErr),
-                                                    },
-                                                    email_from: inv.vendor_name || '',
-                                                    email_subject: `Auto-apply failed — ${inv.invoice_number}`,
-                                                });
-                                            } catch {
-                                                // Non-critical
-                                            }
-                                        } finally {
-                                            _reconcilingPOs.delete(best.orderId);
-                                        }
-                                    }
-                                } catch (autoApplyErr: any) {
-                                    console.warn(
-                                        `[receivings] Auto-apply failed for invoice ${inv.invoice_number} → PO ${best.orderId}: ${autoApplyErr?.message || autoApplyErr}`,
-                                    );
-                                    // Log the failure so it shows on the dashboard
-                                    try {
-                                        await sb.from('ap_activity_log').insert({
-                                            intent: 'RECONCILIATION_AUTO_APPLY_FAILED',
-                                            action_taken: `Auto-apply failed for ${inv.invoice_number} → PO ${best.orderId}`,
-                                            metadata: {
-                                                invoiceNumber: inv.invoice_number,
-                                                poNumber: best.orderId,
-                                                vendorName: inv.vendor_name,
-                                                score: best.score,
-                                                error: autoApplyErr?.message || String(autoApplyErr),
-                                            },
-                                            email_from: inv.vendor_name || '',
-                                            email_subject: `Auto-apply failed — ${inv.invoice_number}`,
-                                        });
-                                    } catch {
-                                        // Non-critical — logging failure shouldn't cascade
-                                    }
+                                    // HERMIA(2026-08-06): Drop junk invoices before scoring
+                                    unmatchedInvoices = unmatchedInvoices.filter((inv: any) => {
+                                        const total = Number(inv.total || 0);
+                                        const invNo = String(inv.invoice_number || "").trim();
+                                        if (total < 1 && !invNo) return false;
+                                        if (total < 1) return false; // $0 placeholders
+                                        return true;
+                                    });
                                 }
 
-                                // Show in suggestions as auto-matched, not hidden
-                                matchSuggestions.push({
-                                    invoiceId: inv.id,
-                                    invoiceNumber: inv.invoice_number,
-                                    vendorName: inv.vendor_name,
-                                    invoiceDate: inv.invoice_date,
-                                    invoiceTotal: inv.total,
-                                    candidates: result.candidates.slice(0, 5),
-                                    autoApplyReady: true,
-                                    autoMatched: true,  // flag: auto-matched, needs human completion
-                                    invoiceLineItems: extractLineItems(inv),
-                                });
-                            } else {
-                                // Needs human attention: show in suggestions
-                                matchSuggestions.push({
-                                    invoiceId: inv.id,
-                                    invoiceNumber: inv.invoice_number,
-                                    vendorName: inv.vendor_name,
-                                    invoiceDate: inv.invoice_date,
-                                    invoiceTotal: inv.total,
-                                    candidates: result.candidates.slice(0, 5),
-                                    autoApplyReady: result.autoApplyReady ?? false,
-                                    fromCache: !!inv._fromCache,
-                                    invoiceLineItems: extractLineItems(inv),
-                                });
+                                if (unmatchedInvoices && unmatchedInvoices.length > 0) {
+                                    // HERMIA(2026-08-06): Paint budget. Was 12×4s sequential-ish scoring
+                                    // + Finale auto-reconcile on GET → 45s panel timeouts.
+                                    // Cap hard: 6 invoices, 2s each, concurrency 4. NO writes on GET.
+                                    const toScore = unmatchedInvoices.slice(0, 6);
+                                    // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
+                                    const { classifyInvoice } = await import('@/config/invoice-classification');
+                                    const filteredToScore = toScore.filter((inv: any) => {
+                                        const cls = classifyInvoice({
+                                            vendorName: inv.vendor_name,
+                                            poNumber: inv.raw_data?.ocrPoCandidate || inv.po_number || null,
+                                        });
+                                        return cls.classification !== 'dropship_flow_through';
+                                    });
+                                    // Prefer filtered list
+                                    const scoreList = filteredToScore; // always use filtered (may be empty)
+
+                                    // ── Phase A: score all invoices in parallel (read-only, concurrency 4) ──
+                                    // DECISION(2026-07-27): Previously this loop scored up to 12 invoices
+                                    // sequentially against 4s findPOCandidates timeouts (~48s worst case).
+                                    // Now scoring runs in parallel at concurrency 4.
+                                    // HERMIA(2026-08-06): Phase B Finale auto-apply REMOVED from GET.
+                                    // GET is paint-only. Auto-match writes belong on POST/cron.
+                                    const scoredResults = await mapConcurrent(scoreList, 4, async (inv) => {
+                                        // OCR short-circuit: no DB call needed — still never offer dropship POs
+                                        const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
+                                        if (inv._fromCache && ocrPo && !/DropshipPO/i.test(String(ocrPo))) {
+                                            return {
+                                                inv,
+                                                status: 'ocr' as const,
+                                                ocrSuggestion: {
+                                                    invoiceId: inv.id,
+                                                    invoiceNumber: inv.invoice_number,
+                                                    vendorName: inv.vendor_name,
+                                                    invoiceDate: inv.invoice_date,
+                                                    invoiceTotal: inv.total,
+                                                    candidates: [{
+                                                        orderId: String(ocrPo),
+                                                        vendorName: inv.vendor_name,
+                                                        orderDate: inv.invoice_date || '',
+                                                        total: Number(inv.total || 0),
+                                                        status: 'ocr_candidate',
+                                                        score: 70,
+                                                        reasons: ['OCR PO# candidate'],
+                                                        isOpen: true,
+                                                    }],
+                                                    autoApplyReady: false,
+                                                    fromCache: true,
+                                                    invoiceLineItems: extractLineItems(inv),
+                                                },
+                                            };
+                                        }
+                                        try {
+                                            const scorePromise = findPOCandidates({
+                                                id: inv.id,
+                                                invoiceNumber: inv.invoice_number,
+                                                vendorName: inv.vendor_name,
+                                                invoiceDate: inv.invoice_date,
+                                                subtotal: Number(inv.subtotal || 0),
+                                                freight: Number(inv.freight || 0),
+                                                tax: Number(inv.tax || 0),
+                                                total: Number(inv.total || 0),
+                                                lineItems: inv.raw_data?.lineItems || [],
+                                                ocrPoCandidate: inv.raw_data?.ocrPoCandidate || inv.raw_data?.poNumber || null,
+                                                ocrOrderCandidate: inv.raw_data?.orderNumber || null,
+                                            });
+                                            const result = await Promise.race([
+                                                scorePromise,
+                                                new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+                                            ]);
+                                            if (!result) {
+                                                return { inv, status: 'timed_out' as const };
+                                            }
+                                            return { inv, status: 'scored' as const, result };
+                                        } catch (err: any) {
+                                            return { inv, status: 'error' as const, err };
+                                        }
+                                    });
+
+                                    // ── Phase B: suggestions only (NO Finale writes on GET) ──
+                                    for (const sr of scoredResults) {
+                                        const { inv } = sr;
+                                        if (sr.status === 'ocr' && sr.ocrSuggestion) {
+                                            // Never offer dropship POs as OCR match targets
+                                            const ocrCands = (sr.ocrSuggestion.candidates || []).filter(
+                                                (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                                            );
+                                            if (ocrCands.length === 0) continue;
+                                            matchSuggestions.push({ ...sr.ocrSuggestion, candidates: ocrCands });
+                                            continue;
+                                        }
+                                        if (sr.status === 'timed_out') {
+                                            matchSuggestions.push({
+                                                invoiceId: inv.id,
+                                                invoiceNumber: inv.invoice_number,
+                                                vendorName: inv.vendor_name,
+                                                invoiceDate: inv.invoice_date,
+                                                invoiceTotal: inv.total,
+                                                candidates: [],
+                                                autoApplyReady: false,
+                                                fromCache: !!inv._fromCache,
+                                                timedOut: true,
+                                                invoiceLineItems: extractLineItems(inv),
+                                            });
+                                            continue;
+                                        }
+                                        if (sr.status === 'error') {
+                                            console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
+                                            continue;
+                                        }
+
+                                        // Scored successfully — surface suggestions only
+                                        const result = sr.result!;
+                                        // Strip dropship POs from candidates — never match those
+                                        result.candidates = (result.candidates || []).filter(
+                                            (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                                        );
+                                        result.bestMatch = result.candidates[0] || null;
+                                        if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
+                                            result.autoApplyReady = false;
+                                        }
+                                        matchSuggestions.push({
+                                            invoiceId: inv.id,
+                                            invoiceNumber: inv.invoice_number,
+                                            vendorName: inv.vendor_name,
+                                            invoiceDate: inv.invoice_date,
+                                            invoiceTotal: inv.total,
+                                            candidates: result.candidates.slice(0, 5),
+                                            autoApplyReady: result.autoApplyReady ?? false,
+                                            fromCache: !!inv._fromCache,
+                                            invoiceLineItems: extractLineItems(inv),
+                                        });
+                                    }
+                                }
                             }
-                        } catch (matchErr: any) {
-                            console.warn(`[receivings] Match scoring failed for invoice: ${matchErr?.message || matchErr}`);
-                        }
-                    }
-                }
-            }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
             let recentAutoCompletions: Array<{
@@ -656,52 +535,65 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             }
 
             // ── Freight classifications for received PO vendors ──
-            // DECISION(2026-07-27): This loop was 40 sequential ~2.2s PostgREST
-            // round-trips and is now bounded-parallel at 8. These are local-DB
-            // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
-            // global queue, so real parallelism is achieved here.
-            const freightClasses: Record<string, any> = {};
-            const fcResults = await mapConcurrent(vendorNames, 8, async (v) => {
-                try {
-                    const result = await getVendorFreightClassification(v);
-                    return { vendor: v, result };
-                } catch (fcErr: any) {
-                    console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
-                    return { vendor: v, result: undefined };
-                }
-            });
-            for (const fr of fcResults) {
-                if (fr.result !== undefined) {
-                    freightClasses[fr.vendor] = fr.result;
+                        // DECISION(2026-07-27): This loop was 40 sequential ~2.2s PostgREST
+                        // round-trips and is now bounded-parallel at 8. These are local-DB
+                        // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
+                        // global queue, so real parallelism is achieved here.
+                        // HERMIA(2026-08-06): Cap to 12 vendors — full list was burning paint budget.
+                        const freightClasses: Record<string, any> = {};
+                        const vendorsForFreight = vendorNames.slice(0, 12);
+                        const fcResults = await mapConcurrent(vendorsForFreight, 8, async (v) => {
+                            try {
+                                const result = await Promise.race([
+                                    getVendorFreightClassification(v),
+                                    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+                                ]);
+                                return { vendor: v, result };
+                            } catch (fcErr: any) {
+                                console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
+                                return { vendor: v, result: undefined };
+                            }
+                        });
+                        for (const fr of fcResults) {
+                            if (fr.result !== undefined && fr.result !== null) {
+                                freightClasses[fr.vendor] = fr.result;
+                            }
+                        }
+
+                        const payload: ReceivingsPayload = {
+                            received,
+                            days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
+                            range: daysParam ? 'rolling_days' : 'rolling_30d',
+                            startDate: startStr,
+                            asOf: todayStr,
+                            matchSuggestions,
+                            freightClasses,
+                            recentAutoCompletions,
+                        };
+                        _getCache = { at: Date.now(), key: cacheKey, payload };
+                        return NextResponse.json(payload, {
+                            headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss' },
+                        });
+                    }
+
+                    const emptyPayload: ReceivingsPayload = {
+                        received,
+                        days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
+                        range: daysParam ? 'rolling_days' : 'rolling_30d',
+                        startDate: startStr,
+                        asOf: todayStr,
+                        matchSuggestions: [],
+                        freightClasses: {},
+                    };
+                    _getCache = { at: Date.now(), key: cacheKey, payload: emptyPayload };
+                    return NextResponse.json(emptyPayload, {
+                        headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss-empty' },
+                    });
+                } catch (err: any) {
+                    console.error('Receivings API error:', err.message);
+                    return NextResponse.json({ error: err.message }, { status: 500 });
                 }
             }
-
-            return NextResponse.json({
-                received,
-                days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
-                range: daysParam ? 'rolling_days' : 'rolling_30d',
-                startDate: startStr,
-                asOf: todayStr,
-                matchSuggestions,
-                freightClasses,
-                recentAutoCompletions,
-            });
-        }
-
-        return NextResponse.json({
-            received,
-            days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
-            range: daysParam ? 'rolling_days' : 'rolling_30d',
-            startDate: startStr,
-            asOf: todayStr,
-            matchSuggestions: [],
-            freightClasses: {},
-        });
-    } catch (err: any) {
-        console.error('Receivings API error:', err.message);
-        return NextResponse.json({ error: err.message }, { status: 500 });
-    }
-}
 
 // ── POST: Complete PO, match invoice, mark freight pattern ──────────────────
 
