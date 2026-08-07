@@ -2,6 +2,9 @@
  * @file    src/lib/purchasing/uline-confirmation.ts
  * @purpose Parse ULINE order confirmation emails from Gmail.
  *          Extracts: order #, PO #, items, prices, totals, tracking.
+ *          Enforces required Ship Via: Freight Collect + FEDEX FREIGHT
+ *          (Uline calls FedEx → bill lands on general FedEx Billing Online,
+ *          not LTL Select Invoice Center).
  * @source  Pattern derived from: customer.service@uline.com confirmation emails
  */
 
@@ -30,6 +33,60 @@ export interface UlineOrderConfirmation {
     shipping: number;
     total: number;
     gmailMessageId: string;
+}
+
+/**
+ * Required Uline Ship Via (checkout / confirmation).
+ * Freight Collect + FEDEX FREIGHT → Uline calls FedEx COLLECT;
+ * carrier invoice hits **general FedEx Billing Online** (not LTL Select).
+ */
+export const ULINE_REQUIRED_SHIP_VIA = "Freight Collect FEDEX FREIGHT";
+
+/** True when shipVia is Freight Collect and FEDEX FREIGHT (case/space flexible). */
+export function isUlineRequiredShipVia(shipVia: string | null | undefined): boolean {
+    const s = String(shipVia || "")
+        .toUpperCase()
+        .replace(/[\s_/,-]+/g, " ")
+        .trim();
+    if (!s) return false;
+    const freightCollect =
+        /\bFREIGHT\s+COLLECT\b/.test(s) || /\bCOLLECT\s+FREIGHT\b/.test(s);
+    const fedexFreight = /\bFEDEX\s+FREIGHT\b/.test(s) || /\bFXFE\b/.test(s) || /\bFXF\b/.test(s);
+    return freightCollect && fedexFreight;
+}
+
+/**
+ * Human-readable check for confirmations / cart review.
+ * @returns ok + reasons when shipVia is wrong or missing
+ */
+export function checkUlineShipVia(shipVia: string | null | undefined): {
+    ok: boolean;
+    shipVia: string;
+    required: string;
+    reasons: string[];
+} {
+    const raw = String(shipVia || "").trim();
+    const reasons: string[] = [];
+    if (!raw) {
+        reasons.push("missing Ship Via");
+    } else if (!isUlineRequiredShipVia(raw)) {
+        const up = raw.toUpperCase();
+        if (!/\bFREIGHT\s+COLLECT\b/.test(up) && !/\bCOLLECT\s+FREIGHT\b/.test(up)) {
+            reasons.push("must be Freight Collect (not prepaid / third-party)");
+        }
+        if (!/\bFEDEX\s+FREIGHT\b/.test(up) && !/\bFXFE\b/.test(up) && !/\bFXF\b/.test(up)) {
+            reasons.push("must be FEDEX FREIGHT (not UPS / parcel / Uline truck)");
+        }
+        if (reasons.length === 0) {
+            reasons.push(`expected "${ULINE_REQUIRED_SHIP_VIA}", got "${raw}"`);
+        }
+    }
+    return {
+        ok: reasons.length === 0,
+        shipVia: raw,
+        required: ULINE_REQUIRED_SHIP_VIA,
+        reasons,
+    };
 }
 
 function decodeBody(payload: any): string {
@@ -65,8 +122,13 @@ export function parseUlineConfirmationEmail(
     const orderDateMatch = text.match(/ORDER\s*DATE\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
     const shipDateMatch = text.match(/SHIP\s*DATE\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
     const custMatch = text.match(/CUSTOMER\s*NUMBER\s*(\d+)/i);
-    const shipViaMatch = text.match(/SHIP\s*VIA\s*([\w\s]+?)(?:\s{2,}|$)/i);
-    const termsMatch = text.match(/TERMS\s*([\w\s]+?)(?:\s{2,}|$)/i);
+    // Ship Via / Terms: stop at next known header (single-spaced HTML→text collapses \s{2,}).
+    const shipViaMatch = text.match(
+        /SHIP\s*VIA\s+(.+?)(?=\s+(?:TERMS|QUANTITY|SUB[-\s]*TOTAL|ORDER\s*#|PO\s*#|CUSTOMER)|$)/i,
+    );
+    const termsMatch = text.match(
+        /TERMS\s+(.+?)(?=\s+(?:SHIP\s*VIA|QUANTITY|SUB[-\s]*TOTAL|ORDER\s*#|PO\s*#|CUSTOMER)|$)/i,
+    );
     const subtotalMatch = text.match(/SUB[\-\s]*TOTAL\s+\$?([\d,]+\.\d{2})/i);
     const taxMatch = text.match(/(?:SALES\s*)?TAX\s+\$?([\d,]+\.\d{2})/i);
     const shippingMatch = text.match(/(?:SHIPPING|HANDLING)\s+\$?([\d,]+\.\d{2})/i);

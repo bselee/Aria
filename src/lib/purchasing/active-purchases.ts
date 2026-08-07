@@ -14,9 +14,10 @@ import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
 import { derivePurchaseMovement, type PurchaseMovement } from "./active-purchases-movement";
 import { classifyShipmentEvidence, listShipmentsForPurchaseOrders, type ShipmentRecord } from "../tracking/shipment-intelligence";
-import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
+import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate, isHighConfidenceReceived } from "./po-receipt-state";
 import { derivePOSentVerification, type POSentVerification } from "./po-sent-verification";
 import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-profile";
+import { normalizeLifecycleStage } from "./po-lifecycle";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
@@ -57,6 +58,30 @@ function addDays(dateStr: string, days: number): string {
 }
 
 /**
+ * Finale often stores the *planned* reception on PO.receiveDate while status
+ * is still Committed. Only use it as ETA when it's still in the future and
+ * within a sane window after order (not junk like +120d).
+ */
+function normalizePlannedReceiveDate(
+    receiveDate: string | null | undefined,
+    orderDate: string | null | undefined,
+    today: string,
+): string | null {
+    if (!receiveDate) return null;
+    const rd = /^(\d{4}-\d{2}-\d{2})/.exec(receiveDate)?.[1] || null;
+    if (!rd) return null;
+    if (rd <= today) return null; // past = real receipt, handled elsewhere
+    if (orderDate) {
+        const ord = /^(\d{4}-\d{2}-\d{2})/.exec(orderDate)?.[1];
+        if (ord) {
+            const days = (Date.parse(rd) - Date.parse(ord)) / 86_400_000;
+            if (days > 75) return null; // absurd planned date
+        }
+    }
+    return rd;
+}
+
+/**
  * Load active purchase orders.
  *
  * Finale is the source of truth for the PO list. Local PostgREST enrichment
@@ -87,8 +112,9 @@ export async function loadActivePurchases(
     const shipmentMap = new Map<string, ShipmentRecord[]>();
     const lifecycleMap = new Map<string, Record<string, any>>();
     const poSendMap = new Map<string, Array<Record<string, any>>>();
-    const invoiceMap = new Map<string, { status: string; id: string; hasDiscrepancies: boolean }>();
-    let completionSignals: Awaited<ReturnType<typeof loadPOCompletionSignalIndex>> = new Map();
+    const invoiceMap = new Map<string, { status: string; id: string; hasDiscrepancies: boolean; total?: number }>();
+        const finaleReceiptActivity = new Set<string>();
+        let completionSignals: Awaited<ReturnType<typeof loadPOCompletionSignalIndex>> = new Map();
 
     const poNumbers = pos.map(p => p.orderId).filter(Boolean);
 
@@ -140,14 +166,15 @@ export async function loadActivePurchases(
                 const chunk = poNumbers.slice(i, i + 100);
                 const [poRes, sendRes] = await Promise.all([
                     db
-                        .from("purchase_orders")
-                        .select(
-                            "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
-                            "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
-                            "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
-                            "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence, tracking_paused, tracking_source"
-                        )
-                        .in("po_number", chunk),
+                                            .from("purchase_orders")
+                                            .select(
+                                                "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
+                                                "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
+                                                "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
+                                                "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence, " +
+                                                "tracking_paused, tracking_source, status, receive_date"
+                                            )
+                                            .in("po_number", chunk),
                     db
                         .from("po_sends")
                         .select("po_number, sent_at, committed_at, sent_to_email, triggered_by, gmail_message_id")
@@ -173,44 +200,88 @@ export async function loadActivePurchases(
             }
 
             try {
-                for (let i = 0; i < poNumbers.length; i += 100) {
-                    const chunk = poNumbers.slice(i, i + 100);
-                    const { data: invData } = await db
-                        .from("invoices")
-                        .select("po_number, status, id, discrepancies")
-                        .in("po_number", chunk);
-                    for (const inv of invData || []) {
-                        invoiceMap.set(inv.po_number, {
-                            status: inv.status,
-                            id: inv.id,
-                            hasDiscrepancies: Array.isArray(inv.discrepancies) && inv.discrepancies.length > 0,
-                        });
-                    }
-                }
+                            for (let i = 0; i < poNumbers.length; i += 100) {
+                                const chunk = poNumbers.slice(i, i + 100);
+                                const { data: invData } = await db
+                                    .from("invoices")
+                                    .select("po_number, status, id, discrepancies, total")
+                                    .in("po_number", chunk);
+                                for (const inv of invData || []) {
+                                    invoiceMap.set(inv.po_number, {
+                                        status: inv.status,
+                                        id: inv.id,
+                                        hasDiscrepancies: Array.isArray(inv.discrepancies) && inv.discrepancies.length > 0,
+                                        total: typeof inv.total === "number" ? inv.total : undefined,
+                                    });
+                                }
+                            }
 
-                for (let i = 0; i < poNumbers.length; i += 100) {
-                    const chunk = poNumbers.slice(i, i + 100);
-                    const { data: paData } = await db
-                        .from("ap_pending_approvals")
-                        .select("order_id")
-                        .eq("status", "pending")
-                        .in("order_id", chunk);
-                    for (const pa of paData || []) {
-                        if (pa.order_id && !invoiceMap.has(pa.order_id)) {
-                            invoiceMap.set(pa.order_id, {
-                                status: "matched_review",
-                                id: "",
-                                hasDiscrepancies: false,
-                            });
-                        } else if (pa.order_id && invoiceMap.has(pa.order_id)) {
-                            const existing = invoiceMap.get(pa.order_id)!;
-                            invoiceMap.set(pa.order_id, {
-                                ...existing,
-                                status: "matched_review",
-                            });
-                        }
-                    }
-                }
+                            // vendor_invoices is the AP primary surface — prefer its totals when present
+                            for (let i = 0; i < poNumbers.length; i += 100) {
+                                const chunk = poNumbers.slice(i, i + 100);
+                                const { data: viData } = await db
+                                    .from("vendor_invoices")
+                                    .select("po_number, status, id, total")
+                                    .in("po_number", chunk)
+                                    .order("created_at", { ascending: false });
+                                for (const inv of viData || []) {
+                                    if (!inv.po_number) continue;
+                                    const existing = invoiceMap.get(inv.po_number);
+                                    // First (newest) vendor_invoice wins for amount accuracy
+                                    if (!existing || existing.total == null) {
+                                        invoiceMap.set(inv.po_number, {
+                                            status: inv.status || existing?.status || "matched",
+                                            id: inv.id || existing?.id || "",
+                                            hasDiscrepancies: existing?.hasDiscrepancies || false,
+                                            total: typeof inv.total === "number" ? inv.total : existing?.total,
+                                        });
+                                    }
+                                }
+                            }
+
+                            // Finale receipt activity — high-conf handoff signal
+                            try {
+                                const since = new Date(Date.now() - 120 * 86400 * 1000).toISOString();
+                                const { data: rcvActs } = await db
+                                    .from("ap_activity_log")
+                                    .select("metadata")
+                                    .eq("intent", "PO_RECEIVED")
+                                    .gte("created_at", since)
+                                    .limit(500);
+                                for (const row of rcvActs || []) {
+                                    const md = row.metadata || {};
+                                    const pid = String(md.poId || "");
+                                    // Skip polluted at-risk rows
+                                    if (md.atRiskItems) continue;
+                                    if (pid && poNumbers.includes(pid)) finaleReceiptActivity.add(pid);
+                                }
+                            } catch (actErr: any) {
+                                console.warn("[active-purchases] PO_RECEIVED activity lookup failed:", actErr?.message || actErr);
+                            }
+
+                            for (let i = 0; i < poNumbers.length; i += 100) {
+                                const chunk = poNumbers.slice(i, i + 100);
+                                const { data: paData } = await db
+                                    .from("ap_pending_approvals")
+                                    .select("order_id")
+                                    .eq("status", "pending")
+                                    .in("order_id", chunk);
+                                for (const pa of paData || []) {
+                                    if (pa.order_id && !invoiceMap.has(pa.order_id)) {
+                                        invoiceMap.set(pa.order_id, {
+                                            status: "matched_review",
+                                            id: "",
+                                            hasDiscrepancies: false,
+                                        });
+                                    } else if (pa.order_id && invoiceMap.has(pa.order_id)) {
+                                        const existing = invoiceMap.get(pa.order_id)!;
+                                        invoiceMap.set(pa.order_id, {
+                                            ...existing,
+                                            status: "matched_review",
+                                        });
+                                    }
+                                }
+                            }
             } catch (e: any) {
                 console.warn("[purchasing] invoice fetch failed:", e.message);
             }
@@ -218,22 +289,39 @@ export async function loadActivePurchases(
             completionSignals = await loadPOCompletionSignalIndex(db, poNumbers);
 
             const healMismatches: Array<{ po_number: string; last_movement_summary: string; updated_at: string }> = [];
-            for (const po of pos) {
-                if (!po.orderId) continue;
-                const isRcvd = hasPurchaseOrderReceipt({ status: po.status, receiveDate: po.receiveDate, shipments: po.shipments });
-                if (!isRcvd) continue;
-                const lifecycle = lifecycleMap.get(po.orderId);
-                if (!lifecycle) continue;
-                const rawStage = lifecycle.lifecycle_stage;
-                if (rawStage === "sent" || rawStage === "vendor_acknowledged" || rawStage === "tracking_unavailable" || rawStage === "ap_follow_up") {
-                    healMismatches.push({
-                        po_number: po.orderId,
-                        last_movement_summary: `Auto-healed ${new Date().toISOString().slice(0, 10)}: Finale reports received but lifecycle was stuck at "${rawStage}"`,
-                        updated_at: new Date().toISOString(),
-                    });
-                    lifecycleMap.set(po.orderId, { ...lifecycle, lifecycle_stage: "RECEIVED" });
-                }
-            }
+                        for (const po of pos) {
+                            if (!po.orderId) continue;
+                            const lifecycle = lifecycleMap.get(po.orderId);
+                            // Merge local receipt signals — Finale status can lag PostgREST
+                            // (local receive_date / status=received / lifecycle RECEIVED).
+                            const localReceiveDate = lifecycle?.receive_date || null;
+                            const localStatus = lifecycle?.status || null;
+                            const isRcvd =
+                                hasPurchaseOrderReceipt({
+                                    status: po.status,
+                                    receiveDate: po.receiveDate || localReceiveDate,
+                                    shipments: po.shipments,
+                                }) ||
+                                hasPurchaseOrderReceipt({
+                                    status: localStatus,
+                                    receiveDate: localReceiveDate,
+                                    shipments: null,
+                                }) ||
+                                normalizeLifecycleStage(lifecycle?.lifecycle_stage ?? null) === "RECEIVED" ||
+                                normalizeLifecycleStage(lifecycle?.lifecycle_stage ?? null) === "COMPLETED";
+                            if (!isRcvd) continue;
+                            if (!lifecycle) continue;
+                            const stage = normalizeLifecycleStage(lifecycle.lifecycle_stage ?? null);
+                            // Heal any non-terminal stage stuck before RECEIVED
+                            if (stage && stage !== "RECEIVED" && stage !== "COMPLETED" && stage !== "CANCELLED") {
+                                healMismatches.push({
+                                    po_number: po.orderId,
+                                    last_movement_summary: `Auto-healed ${new Date().toISOString().slice(0, 10)}: receipt evidence present but lifecycle was stuck at "${lifecycle.lifecycle_stage}"`,
+                                    updated_at: new Date().toISOString(),
+                                });
+                                lifecycleMap.set(po.orderId, { ...lifecycle, lifecycle_stage: "RECEIVED" });
+                            }
+                        }
             if (healMismatches.length > 0) {
                 try {
                     for (let i = 0; i < healMismatches.length; i += 100) {
@@ -281,60 +369,109 @@ export async function loadActivePurchases(
             };
         });
         const confirmedShipments = shipments.filter((shipment) => shipment.evidenceLevel === "confirmed");
-        const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
-            status: po.status,
-            receiveDate: po.receiveDate,
-            shipments: po.shipments,
-        });
-        const isReceived = hasPurchaseOrderReceipt({
-            status: po.status,
-            receiveDate: po.receiveDate,
-            shipments: po.shipments,
-        });
-        const completionSignal = completionSignals.get(po.orderId);
-        const completionState = derivePOCompletionState({
-            finaleReceived: isReceived,
-            trackingDelivered: confirmedShipments.length > 0 && confirmedShipments.every((shipment) => shipment.status_category === "delivered"),
-            hasMatchedInvoice: completionSignal?.hasMatchedInvoice || false,
-            reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
-            freightResolved: completionSignal?.freightResolved || false,
-            unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
-        });
+                const poLifecycleRow = lifecycleMap.get(po.orderId);
+                const invoiceInfo = invoiceMap.get(po.orderId);
 
-        if (completionState === "complete" && isReceived) {
-            continue;
-        }
+                // Merge Finale shipment receipt evidence (cache path used to drop this).
+                // FullPO.shipments carry shipmentId/status/receiveDate from GraphQL.
+                const finaleShips = (po.shipments || []).map((s) => ({
+                    status: s.status,
+                    receiveDate: s.receiveDate,
+                }));
+                // Carry-through lifecycle from cache row when enrichment map misses
+                const cacheStage = (po as any).lifecycleStage as string | null | undefined;
 
-        // Received with no exceptions → move to Receivings, not Active Purchases.
-        // Active Purchases tracks goods that haven't arrived yet.
-        // Only keep received POs if there's an unresolved problem (exception, partial, missing).
-        if (isReceived && completionState !== "exception") {
-            continue;
-        }
+                // Expected ETA early — needed for high-conf amount+past-ETA gate.
+                // Prefer Finale's planned receiveDate when it's in the FUTURE (Committed
+                // POs often carry the planned reception there — not a real receipt yet).
+                // That stops false OVERDUE badges weeks before the planned dock date.
+                let expectedDate: string;
+                let leadProvenance: string;
+                let lt: Awaited<ReturnType<typeof leadTimeService.getForVendor>> | null = null;
+                const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+                const plannedReceive =
+                    normalizePlannedReceiveDate(po.receiveDate || poLifecycleRow?.receive_date, po.orderDate, todayStr);
 
-        let expectedDate: string;
-        let leadProvenance: string;
-        let lt: Awaited<ReturnType<typeof leadTimeService.getForVendor>> | null = null;
-        if (po.orderDate) {
-            lt = await leadTimeService.getForVendor(po.vendorName);
-            expectedDate = addDays(po.orderDate, lt.days);
-            leadProvenance = lt.label;
-        } else {
-            expectedDate = new Date().toISOString().split("T")[0];
-            leadProvenance = "21d default";
-        }
+                if (plannedReceive) {
+                    expectedDate = plannedReceive;
+                    leadProvenance = "Finale planned receive";
+                    if (po.orderDate) {
+                        lt = await leadTimeService.getForVendor(po.vendorName).catch(() => null);
+                    }
+                } else if (po.orderDate) {
+                    lt = await leadTimeService.getForVendor(po.vendorName);
+                    expectedDate = addDays(po.orderDate, lt.days);
+                    leadProvenance = lt.label;
+                } else {
+                    expectedDate = todayStr;
+                    leadProvenance = "21d default";
+                }
 
-        const poLifecycle = lifecycleMap.get(po.orderId);
+                const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
+                    status: po.status,
+                    receiveDate: po.receiveDate || poLifecycleRow?.receive_date || null,
+                    shipments: finaleShips.length ? finaleShips : (po.shipments || []),
+                    orderDate: po.orderDate,
+                }) || resolvePurchaseOrderReceiptDate({
+                    status: poLifecycleRow?.status || null,
+                    receiveDate: poLifecycleRow?.receive_date || null,
+                    shipments: null,
+                    orderDate: po.orderDate,
+                });
+
+                const localStage = normalizeLifecycleStage(
+                    poLifecycleRow?.lifecycle_stage ?? cacheStage ?? null,
+                );
+
+                // High-confidence received → leave Active. Remaining work is Receivings /
+                // invoice match / shipping match — not tracking (Bill 2026-08-06).
+                // 124895 gold: Finale Completed + shipment Received 2026-06-12 → DROP.
+                const isReceived = isHighConfidenceReceived({
+                    status: po.status,
+                    receiveDate: po.receiveDate || poLifecycleRow?.receive_date || null,
+                    shipments: finaleShips.length ? finaleShips : (po.shipments || []),
+                    orderDate: po.orderDate,
+                    lifecycleStage: localStage || poLifecycleRow?.lifecycle_stage || cacheStage,
+                    matchedInvoiceTotal: invoiceInfo?.total ?? null,
+                    matchedInvoiceStatus: invoiceInfo?.status ?? null,
+                    poTotal: typeof po.total === "number" ? po.total : null,
+                    expectedDate,
+                    finaleReceiptActivity: finaleReceiptActivity.has(po.orderId),
+                });
+
+                const completionSignal = completionSignals.get(po.orderId);
+                const completionState = derivePOCompletionState({
+                    finaleReceived: isReceived,
+                    trackingDelivered: confirmedShipments.length > 0 && confirmedShipments.every((shipment) => shipment.status_category === "delivered"),
+                    hasMatchedInvoice: completionSignal?.hasMatchedInvoice || !!invoiceInfo,
+                    reconciliationVerdict: completionSignal?.reconciliationVerdict || null,
+                    freightResolved: completionSignal?.freightResolved || false,
+                    unresolvedBlockers: completionSignal?.unresolvedBlockers || [],
+                });
+
+                // Fully complete AP → gone
+                if (completionState === "complete" && isReceived) {
+                    continue;
+                }
+
+                // High-conf received, no exception → off Active, on to Receivings/AP.
+                // Carrier-delivered but NOT yet received stays (DELIVERED·need receive).
+                if (isReceived && completionState !== "exception") {
+                    continue;
+                }
+
+                const poLifecycle = poLifecycleRow;
         const vendorPromisedEta =
-            (poLifecycle?.vendor_stated_eta &&
-                (poLifecycle?.vendor_stated_eta_confidence === "high" ||
-                 poLifecycle?.vendor_stated_eta_confidence === "medium")
-                    ? poLifecycle.vendor_stated_eta
-                    : null) ??
-            poLifecycle?.last_eta_update?.estimated_delivery_at ??
-            poLifecycle?.last_eta_update?.eta ??
-            poLifecycle?.last_eta_update?.date ??
-            null;
+                    plannedReceive ||
+                    ((poLifecycle?.vendor_stated_eta &&
+                        (poLifecycle?.vendor_stated_eta_confidence === "high" ||
+                         poLifecycle?.vendor_stated_eta_confidence === "medium")
+                            ? poLifecycle.vendor_stated_eta
+                            : null) ??
+                    poLifecycle?.last_eta_update?.estimated_delivery_at ??
+                    poLifecycle?.last_eta_update?.eta ??
+                    poLifecycle?.last_eta_update?.date ??
+                    null);
         const etaProfile = deriveVendorEtaProfile({
             vendorName: po.vendorName,
             orderDate: po.orderDate || new Date().toISOString().slice(0, 10),
@@ -356,9 +493,8 @@ export async function loadActivePurchases(
         });
 
         const vendorProfile = vendorMap.get(po.vendorName?.toLowerCase());
-        const invoiceInfo = invoiceMap.get(po.orderId);
 
-        const movement = derivePurchaseMovement({
+                const movement = derivePurchaseMovement({
                     shipments: shipments.map((shipment) => ({
                         tracking_number: shipment.tracking_number,
                         public_tracking_url: shipment.public_tracking_url,

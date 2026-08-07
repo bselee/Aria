@@ -40,6 +40,10 @@ function isCacheFresh(lastSync: Date | null): boolean {
 /**
  * Upsert Finale PO data into the purchase_orders cache table.
  * Best-effort — failures are logged, never thrown.
+ *
+ * HERMIA(2026-08-06): NEVER write receive_date:null — that wiped real
+ * shipment-level receipts (Stock Bag 124895: PO.receiveDate null but
+ * shipment Received 2026-06-12). Prefer max past shipment receiveDate.
  */
 export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
     const healthy = await probePostgrest(1500);
@@ -52,7 +56,9 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
     const chunks: any[] = [];
 
     for (const po of pos) {
-        chunks.push({
+        const shipRecv = maxPastShipmentReceiveDate(po.shipments);
+        const recv = po.receiveDate || shipRecv || null;
+        const row: Record<string, unknown> = {
             po_number: po.orderId,
             vendor_name: po.vendorName,
             vendor_party_id: po.vendorPartyId || null,
@@ -60,17 +66,14 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
             total: po.total,
             total_amount: po.total,
             // BUGFIX(2026-07-27): do NOT JSON.stringify into a jsonb column.
-            // The db client already JSON-encodes the request body, so stringifying
-            // here stored a JSON *string* ("[{...}]") instead of a JSON array.
-            // 389 of 1123 POs were affected, and every reader that guards with
-            // Array.isArray(po.line_items) (e.g. finale/aria-purchase-history.ts)
-            // silently skipped them — purchase history under-reported real orders.
             line_items: po.items || [],
             issue_date: po.orderDate || null,
             required_date: (po as any).expectedDate || (po as any).dueDate || null,
-            receive_date: po.receiveDate || null,
             updated_at: now,
-        });
+        };
+        // Only set receive_date when we have a real value — never null-wipe.
+        if (recv) row.receive_date = recv;
+        chunks.push(row);
     }
 
     for (let i = 0; i < chunks.length; i += 100) {
@@ -81,6 +84,19 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
             console.error("[po-cache] batch upsert failed:", (e as Error).message);
         }
     }
+}
+
+/** Latest past shipment receiveDate (YYYY-MM-DD), or null. */
+function maxPastShipmentReceiveDate(
+    shipments: FullPO["shipments"] | undefined,
+): string | null {
+    if (!shipments?.length) return null;
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+    const past = shipments
+        .map((s) => (s.receiveDate || "").slice(0, 10))
+        .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && d <= today);
+    if (past.length === 0) return null;
+    return past.sort().at(-1) || null;
 }
 
 async function readCachedPos(): Promise<FullPO[]> {
@@ -106,19 +122,33 @@ async function readCachedPos(): Promise<FullPO[]> {
             } catch { items = []; }
 
             return {
-                orderId: row.po_number,
-                vendorName: row.vendor_name || "",
-                vendorPartyId: row.vendor_party_id || null,
-                orderDate: row.issue_date ? new Date(row.issue_date).toISOString().split("T")[0] : "",
-                status: row.status || "",
-                total: Number(row.total) || 0,
-                receiveDate: row.receive_date ? new Date(row.receive_date).toISOString().split("T")[0] : null,
-                items,
-                itemList: { edges: items.map((i: any) => ({ node: { product: { productId: i.productId }, quantity: i.quantity } })) },
-                supplier: { name: row.vendor_name || "" },
-                orderUrl: "",
-                shipmentList: [],
-            } as unknown as FullPO;
+                            orderId: row.po_number,
+                            vendorName: row.vendor_name || "",
+                            vendorPartyId: row.vendor_party_id || null,
+                            orderDate: row.issue_date ? new Date(row.issue_date).toISOString().split("T")[0] : "",
+                            status: row.status || "",
+                            total: Number(row.total) || Number(row.total_amount) || 0,
+                            receiveDate: row.receive_date ? new Date(row.receive_date).toISOString().split("T")[0] : null,
+                            items,
+                            itemList: { edges: items.map((i: any) => ({ node: { product: { productId: i.productId }, quantity: i.quantity } })) },
+                            supplier: { name: row.vendor_name || "" },
+                            orderUrl: "",
+                            shipmentList: [],
+                            // HERMIA(2026-08-06): Cache path used to drop shipment receive
+                            // evidence. Reconstruct a synthetic shipment when receive_date
+                            // exists so hasPurchaseOrderReceipt still sees it. Also pass
+                            // lifecycle_stage through for Active exit.
+                            shipments: row.receive_date
+                                ? [{
+                                    shipmentId: `${row.po_number}-cached`,
+                                    status: "Received",
+                                    receiveDate: new Date(row.receive_date).toISOString().split("T")[0],
+                                    shipDate: null,
+                                }]
+                                : [],
+                            // @ts-expect-error carry-through for loadActivePurchases
+                            lifecycleStage: row.lifecycle_stage || null,
+                        } as unknown as FullPO;
         });
     } catch {
         return [];

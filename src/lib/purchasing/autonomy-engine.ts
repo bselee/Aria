@@ -91,7 +91,9 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     await db.from('ap_activity_log').insert({
                         email_from: draft.vendorName,
                         email_subject: `PO #${draft.orderId} manually sent detection`,
-                        intent: 'PO_RECEIVED',
+                        // HERMIA(2026-08-06): NEVER reuse PO_RECEIVED — that intent means
+                        // Finale goods receipt (pollPOReceivings). Manual-send detection is SENT.
+                        intent: 'PO_SENT_DETECTED',
                         action_taken: `PO #${draft.orderId} manually sent — detected via Gmail search. Marking as sent in database & committing in Finale.`,
                         metadata: { poId: draft.orderId, supplier: draft.vendorName, source: 'gmail_search_proof' },
                     });

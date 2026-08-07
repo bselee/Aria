@@ -413,14 +413,21 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
             };
 
             if (existing && existing.length > 0) {
+                // HARD RULE: update ONLY by primary key + re-assert intent.
+                // 2026-07-27 incident: at-risk payload polluted non-risk rows
+                // (ADVERTISEMENT / BLOCKED_SENDER / even PO_RECEIVED) when an
+                // unscoped update path existed. Never update by poId alone.
                 const { error } = await sb
                     .from("ap_activity_log")
                     .update({
+                        intent: ACTIVITY_INTENT_PO_AT_RISK,
                         action_taken: action,
                         email_subject: subject,
+                        email_from: risk.vendorName,
                         metadata,
                     })
-                    .eq("id", existing[0].id);
+                    .eq("id", existing[0].id)
+                    .eq("intent", ACTIVITY_INTENT_PO_AT_RISK);
                 if (error) {
                     console.warn(`[po-arrival-risk] update ${risk.poId} failed: ${error.message}`);
                     failed++;

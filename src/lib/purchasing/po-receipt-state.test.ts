@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "./po-receipt-state";
+import {
+    hasPurchaseOrderReceipt,
+    resolvePurchaseOrderReceiptDate,
+    isHighConfidenceReceived,
+} from "./po-receipt-state";
 
 describe("po receipt state", () => {
     it("treats status 'received' as received", () => {
@@ -118,5 +122,95 @@ describe("po receipt state", () => {
                 { status: "Received", receiveDate: "2026-03-20" },
             ],
         })).toBe("2026-04-06");
+    });
+
+    it("trusts shipment status Received even when PO.receiveDate is null (124895)", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Completed",
+            receiveDate: null,
+            shipments: [
+                { status: "Received", receiveDate: "2026-06-12" },
+            ],
+        })).toBe(true);
+    });
+
+    it("trusts shipment status Received without receiveDate", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Completed",
+            receiveDate: null,
+            shipments: [
+                { status: "Received", receiveDate: null },
+            ],
+        })).toBe(true);
+    });
+
+    it("does NOT trust Completed alone without shipment Received", () => {
+        expect(hasPurchaseOrderReceipt({
+            status: "Completed",
+            receiveDate: null,
+            shipments: [
+                { status: "Editable", receiveDate: null },
+            ],
+        })).toBe(false);
+    });
+});
+
+describe("isHighConfidenceReceived — Active Purchases exit", () => {
+    it("drops on hard receipt", () => {
+        expect(isHighConfidenceReceived({
+            status: "Received",
+            receiveDate: "2026-07-01",
+        })).toBe(true);
+    });
+
+    it("drops on lifecycle RECEIVED", () => {
+        expect(isHighConfidenceReceived({
+            status: "Committed",
+            lifecycleStage: "RECEIVED",
+        })).toBe(true);
+    });
+
+    it("drops on accurate matched invoice + past ETA", () => {
+        expect(isHighConfidenceReceived({
+            status: "Committed",
+            matchedInvoiceTotal: 1000,
+            matchedInvoiceStatus: "reconciled",
+            poTotal: 1000,
+            expectedDate: "2026-07-01", // past
+        })).toBe(true);
+    });
+
+    it("keeps open when invoice amount is off by >2%", () => {
+        expect(isHighConfidenceReceived({
+            status: "Committed",
+            matchedInvoiceTotal: 500,
+            matchedInvoiceStatus: "matched",
+            poTotal: 1000,
+            expectedDate: "2026-07-01",
+        })).toBe(false);
+    });
+
+    it("keeps unreceived open POs on Active", () => {
+        expect(isHighConfidenceReceived({
+            status: "Committed",
+            receiveDate: null,
+            shipments: [],
+        })).toBe(false);
+    });
+
+    it("drops Completed + accurate invoice even without past ETA", () => {
+        expect(isHighConfidenceReceived({
+            status: "Completed",
+            matchedInvoiceTotal: 2000,
+            matchedInvoiceStatus: "paid",
+            poTotal: 2000,
+        })).toBe(true);
+    });
+
+    it("drops on finaleReceiptActivity", () => {
+        expect(isHighConfidenceReceived({
+            status: "Committed",
+            finaleReceiptActivity: true,
+        })).toBe(true);
     });
 });

@@ -440,9 +440,20 @@ export class POService {
                         await db.from("ap_activity_log").insert({
                             email_from: po.supplier,
                             email_subject: `PO ${po.orderId} received`,
+                            // SEMANTICS (locked 2026-08-06): PO_RECEIVED = Finale goods
+                            // receipt observed by pollPOReceivings. NOT carrier delivery.
+                            // Carrier delivery lives on shipments.status_category=delivered.
+                            // Vault "DELIVERED · need receive" must NOT treat this intent alone
+                            // as carrier proof (HerbsNOW 125126 trust break).
                             intent: "PO_RECEIVED",
                             action_taken: `PO #${po.orderId} from ${po.supplier} received \u2014 $${po.total.toFixed(2)}`,
-                            metadata: { poId: po.orderId, supplier: po.supplier, total: po.total },
+                            metadata: {
+                                poId: po.orderId,
+                                supplier: po.supplier,
+                                total: po.total,
+                                source: "finale_pollPOReceivings",
+                                kind: "finale_receipt",
+                            },
                         });
                     } catch (err: any) {
                         console.warn(`[pollPOReceivings] Activity write failed for PO ${po.orderId}:`, err.message);
