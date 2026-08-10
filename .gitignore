@@ -221,3 +221,6 @@ scripts/_probe-gmail.ts
 scripts/_probe-gmail-deep.ts
 # Duplicate of tracked scripts/warm-purchasing-cache-cron.mts
 scripts/warm-purchasing-cache.mjs
+
+# Shell warm-up capture (13-byte "EXIT CODE: 0" artifact, never useful in repo)
+_warm_output.log
