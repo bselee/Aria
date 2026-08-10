@@ -60,9 +60,39 @@ Note: the `sessions` table has no `updated_at` / `created_at` column — order b
 
 `Desktop\Hermes-Desktop.vbs` is canonical. `Desktop\Hermes-Desktop.bat`, `Startup\hermes-desktop-launch.vbs`, and the Start Menu `Hermes.lnk` are THIN REDIRECTS to it. The Startup copy had drifted into a stale FULL COPY running different logic from double-click — that is how a second racing instance got introduced. Never paste launch logic back into a redirect.
 
-## Open item
+## Resolved 2026-08-10: the stale build is GONE
 
-The all-users tile `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Hermes.lnk` still targets the Program Files exe and needs admin to rewrite (see `repoint-hermes-shortcuts.ps1`). The 10-minute reaper cron neutralizes it meanwhile.
+`C:\Program Files\Hermes` (374 MB), the all-users Start Menu tile, and the
+Add/Remove Programs entry were all removed. The root cause is now physically
+unlaunchable rather than merely guarded.
+
+**Removed manually via `remove-pf-hermes-install.ps1` — NOT via the bundled
+NSIS uninstaller.** That was deliberate:
+
+- `Uninstall Hermes.exe` is NSIS/electron-builder, and those close the running
+  app **by exe name**. Three separate binaries here are all named
+  `Hermes.exe` / `hermes.exe`: the Program Files build, the win-unpacked
+  Desktop, and the venv CLI (`hermes-agent\venv\Scripts\hermes.exe`). A
+  kill-by-name step would have taken down the live Desktop and the active agent
+  session.
+- It may also delete the shared Electron userData dir `%APPDATA%\Hermes`, which
+  the GOOD build uses for window state, composer prefs, and localStorage.
+
+Nothing outside the install dir depended on it — verified before removal:
+HKLM `App Paths` 0 matches; the `hermes://` handler already pointed at the
+win-unpacked build; agent home / state.db / config / skills / cron all live
+under `%LOCALAPPDATA%\hermes`.
+
+Pre-removal backup: `%LOCALAPPDATA%\hermes\backups\20260810-preuninstall\`
+(full userData copy — 307 files, only caches and zero-byte LOCK files skipped;
+exported uninstall registry key; 13-pin manifest).
+
+Verified after: install dir / machine tile / ARP entry all absent, 5
+win-unpacked Desktop processes alive, CLI alive, 13 pins intact, reaper silent
+with exit 0 on the now-clean machine.
+
+The reaper cron stays as a cheap backstop in case the package is ever
+reinstalled.
 
 ---
 
