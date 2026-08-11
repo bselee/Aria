@@ -4,21 +4,21 @@
  * @purpose  Reclaim disk space from email_inbox_queue and cron_runs.
  *           Safe to run repeatedly — all operations are idempotent.
  *
- *           1. VACUUM FULL email_inbox_queue  (reclaims bloat: ~100 MB expected)
- *           2. VACUUM FULL cron_runs           (reclaims index/heap bloat)
- *           3. VACUUM ANALYZE both tables      (refresh planner stats)
+ *           1. Batched DELETE of cron_runs older than 14 days (PROGRESS BAR)
+ *           2. Batched DELETE of email_inbox_queue older than 30 days (email retention)
+ *           3. VACUUM FULL + ANALYZE both tables
  *           4. Print before/after size deltas
  *
- *           The retention deletion for cron_runs (>30 days) and the trigger
- *           that nulls bodies on terminal email status are set up in the
- *           migration file. This script focuses on VACUUM FULL + reporting.
+ *           KAIZEN(2026-08-11): Switched from single DELETE to batched DELETE
+ *           (5 000 rows per batch with 100 ms inter-batch pause) to avoid ETIMEDOUT
+ *           on large tables. Retention window tightened from 30d to 14d for cron_runs.
  *
  *           Exit code:
  *             0 — success (even if 0 rows affected)
  *             non-zero — real DB error
  *
- * @author  Hermia
- * @created 2026-07-28
+ * @author  Hermia / Aria Implementer
+ * @created 2026-07-28, updated 2026-08-11
  * @deps    pg (already in node_modules)
  * @env     DATABASE_URL — full connection string (read from .env.local by the
  *          cron job). Falls back to the local aria DB with NO embedded
@@ -27,7 +27,7 @@
  * USAGE:
  *   node --env-file=.env.local scripts/prune-retention.js
  *   # or explicitly:
- *   DATABASE_URL=postgresql://user:pass@host:5432/db node scripts/prune-retention.js
+ *   DATABASE_URL=postgresql://user:***@host:5432/db node scripts/prune-retention.js
  */
 
 const { Client } = require("pg");
@@ -40,10 +40,26 @@ const CONNECTION =
   process.env.DATABASE_URL ||
   "postgresql://aria@localhost:5432/aria";
 
+/** Batch size for batched DELETE. Kept small enough to avoid long locks. */
+const BATCH_SIZE = 5_000;
+
+/** Millisecond pause between batches — gives Postgres a breath. */
+const BATCH_PAUSE_MS = 100;
+
+/** Retention threshold for cron_runs (retain 14 days). */
+const CRON_RETENTION_DAYS = 14;
+
+/** Retention threshold for email_inbox_queue (retain 30 days). */
+const EMAIL_RETENTION_DAYS = 30;
+
 function fmt(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} kB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 async function getSizes(client) {
@@ -61,6 +77,58 @@ async function getSizes(client) {
   const map = {};
   for (const r of rows) map[r.relname] = r;
   return map;
+}
+
+/**
+ * Batch-delete old rows from a table using a timestamp column.
+ * Reports progress every batch so cron logs show liveness.
+ */
+async function batchedDelete(client, table, column, retentionDays, label) {
+  const countRes = await client.query(
+    `SELECT COUNT(*)::int AS cnt FROM public.${table} WHERE ${column} < NOW() - INTERVAL '${retentionDays} days'`
+  );
+  const totalToDelete = Number(countRes.rows[0].cnt);
+
+  console.log(`\n[${label}] ${totalToDelete} rows to delete (>${retentionDays}d old)`);
+
+  if (totalToDelete === 0) {
+    console.log(`[${label}] Nothing to prune.`);
+    return 0;
+  }
+
+  let deleted = 0;
+  let batch = 0;
+
+  // Use a loop with LIMIT — each DELETE removes up to BATCH_SIZE rows
+  // and the loop continues until 0 rows affected.
+  while (true) {
+    const delRes = await client.query(
+      `DELETE FROM public.${table}
+       WHERE id IN (
+         SELECT id FROM public.${table}
+         WHERE ${column} < NOW() - INTERVAL '${retentionDays} days'
+         ORDER BY id
+         LIMIT $1
+       )`,
+      [BATCH_SIZE]
+    );
+
+    const batchRows = delRes.rowCount ?? 0;
+    if (batchRows === 0) break;
+
+    deleted += batchRows;
+    batch++;
+    const pct = ((deleted / totalToDelete) * 100).toFixed(1);
+    console.log(
+      `[${label}] batch ${batch}: ${deleted}/${totalToDelete} (${pct}%) — ${batchRows} rows deleted`
+    );
+
+    if (batchRows < BATCH_SIZE) break; // last batch — fewer than limit
+    await sleep(BATCH_PAUSE_MS);
+  }
+
+  console.log(`[${label}] Done: ${deleted} rows deleted.`);
+  return deleted;
 }
 
 async function main() {
@@ -84,13 +152,9 @@ async function main() {
       );
     }
 
-    // ---- Run retention if migration hasn't been applied yet ----
-    // Delete cron_runs older than 30 days (safe to run unconditionally)
-    const delResult = await client.query(`
-      DELETE FROM public.cron_runs
-      WHERE started_at < NOW() - INTERVAL '30 days'
-    `);
-    console.log(`\n  cron_runs: deleted ${delResult.rowCount} rows older than 30 days`);
+    // ---- Retention delete (batched) ----
+    await batchedDelete(client, "cron_runs", "started_at", CRON_RETENTION_DAYS, "cron_runs");
+    await batchedDelete(client, "email_inbox_queue", "created_at", EMAIL_RETENTION_DAYS, "email_inbox_queue");
 
     // ---- VACUUM FULL — reclaims heap from bloat ----
     // VACUUM FULL acquires an ACCESS EXCLUSIVE lock — on a local dev DB
