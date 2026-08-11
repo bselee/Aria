@@ -190,6 +190,95 @@ describe("inferPONumberFromRecentPOs (ported from tracking-agent.ts)", () => {
         expect(result).toBe("124503");
     });
 
+    // ── Score-floor regression tests (P0 fix: PO 125178 magnet) ──────────────
+    // These guard against the bug where a single 3-char vendor token match
+    // (score = 1) caused email_ingest_inferred to glom 567 shipments onto
+    // one freshly created PO.  Minimum score floor is now 2.
+
+    it("returns null for a single weak vendor token match (score=1, below floor)", () => {
+        // PO: "Rootwise Soil Dynamics" — tokens: rootwise (8), soil (4), dynamics (8)
+        // Email mentions only one token ("dynamics") from a generic notification
+        // → score=1, below floor of 2 → must return null
+        const singleTokenPOs: RecentPO[] = [
+            {
+                po_number: "125178",
+                vendor_name: "Rootwise Soil Dynamics",
+                created_at: "2026-08-09T12:00:00.000Z",
+            },
+        ];
+        const result = inferPONumberFromRecentPOs(
+            {
+                subject: "Your package has been picked up",
+                bodySnippet: "Freight dynamics update: shipment pickup confirmed.",
+                fromEmail: "carrier@freight-dynamics.com",
+            },
+            singleTokenPOs,
+        );
+        expect(result).toBeNull();
+    });
+
+    it("returns null when email contains only a single stop-word-filtered vendor token", () => {
+        // "Supply" from "Wine Supply Inc" matches but "Inc" is a stop word
+        // → score=1 (single token "supply"), below floor → null
+        const supplyPOs: RecentPO[] = [
+            {
+                po_number: "100400",
+                vendor_name: "Wine Supply Inc",
+                created_at: "2026-08-01T12:00:00.000Z",
+            },
+        ];
+        const result = inferPONumberFromRecentPOs(
+            {
+                subject: "Supply chain update",
+                bodySnippet: "Your supply shipment has been dispatched.",
+                fromEmail: "updates@logistics.com",
+            },
+            supplyPOs,
+        );
+        expect(result).toBeNull();
+    });
+
+    it("returns PO when two vendor tokens match (score=2, meets floor)", () => {
+        // "Rootwise" and "Soil" both match → score=2, meets floor → return PO
+        const twoTokenPOs: RecentPO[] = [
+            {
+                po_number: "125178",
+                vendor_name: "Rootwise Soil Dynamics",
+                created_at: "2026-08-09T12:00:00.000Z",
+            },
+        ];
+        const result = inferPONumberFromRecentPOs(
+            {
+                subject: "Rootwise Soil shipment notification",
+                bodySnippet: "Your Rootwise Soil order is on the way.",
+                fromEmail: "shipping@rootwise.com",
+            },
+            twoTokenPOs,
+        );
+        expect(result).toBe("125178");
+    });
+
+    it("returns PO when full vendor name substring matches (score >= 10, meets floor)", () => {
+        // Full vendor name "Thirsty Earth" appears in body → score >= 10
+        // Also two individual tokens match.  Still valid.
+        const fullVendorPOs: RecentPO[] = [
+            {
+                po_number: "124503",
+                vendor_name: "Thirsty Earth",
+                created_at: "2026-03-27T19:29:31.000Z",
+            },
+        ];
+        const result = inferPONumberFromRecentPOs(
+            {
+                subject: "Thirsty Earth has shipped your items",
+                bodySnippet: "Thank you for your order from Thirsty Earth!",
+                fromEmail: "tracking@shipstation.com",
+            },
+            fullVendorPOs,
+        );
+        expect(result).toBe("124503");
+    });
+
     it("scores full vendor name match higher than partial token match", () => {
         // Multiple vendors might share a token ("Earth" appears nowhere),
         // but full name match for "Thirsty Earth" gets +10 bonus

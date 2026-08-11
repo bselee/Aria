@@ -373,6 +373,27 @@ async function processMessage(
                 );
 
                 if (inferredPO) {
+                    // Per-PO cap: don't let a single PO accumulate a magnet
+                    // of inferred-only shipments. After 10 inferred links,
+                    // store tracking numbers unlinked so they don't poison
+                    // the PO's shipment count. (P0 fix: PO 125178 / 567 rows)
+                    const { data: capData } = await db
+                        .from("shipments")
+                        .select("id")
+                        .overlap("po_numbers", [inferredPO])
+                        .eq("last_source", "email_ingest_inferred");
+                    const inferredCount = (capData || []).length;
+
+                    if (inferredCount >= 10) {
+                        console.log(
+                            `[email-tracking-ingest] Skipping inferred PO #${inferredPO} — ` +
+                            `already has ${inferredCount} inferred shipments (cap=10)`,
+                        );
+                        inferredPO = null;
+                    }
+                }
+
+                if (inferredPO) {
                     console.log(
                         `[email-tracking-ingest] Inferred PO #${inferredPO} for tracking ` +
                         `(no explicit PO in email/PDF text)`,
@@ -713,7 +734,8 @@ function extractNumericHints(text: string): string[] {
  * 1. Direct numeric-hint match against po_number (returns immediately if
  *    exactly one candidate matches).
  * 2. Vendor-name token overlap: full vendor name substring match scores +10,
- *    individual token matches score +1 each.
+ *    individual token matches score +1 each. Minimum score floor is 2
+ *    (a single weak 3-char token match is not evidence).
  * 3. Tie-breaking: excludes dropship POs when there is ambiguity.
  *
  * @exportedForTesting — exported so unit tests can exercise the pure
@@ -751,7 +773,7 @@ export function inferPONumberFromRecentPOs(
             const tokenMatches = tokens.filter((token) => normalizedCombined.includes(token)).length;
             return { po, score: (fullMatch ? 10 : 0) + tokenMatches };
         })
-        .filter((entry) => entry.score > 0)
+        .filter((entry) => entry.score >= 2)  // floor: full vendor (>= 10) or 2+ tokens
         .sort((a, b) => b.score - a.score);
 
     if (!scored.length) return null;
