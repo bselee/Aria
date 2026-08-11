@@ -267,204 +267,117 @@ function MatchComparisonView({
                 <div className="px-3 py-2 bg-rose-950/10 text-[10px] font-mono text-rose-400">{error}</div>
             )}
 
-            {diff && (
-                <>
-                    {/* ── Charges Comparison Table ── */}
-                    {matchedInv && (
-                        <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/40">
-                            <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Charges Comparison</div>
-                            <table className="w-full text-[10px] font-mono">
-                                <thead>
-                                    <tr className="text-zinc-600 border-b border-zinc-800/40">
-                                        <th className="text-left py-0.5 pr-2">Charge</th>
-                                        <th className="text-right py-0.5 px-2">PO</th>
-                                        <th className="text-right py-0.5 px-2">Invoice</th>
-                                        <th className="text-right py-0.5 pl-2">Diff</th>
+            {/* ── Charges Comparison (from GET enrichment, always visible) ── */}
+            {rec?.chargesComparison && (
+                <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/40">
+                    <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Charges Comparison</div>
+                    <table className="w-full text-[10px] font-mono">
+                        <thead>
+                            <tr className="text-zinc-600 border-b border-zinc-800/40">
+                                <th className="text-left py-0.5 pr-2">Charge</th>
+                                <th className="text-right py-0.5 px-2">PO</th>
+                                <th className="text-right py-0.5 px-2">Invoice</th>
+                                <th className="text-right py-0.5 pl-2">Diff</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {(["subtotal","freight","tax","tariffs","total"] as const).map((k, i) => {
+                                const po = rec.chargesComparison!.po[k];
+                                const inv = rec.chargesComparison!.invoice[k];
+                                const diff = rec.chargesComparison!.diffs[k];
+                                const label = k.charAt(0).toUpperCase() + k.slice(1);
+                                const diffAbs = Math.abs(diff ?? 0);
+                                const diffCls = diffAbs < 0.01 ? "text-zinc-600" : diffAbs > 50 ? "text-rose-400" : "text-amber-300";
+                                const rowCls = k === "total" ? "border-t border-zinc-700/50 font-semibold" : "";
+                                return (
+                                    <tr key={k} className={rowCls}>
+                                        <td className="py-0.5 pr-2 text-zinc-400">{label}</td>
+                                        <td className="text-right py-0.5 px-2 text-zinc-300">{po != null ? `$${po.toFixed(2)}` : "—"}</td>
+                                        <td className="text-right py-0.5 px-2 text-zinc-300">{inv != null ? `$${inv.toFixed(2)}` : "—"}</td>
+                                        <td className={`text-right py-0.5 pl-2 ${diffCls}`}>
+                                            {diff != null ? `${diff > 0 ? "+" : ""}$${diff.toFixed(2)}` : "—"}
+                                        </td>
                                     </tr>
-                                </thead>
-                                <tbody>
-                                    {(() => {
-                                        const rows: Array<{ label: string; po: number | null; inv: number | null; cls?: string }> = [
-                                            { label: "Subtotal", po: po.total, inv: matchedInv.subtotal },
-                                            { label: "Freight", po: diff.poFreight ?? 0, inv: diff.invoiceFreight ?? matchedInv.freight ?? 0 },
-                                            { label: "Tax", po: null, inv: matchedInv.tax },
-                                            { label: "Total", po: po.total, inv: matchedInv.total, cls: "border-t border-zinc-700/50 font-semibold" },
-                                        ];
-                                        return rows.map(row => {
-                                            const diffVal = row.po != null && row.inv != null ? row.inv - row.po : null;
-                                            const diffCls = diffVal != null && Math.abs(diffVal) > 0.01
-                                                ? diffVal > 50 ? "text-rose-400" : "text-amber-300"
-                                                : "text-zinc-600";
-                                            return (
-                                                <tr key={row.label} className={row.cls || ""}>
-                                                    <td className="py-0.5 pr-2 text-zinc-400">{row.label}</td>
-                                                    <td className="text-right py-0.5 px-2 text-zinc-300">
-                                                        {row.po != null ? `$${row.po.toFixed(2)}` : "—"}
-                                                    </td>
-                                                    <td className="text-right py-0.5 px-2 text-zinc-300">
-                                                        {row.inv != null ? `$${row.inv.toFixed(2)}` : "—"}
-                                                    </td>
-                                                    <td className={`text-right py-0.5 pl-2 ${diffCls}`}>
-                                                        {diffVal != null ? `${diffVal > 0 ? "+" : ""}$${diffVal.toFixed(2)}` : "—"}
-                                                    </td>
-                                                </tr>
-                                            );
-                                        });
-                                    })()}
-                                </tbody>
-                            </table>
-                            {matchedInv.total != null && po.total > 0 && Math.abs(matchedInv.total - po.total) > 0.01 && (
-                                <div className="mt-1 text-[10px] font-mono text-rose-400">
-                                    Total variance: {matchedInv.total > po.total ? "+" : ""}${Math.abs(matchedInv.total - po.total).toFixed(2)}
-                                </div>
-                            )}
-                        </div>
-                    )}
-
-                    {/* ── Line-Item Comparison Table ── */}
-                    {diff.lineItems && diff.lineItems.length > 0 && (
-                        <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/20">
-                            <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Line-Item Comparison</div>
-                            <table className="w-full text-[10px] font-mono">
-                                <thead>
-                                    <tr className="text-zinc-600 border-b border-zinc-800/40">
-                                        <th className="text-left py-0.5 pr-1.5">SKU</th>
-                                        <th className="text-right py-0.5 px-1">PO Qty</th>
-                                        <th className="text-right py-0.5 px-1">PO $</th>
-                                        <th className="text-right py-0.5 px-1">Rcv</th>
-                                        <th className="text-right py-0.5 px-1">Inv Qty</th>
-                                        <th className="text-right py-0.5 px-1">Inv $</th>
-                                        <th className="text-right py-0.5 pl-1.5">Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {diff.lineItems.map((li: any) => {
-                                        const qtyChanged = li.quantityDiff !== null && li.quantityDiff !== 0;
-                                        const priceChanged = li.priceDiff !== null && li.priceDiff !== 0;
-                                        const isBlocking = li.quantityDiff !== null && li.quantityDiff > 0; // over-billed
-                                        const isVariance = qtyChanged || priceChanged;
-
-                                        const poItem = po.items.find(i => i.productId === li.productId);
-                                        const receivedQty = poItem?.receivedQuantity ?? poItem?.quantity;
-
-                                        let rowCls = "text-zinc-300 border-b border-zinc-800/20";
-                                        if (isBlocking) rowCls = "bg-rose-950/15 border-b border-rose-800/20 text-rose-200";
-                                        else if (isVariance) rowCls = "bg-amber-950/10 border-b border-amber-800/20 text-amber-200";
-
-                                        const statusIcon = isBlocking ? "🔴" : isVariance ? "🟡" : "🟢";
-
-                                        return (
-                                            <tr key={li.productId} className={rowCls}>
-                                                <td className="py-0.5 pr-1.5 text-left font-semibold truncate max-w-[80px]" title={li.productId || li.productName}>
-                                                    {li.productId || li.productName || "—"}
-                                                </td>
-                                                <td className="text-right py-0.5 px-1">{fmtQty(li.poQuantity)}</td>
-                                                <td className="text-right py-0.5 px-1">${(li.poUnitPrice ?? 0).toFixed(2)}</td>
-                                                <td className="text-right py-0.5 px-1 text-cyan-400">{fmtQty(receivedQty)}</td>
-                                                <td className={`text-right py-0.5 px-1 font-semibold ${qtyChanged ? "text-rose-300" : ""}`}>
-                                                    {li.invoiceQuantity != null ? fmtQty(li.invoiceQuantity) : "—"}
-                                                </td>
-                                                <td className={`text-right py-0.5 px-1 font-semibold ${priceChanged ? "text-rose-300" : ""}`}>
-                                                    {li.invoiceUnitPrice != null ? `$${li.invoiceUnitPrice.toFixed(2)}` : "—"}
-                                                </td>
-                                                <td className="text-right py-0.5 pl-1.5">{statusIcon}</td>
-                                            </tr>
-                                        );
-                                    })}
-                                </tbody>
-                            </table>
-                        </div>
-                    )}
-
-                    {/* ── Proposed Changes Summary ── */}
-                    <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/30">
-                        <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Proposed Changes</div>
-                        <div className="space-y-0.5">
-                            {diff.lineItems?.filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                .map((li: any) => {
-                                    const parts: string[] = [];
-                                    if (li.priceDiff !== null && li.priceDiff !== 0) {
-                                        parts.push(`price $${(li.poUnitPrice ?? 0).toFixed(2)}→$${(li.invoiceUnitPrice ?? 0).toFixed(2)}`);
-                                    }
-                                    if (li.quantityDiff !== null && li.quantityDiff !== 0) {
-                                        parts.push(`qty ${fmtQty(li.poQuantity)}→${fmtQty(li.invoiceQuantity ?? 0)}`);
-                                    }
-                                    return (
-                                        <div key={li.productId} className="text-[10px] font-mono flex items-center gap-1.5">
-                                            <span className="text-zinc-300 font-semibold w-16 truncate">{li.productId}</span>
-                                            <span className={li.priceDiff && li.priceDiff > 0 || li.quantityDiff && li.quantityDiff > 0 ? "text-rose-300" : "text-emerald-300"}>
-                                                {parts.join(", ")}
-                                            </span>
-                                        </div>
-                                    );
-                                })}
-                            {diff.freightDiff != null && Math.abs(diff.freightDiff) > 0.01 && (
-                                <div className="text-[10px] font-mono">
-                                    <span className="text-zinc-400">Freight: </span>
-                                    <span className={diff.freightDiff > 0 ? "text-rose-300" : "text-emerald-300"}>
-                                        {diff.freightDiff > 0 ? "+" : ""}${diff.freightDiff.toFixed(2)}
-                                    </span>
-                                </div>
-                            )}
-                            {diff.lineItems?.every((li: any) => (li.quantityDiff ?? 0) === 0 && (li.priceDiff ?? 0) === 0)
-                                && (!diff.freightDiff || Math.abs(diff.freightDiff) < 0.01) && (
-                                <div className="text-[10px] font-mono text-emerald-400/70">✅ No changes needed — PO matches invoice within tolerance</div>
-                            )}
-                        </div>
-                    </div>
-
-                    {/* ── Action Buttons ── */}
-                    <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/50">
-                        <button
-                            onClick={e => { e.stopPropagation(); onToggle(); }}
-                            className="px-2 py-1 rounded text-[10px] font-mono text-zinc-400 hover:text-zinc-200 border border-zinc-700/40 hover:border-zinc-600 transition-colors"
-                        >
-                            Close
-                        </button>
-                        {status === "no_match" ? (
-                            <button
-                                onClick={e => { e.stopPropagation(); onComplete(); }}
-                                className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-blue-500/15 border border-blue-500/40 text-blue-300 hover:bg-blue-500/25 cursor-pointer transition-colors"
-                            >
-                                Match Invoice
-                            </button>
-                        ) : (
-                            <>
-                                {diff.hasChanges ? (
-                                    <button
-                                        onClick={e => {
-                                            e.stopPropagation();
-                                            const adjustments = diff.lineItems
-                                                .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                                .map((li: any) => ({
-                                                    productId: li.productId,
-                                                    newQuantity: li.invoiceQuantity ?? undefined,
-                                                    newUnitPrice: li.invoiceUnitPrice ?? undefined,
-                                                }));
-                                            onApply(adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null);
-                                        }}
-                                        disabled={saving}
-                                        className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${
-                                            saving
-                                                ? "bg-amber-500/10 text-amber-400/50 border border-amber-500/30 cursor-wait"
-                                                : "bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer"
-                                        }`}
-                                    >
-                                        {saving ? "Applying..." : "Review & Apply Changes → Complete"}
-                                    </button>
-                                ) : (
-                                    <button
-                                        onClick={e => { e.stopPropagation(); onComplete(); }}
-                                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
-                                    >
-                                        Complete PO
-                                    </button>
-                                )}
-                            </>
-                        )}
-                    </div>
-                </>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
             )}
+
+            {/* ── Line-Item Comparison (from GET enrichment, always visible) ── */}
+            {rec?.lineComparison && rec.lineComparison.length > 0 && (
+                <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/20">
+                    <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Line-Item Comparison</div>
+                    <table className="w-full text-[10px] font-mono">
+                        <thead>
+                            <tr className="text-zinc-600 border-b border-zinc-800/40">
+                                <th className="text-left py-0.5 pr-1.5">SKU</th>
+                                <th className="text-right py-0.5 px-1">PO Qty</th>
+                                <th className="text-right py-0.5 px-1">PO $</th>
+                                <th className="text-right py-0.5 px-1">Rcv</th>
+                                <th className="text-right py-0.5 px-1">Inv Qty</th>
+                                <th className="text-right py-0.5 px-1">Inv $</th>
+                                <th className="text-right py-0.5 pl-1.5">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rec.lineComparison.map((l: any) => {
+                                const isBlocking = l.status === "blocking";
+                                const isVariance = l.status === "variance";
+                                const rowCls = isBlocking ? "bg-rose-950/15 border-b border-rose-800/20 text-rose-200"
+                                    : isVariance ? "bg-amber-950/10 border-b border-amber-800/20 text-amber-200"
+                                    : "text-zinc-300 border-b border-zinc-800/20";
+                                const statusIcon = isBlocking ? "🔴" : isVariance ? "🟡" : "🟢";
+                                return (
+                                    <tr key={l.productId} className={rowCls}>
+                                        <td className="py-0.5 pr-1.5 text-left font-semibold truncate max-w-[80px]" title={l.productId}>{l.productId || "—"}</td>
+                                        <td className="text-right py-0.5 px-1">{fmtQty(l.poQty)}</td>
+                                        <td className="text-right py-0.5 px-1">${(l.poUnitPrice ?? 0).toFixed(2)}</td>
+                                        <td className="text-right py-0.5 px-1 text-cyan-400">{l.receivedQty != null ? fmtQty(l.receivedQty) : "—"}</td>
+                                        <td className="text-right py-0.5 px-1">{l.invoiceQty != null ? fmtQty(l.invoiceQty) : "—"}</td>
+                                        <td className="text-right py-0.5 px-1">{l.invoiceUnitPrice != null ? `$${l.invoiceUnitPrice.toFixed(2)}` : "—"}</td>
+                                        <td className="text-right py-0.5 pl-1.5">{statusIcon}</td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+
+            {/* ── 3-Way Match Summary ── */}
+            {rec?.threeWayMatch && (
+                <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/30">
+                    <div className="text-[10px] font-mono text-zinc-400">{rec.threeWayMatch.summary}</div>
+                    {rec.threeWayMatch.discrepancies?.length > 0 && rec.threeWayMatch.discrepancies.map((d: any) => (
+                        <div key={d.productId + d.kind} className={`text-[9px] font-mono mt-0.5 ${d.blocking ? "text-rose-400" : "text-amber-400"}`}>
+                            {d.blocking ? "🚫" : "⚠️"} {d.message} {d.dollarImpact ? `($${d.dollarImpact})` : ""}
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* ── Action ── */}
+            <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/50">
+                {status === "no_match" ? (
+                    <span className="text-[9px] font-mono text-zinc-600 mr-auto">No invoice matched</span>
+                ) : rec?.threeWayMatch?.canApprove ? (
+                    <button
+                        onClick={e => { e.stopPropagation(); onComplete(); }}
+                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
+                    >
+                        Complete PO
+                    </button>
+                ) : (
+                    <button
+                        onClick={e => { e.stopPropagation(); onComplete(); }}
+                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer transition-colors"
+                    >
+                        Review & Complete
+                    </button>
+                )}
+            </div>
         </div>
     );
 }
@@ -1259,6 +1172,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 .filter(po => {
                                     if (showAllReceived) return true;
                                     const lbl = apMap[po.orderId]?.label || "";
+                                    // Always show POs with match data so line-item/charges comparison is visible
+                                    const recStatus = (po as any)._reconciliation?.matchStatus;
+                                    if (recStatus === "match" || recStatus === "possible_match") return true;
                                     return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
                                 })
                                 .map(po => {
