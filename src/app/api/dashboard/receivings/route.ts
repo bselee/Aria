@@ -301,49 +301,18 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 }
                             } catch { /* non-blocking */ }
 
-                            // ── Load receipt quantities from Finale in parallel ──────────
+                            // ── Shipment detail fetches DEFERRED to POST complete_po ──────
+                            // GET enrichment is display-only: compare PO vs invoice lines.
+                            // Quantity-over-billed detection (which needs per-SKU receivedQtys
+                            // from Finale shipment details) runs during POST complete_po, when
+                            // the user actually commits. Skipping it here keeps GET fast.
                             const receiptQtysMap = new Map<string, Record<string, number>>();
                             const packMultipliersMap = new Map<string, Record<string, number>>();
-                            const finaleForReceipts = new FinaleClient();
-
-                            await mapConcurrent(matchedPOs, 3, async (po: any) => {
+                            for (const po of matchedPOs) {
                                 const poNum = po.poNumber || po.orderId;
-                                try {
-                                    const receivedQtys: Record<string, number> = {};
-                                    const packMultipliers: Record<string, number> = {};
-                                    const poDetails = await finaleForReceipts.getOrderDetails(poNum);
-                                    const shipments = poDetails?.shipmentList || [];
-                                    const allShipmentItems: Array<{ productId: string; quantity: number }> = [];
-                                    for (const shipment of shipments) {
-                                        const shipmentUrl = shipment?.shipmentUrl;
-                                        if (!shipmentUrl) continue;
-                                        try {
-                                            const detail = await finaleForReceipts.getShipmentDetails(String(shipmentUrl));
-                                            const { getShipmentReceiptItems } = await import("@/lib/finale/core-client");
-                                            allShipmentItems.push(...getShipmentReceiptItems(detail));
-                                        } catch { /* skip failed shipment detail fetch */ }
-                                    }
-                                    for (const item of allShipmentItems) {
-                                        receivedQtys[item.productId] = (receivedQtys[item.productId] ?? 0) + item.quantity;
-                                    }
-                                    const allSkus = [...new Set(Object.keys(receivedQtys))];
-                                    if (allSkus.length > 0) {
-                                        try {
-                                            const { getPackSizes } = await import("@/lib/purchasing/pack-size-registry");
-                                            const sizes = await getPackSizes(allSkus);
-                                            for (const [sku, pr] of sizes) {
-                                                if (pr.unitsPerPack > 1) packMultipliers[sku] = pr.unitsPerPack;
-                                            }
-                                        } catch { /* pack sizes optional */ }
-                                    }
-                                    receiptQtysMap.set(poNum, receivedQtys);
-                                    packMultipliersMap.set(poNum, packMultipliers);
-                                } catch (receiptErr: any) {
-                                    console.warn(`[receivings] Receipt fetch failed for PO ${poNum}: ${receiptErr?.message || receiptErr}`);
-                                    receiptQtysMap.set(poNum, {});
-                                    packMultipliersMap.set(poNum, {});
-                                }
-                            });
+                                receiptQtysMap.set(poNum, {});
+                                packMultipliersMap.set(poNum, {});
+                            }
 
                             // ── Evaluate 3-way match for each matched PO ─────────────────
                             const { enrichReceivedPO } = await import("@/lib/purchasing/receivings-enrichment");
