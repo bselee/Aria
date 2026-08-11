@@ -248,3 +248,39 @@ describe("3-way match — defaults", () => {
         expect(DEFAULT_TOLERANCES.qtyAbsUnits).toBe(1);
     });
 });
+
+describe("3-way match — acceptance: real receipt quantities catch the faked-data bug", () => {
+    it("BLOCKS when invoice bills 100 but only 60 arrived (real receivedQty=60)", () => {
+        // This is the scenario the old code NEVER caught because it set
+        // receivedQty = poQty when hasReceipt was true.
+        const r = evaluateThreeWayMatch(input([cleanLine({ receivedQty: 60 })]));
+        expect(r.verdict).toBe("exception");
+        expect(r.canApprove).toBe(false);
+        const d = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(d?.blocking).toBe(true);
+        expect(d?.dollarImpact).toBe(400); // 40 units x $10
+    });
+
+    it("flags short shipment as non-blocking variance when invoice bills only what arrived", () => {
+        // 60 of 100 arrived, vendor correctly billed only 60.
+        // Payment for received goods should proceed; shortfall is informational.
+        const r = evaluateThreeWayMatch(
+            input([cleanLine({ receivedQty: 60, invoiceQty: 60 })]),
+        );
+        expect(r.verdict).toBe("variance");
+        expect(r.canApprove).toBe(false); // surfaced for review, not auto-approved
+        const short = r.discrepancies.find((x) => x.kind === "qty_short_received");
+        expect(short?.blocking).toBe(false);
+        expect(short?.message).toContain("short 40");
+    });
+
+    it("treats null receivedQty as zero received (over-bill detected)", () => {
+        // When receipt data is unavailable (receivedQty = null), the module
+        // treats it as zero. Invoice of 100 against zero received = over-bill.
+        const r = evaluateThreeWayMatch(input([cleanLine({ receivedQty: null })]));
+        expect(r.verdict).toBe("exception");
+        expect(r.canApprove).toBe(false);
+        const d = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(d?.blocking).toBe(true);
+    });
+});

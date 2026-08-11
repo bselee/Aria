@@ -96,9 +96,9 @@ function extractLineItems(inv: any): Array<{ sku?: string; qty?: number; descrip
             const parsed = typeof inv.line_items === 'string' ? JSON.parse(inv.line_items) : inv.line_items;
             if (Array.isArray(parsed) && parsed.length > 0) {
                 return parsed.map((li: any) => ({
-                    sku: li.sku || li.productId || undefined,
-                    qty: li.qty ?? li.quantity ?? undefined,
-                    description: li.description || undefined,
+            sku: li.sku || li.productId || undefined,
+            qty: li.qty ?? li.quantity ?? undefined,
+            description: li.description || undefined,
                 }));
             }
         } catch { /* not JSON */ }
@@ -197,7 +197,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             received = await Promise.race([
                 finale.getTodaysReceivedPOs(startStr, tomorrowStr),
                 new Promise<any[]>((_, reject) =>
-                    setTimeout(() => reject(new Error('getTodaysReceivedPOs soft budget 12s')), 12_000),
+            setTimeout(() => reject(new Error('getTodaysReceivedPOs soft budget 12s')), 12_000),
                 ),
             ]);
         } catch (finaleErr: any) {
@@ -219,44 +219,44 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
             if (poNumbers.length > 0) {
                 const { data: invoices } = await sb
-                    .from('vendor_invoices')
-                    .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref')
-                    .in('po_number', poNumbers)
-                    .order('created_at', { ascending: false });
+            .from('vendor_invoices')
+            .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref')
+            .in('po_number', poNumbers)
+            .order('created_at', { ascending: false });
 
                 const { data: outcomes } = await sb
-                    .from('reconciliation_outcomes')
-                    .select('po_id, invoice_id, outcome, outcome_meta, created_at, resolved_at')
-                    .in('po_id', poNumbers)
-                    .order('created_at', { ascending: false });
+            .from('reconciliation_outcomes')
+            .select('po_id, invoice_id, outcome, outcome_meta, created_at, resolved_at')
+            .in('po_id', poNumbers)
+            .order('created_at', { ascending: false });
 
                 const invoiceMap = new Map<string, any[]>();
                 for (const inv of (invoices || [])) {
-                    const key = inv.po_number;
-                    if (!invoiceMap.has(key)) invoiceMap.set(key, []);
-                    invoiceMap.get(key)!.push(inv);
+            const key = inv.po_number;
+            if (!invoiceMap.has(key)) invoiceMap.set(key, []);
+            invoiceMap.get(key)!.push(inv);
                 }
 
                 const outcomeMap = new Map<string, any[]>();
                 for (const oc of (outcomes || [])) {
-                    const key = oc.po_id;
-                    if (!outcomeMap.has(key)) outcomeMap.set(key, []);
-                    outcomeMap.get(key)!.push(oc);
+            const key = oc.po_id;
+            if (!outcomeMap.has(key)) outcomeMap.set(key, []);
+            outcomeMap.get(key)!.push(oc);
                 }
 
                 for (const po of received) {
-                    const poNum = po.poNumber || po.orderId;
-                    (po as any)._reconciliation = {
-                        invoices: invoiceMap.get(poNum) || [],
-                        outcomes: outcomeMap.get(poNum) || [],
-                        hasPendingApproval: (outcomeMap.get(poNum) || []).some(
-                            (o: any) => o.outcome === 'pending_approval' && !o.resolved_at
-                        ),
-                        hasAutoApplied: (outcomeMap.get(poNum) || []).some(
-                            (o: any) => o.outcome === 'auto_applied'
-                        ),
-                        matchedInvoice: (invoiceMap.get(poNum) || [])[0] || null,
-                    };
+            const poNum = po.poNumber || po.orderId;
+            (po as any)._reconciliation = {
+                invoices: invoiceMap.get(poNum) || [],
+                outcomes: outcomeMap.get(poNum) || [],
+                hasPendingApproval: (outcomeMap.get(poNum) || []).some(
+                    (o: any) => o.outcome === 'pending_approval' && !o.resolved_at
+                ),
+                hasAutoApplied: (outcomeMap.get(poNum) || []).some(
+                    (o: any) => o.outcome === 'auto_applied'
+                ),
+                matchedInvoice: (invoiceMap.get(poNum) || [])[0] || null,
+            };
                 }
             }
 
@@ -267,240 +267,240 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             if (vendorNames.length > 0) {
                 let unmatchedInvoices: any[] = [];
                 try {
-                    const { data } = await sb
-                        .from('vendor_invoices')
-                        .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
-                        .is('po_number', null)
-                        .in('vendor_name', vendorNames)
-                        .order('created_at', { ascending: false })
-                        .limit(20);
-                    unmatchedInvoices = data || [];
+            const { data } = await sb
+                .from('vendor_invoices')
+                .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
+                .is('po_number', null)
+                .in('vendor_name', vendorNames)
+                .order('created_at', { ascending: false })
+                .limit(20);
+            unmatchedInvoices = data || [];
                 } catch (fetchErr: any) {
-                    console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
-                    unmatchedInvoices = [];
+            console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
+            unmatchedInvoices = [];
                 }
 
                 // Local invoice_cache fallback when PostgREST is empty/down (photo invoices etc.)
                 try {
-                    const { getUnmatchedInvoices, getInvoiceCacheByVendor } = await import(
-                        '@/lib/storage/purchasing-cache'
-                    );
-                    const localUnmatched = getUnmatchedInvoices();
-                    const seen = new Set(
-                        unmatchedInvoices.map(
-                            (i) =>
-                                `${(i.vendor_name || '').toLowerCase()}|${i.invoice_number || ''}|${i.total || 0}`,
-                        ),
-                    );
-                    for (const v of vendorNames) {
-                        const rows = [
-                            ...localUnmatched.filter((r) =>
-                                (r.vendor_name || '').toLowerCase().includes(String(v).toLowerCase().slice(0, 12)),
-                            ),
-                            ...getInvoiceCacheByVendor(v).filter((r) => !r.matched_po && !r.po_number),
-                        ];
-                        for (const row of rows) {
-                            const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
-                            if (seen.has(key)) continue;
-                            // Only skip confirmed matches — OCR may set po_number as candidate
-                            if (row.matched_po) continue;
-                            seen.add(key);
-                            unmatchedInvoices.push({
-                                id: row.vendor_invoice_id || key,
-                                invoice_number: row.invoice_number,
-                                vendor_name: row.vendor_name,
-                                invoice_date: row.invoice_date,
-                                subtotal: row.total || 0,
-                                freight: row.freight || 0,
-                                tax: row.tax || 0,
-                                total: row.total || 0,
-                                raw_data: {
-                                    lineItems: (() => {
-                                        try {
-                                            return JSON.parse(row.line_items || '[]');
-                                        } catch {
-                                            return [];
-                                        }
-                                    })(),
-                                    source: 'invoice_cache',
-                                    ocrPoCandidate: row.po_number || null,
-                                },
-                                _fromCache: true,
-                            });
+            const { getUnmatchedInvoices, getInvoiceCacheByVendor } = await import(
+                '@/lib/storage/purchasing-cache'
+            );
+            const localUnmatched = getUnmatchedInvoices();
+            const seen = new Set(
+                unmatchedInvoices.map(
+                    (i) =>
+                `${(i.vendor_name || '').toLowerCase()}|${i.invoice_number || ''}|${i.total || 0}`,
+                ),
+            );
+            for (const v of vendorNames) {
+                const rows = [
+                    ...localUnmatched.filter((r) =>
+                (r.vendor_name || '').toLowerCase().includes(String(v).toLowerCase().slice(0, 12)),
+                    ),
+                    ...getInvoiceCacheByVendor(v).filter((r) => !r.matched_po && !r.po_number),
+                ];
+                for (const row of rows) {
+                    const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
+                    if (seen.has(key)) continue;
+                    // Only skip confirmed matches — OCR may set po_number as candidate
+                    if (row.matched_po) continue;
+                    seen.add(key);
+                    unmatchedInvoices.push({
+                id: row.vendor_invoice_id || key,
+                invoice_number: row.invoice_number,
+                vendor_name: row.vendor_name,
+                invoice_date: row.invoice_date,
+                subtotal: row.total || 0,
+                freight: row.freight || 0,
+                tax: row.tax || 0,
+                total: row.total || 0,
+                raw_data: {
+                    lineItems: (() => {
+                        try {
+                    return JSON.parse(row.line_items || '[]');
+                        } catch {
+                    return [];
                         }
-                    }
-                    // Also surface DTE / recent AP photo invoices even if vendor name on PO differs slightly
-                    for (const row of localUnmatched.slice(0, 30)) {
-                        const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
-                        if (seen.has(key)) continue;
-                        if (row.matched_po) continue;
-                        seen.add(key);
-                        unmatchedInvoices.push({
-                            id: row.vendor_invoice_id || key,
-                            invoice_number: row.invoice_number,
-                            vendor_name: row.vendor_name,
-                            invoice_date: row.invoice_date,
-                            subtotal: row.total || 0,
-                            freight: row.freight || 0,
-                            tax: row.tax || 0,
-                            total: row.total || 0,
-                            raw_data: {
-                                source: 'invoice_cache',
-                                ocrPoCandidate: row.po_number || null,
-                            },
-                            _fromCache: true,
-                        });
-                    }
+                    })(),
+                    source: 'invoice_cache',
+                    ocrPoCandidate: row.po_number || null,
+                },
+                _fromCache: true,
+                    });
+                }
+            }
+            // Also surface DTE / recent AP photo invoices even if vendor name on PO differs slightly
+            for (const row of localUnmatched.slice(0, 30)) {
+                const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
+                if (seen.has(key)) continue;
+                if (row.matched_po) continue;
+                seen.add(key);
+                unmatchedInvoices.push({
+                    id: row.vendor_invoice_id || key,
+                    invoice_number: row.invoice_number,
+                    vendor_name: row.vendor_name,
+                    invoice_date: row.invoice_date,
+                    subtotal: row.total || 0,
+                    freight: row.freight || 0,
+                    tax: row.tax || 0,
+                    total: row.total || 0,
+                    raw_data: {
+                source: 'invoice_cache',
+                ocrPoCandidate: row.po_number || null,
+                    },
+                    _fromCache: true,
+                });
+            }
                 } catch (cacheErr: any) {
-                    console.warn('[receivings] invoice_cache fallback failed:', cacheErr?.message || cacheErr);
+            console.warn('[receivings] invoice_cache fallback failed:', cacheErr?.message || cacheErr);
                 }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
-                                    // HERMIA(2026-08-06): Drop junk invoices before scoring
-                                    unmatchedInvoices = unmatchedInvoices.filter((inv: any) => {
-                                        const total = Number(inv.total || 0);
-                                        const invNo = String(inv.invoice_number || "").trim();
-                                        if (total < 1 && !invNo) return false;
-                                        if (total < 1) return false; // $0 placeholders
-                                        return true;
-                                    });
-                                }
+                    // HERMIA(2026-08-06): Drop junk invoices before scoring
+                    unmatchedInvoices = unmatchedInvoices.filter((inv: any) => {
+                        const total = Number(inv.total || 0);
+                        const invNo = String(inv.invoice_number || "").trim();
+                        if (total < 1 && !invNo) return false;
+                        if (total < 1) return false; // $0 placeholders
+                        return true;
+                    });
+                }
 
-                                if (unmatchedInvoices && unmatchedInvoices.length > 0) {
-                                    // HERMIA(2026-08-06): Paint budget. Was 12×4s sequential-ish scoring
-                                    // + Finale auto-reconcile on GET → 45s panel timeouts.
-                                    // Cap hard: 6 invoices, 2s each, concurrency 4. NO writes on GET.
-                                    const toScore = unmatchedInvoices.slice(0, 6);
-                                    // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
-                                    const { classifyInvoice } = await import('@/config/invoice-classification');
-                                    const filteredToScore = toScore.filter((inv: any) => {
-                                        const cls = classifyInvoice({
-                                            vendorName: inv.vendor_name,
-                                            poNumber: inv.raw_data?.ocrPoCandidate || inv.po_number || null,
-                                        });
-                                        return cls.classification !== 'dropship_flow_through';
-                                    });
-                                    // Prefer filtered list
-                                    const scoreList = filteredToScore; // always use filtered (may be empty)
+                if (unmatchedInvoices && unmatchedInvoices.length > 0) {
+                    // HERMIA(2026-08-06): Paint budget. Was 12×4s sequential-ish scoring
+                    // + Finale auto-reconcile on GET → 45s panel timeouts.
+                    // Cap hard: 6 invoices, 2s each, concurrency 4. NO writes on GET.
+                    const toScore = unmatchedInvoices.slice(0, 6);
+                    // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
+                    const { classifyInvoice } = await import('@/config/invoice-classification');
+                    const filteredToScore = toScore.filter((inv: any) => {
+                        const cls = classifyInvoice({
+                    vendorName: inv.vendor_name,
+                    poNumber: inv.raw_data?.ocrPoCandidate || inv.po_number || null,
+                        });
+                        return cls.classification !== 'dropship_flow_through';
+                    });
+                    // Prefer filtered list
+                    const scoreList = filteredToScore; // always use filtered (may be empty)
 
-                                    // ── Phase A: score all invoices in parallel (read-only, concurrency 4) ──
-                                    // DECISION(2026-07-27): Previously this loop scored up to 12 invoices
-                                    // sequentially against 4s findPOCandidates timeouts (~48s worst case).
-                                    // Now scoring runs in parallel at concurrency 4.
-                                    // HERMIA(2026-08-06): Phase B Finale auto-apply REMOVED from GET.
-                                    // GET is paint-only. Auto-match writes belong on POST/cron.
-                                    const scoredResults = await mapConcurrent(scoreList, 4, async (inv) => {
-                                        // OCR short-circuit: no DB call needed — still never offer dropship POs
-                                        const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
-                                        if (inv._fromCache && ocrPo && !/DropshipPO/i.test(String(ocrPo))) {
-                                            return {
-                                                inv,
-                                                status: 'ocr' as const,
-                                                ocrSuggestion: {
-                                                    invoiceId: inv.id,
-                                                    invoiceNumber: inv.invoice_number,
-                                                    vendorName: inv.vendor_name,
-                                                    invoiceDate: inv.invoice_date,
-                                                    invoiceTotal: inv.total,
-                                                    candidates: [{
-                                                        orderId: String(ocrPo),
-                                                        vendorName: inv.vendor_name,
-                                                        orderDate: inv.invoice_date || '',
-                                                        total: Number(inv.total || 0),
-                                                        status: 'ocr_candidate',
-                                                        score: 70,
-                                                        reasons: ['OCR PO# candidate'],
-                                                        isOpen: true,
-                                                    }],
-                                                    autoApplyReady: false,
-                                                    fromCache: true,
-                                                    invoiceLineItems: extractLineItems(inv),
-                                                },
-                                            };
-                                        }
-                                        try {
-                                            const scorePromise = findPOCandidates({
-                                                id: inv.id,
-                                                invoiceNumber: inv.invoice_number,
-                                                vendorName: inv.vendor_name,
-                                                invoiceDate: inv.invoice_date,
-                                                subtotal: Number(inv.subtotal || 0),
-                                                freight: Number(inv.freight || 0),
-                                                tax: Number(inv.tax || 0),
-                                                total: Number(inv.total || 0),
-                                                lineItems: inv.raw_data?.lineItems || [],
-                                                ocrPoCandidate: inv.raw_data?.ocrPoCandidate || inv.raw_data?.poNumber || null,
-                                                ocrOrderCandidate: inv.raw_data?.orderNumber || null,
-                                            });
-                                            const result = await Promise.race([
-                                                scorePromise,
-                                                new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
-                                            ]);
-                                            if (!result) {
-                                                return { inv, status: 'timed_out' as const };
-                                            }
-                                            return { inv, status: 'scored' as const, result };
-                                        } catch (err: any) {
-                                            return { inv, status: 'error' as const, err };
-                                        }
-                                    });
+                    // ── Phase A: score all invoices in parallel (read-only, concurrency 4) ──
+                    // DECISION(2026-07-27): Previously this loop scored up to 12 invoices
+                    // sequentially against 4s findPOCandidates timeouts (~48s worst case).
+                    // Now scoring runs in parallel at concurrency 4.
+                    // HERMIA(2026-08-06): Phase B Finale auto-apply REMOVED from GET.
+                    // GET is paint-only. Auto-match writes belong on POST/cron.
+                    const scoredResults = await mapConcurrent(scoreList, 4, async (inv) => {
+                        // OCR short-circuit: no DB call needed — still never offer dropship POs
+                        const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
+                        if (inv._fromCache && ocrPo && !/DropshipPO/i.test(String(ocrPo))) {
+                    return {
+                        inv,
+                        status: 'ocr' as const,
+                        ocrSuggestion: {
+                            invoiceId: inv.id,
+                            invoiceNumber: inv.invoice_number,
+                            vendorName: inv.vendor_name,
+                            invoiceDate: inv.invoice_date,
+                            invoiceTotal: inv.total,
+                            candidates: [{
+                                orderId: String(ocrPo),
+                                vendorName: inv.vendor_name,
+                                orderDate: inv.invoice_date || '',
+                                total: Number(inv.total || 0),
+                                status: 'ocr_candidate',
+                                score: 70,
+                                reasons: ['OCR PO# candidate'],
+                                isOpen: true,
+                            }],
+                            autoApplyReady: false,
+                            fromCache: true,
+                            invoiceLineItems: extractLineItems(inv),
+                        },
+                    };
+                        }
+                        try {
+                    const scorePromise = findPOCandidates({
+                        id: inv.id,
+                        invoiceNumber: inv.invoice_number,
+                        vendorName: inv.vendor_name,
+                        invoiceDate: inv.invoice_date,
+                        subtotal: Number(inv.subtotal || 0),
+                        freight: Number(inv.freight || 0),
+                        tax: Number(inv.tax || 0),
+                        total: Number(inv.total || 0),
+                        lineItems: inv.raw_data?.lineItems || [],
+                        ocrPoCandidate: inv.raw_data?.ocrPoCandidate || inv.raw_data?.poNumber || null,
+                        ocrOrderCandidate: inv.raw_data?.orderNumber || null,
+                    });
+                    const result = await Promise.race([
+                        scorePromise,
+                        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+                    ]);
+                    if (!result) {
+                        return { inv, status: 'timed_out' as const };
+                    }
+                    return { inv, status: 'scored' as const, result };
+                        } catch (err: any) {
+                    return { inv, status: 'error' as const, err };
+                        }
+                    });
 
-                                    // ── Phase B: suggestions only (NO Finale writes on GET) ──
-                                    for (const sr of scoredResults) {
-                                        const { inv } = sr;
-                                        if (sr.status === 'ocr' && sr.ocrSuggestion) {
-                                            // Never offer dropship POs as OCR match targets
-                                            const ocrCands = (sr.ocrSuggestion.candidates || []).filter(
-                                                (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
-                                            );
-                                            if (ocrCands.length === 0) continue;
-                                            matchSuggestions.push({ ...sr.ocrSuggestion, candidates: ocrCands });
-                                            continue;
-                                        }
-                                        if (sr.status === 'timed_out') {
-                                            matchSuggestions.push({
-                                                invoiceId: inv.id,
-                                                invoiceNumber: inv.invoice_number,
-                                                vendorName: inv.vendor_name,
-                                                invoiceDate: inv.invoice_date,
-                                                invoiceTotal: inv.total,
-                                                candidates: [],
-                                                autoApplyReady: false,
-                                                fromCache: !!inv._fromCache,
-                                                timedOut: true,
-                                                invoiceLineItems: extractLineItems(inv),
-                                            });
-                                            continue;
-                                        }
-                                        if (sr.status === 'error') {
-                                            console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
-                                            continue;
-                                        }
+                    // ── Phase B: suggestions only (NO Finale writes on GET) ──
+                    for (const sr of scoredResults) {
+                        const { inv } = sr;
+                        if (sr.status === 'ocr' && sr.ocrSuggestion) {
+                    // Never offer dropship POs as OCR match targets
+                    const ocrCands = (sr.ocrSuggestion.candidates || []).filter(
+                        (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                    );
+                    if (ocrCands.length === 0) continue;
+                    matchSuggestions.push({ ...sr.ocrSuggestion, candidates: ocrCands });
+                    continue;
+                        }
+                        if (sr.status === 'timed_out') {
+                    matchSuggestions.push({
+                        invoiceId: inv.id,
+                        invoiceNumber: inv.invoice_number,
+                        vendorName: inv.vendor_name,
+                        invoiceDate: inv.invoice_date,
+                        invoiceTotal: inv.total,
+                        candidates: [],
+                        autoApplyReady: false,
+                        fromCache: !!inv._fromCache,
+                        timedOut: true,
+                        invoiceLineItems: extractLineItems(inv),
+                    });
+                    continue;
+                        }
+                        if (sr.status === 'error') {
+                    console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
+                    continue;
+                        }
 
-                                        // Scored successfully — surface suggestions only
-                                        const result = sr.result!;
-                                        // Strip dropship POs from candidates — never match those
-                                        result.candidates = (result.candidates || []).filter(
-                                            (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
-                                        );
-                                        result.bestMatch = result.candidates[0] || null;
-                                        if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
-                                            result.autoApplyReady = false;
-                                        }
-                                        matchSuggestions.push({
-                                            invoiceId: inv.id,
-                                            invoiceNumber: inv.invoice_number,
-                                            vendorName: inv.vendor_name,
-                                            invoiceDate: inv.invoice_date,
-                                            invoiceTotal: inv.total,
-                                            candidates: result.candidates.slice(0, 5),
-                                            autoApplyReady: result.autoApplyReady ?? false,
-                                            fromCache: !!inv._fromCache,
-                                            invoiceLineItems: extractLineItems(inv),
-                                        });
-                                    }
-                                }
-                            }
+                        // Scored successfully — surface suggestions only
+                        const result = sr.result!;
+                        // Strip dropship POs from candidates — never match those
+                        result.candidates = (result.candidates || []).filter(
+                    (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                        );
+                        result.bestMatch = result.candidates[0] || null;
+                        if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
+                    result.autoApplyReady = false;
+                        }
+                        matchSuggestions.push({
+                    invoiceId: inv.id,
+                    invoiceNumber: inv.invoice_number,
+                    vendorName: inv.vendor_name,
+                    invoiceDate: inv.invoice_date,
+                    invoiceTotal: inv.total,
+                    candidates: result.candidates.slice(0, 5),
+                    autoApplyReady: result.autoApplyReady ?? false,
+                    fromCache: !!inv._fromCache,
+                    invoiceLineItems: extractLineItems(inv),
+                        });
+                    }
+                }
+                    }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
             let recentAutoCompletions: Array<{
@@ -514,84 +514,84 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             try {
                 const cutoff = new Date(Date.now() - 30 * 86400 * 1000).toISOString(); // 30 days
                 const { data: activityLog } = await sb
-                    .from('ap_activity_log')
-                    .select('intent, created_at, metadata')
-                    .in('intent', ['RECONCILIATION_AUTO_APPLIED', 'RECONCILIATION_ERROR'])
-                    .gte('created_at', cutoff)
-                    .order('created_at', { ascending: false })
-                    .limit(20);
+            .from('ap_activity_log')
+            .select('intent, created_at, metadata')
+            .in('intent', ['RECONCILIATION_AUTO_APPLIED', 'RECONCILIATION_ERROR'])
+            .gte('created_at', cutoff)
+            .order('created_at', { ascending: false })
+            .limit(20);
                 if (activityLog) {
-                    recentAutoCompletions = activityLog.map((row: any) => ({
-                        intent: row.intent,
-                        poNumber: row.metadata?.poNumber || row.metadata?.orderId || '',
-                        invoiceNumber: row.metadata?.invoice || row.metadata?.invoiceNumber || '',
-                        vendorName: row.metadata?.vendorName || '',
-                        createdAt: row.created_at,
-                        metadata: row.metadata,
-                    }));
+            recentAutoCompletions = activityLog.map((row: any) => ({
+                intent: row.intent,
+                poNumber: row.metadata?.poNumber || row.metadata?.orderId || '',
+                invoiceNumber: row.metadata?.invoice || row.metadata?.invoiceNumber || '',
+                vendorName: row.metadata?.vendorName || '',
+                createdAt: row.created_at,
+                metadata: row.metadata,
+            }));
                 }
             } catch (completionsErr: any) {
                 console.warn(`[receivings] Failed to fetch recent auto-completions: ${completionsErr?.message || completionsErr}`);
             }
 
             // ── Freight classifications for received PO vendors ──
-                        // DECISION(2026-07-27): This loop was 40 sequential ~2.2s PostgREST
-                        // round-trips and is now bounded-parallel at 8. These are local-DB
-                        // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
-                        // global queue, so real parallelism is achieved here.
-                        // HERMIA(2026-08-06): Cap to 12 vendors — full list was burning paint budget.
-                        const freightClasses: Record<string, any> = {};
-                        const vendorsForFreight = vendorNames.slice(0, 12);
-                        const fcResults = await mapConcurrent(vendorsForFreight, 8, async (v) => {
-                            try {
-                                const result = await Promise.race([
-                                    getVendorFreightClassification(v),
-                                    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
-                                ]);
-                                return { vendor: v, result };
-                            } catch (fcErr: any) {
-                                console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
-                                return { vendor: v, result: undefined };
-                            }
-                        });
-                        for (const fr of fcResults) {
-                            if (fr.result !== undefined && fr.result !== null) {
-                                freightClasses[fr.vendor] = fr.result;
-                            }
-                        }
-
-                        const payload: ReceivingsPayload = {
-                            received,
-                            days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
-                            range: daysParam ? 'rolling_days' : 'rolling_30d',
-                            startDate: startStr,
-                            asOf: todayStr,
-                            matchSuggestions,
-                            freightClasses,
-                            recentAutoCompletions,
-                        };
-                        _getCache = { at: Date.now(), key: cacheKey, payload };
-                        return NextResponse.json(payload, {
-                            headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss' },
-                        });
+                // DECISION(2026-07-27): This loop was 40 sequential ~2.2s PostgREST
+                // round-trips and is now bounded-parallel at 8. These are local-DB
+                // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
+                // global queue, so real parallelism is achieved here.
+                // HERMIA(2026-08-06): Cap to 12 vendors — full list was burning paint budget.
+                const freightClasses: Record<string, any> = {};
+                const vendorsForFreight = vendorNames.slice(0, 12);
+                const fcResults = await mapConcurrent(vendorsForFreight, 8, async (v) => {
+                    try {
+                const result = await Promise.race([
+                    getVendorFreightClassification(v),
+                    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+                ]);
+                return { vendor: v, result };
+                    } catch (fcErr: any) {
+                console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
+                return { vendor: v, result: undefined };
                     }
+                });
+                for (const fr of fcResults) {
+                    if (fr.result !== undefined && fr.result !== null) {
+                freightClasses[fr.vendor] = fr.result;
+                    }
+                }
 
-                    const emptyPayload: ReceivingsPayload = {
-                        received,
-                        days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
-                        range: daysParam ? 'rolling_days' : 'rolling_30d',
-                        startDate: startStr,
-                        asOf: todayStr,
-                        matchSuggestions: [],
-                        freightClasses: {},
-                    };
-                    _getCache = { at: Date.now(), key: cacheKey, payload: emptyPayload };
-                    return NextResponse.json(emptyPayload, {
-                        headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss-empty' },
-                    });
+                const payload: ReceivingsPayload = {
+                    received,
+                    days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
+                    range: daysParam ? 'rolling_days' : 'rolling_30d',
+                    startDate: startStr,
+                    asOf: todayStr,
+                    matchSuggestions,
+                    freightClasses,
+                    recentAutoCompletions,
+                };
+                _getCache = { at: Date.now(), key: cacheKey, payload };
+                return NextResponse.json(payload, {
+                    headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss' },
+                });
+            }
+
+            const emptyPayload: ReceivingsPayload = {
+                received,
+                days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
+                range: daysParam ? 'rolling_days' : 'rolling_30d',
+                startDate: startStr,
+                asOf: todayStr,
+                matchSuggestions: [],
+                freightClasses: {},
+            };
+            _getCache = { at: Date.now(), key: cacheKey, payload: emptyPayload };
+            return NextResponse.json(emptyPayload, {
+                headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss-empty' },
+            });
                 } catch (err: any) {
-                    console.error('Receivings API error:', err.message);
-                    return NextResponse.json({ error: err.message }, { status: 500 });
+            console.error('Receivings API error:', err.message);
+            return NextResponse.json({ error: err.message }, { status: 500 });
                 }
             }
 
@@ -638,15 +638,15 @@ export async function POST(req: NextRequest) {
             if (!reconciliationResult) {
                 // Nothing to post. Refuse rather than mark the PO reconciled.
                 return NextResponse.json(
-                    {
-                        error: 'No reconciliation on file for this PO',
-                        detail:
-                            `No stored reconciliation_result was found for ${orderId}, so there is ` +
-                            `nothing to push to Finale. Re-run the AP match for this PO before approving.`,
-                        orderId,
-                        applied: false,
-                    },
-                    { status: 409 },
+            {
+                error: 'No reconciliation on file for this PO',
+                detail:
+                    `No stored reconciliation_result was found for ${orderId}, so there is ` +
+                    `nothing to push to Finale. Re-run the AP match for this PO before approving.`,
+                orderId,
+                applied: false,
+            },
+            { status: 409 },
                 );
             }
 
@@ -659,27 +659,27 @@ export async function POST(req: NextRequest) {
                 appliedCount = applyResult.applied.length;
 
                 if (applyResult.errors.length > 0) {
-                    return NextResponse.json(
-                        {
-                            error: 'Finale rejected part of the reconciliation',
-                            detail: applyResult.errors.join('; '),
-                            orderId,
-                            applied: false,
-                            appliedCount,
-                        },
-                        { status: 502 },
-                    );
+            return NextResponse.json(
+                {
+                    error: 'Finale rejected part of the reconciliation',
+                    detail: applyResult.errors.join('; '),
+                    orderId,
+                    applied: false,
+                    appliedCount,
+                },
+                { status: 502 },
+            );
                 }
             } catch (err: any) {
                 console.error(`[receivings/approve] Finale apply failed for ${orderId}:`, err?.message);
                 return NextResponse.json(
-                    {
-                        error: 'Failed to apply reconciliation to Finale',
-                        detail: err?.message ?? String(err),
-                        orderId,
-                        applied: false,
-                    },
-                    { status: 502 },
+            {
+                error: 'Failed to apply reconciliation to Finale',
+                detail: err?.message ?? String(err),
+                orderId,
+                applied: false,
+            },
+            { status: 502 },
                 );
             }
 
@@ -687,20 +687,20 @@ export async function POST(req: NextRequest) {
             const approvalId = (approval as any)?.id;
             if (approvalId) {
                 await sb
-                    .from('ap_pending_approvals')
-                    .update({ status: 'approved', resolved_at: now })
-                    .eq('id', approvalId);
+            .from('ap_pending_approvals')
+            .update({ status: 'approved', resolved_at: now })
+            .eq('id', approvalId);
             } else if (invoiceId) {
                 await sb
-                    .from('ap_pending_approvals')
-                    .update({ status: 'approved', resolved_at: now })
-                    .eq('order_id', orderId)
-                    .eq('invoice_number', invoiceId);
+            .from('ap_pending_approvals')
+            .update({ status: 'approved', resolved_at: now })
+            .eq('order_id', orderId)
+            .eq('invoice_number', invoiceId);
             } else {
                 await sb
-                    .from('ap_pending_approvals')
-                    .update({ status: 'approved', resolved_at: now })
-                    .eq('order_id', orderId);
+            .from('ap_pending_approvals')
+            .update({ status: 'approved', resolved_at: now })
+            .eq('order_id', orderId);
             }
 
             // Update reconciliation_outcomes
@@ -739,6 +739,108 @@ export async function POST(req: NextRequest) {
             if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
 
             const finale = new FinaleClient();
+
+            // ── Phase 1: Run the 3-way match gate BEFORE touching Finale ──
+            // The gate is a pure evaluation — no side effects. If it blocks,
+            // we return 409 without having modified anything anywhere.
+            let receivedQtys: Record<string, number> = {};
+            let packMultipliers: Record<string, number> = {};
+            try {
+                // Load receipt quantities from Finale shipment details (read-only)
+                const poDetails = await finale.getOrderDetails(orderId);
+                const shipments = poDetails?.shipmentList || [];
+                const allShipmentItems: Array<{ productId: string; quantity: number }> = [];
+                for (const shipment of shipments) {
+                    const shipmentUrl = shipment?.shipmentUrl;
+                    if (!shipmentUrl) continue;
+                    try {
+                        const detail = await finale.getShipmentDetails(String(shipmentUrl));
+                        const { getShipmentReceiptItems } = await import('@/lib/finale/core-client');
+                        allShipmentItems.push(...getShipmentReceiptItems(detail));
+                    } catch { /* skip failed shipment detail fetch */ }
+                }
+                for (const item of allShipmentItems) {
+                    receivedQtys[item.productId] = (receivedQtys[item.productId] ?? 0) + item.quantity;
+                }
+                // Load pack sizes for UOM normalization
+                const allSkus = [...new Set(Object.keys(receivedQtys))];
+                if (allSkus.length > 0) {
+                    try {
+                        const { getPackSizes } = await import('@/lib/purchasing/pack-size-registry');
+                        const sizes = await getPackSizes(allSkus);
+                        for (const [sku, rec] of sizes) {
+                            if (rec.unitsPerPack > 1) packMultipliers[sku] = rec.unitsPerPack;
+                        }
+                    } catch { /* pack sizes optional */ }
+                }
+            } catch (receiptErr: any) {
+                console.warn(`[receivings] complete_po ${orderId}: receipt load failed: ${receiptErr?.message || receiptErr}`);
+            }
+
+            // Evaluate the 3-way match BEFORE any state change
+            let gateBlockReason: string | null = null;
+            try {
+                const sb = createClient();
+                if (sb) {
+                    const [poRes, invRes] = await Promise.all([
+                        sb.from('purchase_orders')
+                            .select('line_items, receive_date')
+                            .eq('po_number', orderId).maybeSingle(),
+                        sb.from('invoices')
+                            .select('line_items')
+                            .eq('po_number', orderId)
+                            .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+                    ]);
+                    const poData = (poRes as any)?.data;
+                    const invoiceData = (invRes as any)?.data;
+                    const hasReceipt = !!(poData as any)?.receive_date
+                        && new Date((poData as any).receive_date).getTime() < Date.now();
+
+                    if (invoiceData?.line_items && poData?.line_items) {
+                        const { evaluateThreeWayMatch } = await import('@/lib/purchasing/three-way-match');
+                        const match = evaluateThreeWayMatch({
+                            orderId,
+                            hasPurchaseOrder: !!poData,
+                            hasReceipt,
+                            hasInvoice: !!invoiceData,
+                            lines: (poData.line_items ?? []).map((pi: any) => {
+                                const sku = pi.productId ?? pi.sku ?? pi.description ?? 'UNKNOWN';
+                                const il = (invoiceData.line_items ?? []).find(
+                                    (l: any) => l.sku === pi.productId || l.sku === sku || l.description === pi.description,
+                                );
+                                const realQty = receivedQtys[sku] ?? receivedQtys[pi.productId];
+                                const receivedQty = realQty !== undefined ? realQty : (hasReceipt ? (pi.receivedQty ?? pi.quantity ?? null) : null);
+                                const pack = packMultipliers[sku] ?? packMultipliers[pi.productId] ?? undefined;
+                                return {
+                                    productId: pi.productId ?? pi.sku ?? pi.description ?? 'UNKNOWN',
+                                    poQty: pi.quantity ?? 0,
+                                    poUnitPrice: pi.unitPrice ?? 0,
+                                    receivedQty,
+                                    invoiceQty: il?.qty ?? 0,
+                                    invoiceUnitPrice: il?.unitPrice ?? 0,
+                                    ...(pack ? { packMultiplier: pack } : {}),
+                                };
+                            }),
+                        });
+                        if (!match.canApprove) {
+                            gateBlockReason = match.summary;
+                        }
+                    }
+                }
+            } catch (gateErr: any) {
+                console.warn(`[receivings] complete_po ${orderId}: pre-check gate error: ${gateErr?.message || gateErr}`);
+                // Non-blocking — belt, not suspenders
+            }
+
+            if (gateBlockReason) {
+                console.warn(`[receivings] complete_po ${orderId} BLOCKED before Finale write: ${gateBlockReason}`);
+                return NextResponse.json(
+                    { error: '3-way match gate refused completion', detail: gateBlockReason, orderId, completed: false },
+                    { status: 409 },
+                );
+            }
+
+            // ── Phase 2: Gate passed — complete the order in Finale ──
             const result = await finale.completeOrder(orderId);
             const finalStatus = result?.finalStatus || 'ORDER_COMPLETED';
 
@@ -751,6 +853,13 @@ export async function POST(req: NextRequest) {
                 freightMatched: freightMatched || false,
                 completedBy: 'dashboard',
             });
+
+            // Transition lifecycle to COMPLETED (gate runs again as belt-and-suspenders)
+            const { transitionLifecycleState } = await import('@/lib/purchasing/po-lifecycle');
+            await transitionLifecycleState(
+                orderId, 'COMPLETED', 'dashboard-receivings',
+                { receivedQtys, packMultipliers, finalStatus, vendorName: vendorName || '' },
+            );
 
             // Invalidate caches so Active Purchases drops this PO
             const { invalidatePurchasingCaches } = await import('@/lib/purchasing/cache');
