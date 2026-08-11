@@ -227,14 +227,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
          */
         const notifyReceiptRef = useRef(lifecycle.notifyReceipt);
         notifyReceiptRef.current = lifecycle.notifyReceipt;
-    /** PO modification state: orderId → expanded & diff data */
-    const [modifyingPO, setModifyingPO] = useState<Map<string, {
-        loading: boolean;
-        diff?: any;
-        error?: string;
-        saving?: boolean;
-    }>>(new Map());
-    const [modifySuccess, setModifySuccess] = useState<string | null>(null);
+    /** Gate refusal message per PO — set when complete_po returns 409 */
+        const [gateBlockReason, setGateBlockReason] = useState<Map<string, string>>(new Map());
+        /** PO modification state: orderId → expanded & diff data */
+        const [modifyingPO, setModifyingPO] = useState<Map<string, {
+            loading: boolean;
+            diff?: any;
+            error?: string;
+            saving?: boolean;
+        }>>(new Map());
+        const [modifySuccess, setModifySuccess] = useState<string | null>(null);
     /** Unmatched POs check state */
     const [unmatchedData, setUnmatchedData] = useState<{
         unmatchedPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string }>;
@@ -284,19 +286,28 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     }
 
     async function handleCompletePO(orderId: string, vendorName: string) {
-        try {
-            const res = await fetch("/api/dashboard/receivings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "complete_po", orderId, vendorName }),
-            });
-            if (res.ok) {
-                fetchReceivings(true);
+            try {
+                const res = await fetch("/api/dashboard/receivings", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ action: "complete_po", orderId, vendorName }),
+                });
+                const json = await res.json();
+                if (res.ok) {
+                    // Clear any previous gate refusal for this PO
+                    setGateBlockReason(prev => { const next = new Map(prev); next.delete(orderId); return next; });
+                    fetchReceivings(true);
+                } else if (res.status === 409 && json.detail) {
+                    // Gate refused — show the 3-way match summary inline
+                    setGateBlockReason(prev => { const next = new Map(prev); next.set(orderId, json.detail); return next; });
+                    console.warn(`[ReceivedItems] complete_po ${orderId} blocked by 3-way gate: ${json.detail}`);
+                } else {
+                    throw new Error(json.error || `HTTP ${res.status}`);
+                }
+            } catch (e: any) {
+                console.error("Complete PO error:", e.message);
             }
-        } catch (e: any) {
-            console.error("Complete PO error:", e.message);
         }
-    }
 
     async function handleManualMatch(invoiceId: string) {
         const state = manuallyMatching.get(invoiceId);
@@ -1278,7 +1289,25 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             })()}
                                         </div>
 
-                                                        {/* ── PO Modifier Inline Expansion ── */}
+                                                                                {/* ── Gate Refusal Banner ── */}
+                                                                                {gateBlockReason.has(po.orderId) && (() => {
+                                                                                    const reason = gateBlockReason.get(po.orderId)!;
+                                                                                    return (
+                                                                                        <div className="mt-2 px-3 py-2.5 border border-rose-500/30 bg-rose-950/15 rounded flex items-start gap-2">
+                                                                                            <span className="text-rose-400 text-[11px] mt-0.5 shrink-0">🚫</span>
+                                                                                            <div className="flex-1 min-w-0">
+                                                                                                <div className="text-[10px] font-mono text-rose-400 font-semibold uppercase tracking-wider mb-0.5">3-Way Match Gate Refused</div>
+                                                                                                <div className="text-[11px] font-mono text-rose-200/90 leading-relaxed">{reason}</div>
+                                                                                            </div>
+                                                                                            <button
+                                                                                                onClick={() => setGateBlockReason(prev => { const next = new Map(prev); next.delete(po.orderId); return next; })}
+                                                                                                className="text-rose-400/40 hover:text-rose-300 shrink-0 text-[11px]"
+                                                                                            >✕</button>
+                                                                                        </div>
+                                                                                    );
+                                                                                })()}
+
+                                                                                                {/* ── PO Modifier Inline Expansion ── */}
                                                         {modifyingPO.has(po.orderId) && (() => {
                                                         const m = modifyingPO.get(po.orderId)!;
                                                         if (m.loading) {
@@ -1303,32 +1332,15 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 <div className="flex items-center justify-between">
                                                                     <span className="text-[11px] font-mono text-emerald-400">✅ PO matches invoice — no adjustments needed</span>
                                                                     <div className="flex items-center gap-2">
-                                                                        <button
-                                                                            onClick={e => {
-                                                                                e.stopPropagation();
-                                                                                fetch('/api/dashboard/po-modify', {
-                                                                                    method: 'POST',
-                                                                                    headers: { 'Content-Type': 'application/json' },
-                                                                                    body: JSON.stringify({
-                                                                                        action: 'verify_and_complete',
-                                                                                        orderId: po.orderId,
-                                                                                        invoiceId: rec?.matchedInvoice?.invoice_number,
-                                                                                    }),
-                                                                                })
-                                                                                .then(r => r.json())
-                                                                                .then(result => {
-                                                                                    if (result.success) {
-                                                                                        setModifySuccess(`PO ${po.orderId} completed ✅`);
-                                                                                        toggleModifier(po.orderId);
-                                                                                        setTimeout(() => fetchReceivings(true), 1500);
-                                                                                    }
-                                                                                })
-                                                                                .catch(() => {});
-                                                                            }}
-                                                                            className="px-2 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
-                                                                        >
-                                                                            Complete PO
-                                                                        </button>
+                                                                                                                                                <button
+                                                                                                                                                    onClick={e => {
+                                                                                                                                                        e.stopPropagation();
+                                                                                                                                                        handleCompletePO(po.orderId, po.supplier);
+                                                                                                                                                    }}
+                                                                                                                                                    className="px-2 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
+                                                                                                                                                >
+                                                                                                                                                    Complete PO
+                                                                                                                                                </button>
                                                                         <button onClick={() => toggleModifier(po.orderId)} className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300">Close</button>
                                                                     </div>
                                                                 </div>
@@ -1407,41 +1419,23 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                         >
                                                                         {m.saving ? 'Applying...' : 'Apply Changes to PO'}
                                                                         </button>
-                                                                        {/* Verify & Complete — PO totals match invoice, ready to close */}
-                                                                        <button
-                                                                        onClick={e => {
-                                                                            e.stopPropagation();
-                                                                            // First apply modifications, then verify & complete
-                                                                            const adjustments = diff.lineItems
-                                                                                .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                                                                .map((li: any) => ({
-                                                                                    productId: li.productId,
-                                                                                    newQuantity: li.invoiceQuantity ?? undefined,
-                                                                                    newUnitPrice: li.invoiceUnitPrice ?? undefined,
-                                                                                }));
-                                                                            // Apply modifications first
-                                                                            applyPOInvoiceModification(po.orderId, adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null)
-                                                                                .then(() => {
-                                                                                    // Then verify & complete
-                                                                                    fetch('/api/dashboard/po-modify', {
-                                                                                        method: 'POST',
-                                                                                        headers: { 'Content-Type': 'application/json' },
-                                                                                        body: JSON.stringify({
-                                                                                            action: 'verify_and_complete',
-                                                                                            orderId: po.orderId,
-                                                                                            invoiceId: rec?.matchedInvoice?.invoice_number,
-                                                                                        }),
-                                                                                    })
-                                                                                    .then(r => r.json())
-                                                                                    .then(result => {
-                                                                                        if (result.success) {
-                                                                                            setModifySuccess(`PO ${po.orderId} modified and completed ✅`);
-                                                                                            setTimeout(() => fetchReceivings(true), 1500);
-                                                                                        }
-                                                                                    })
-                                                                                    .catch(() => {});
-                                                                                });
-                                                                        }}
+                                                                        /* Apply & Complete — apply modifications, then complete through gate-checked API */
+                                                                                                                                                <button
+                                                                                                                                                onClick={e => {
+                                                                                                                                                    e.stopPropagation();
+                                                                                                                                                    const adjustments = diff.lineItems
+                                                                                                                                                        .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
+                                                                                                                                                        .map((li: any) => ({
+                                                                                                                                                            productId: li.productId,
+                                                                                                                                                            newQuantity: li.invoiceQuantity ?? undefined,
+                                                                                                                                                            newUnitPrice: li.invoiceUnitPrice ?? undefined,
+                                                                                                                                                        }));
+                                                                                                                                                    // Apply modifications first, then complete through gate
+                                                                                                                                                    applyPOInvoiceModification(po.orderId, adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null)
+                                                                                                                                                        .then(() => {
+                                                                                                                                                            handleCompletePO(po.orderId, po.supplier);
+                                                                                                                                                        });
+                                                                                                                                                }}
                                                                         disabled={m.saving}
                                                                         className="px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer"
                                                                         >
