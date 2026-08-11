@@ -866,12 +866,170 @@ export async function POST(req: NextRequest) {
         }
 
         if (action === 'complete_po') {
-            const { orderId, vendorName, hadFreightOnPO, invoiceFreight, freightMatched } = body;
-            if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+                    const { orderId, vendorName, hadFreightOnPO, invoiceFreight, freightMatched } = body;
+                    // ── Changes payload: price updates, line adjustments, freight, tax, tariffs ──
+                    // These are applied to Finale BEFORE the gate runs, so the gate evaluates
+                    // the PO in its final corrected state (belt-and-suspenders).
+                    const changes: {
+                        priceUpdates?: Record<string, number>;
+                        lineAdjustments?: Array<{ productId: string; newQty: number; newUnitPrice: number }>;
+                        freight?: number;
+                        tax?: number;
+                        tariffs?: number;
+                    } | undefined = body.changes;
+                    if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
 
-            const finale = new FinaleClient();
+                    const finale = new FinaleClient();
 
-            // ── Phase 1: Run the 3-way match gate BEFORE touching Finale ──
+                    // ── Phase 0: Apply proposed changes to Finale BEFORE completing ──
+                    // DECISION(2026-08-11): Invoice is the source of truth. When the
+                    // operator approves a PO for completion, price/qty/freight/tax/tariff
+                    // corrections must land in Finale first. The 3-way match gate then
+                    // runs against the corrected PO — belt and suspenders.
+                    if (changes) {
+                        console.log(`[receivings] complete_po ${orderId}: applying changes before completion:`,
+                            JSON.stringify({
+                                priceCount: Object.keys(changes.priceUpdates || {}).length,
+                                lineAdjCount: (changes.lineAdjustments || []).length,
+                                freight: changes.freight,
+                                tax: changes.tax,
+                                tariffs: changes.tariffs,
+                            }));
+
+                        // Phase 0a: Update SKU master prices (best-effort — these affect FUTURE POs)
+                        if (changes.priceUpdates) {
+                            for (const [productId, newPrice] of Object.entries(changes.priceUpdates)) {
+                                try {
+                                    // Resolve the supplier URL from the PO's order role list
+                                    const poDetails = await finale.getOrderDetails(orderId);
+                                    const supplierRole = (poDetails as any)?.orderRoleList?.find((r: any) => r.roleTypeId === 'SUPPLIER');
+                                    const supplierPartyUrl = supplierRole?.partyId
+                                        ? `/${finale['accountPath']}/api/partygroup/${supplierRole.partyId}`
+                                        : null;
+
+                                    if (supplierPartyUrl) {
+                                        await finale.updateProductSupplierPrice(productId, supplierPartyUrl, newPrice);
+                                        console.log(`[receivings] complete_po ${orderId}: SKU ${productId} price → $${newPrice}`);
+                                    } else {
+                                        console.warn(`[receivings] complete_po ${orderId}: No supplier URL for SKU ${productId} — price not synced`);
+                                    }
+                                } catch (skuErr: any) {
+                                    console.warn(`[receivings] complete_po ${orderId}: SKU price update failed for ${productId}: ${skuErr?.message || skuErr}`);
+                                    // Best-effort: SKU price sync is for future POs, don't block completion
+                                }
+                            }
+                        }
+
+                        // Phase 0b: Apply line-level qty/price adjustments to the PO
+                        if (changes.lineAdjustments) {
+                            for (const adj of changes.lineAdjustments) {
+                                try {
+                                    await finale.updateOrderItemQuantityAndPrice(
+                                        orderId,
+                                        adj.productId,
+                                        adj.newQty,
+                                        adj.newUnitPrice,
+                                    );
+                                    console.log(`[receivings] complete_po ${orderId}: Line ${adj.productId} qty=${adj.newQty} price=$${adj.newUnitPrice}`);
+                                } catch (lineErr: any) {
+                                    console.error(`[receivings] complete_po ${orderId}: Line adjustment failed for ${adj.productId}: ${lineErr?.message || lineErr}`);
+                                    return NextResponse.json(
+                                        {
+                                            error: 'Failed to apply line adjustment to Finale',
+                                            detail: lineErr?.message || String(lineErr),
+                                            orderId,
+                                            productId: adj.productId,
+                                            completed: false,
+                                        },
+                                        { status: 502 },
+                                    );
+                                }
+                            }
+                        }
+
+                        // Phase 0c: Apply freight to the PO
+                        if (changes.freight != null) {
+                            try {
+                                await finale.updateOrderAdjustmentAmount(orderId, 'FREIGHT', changes.freight, 'Freight');
+                                console.log(`[receivings] complete_po ${orderId}: Freight → $${changes.freight}`);
+                            } catch (freightErr: any) {
+                                console.error(`[receivings] complete_po ${orderId}: Freight update failed: ${freightErr?.message || freightErr}`);
+                                return NextResponse.json(
+                                    {
+                                        error: 'Failed to apply freight adjustment to Finale',
+                                        detail: freightErr?.message || String(freightErr),
+                                        orderId,
+                                        completed: false,
+                                    },
+                                    { status: 502 },
+                                );
+                            }
+                        }
+
+                        // Phase 0d: Apply tax to the PO
+                        if (changes.tax != null) {
+                            try {
+                                await finale.updateOrderAdjustmentAmount(orderId, 'TAX', changes.tax, 'Tax');
+                                console.log(`[receivings] complete_po ${orderId}: Tax → $${changes.tax}`);
+                            } catch (taxErr: any) {
+                                console.error(`[receivings] complete_po ${orderId}: Tax update failed: ${taxErr?.message || taxErr}`);
+                                return NextResponse.json(
+                                    {
+                                        error: 'Failed to apply tax adjustment to Finale',
+                                        detail: taxErr?.message || String(taxErr),
+                                        orderId,
+                                        completed: false,
+                                    },
+                                    { status: 502 },
+                                );
+                            }
+                        }
+
+                        // Phase 0e: Apply tariffs to the PO
+                        if (changes.tariffs != null) {
+                            try {
+                                await finale.updateOrderAdjustmentAmount(orderId, 'TARIFF', changes.tariffs, 'Tariff');
+                                console.log(`[receivings] complete_po ${orderId}: Tariffs → $${changes.tariffs}`);
+                            } catch (tariffErr: any) {
+                                console.error(`[receivings] complete_po ${orderId}: Tariff update failed: ${tariffErr?.message || tariffErr}`);
+                                return NextResponse.json(
+                                    {
+                                        error: 'Failed to apply tariff adjustment to Finale',
+                                        detail: tariffErr?.message || String(tariffErr),
+                                        orderId,
+                                        completed: false,
+                                    },
+                                    { status: 502 },
+                                );
+                            }
+                        }
+
+                        // Phase 0f: Persist tax/tariffs to reconciliation_outcomes for audit
+                        try {
+                            const sb = createClient();
+                            if (sb) {
+                                await sb.from('reconciliation_outcomes').upsert({
+                                    po_id: orderId,
+                                    invoice_id: null,  // may be linked later
+                                    outcome: 'manual_complete_changes_applied',
+                                    outcome_meta: {
+                                        appliedAt: new Date().toISOString(),
+                                        freight: changes.freight ?? null,
+                                        tax: changes.tax ?? null,
+                                        tariffs: changes.tariffs ?? null,
+                                        priceUpdates: changes.priceUpdates ? Object.keys(changes.priceUpdates).length : 0,
+                                        lineAdjustments: changes.lineAdjustments ? changes.lineAdjustments.length : 0,
+                                    },
+                                    created_at: new Date().toISOString(),
+                                }, { onConflict: 'po_id' });
+                            }
+                        } catch (auditErr: any) {
+                            console.warn(`[receivings] complete_po ${orderId}: Audit record failed: ${auditErr?.message || auditErr}`);
+                            // Non-blocking — the Finale changes already landed
+                        }
+                    }
+
+                    // ── Phase 1: Run the 3-way match gate BEFORE touching Finale ──
             // The gate is a pure evaluation — no side effects. If it blocks,
             // we return 409 without having modified anything anywhere.
             let receivedQtys: Record<string, number> = {};
