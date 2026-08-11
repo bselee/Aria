@@ -241,142 +241,121 @@ function MatchComparisonView({
     const cfg = matchStatusConfig[status];
     const rec = po._reconciliation;
     const matchedInv = rec?.matchedInvoice;
+    const twm = rec?.threeWayMatch;
+    const invNum = matchedInv?.invoice_number;
 
-    return (
-        <div className="mt-2 border border-zinc-800/60 rounded overflow-hidden">
-            {/* ── Match Status Banner ── */}
-            <div className={`px-3 py-2 flex items-center gap-2 ${cfg.cls} border-b border-zinc-800/40`}>
-                <span className="text-[12px]">{cfg.emoji}</span>
-                <span className="text-[10px] font-mono font-semibold uppercase tracking-wider">{cfg.label}</span>
-                <div className="flex-1" />
+    // Nothing matched — the Invoices-to-Match list above handles those.
+    if (!matchedInv || !twm) return null;
+
+    // ── CLEAN MATCH: one line, no tables ──────────────────────────────────────
+    // Bill(2026-08-11): "If they are received and clearly match invoices, call
+    // it — PO#XXXXXX matched with Invoice #? ready for completion in Finale."
+    if (twm.canApprove) {
+        return (
+            <div className="mt-2 px-3 py-2 border border-emerald-500/25 bg-emerald-500/5 rounded flex items-center gap-2">
+                <span className="text-[11px]">✅</span>
+                <span className="text-[11px] font-mono text-emerald-200/90 flex-1 min-w-0">
+                    PO {po.orderId} matched with Invoice {invNum ? `#${invNum}` : "(no number)"} — ready for completion in Finale
+                </span>
                 <button
-                    onClick={e => { e.stopPropagation(); onToggle(); }}
-                    className="text-[9px] font-mono text-zinc-500 hover:text-zinc-300 underline underline-offset-2 decoration-zinc-700/30"
+                    onClick={e => { e.stopPropagation(); onComplete(); }}
+                    className="shrink-0 px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
                 >
-                    {loading ? "Loading..." : loading === undefined ? "Compare" : diff ? "Hide" : "Compare"}
+                    Complete PO
                 </button>
             </div>
+        );
+    }
 
-            {loading && (
-                <div className="px-3 py-3 bg-zinc-950/30">
-                    <span className="text-[10px] font-mono text-cyan-300/60 animate-pulse">Loading invoice comparison...</span>
+    // ── DIFFERS FROM INVOICE: show what to review ─────────────────────────────
+    const discrepancies = twm.discrepancies || [];
+    const lines = (rec?.lineComparison || []).filter((l: any) => l.status !== "matched");
+    const cc = rec?.chargesComparison;
+
+    return (
+        <div className="mt-2 border border-amber-500/30 rounded overflow-hidden">
+            {/* Header — what differs, in dollars */}
+            <div className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20">
+                <div className="flex items-center gap-2">
+                    <span className="text-[11px]">⚠️</span>
+                    <span className="text-[11px] font-mono text-amber-200 font-semibold flex-1 min-w-0">
+                        PO {po.orderId} vs Invoice {invNum ? `#${invNum}` : "(no number)"} — needs review
+                    </span>
+                    {twm.totalDollarImpact > 0 && (
+                        <span className="text-[11px] font-mono text-rose-300 font-semibold shrink-0">
+                            ${twm.totalDollarImpact.toFixed(2)}
+                        </span>
+                    )}
+                </div>
+                <div className="mt-1 text-[10px] font-mono text-amber-200/70 leading-relaxed">{twm.summary}</div>
+            </div>
+
+            {/* Totals — always relevant, 3 numbers */}
+            {cc && (
+                <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/40 flex items-center gap-4 text-[10px] font-mono">
+                    <span className="text-zinc-500">PO <span className="text-zinc-200">${(cc.po.subtotal || cc.po.total).toFixed(2)}</span></span>
+                    <span className="text-zinc-500">Invoice <span className="text-zinc-200">${(cc.invoice.total || cc.invoice.subtotal).toFixed(2)}</span></span>
+                    {cc.invoice.freight > 0 && <span className="text-zinc-500">Freight <span className="text-zinc-200">${cc.invoice.freight.toFixed(2)}</span></span>}
+                    {cc.invoice.tax > 0 && <span className="text-zinc-500">Tax <span className="text-zinc-200">${cc.invoice.tax.toFixed(2)}</span></span>}
+                    {Math.abs(cc.diffs.total) > 0.01 && (
+                        <span className={cc.diffs.total > 0 ? "text-rose-300" : "text-amber-300"}>
+                            Δ {cc.diffs.total > 0 ? "+" : ""}${cc.diffs.total.toFixed(2)}
+                        </span>
+                    )}
                 </div>
             )}
 
-            {error && (
-                <div className="px-3 py-2 bg-rose-950/10 text-[10px] font-mono text-rose-400">{error}</div>
-            )}
-
-            {/* ── Charges Comparison (from GET enrichment, always visible) ── */}
-            {rec?.chargesComparison && (
-                <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/40">
-                    <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Charges Comparison</div>
+            {/* Only the lines that actually differ */}
+            {lines.length > 0 && (
+                <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/20">
                     <table className="w-full text-[10px] font-mono">
                         <thead>
-                            <tr className="text-zinc-600 border-b border-zinc-800/40">
-                                <th className="text-left py-0.5 pr-2">Charge</th>
-                                <th className="text-right py-0.5 px-2">PO</th>
-                                <th className="text-right py-0.5 px-2">Invoice</th>
-                                <th className="text-right py-0.5 pl-2">Diff</th>
+                            <tr className="text-zinc-600">
+                                <th className="text-left py-0.5 pr-2">SKU</th>
+                                <th className="text-right py-0.5 px-1">PO</th>
+                                <th className="text-right py-0.5 px-1">Invoice</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {(["subtotal","freight","tax","tariffs","total"] as const).map((k, i) => {
-                                const po = rec.chargesComparison!.po[k];
-                                const inv = rec.chargesComparison!.invoice[k];
-                                const diff = rec.chargesComparison!.diffs[k];
-                                const label = k.charAt(0).toUpperCase() + k.slice(1);
-                                const diffAbs = Math.abs(diff ?? 0);
-                                const diffCls = diffAbs < 0.01 ? "text-zinc-600" : diffAbs > 50 ? "text-rose-400" : "text-amber-300";
-                                const rowCls = k === "total" ? "border-t border-zinc-700/50 font-semibold" : "";
-                                return (
-                                    <tr key={k} className={rowCls}>
-                                        <td className="py-0.5 pr-2 text-zinc-400">{label}</td>
-                                        <td className="text-right py-0.5 px-2 text-zinc-300">{po != null ? `$${po.toFixed(2)}` : "—"}</td>
-                                        <td className="text-right py-0.5 px-2 text-zinc-300">{inv != null ? `$${inv.toFixed(2)}` : "—"}</td>
-                                        <td className={`text-right py-0.5 pl-2 ${diffCls}`}>
-                                            {diff != null ? `${diff > 0 ? "+" : ""}$${diff.toFixed(2)}` : "—"}
-                                        </td>
-                                    </tr>
-                                );
-                            })}
+                            {lines.map((l: any) => (
+                                <tr key={l.productId} className={l.status === "blocking" ? "text-rose-200" : "text-amber-200"}>
+                                    <td className="py-0.5 pr-2 truncate max-w-[110px]" title={l.productId}>{l.productId}</td>
+                                    <td className="text-right py-0.5 px-1">{fmtQty(l.poQty)} @ ${(l.poUnitPrice ?? 0).toFixed(2)}</td>
+                                    <td className="text-right py-0.5 px-1">{fmtQty(l.invoiceQty)} @ ${(l.invoiceUnitPrice ?? 0).toFixed(2)}</td>
+                                </tr>
+                            ))}
                         </tbody>
                     </table>
                 </div>
             )}
 
-            {/* ── Line-Item Comparison (from GET enrichment, always visible) ── */}
-            {rec?.lineComparison && rec.lineComparison.length > 0 && (
-                <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/20">
-                    <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-500 mb-1.5">Line-Item Comparison</div>
-                    <table className="w-full text-[10px] font-mono">
-                        <thead>
-                            <tr className="text-zinc-600 border-b border-zinc-800/40">
-                                <th className="text-left py-0.5 pr-1.5">SKU</th>
-                                <th className="text-right py-0.5 px-1">PO Qty</th>
-                                <th className="text-right py-0.5 px-1">PO $</th>
-                                <th className="text-right py-0.5 px-1">Rcv</th>
-                                <th className="text-right py-0.5 px-1">Inv Qty</th>
-                                <th className="text-right py-0.5 px-1">Inv $</th>
-                                <th className="text-right py-0.5 pl-1.5">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {rec.lineComparison.map((l: any) => {
-                                const isBlocking = l.status === "blocking";
-                                const isVariance = l.status === "variance";
-                                const rowCls = isBlocking ? "bg-rose-950/15 border-b border-rose-800/20 text-rose-200"
-                                    : isVariance ? "bg-amber-950/10 border-b border-amber-800/20 text-amber-200"
-                                    : "text-zinc-300 border-b border-zinc-800/20";
-                                const statusIcon = isBlocking ? "🔴" : isVariance ? "🟡" : "🟢";
-                                return (
-                                    <tr key={l.productId} className={rowCls}>
-                                        <td className="py-0.5 pr-1.5 text-left font-semibold truncate max-w-[80px]" title={l.productId}>{l.productId || "—"}</td>
-                                        <td className="text-right py-0.5 px-1">{fmtQty(l.poQty)}</td>
-                                        <td className="text-right py-0.5 px-1">${(l.poUnitPrice ?? 0).toFixed(2)}</td>
-                                        <td className="text-right py-0.5 px-1 text-cyan-400">{l.receivedQty != null ? fmtQty(l.receivedQty) : "—"}</td>
-                                        <td className="text-right py-0.5 px-1">{l.invoiceQty != null ? fmtQty(l.invoiceQty) : "—"}</td>
-                                        <td className="text-right py-0.5 px-1">{l.invoiceUnitPrice != null ? `$${l.invoiceUnitPrice.toFixed(2)}` : "—"}</td>
-                                        <td className="text-right py-0.5 pl-1.5">{statusIcon}</td>
-                                    </tr>
-                                );
-                            })}
-                        </tbody>
-                    </table>
-                </div>
-            )}
-
-            {/* ── 3-Way Match Summary ── */}
-            {rec?.threeWayMatch && (
-                <div className="px-3 py-2 border-b border-zinc-800/40 bg-zinc-950/30">
-                    <div className="text-[10px] font-mono text-zinc-400">{rec.threeWayMatch.summary}</div>
-                    {rec.threeWayMatch.discrepancies?.length > 0 && rec.threeWayMatch.discrepancies.map((d: any) => (
-                        <div key={d.productId + d.kind} className={`text-[9px] font-mono mt-0.5 ${d.blocking ? "text-rose-400" : "text-amber-400"}`}>
-                            {d.blocking ? "🚫" : "⚠️"} {d.message} {d.dollarImpact ? `($${d.dollarImpact})` : ""}
+            {/* Plain-language discrepancy list */}
+            {discrepancies.length > 0 && (
+                <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/30 space-y-0.5">
+                    {discrepancies.map((d: any, i: number) => (
+                        <div key={i} className={`text-[10px] font-mono leading-relaxed ${d.blocking ? "text-rose-300" : "text-amber-300/90"}`}>
+                            {d.blocking ? "🚫" : "•"} {d.message}
                         </div>
                     ))}
                 </div>
             )}
 
-            {/* ── Action ── */}
             <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/50">
-                {status === "no_match" ? (
-                    <span className="text-[9px] font-mono text-zinc-600 mr-auto">No invoice matched</span>
-                ) : rec?.threeWayMatch?.canApprove ? (
-                    <button
-                        onClick={e => { e.stopPropagation(); onComplete(); }}
-                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
-                    >
-                        Complete PO
-                    </button>
-                ) : (
-                    <button
-                        onClick={e => { e.stopPropagation(); onComplete(); }}
-                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer transition-colors"
-                    >
-                        Review & Complete
-                    </button>
-                )}
+                <a
+                    href={po.finaleUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={e => e.stopPropagation()}
+                    className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 mr-auto"
+                >
+                    Open PO in Finale
+                </a>
+                <button
+                    onClick={e => { e.stopPropagation(); onComplete(); }}
+                    className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer transition-colors"
+                >
+                    Apply Invoice &amp; Complete
+                </button>
             </div>
         </div>
     );
