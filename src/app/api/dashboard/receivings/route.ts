@@ -267,39 +267,67 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         if (matchedPOs.length > 0) {
                             const matchedPoNums = matchedPOs.map((p: any) => p.poNumber || p.orderId);
 
-                            // Batch-fetch PO line_items + receive_date
+                            // ── PO lines straight off the bulk GraphQL payload ──────────────
+                            // HERMIA(2026-08-11): the local purchase_orders.line_items cache
+                            // strips unitPrice (only {quantity, productId} survives), which
+                            // made the 3-way match compare poUnitPrice=0 and report a
+                            // meaningless "clean match".
+                            //
+                            // The fix is NOT per-PO getOrderDetails calls: core-client enforces
+                            // a process-wide 500ms serial request interval, so N POs cost
+                            // N × 500ms minimum and blow the route's 20s guard (measured:
+                            // every PO hit a 4s budget and the whole enrichment was abandoned).
+                            //
+                            // Instead `unitPrice` was added to the bulk orderViewConnection
+                            // query in getTodaysReceivedPOs — the SAME call that already
+                            // fetched these POs. Prices now arrive on po.items at zero extra
+                            // request cost.
                             const poLinesMap = new Map<string, any[]>();
                             const poReceiveMap = new Map<string, string | null>();
-                            try {
-                                const { data: poRows } = await sb
-                                    .from("purchase_orders")
-                                    .select("po_number, line_items, receive_date")
-                                    .in("po_number", matchedPoNums);
-                                for (const row of poRows || []) {
-                                    let items: any[] = [];
-                                    if (row.line_items) {
-                                        try { items = typeof row.line_items === "string" ? JSON.parse(row.line_items) : row.line_items; } catch { /* not JSON */ }
-                                    }
-                                    poLinesMap.set(row.po_number, Array.isArray(items) ? items : []);
-                                    poReceiveMap.set(row.po_number, row.receive_date ?? null);
-                                }
-                            } catch { /* non-blocking — enrichment proceeds without PO lines */ }
+                            const poAdjustmentsMap = new Map<string, { freight: number; tax: number; tariffs: number }>();
 
-                            // Batch-fetch invoice line_items
+                            for (const po of matchedPOs) {
+                                const poNum = po.poNumber || po.orderId;
+                                poLinesMap.set(poNum, (po.items || []).map((it: any) => ({
+                                    productId: it.productId,
+                                    quantity: Number(it.orderedQuantity ?? it.quantity ?? 0),
+                                    unitPrice: Number(it.unitPrice ?? 0),
+                                    description: it.description ?? undefined,
+                                })));
+                                poReceiveMap.set(poNum, po.receiveDate ?? null);
+                                // PO-level freight/tax/tariffs are not on the bulk payload;
+                                // complete_po resolves them from orderAdjustmentList at commit.
+                                poAdjustmentsMap.set(poNum, { freight: 0, tax: 0, tariffs: 0 });
+                            }
+
+                            // ── Invoice lines from vendor_invoices ──────────────────────────
+                            // NOTE: the `invoices` table has NO line_items column — querying it
+                            // returns HTTP 400 (42703) and silently yields nothing. The real
+                            // per-line data lives on vendor_invoices.line_items (OCR output).
                             const invLinesMap = new Map<string, any[]>();
                             try {
                                 const { data: invRows } = await sb
-                                    .from("invoices")
-                                    .select("po_number, line_items")
+                                    .from("vendor_invoices")
+                                    .select("po_number, line_items, raw_data")
                                     .in("po_number", matchedPoNums);
                                 for (const row of invRows || []) {
                                     let items: any[] = [];
-                                    if (row.line_items) {
-                                        try { items = typeof row.line_items === "string" ? JSON.parse(row.line_items) : row.line_items; } catch { /* not JSON */ }
+                                    const src = row.line_items ?? (row.raw_data as any)?.lineItems;
+                                    if (src) {
+                                        try { items = typeof src === "string" ? JSON.parse(src) : src; } catch { /* not JSON */ }
                                     }
-                                    invLinesMap.set(row.po_number, Array.isArray(items) ? items : []);
+                                    // Normalize OCR shapes: {qty|quantity, sku|productId, unit_price|unitPrice}
+                                    const norm = (Array.isArray(items) ? items : []).map((li: any) => ({
+                                        sku: li.sku ?? li.productId ?? li.partNumber ?? undefined,
+                                        qty: Number(li.qty ?? li.quantity ?? 0),
+                                        unitPrice: Number(li.unit_price ?? li.unitPrice ?? 0),
+                                        description: li.description ?? undefined,
+                                    }));
+                                    if (norm.length > 0) invLinesMap.set(row.po_number, norm);
                                 }
-                            } catch { /* non-blocking */ }
+                            } catch (invErr: any) {
+                                console.warn(`[receivings] vendor_invoices line fetch failed: ${invErr?.message || invErr}`);
+                            }
 
                             // ── Shipment detail fetches DEFERRED to POST complete_po ──────
                             // GET enrichment is display-only: compare PO vs invoice lines.
@@ -329,6 +357,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         hasReceiveDate: poReceiveMap.get(poNum) != null,
                                         receivedQtys: receiptQtysMap.get(poNum) || {},
                                         packMultipliers: packMultipliersMap.get(poNum) || {},
+                                        poAdjustments: poAdjustmentsMap.get(poNum) || { freight: 0, tax: 0, tariffs: 0 },
                                     });
                                     rec.matchStatus = result.matchStatus;
                                     rec.threeWayMatch = result.threeWayMatch;

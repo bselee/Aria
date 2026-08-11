@@ -89,8 +89,10 @@ export async function enrichReceivedPO(params: {
     hasReceiveDate: boolean;
     receivedQtys: Record<string, number>;
     packMultipliers: Record<string, number>;
+    poAdjustments?: { freight: number; tax: number; tariffs: number };
 }): Promise<EnrichmentResult> {
     const { po, poNum, matchedInvoice, poLines, invLines, hasReceiveDate, receivedQtys, packMultipliers } = params;
+    const poAdj = params.poAdjustments ?? { freight: 0, tax: 0, tariffs: 0 };
 
     // Build charges comparison
     const poSubtotal = poLines.reduce(
@@ -103,27 +105,29 @@ export async function enrichReceivedPO(params: {
     const invTax = Number(matchedInvoice?.tax ?? 0);
     const invTotal = Number(matchedInvoice?.total ?? invSubtotal + invFreight + invTax);
 
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+
     const chargesComparison: ChargesComparison = {
         po: {
-            subtotal: Math.round(poSubtotal * 100) / 100,
-            freight: 0,
-            tax: 0,
-            tariffs: 0,
-            total: poTotal,
+            subtotal: r2(poSubtotal),
+            freight: r2(poAdj.freight),
+            tax: r2(poAdj.tax),
+            tariffs: r2(poAdj.tariffs),
+            total: r2(poTotal),
         },
         invoice: {
-            subtotal: invSubtotal,
-            freight: invFreight,
-            tax: invTax,
+            subtotal: r2(invSubtotal),
+            freight: r2(invFreight),
+            tax: r2(invTax),
             tariffs: 0,
-            total: invTotal,
+            total: r2(invTotal),
         },
         diffs: {
-            subtotal: Math.round((invSubtotal - poSubtotal) * 100) / 100,
-            freight: invFreight,
-            tax: invTax,
-            tariffs: 0,
-            total: Math.round((invTotal - poTotal) * 100) / 100,
+            subtotal: r2(invSubtotal - poSubtotal),
+            freight: r2(invFreight - poAdj.freight),
+            tax: r2(invTax - poAdj.tax),
+            tariffs: r2(0 - poAdj.tariffs),
+            total: r2(invTotal - poTotal),
         },
     };
 
@@ -187,6 +191,54 @@ export async function enrichReceivedPO(params: {
 
     let threeWayMatch: ThreeWayMatchResult | null = null;
     let matchStatus: MatchStatus = "no_match";
+
+    // ── Total-only comparison when the invoice has no extracted lines ─────────
+    // HERMIA(2026-08-11): most invoices are photo/OCR captures where only the
+    // TOTAL was extracted (line_items: []). Feeding those into the line-level
+    // gate produced a false "100% price variance" on every line, because every
+    // invoiceUnitPrice was 0. When there are no invoice lines, compare the one
+    // number we actually have — invoice total vs PO total — and say so plainly.
+    const invoiceHasLines = invLines.length > 0
+        && invLines.some((l: any) => Number(l.qty ?? l.quantity ?? 0) > 0);
+
+    if (matchedInvoice && !invoiceHasLines) {
+        const poCompare = poSubtotal > 0 ? poSubtotal : poTotal;
+        const invCompare = invTotal > 0 ? invTotal : invSubtotal;
+        const delta = r2(invCompare - poCompare);
+        const pct = poCompare > 0 ? Math.abs(delta) / poCompare : 1;
+        // 2% band mirrors DEFAULT_TOLERANCES.pricePct
+        const withinTolerance = poCompare > 0 && pct <= 0.02;
+
+        matchStatus = withinTolerance ? "match" : "possible_match";
+        threeWayMatch = {
+            orderId: poNum,
+            verdict: withinTolerance ? "matched" : "variance",
+            canApprove: withinTolerance,
+            missingLegs: [],
+            discrepancies: withinTolerance ? [] : [{
+                productId: "(order total)",
+                kind: "price_variance",
+                blocking: false,
+                dollarImpact: Math.abs(delta),
+                message: `Invoice total $${invCompare.toFixed(2)} vs PO total $${poCompare.toFixed(2)} — ${delta > 0 ? "over" : "under"} by $${Math.abs(delta).toFixed(2)} (${(pct * 100).toFixed(1)}%). Invoice has no itemized lines; compared on totals only.`,
+            }],
+            totalDollarImpact: withinTolerance ? 0 : Math.abs(delta),
+            summary: withinTolerance
+                ? `Totals agree ($${invCompare.toFixed(2)}) — no itemized invoice lines, matched on total.`
+                : `Total differs by $${Math.abs(delta).toFixed(2)} (${(pct * 100).toFixed(1)}%) — invoice $${invCompare.toFixed(2)} vs PO $${poCompare.toFixed(2)}. No itemized invoice lines.`,
+        };
+        // Leave per-line rows informational — no invoice side to compare against
+        for (const ml of matchLines) ml.status = "matched";
+
+        return {
+            matchStatus,
+            threeWayMatch,
+            chargesComparison,
+            lineComparison: matchLines,
+            matchedInvoiceLineItems: extractLineItems(matchedInvoice),
+            matchedInvoiceRawLines: invLines,
+        };
+    }
 
     try {
         const { evaluateThreeWayMatch } = await import("./three-way-match");

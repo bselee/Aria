@@ -682,6 +682,7 @@ export function deriveReceivedPurchaseOrders(
                     productId: ie.node.product?.productId || "?",
                     quantity: parseFinaleNumber(ie.node.quantity),
                     orderedQuantity: parseFinaleNumber(ie.node.quantity),
+                    unitPrice: parseFinaleNumber(ie.node.unitPrice),
                 })),
                 finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
             } satisfies ReceivedPO;
