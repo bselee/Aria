@@ -220,7 +220,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             if (poNumbers.length > 0) {
                 const { data: invoices } = await sb
             .from('vendor_invoices')
-            .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref')
+            .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items, raw_data')
             .in('po_number', poNumbers)
             .order('created_at', { ascending: false });
 
@@ -257,8 +257,139 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 ),
                 matchedInvoice: (invoiceMap.get(poNum) || [])[0] || null,
             };
-                }
-            }
+                            }
+
+                        // ── 3-way match enrichment for POs with matched invoices ─────────
+                        const matchedPOs = received.filter((po: any) =>
+                            (po as any)._reconciliation?.matchedInvoice != null
+                        );
+
+                        if (matchedPOs.length > 0) {
+                            const matchedPoNums = matchedPOs.map((p: any) => p.poNumber || p.orderId);
+
+                            // Batch-fetch PO line_items + receive_date
+                            const poLinesMap = new Map<string, any[]>();
+                            const poReceiveMap = new Map<string, string | null>();
+                            try {
+                                const { data: poRows } = await sb
+                                    .from("purchase_orders")
+                                    .select("po_number, line_items, receive_date")
+                                    .in("po_number", matchedPoNums);
+                                for (const row of poRows || []) {
+                                    let items: any[] = [];
+                                    if (row.line_items) {
+                                        try { items = typeof row.line_items === "string" ? JSON.parse(row.line_items) : row.line_items; } catch { /* not JSON */ }
+                                    }
+                                    poLinesMap.set(row.po_number, Array.isArray(items) ? items : []);
+                                    poReceiveMap.set(row.po_number, row.receive_date ?? null);
+                                }
+                            } catch { /* non-blocking — enrichment proceeds without PO lines */ }
+
+                            // Batch-fetch invoice line_items
+                            const invLinesMap = new Map<string, any[]>();
+                            try {
+                                const { data: invRows } = await sb
+                                    .from("invoices")
+                                    .select("po_number, line_items")
+                                    .in("po_number", matchedPoNums);
+                                for (const row of invRows || []) {
+                                    let items: any[] = [];
+                                    if (row.line_items) {
+                                        try { items = typeof row.line_items === "string" ? JSON.parse(row.line_items) : row.line_items; } catch { /* not JSON */ }
+                                    }
+                                    invLinesMap.set(row.po_number, Array.isArray(items) ? items : []);
+                                }
+                            } catch { /* non-blocking */ }
+
+                            // ── Load receipt quantities from Finale in parallel ──────────
+                            const receiptQtysMap = new Map<string, Record<string, number>>();
+                            const packMultipliersMap = new Map<string, Record<string, number>>();
+                            const finaleForReceipts = new FinaleClient();
+
+                            await mapConcurrent(matchedPOs, 3, async (po: any) => {
+                                const poNum = po.poNumber || po.orderId;
+                                try {
+                                    const receivedQtys: Record<string, number> = {};
+                                    const packMultipliers: Record<string, number> = {};
+                                    const poDetails = await finaleForReceipts.getOrderDetails(poNum);
+                                    const shipments = poDetails?.shipmentList || [];
+                                    const allShipmentItems: Array<{ productId: string; quantity: number }> = [];
+                                    for (const shipment of shipments) {
+                                        const shipmentUrl = shipment?.shipmentUrl;
+                                        if (!shipmentUrl) continue;
+                                        try {
+                                            const detail = await finaleForReceipts.getShipmentDetails(String(shipmentUrl));
+                                            const { getShipmentReceiptItems } = await import("@/lib/finale/core-client");
+                                            allShipmentItems.push(...getShipmentReceiptItems(detail));
+                                        } catch { /* skip failed shipment detail fetch */ }
+                                    }
+                                    for (const item of allShipmentItems) {
+                                        receivedQtys[item.productId] = (receivedQtys[item.productId] ?? 0) + item.quantity;
+                                    }
+                                    const allSkus = [...new Set(Object.keys(receivedQtys))];
+                                    if (allSkus.length > 0) {
+                                        try {
+                                            const { getPackSizes } = await import("@/lib/purchasing/pack-size-registry");
+                                            const sizes = await getPackSizes(allSkus);
+                                            for (const [sku, pr] of sizes) {
+                                                if (pr.unitsPerPack > 1) packMultipliers[sku] = pr.unitsPerPack;
+                                            }
+                                        } catch { /* pack sizes optional */ }
+                                    }
+                                    receiptQtysMap.set(poNum, receivedQtys);
+                                    packMultipliersMap.set(poNum, packMultipliers);
+                                } catch (receiptErr: any) {
+                                    console.warn(`[receivings] Receipt fetch failed for PO ${poNum}: ${receiptErr?.message || receiptErr}`);
+                                    receiptQtysMap.set(poNum, {});
+                                    packMultipliersMap.set(poNum, {});
+                                }
+                            });
+
+                            // ── Evaluate 3-way match for each matched PO ─────────────────
+                            const { enrichReceivedPO } = await import("@/lib/purchasing/receivings-enrichment");
+                            await mapConcurrent(matchedPOs, 4, async (po: any) => {
+                                const poNum = po.poNumber || po.orderId;
+                                const rec = (po as any)._reconciliation;
+                                try {
+                                    const result = await enrichReceivedPO({
+                                        po,
+                                        poNum,
+                                        matchedInvoice: rec.matchedInvoice,
+                                        poLines: poLinesMap.get(poNum) || [],
+                                        invLines: invLinesMap.get(poNum) || [],
+                                        hasReceiveDate: poReceiveMap.get(poNum) != null,
+                                        receivedQtys: receiptQtysMap.get(poNum) || {},
+                                        packMultipliers: packMultipliersMap.get(poNum) || {},
+                                    });
+                                    rec.matchStatus = result.matchStatus;
+                                    rec.threeWayMatch = result.threeWayMatch;
+                                    rec.chargesComparison = result.chargesComparison;
+                                    rec.lineComparison = result.lineComparison;
+                                    if (rec.matchedInvoice && result.matchedInvoiceLineItems) {
+                                        (rec.matchedInvoice as any)._lineItems = result.matchedInvoiceLineItems;
+                                        (rec.matchedInvoice as any)._invoiceLines = result.matchedInvoiceRawLines;
+                                    }
+                                } catch (enrichmentErr: any) {
+                                    console.warn(`[receivings] Enrichment eval failed for PO ${poNum}: ${enrichmentErr?.message || enrichmentErr}`);
+                                    rec.matchStatus = rec.matchedInvoice ? "possible_match" : "no_match";
+                                    rec.threeWayMatch = null;
+                                    rec.chargesComparison = null;
+                                    rec.lineComparison = [];
+                                }
+                            });
+                        }
+
+                        // Set no_match for POs without invoices (no enrichment attempted)
+                        for (const po of received) {
+                            const rec = (po as any)._reconciliation;
+                            if (!rec.matchedInvoice && rec.matchStatus === undefined) {
+                                rec.matchStatus = "no_match";
+                                rec.threeWayMatch = null;
+                                rec.chargesComparison = null;
+                                rec.lineComparison = [];
+                            }
+                        }
+                        }
 
             // ── Match suggestions: find unmatched invoices for received PO vendors ──
             const vendorNames = [...new Set(received.map((r: any) => r.supplier).filter(Boolean))] as string[];
