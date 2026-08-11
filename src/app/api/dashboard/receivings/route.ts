@@ -17,6 +17,7 @@ import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
+import { isReceivingsPdfVendor } from '@/config/receivings-pdf-vendors';
 
 // ── In-flight PO reconciliation guard ─────────────────────────────────────
 // Prevents concurrent Finale writes when two browser tabs / bust=1 calls
@@ -220,7 +221,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             if (poNumbers.length > 0) {
                 const { data: invoices } = await sb
             .from('vendor_invoices')
-            .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items, raw_data')
+            .select('po_number, invoice_number, vendor_name, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items, raw_data')
             .in('po_number', poNumbers)
             .order('created_at', { ascending: false });
 
@@ -256,10 +257,15 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     (o: any) => o.outcome === 'auto_applied'
                 ),
                 matchedInvoice: (invoiceMap.get(poNum) || [])[0] || null,
-            };
+                            };
+                            // Stamp pdfAvailable for downstream UI
+                            const mi = (po as any)._reconciliation.matchedInvoice;
+                            if (mi && !mi.pdfAvailable) {
+                                mi.pdfAvailable = !!(mi.pdf_storage_path && isReceivingsPdfVendor(mi.vendor_name));
                             }
+                                            }
 
-                        // ── 3-way match enrichment for POs with matched invoices ─────────
+                                        // ── 3-way match enrichment for POs with matched invoices ─────────
                         const matchedPOs = received.filter((po: any) =>
                             (po as any)._reconciliation?.matchedInvoice != null
                         );
@@ -420,8 +426,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 try {
             const { data } = await sb
                 .from('vendor_invoices')
-                .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
-                .is('po_number', null)
+                .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, pdf_storage_path')
+                                .is('po_number', null)
                 .in('vendor_name', vendorNames)
                 .order('created_at', { ascending: false })
                 .limit(20);
@@ -553,6 +559,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             vendorName: inv.vendor_name,
                             invoiceDate: inv.invoice_date,
                             invoiceTotal: inv.total,
+                            pdfStoragePath: inv.pdf_storage_path || null,
+                            pdfAvailable: !!(inv.pdf_storage_path && isReceivingsPdfVendor(inv.vendor_name)),
                             candidates: [{
                                 orderId: String(ocrPo),
                                 vendorName: inv.vendor_name,
@@ -564,9 +572,9 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 isOpen: true,
                             }],
                             autoApplyReady: false,
-                            fromCache: true,
-                            invoiceLineItems: extractLineItems(inv),
-                        },
+                                                                                    fromCache: true,
+                                                                                    invoiceLineItems: extractLineItems(inv),
+                                                                                },
                     };
                         }
                         try {
@@ -615,15 +623,17 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         vendorName: inv.vendor_name,
                         invoiceDate: inv.invoice_date,
                         invoiceTotal: inv.total,
+                        pdfStoragePath: inv.pdf_storage_path || null,
+                        pdfAvailable: !!(inv.pdf_storage_path && isReceivingsPdfVendor(inv.vendor_name)),
                         candidates: [],
                         autoApplyReady: false,
                         fromCache: !!inv._fromCache,
                         timedOut: true,
-                        invoiceLineItems: extractLineItems(inv),
-                    });
-                    continue;
-                        }
-                        if (sr.status === 'error') {
+                                                                        invoiceLineItems: extractLineItems(inv),
+                                                                    });
+                                            continue;
+                                                }
+                                                if (sr.status === 'error') {
                     console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
                     continue;
                         }
@@ -644,11 +654,13 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     vendorName: inv.vendor_name,
                     invoiceDate: inv.invoice_date,
                     invoiceTotal: inv.total,
+                    pdfStoragePath: inv.pdf_storage_path || null,
+                    pdfAvailable: !!(inv.pdf_storage_path && isReceivingsPdfVendor(inv.vendor_name)),
                     candidates: result.candidates.slice(0, 5),
                     autoApplyReady: result.autoApplyReady ?? false,
-                    fromCache: !!inv._fromCache,
-                    invoiceLineItems: extractLineItems(inv),
-                        });
+                                        fromCache: !!inv._fromCache,
+                                                                                invoiceLineItems: extractLineItems(inv),
+                                                                                    });
                     }
                 }
                     }
