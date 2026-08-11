@@ -657,27 +657,6 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
         }
     }
 
-    async function toggleTrackingPaused(orderId: string) {
-        setActionLoading(orderId + "-toggle");
-        setError(null);
-        try {
-            const res = await fetch("/api/dashboard/active-purchases", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "toggle_tracking_paused", orderId }),
-            });
-            const json = await res.json();
-            if (!res.ok) throw new Error(json.error || "Toggle failed");
-            setPurchases((prev) => prev.map((po) => po.orderId === orderId
-                ? { ...po, trackingPaused: json.trackingPaused }
-                : po));
-        } catch (e: any) {
-            setError(e.message);
-        } finally {
-            setActionLoading(null);
-        }
-    }
-
     async function saveTrackingNumber(orderId: string, vendorName: string) {
         if (!newTrackingNum) return;
         setActionLoading(orderId + "-tracking");
@@ -1515,37 +1494,14 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                          {/* Active Purchases Controls & Toolbar */}
                                          <div className="mt-2.5 flex items-center justify-between flex-wrap gap-2 text-[10px] font-mono border-t border-zinc-800/40 pt-2 bg-zinc-950/20 px-2 py-1 rounded border border-zinc-800/30">
                                              <div className="flex items-center gap-2">
-                                                 <button
-                                                     onClick={(e) => {
-                                                         e.stopPropagation();
-                                                         toggleTrackingPaused(po.orderId);
-                                                     }}
-                                                     disabled={actionLoading === po.orderId + "-toggle"}
-                                                     className={`px-1.5 py-0.5 rounded border text-[9px] uppercase font-bold transition-all ${
-                                                         po.trackingPaused
-                                                             ? "bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20"
-                                                             : "bg-zinc-800/60 border-zinc-700/60 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
-                                                     }`}
-                                                 >
-                                                     {actionLoading === po.orderId + "-toggle"
-                                                         ? "updating..."
-                                                         : po.trackingPaused
-                                                         ? "⏸ PAUSED"
-                                                         : "▶ ACTIVE"}
-                                                 </button>
-
-                                                 {po.trackingSource ? (
-                                                     <span className="text-zinc-500">
-                                                         Found: <span className="text-zinc-300 font-bold">{po.trackingSource}</span>
-                                                     </span>
-                                                 ) : po.typicalTrackingSource ? (
-                                                     <span className="text-zinc-500">
-                                                         Typically: <span className="text-zinc-300 font-bold">{po.typicalTrackingSource}</span>
-                                                     </span>
-                                                 ) : (
-                                                     <span className="text-zinc-600 italic">No tracking source pattern yet</span>
-                                                 )}
-                                             </div>
+                                                                                             {po.typicalTrackingSource ? (
+                                                                                                 <span className="text-zinc-500">
+                                                                                                     Typically: <span className="text-zinc-300 font-bold">{po.typicalTrackingSource}</span>
+                                                                                                 </span>
+                                                                                             ) : (
+                                                                                                 <span className="text-zinc-600 italic">No tracking source pattern yet</span>
+                                                                                             )}
+                                                                                         </div>
 
                                              <div className="flex items-center gap-1.5">
                                                  <button

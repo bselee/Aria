@@ -854,12 +854,46 @@ export async function POST(req: NextRequest) {
                 completedBy: 'dashboard',
             });
 
-            // Transition lifecycle to COMPLETED (gate runs again as belt-and-suspenders)
-            const { transitionLifecycleState } = await import('@/lib/purchasing/po-lifecycle');
-            await transitionLifecycleState(
-                orderId, 'COMPLETED', 'dashboard-receivings',
-                { receivedQtys, packMultipliers, finalStatus, vendorName: vendorName || '' },
-            );
+            // Transition lifecycle to COMPLETED (gate runs again as belt-and-suspenders).
+            // Use the same pattern as approve_reconciliation (active-purchases/route.ts:511):
+            // wrap in try/catch and check the return value — if the gate refuses, surface
+            // the refusal and do NOT report success.
+            try {
+                const tlResult = await transitionLifecycleState(
+                    orderId,
+                    'COMPLETED',
+                    'dashboard-receivings',
+                    { receivedQtys, packMultipliers, finalStatus, vendorName: vendorName || '' },
+                );
+
+                if (!tlResult.ok) {
+                    console.warn(
+                        `[receivings] complete_po ${orderId}: lifecycle gate refused — ${tlResult.blockReason}`,
+                    );
+                    return NextResponse.json(
+                        {
+                            error: 'Lifecycle gate refused completion',
+                            detail: tlResult.blockReason,
+                            orderId,
+                            completed: false,
+                        },
+                        { status: 409 },
+                    );
+                }
+            } catch (tlErr: any) {
+                console.warn(
+                    `[receivings] complete_po ${orderId}: lifecycle transition error — ${tlErr?.message || tlErr}`,
+                );
+                return NextResponse.json(
+                    {
+                        error: 'Lifecycle transition failed',
+                        detail: tlErr?.message || String(tlErr),
+                        orderId,
+                        completed: false,
+                    },
+                    { status: 500 },
+                );
+            }
 
             // Invalidate caches so Active Purchases drops this PO
             const { invalidatePurchasingCaches } = await import('@/lib/purchasing/cache');
