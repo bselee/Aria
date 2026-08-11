@@ -116,24 +116,12 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     if (nonInvoiceSubjects.some((s) => subjectLower.includes(s))) {
         return true;
     }
-    // Belt Power no-reply / AR = ship notices + statements/collections (invoices = remitto@)
-    if (fromLower.includes("no-reply@beltpower.com")) {
-        return true;
-    }
-    if (fromLower.includes("beltpowerar@")) {
-        return true;
-    }
     // Toyota Industries Commercial Finance — paid online
     if (
         fromLower.includes("toyota commercial finance") ||
         fromLower.includes("ticf") ||
         (fromLower.includes("billtrust.com") && (fromLower.includes("toyota") || subjectLower.includes("ticf")))
     ) {
-        return true;
-    }
-    // AAA Cooper Transportation — individual Pro# invoices left for manual review
-    // Subject pattern: "Invoice Stmt - Cust 0001159492 Pro#: 64471684"
-    if (subjectLower.includes("invoice stmt - cust 0001159492 pro#")) {
         return true;
     }
     return false;
@@ -1037,21 +1025,19 @@ export async function runReconciliationHandoff(): Promise<{
  * Called after all PDFs in an email have been forwarded to Bill.com.
  */
 async function markEmailProcessed(gmail: any, messageId: string): Promise<void> {
-    // Resolve "Invoice Forward" label by name → real Gmail label id.
-    // Passing the human name as labelId throws: Invalid label: Invoice Forward
     try {
         await applyMessageLabelPolicy({
             gmail,
             gmailMessageId: messageId,
             addLabels: ["Invoice Forward"],
-            removeLabels: ["INBOX", "UNREAD"],
+            removeLabels: ["UNREAD"],
         });
     } catch (e: any) {
         try {
             await gmail.users.messages.modify({
                 userId: "me",
                 id: messageId,
-                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+                requestBody: { removeLabelIds: ["UNREAD"] },
             });
         } catch (e2: any) {
             console.warn(`   [AP-Local] Failed to mark email ${messageId} as processed:`, e2.message);

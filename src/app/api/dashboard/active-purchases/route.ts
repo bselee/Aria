@@ -130,33 +130,7 @@ export async function POST(req: Request) {
             });
         }
 
-        // Action 2: Toggle Tracking Paused
-        if (action === "toggle_tracking_paused") {
-            // Get current status
-            const { data: poData } = await db
-                .from("purchase_orders")
-                .select("tracking_paused")
-                .eq("po_number", orderId)
-                .maybeSingle();
-
-            const nextPaused = !(poData?.tracking_paused || false);
-
-            const { error } = await db.from("purchase_orders").upsert({
-                po_number: orderId,
-                tracking_paused: nextPaused,
-                updated_at: now,
-            }, { onConflict: "po_number" });
-
-            if (error) throw error;
-
-            return NextResponse.json({
-                ok: true,
-                orderId,
-                trackingPaused: nextPaused,
-            });
-        }
-
-        // Action 3: Add Tracking Number manually (with search tracking source pattern)
+        // Action 2: Add Tracking Number manually (with search tracking source pattern)
         if (action === "add_tracking_number") {
             const trackingNumber = String(body.trackingNumber || "").trim();
             const trackingSource = String(body.trackingSource || "").trim();
@@ -178,21 +152,17 @@ export async function POST(req: Request) {
                 trackingList = [...trackingList, trackingNumber];
             }
 
-            const upsertPayload: any = {
-                po_number: orderId,
-                tracking_numbers: trackingList,
-                updated_at: now,
-            };
+            const upsertPayload: Record<string, unknown> = {
+                        po_number: orderId,
+                        tracking_numbers: trackingList,
+                        updated_at: now,
+                    };
 
-            if (trackingSource) {
-                upsertPayload.tracking_source = trackingSource;
-            }
+                    const { error: updateErr } = await db
+                        .from("purchase_orders")
+                        .upsert(upsertPayload, { onConflict: "po_number" });
 
-            const { error: updateErr } = await db
-                .from("purchase_orders")
-                .upsert(upsertPayload, { onConflict: "po_number" });
-
-            if (updateErr) throw updateErr;
+                    if (updateErr) throw updateErr;
 
             // Transition lifecycle: moving_with_tracking → SENT (flag, preserve in metadata)
             try {

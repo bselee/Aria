@@ -1473,7 +1473,7 @@ defineJob({
             const { getAuthenticatedClient } = await import(
                 "@/lib/gmail/auth"
             );
-            const { GmailApi } = await import("@googleapis/gmail");
+            const { gmail: GmailApi } = await import("@googleapis/gmail");
             const { collectGoldSamples } = await import(
                 "@/lib/intelligence/gold-sample-collector"
             );

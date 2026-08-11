@@ -144,9 +144,11 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                                 node {
                                                     product { productId }
                                                     quantity
+                                                    unitPrice
                                                 }
                                             }
                                         }
+                                        subtotal
                                     }
                                 }
                             }
@@ -1655,6 +1657,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             node {
                                                 product { productId }
                                                 quantity
+                                                unitPrice
                                             }
                                         }
                                     }

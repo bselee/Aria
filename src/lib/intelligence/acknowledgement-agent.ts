@@ -48,6 +48,7 @@ export class AcknowledgementAgent {
         '@notifications.google',  // Google Workspace notifications
         '@googlemail.l.google',   // Gmail system messages
         'noreply@google.com',     // Google Cloud, Calendar, etc.
+        'calendar-notification@google.com', // Google Calendar daily agenda
         'no-reply@accounts.google', // Google account notifications
         'stripe.com',             // Stripe payment receipts
         'shopify.com',            // Shopify order confirmations
@@ -75,6 +76,7 @@ export class AcknowledgementAgent {
     private static SYSTEM_SUBJECT_PATTERNS = [
         /^OOS Report\b/i,             // ARIA's OOS report emails
         /^Out Of Stock\b/i,           // Stockie alert subject
+        /^Daily Agenda\b/i,           // Google Calendar daily agenda
     ];
 
     private isSystemSender(from: string): boolean {

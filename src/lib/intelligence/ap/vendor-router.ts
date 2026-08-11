@@ -92,17 +92,7 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { subjectContains: 'your statement' }, action: 'skip', label: 'Your Statement (Not Invoice)' },
     { match: { subjectContains: 'reminder on overdue' }, action: 'skip', label: 'Overdue Reminder (Not Invoice)' },
     { match: { subjectContains: 'packing list' }, action: 'skip', label: 'Packing List (Not Invoice)' },
-    // Belt Power: invoices only from remitto@. AR mailbox + reminders/statements are noise.
-    { match: { fromExact: 'no-reply@beltpower.com' }, action: 'skip', label: 'Belt Power No-Reply (Ship Notices)' },
-    { match: { fromExact: 'beltpowerar@beltpower.com' }, action: 'skip', label: 'Belt Power AR (Statements/Collections)' },
-    { match: { senderContains: 'beltpowerar' }, action: 'skip', label: 'Belt Power AR (Statements/Collections)' },
-    { match: { senderContains: 'beltpower', subjectContains: 'statement' }, action: 'skip', label: 'Belt Power Statement' },
-    { match: { senderContains: 'beltpower', subjectContains: 'overdue' }, action: 'skip', label: 'Belt Power Overdue Reminder' },
-    { match: { senderContains: 'beltpower', subjectContains: 'shipment' }, action: 'skip', label: 'Belt Power Shipment' },
-    { match: { senderContains: 'beltpower', subjectContains: 'reminder' }, action: 'skip', label: 'Belt Power Invoice Reminder' },
-    { match: { senderContains: 'beltpower', subjectContains: 'immediate attention' }, action: 'skip', label: 'Belt Power Collections Notice' },
-    // Filename-aware rules (local-forwarder passes attachment name into matchVendorRouting)
-    { match: { senderContains: 'beltpower', filenameContains: 'statement' }, action: 'skip', label: 'Belt Power Statement PDF' },
+    // Belt Power: ALL emails forwarded (remitto@ invoices + AR/ship notices).
     { match: { filenameContains: '_statement' }, action: 'skip', label: 'Statement Attachment (Not Invoice)' },
     { match: { filenameContains: 'statement.pdf' }, action: 'skip', label: 'Statement PDF (Not Invoice)' },
 

@@ -64,7 +64,14 @@ export interface ReceivedPO {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
+    /**
+     * Goods-only subtotal from Finale GraphQL. `total - subtotal` = applied PO
+     * adjustments (freight, written by the reconcilers under productpromo/10007).
+     * Finale's GraphQL order type exposes no adjustment fields, so this delta is
+     * the only zero-extra-request way to see freight already on the PO.
+     */
+    subtotal?: number;
+    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number; unitPrice?: number }>;
     receiptHistory?: Array<{
         shipmentId: string;
         receiveDate: string;
@@ -682,7 +689,18 @@ export function deriveReceivedPurchaseOrders(
                     productId: ie.node.product?.productId || "?",
                     quantity: parseFinaleNumber(ie.node.quantity),
                     orderedQuantity: parseFinaleNumber(ie.node.quantity),
+                    unitPrice: parseFinaleNumber(ie.node.unitPrice),
                 })),
+                // HERMIA(2026-08-11): Finale's GraphQL `order` type exposes no
+                // adjustment fields (probed: orderAdjustmentList / adjustments /
+                // freight / shippingTotal / adjustmentTotal all rejected; only
+                // `subtotal` resolves). total - subtotal therefore IS the PO's
+                // applied adjustments — which for BAS POs is freight written by
+                // the reconcilers under productpromo/10007. Carrying subtotal
+                // here lets the receivings card see freight already on the PO
+                // without a per-PO REST call. Verified PO 125051: subtotal
+                // 6523.20, total 7242.85, REST adjustment 719.65 = the delta.
+                subtotal: parseFinaleNumber(po.subtotal),
                 finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
             } satisfies ReceivedPO;
         })
