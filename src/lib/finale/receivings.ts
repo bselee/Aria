@@ -148,6 +148,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                                 }
                                             }
                                         }
+                                        subtotal
                                     }
                                 }
                             }

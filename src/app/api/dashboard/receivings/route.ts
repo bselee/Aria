@@ -295,9 +295,28 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     description: it.description ?? undefined,
                                 })));
                                 poReceiveMap.set(poNum, po.receiveDate ?? null);
-                                // PO-level freight/tax/tariffs are not on the bulk payload;
-                                // complete_po resolves them from orderAdjustmentList at commit.
-                                poAdjustmentsMap.set(poNum, { freight: 0, tax: 0, tariffs: 0 });
+
+                                // HERMIA(2026-08-11): freight ALREADY on the PO, derived from
+                                // total - subtotal. Finale's GraphQL order type exposes no
+                                // adjustment fields (orderAdjustmentList/freight/shippingTotal
+                                // all rejected), and the REST payload returns
+                                // orderAdjustmentTypeId as UNDEFINED — the real marker is
+                                // productPromoUrl /productpromo/10007. Hardcoding freight:0
+                                // here made every card claim "Freight $X invoiced — none on PO"
+                                // even for POs where reconcile-billtrust-freight had already
+                                // applied it (verified: 125057 $363.95, 125080 $361.09,
+                                // 125051 $719.65, 125138 $220.00 all present in Finale).
+                                const poSub = Number(po.subtotal ?? 0);
+                                const poTot = Number(po.total ?? 0);
+                                const appliedAdjustments = poSub > 0 && poTot > 0
+                                    ? Math.round((poTot - poSub) * 100) / 100
+                                    : 0;
+                                poAdjustmentsMap.set(poNum, {
+                                    // Freight is the only adjustment class BAS writes to POs.
+                                    freight: appliedAdjustments > 0.01 ? appliedAdjustments : 0,
+                                    tax: 0,
+                                    tariffs: 0,
+                                });
                             }
 
                             // ── Invoice lines from vendor_invoices ──────────────────────────
@@ -363,6 +382,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     rec.threeWayMatch = result.threeWayMatch;
                                     rec.chargesComparison = result.chargesComparison;
                                     rec.lineComparison = result.lineComparison;
+                                    rec.variance = result.variance;
                                     if (rec.matchedInvoice && result.matchedInvoiceLineItems) {
                                         (rec.matchedInvoice as any)._lineItems = result.matchedInvoiceLineItems;
                                         (rec.matchedInvoice as any)._invoiceLines = result.matchedInvoiceRawLines;
@@ -373,6 +393,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     rec.threeWayMatch = null;
                                     rec.chargesComparison = null;
                                     rec.lineComparison = [];
+                                    rec.variance = null;
                                 }
                             });
                         }
@@ -385,6 +406,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 rec.threeWayMatch = null;
                                 rec.chargesComparison = null;
                                 rec.lineComparison = [];
+                                rec.variance = null;
                             }
                         }
                         }

@@ -267,96 +267,140 @@ function MatchComparisonView({
         );
     }
 
-    // ── DIFFERS FROM INVOICE: show what to review ─────────────────────────────
-    const discrepancies = twm.discrepancies || [];
-    const lines = (rec?.lineComparison || []).filter((l: any) => l.status !== "matched");
+    // ── DIFFERS FROM INVOICE: collapsed row, expand for the breakdown ─────────
+    // Bill(2026-08-11): "should be expandable card" + "needs to discern
+    // shipping, taxes fees, and sku or product variences to make a decision".
+    // Collapsed = verdict + per-kind chips. Expanded = itemized causes.
+    const variance = rec?.variance;
+    const items: any[] = variance?.items || [];
     const cc = rec?.chargesComparison;
+    const expanded = !!diff;
+
+    // Per-kind visual language so the bucket is identifiable at a glance
+    const KIND_UI: Record<string, { label: string; icon: string; cls: string }> = {
+        freight:       { label: "Freight",     icon: "🚚", cls: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
+        tax:           { label: "Tax",         icon: "🧾", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
+        tariff:        { label: "Tariff",      icon: "🛃", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
+        fee:           { label: "Fees",        icon: "➕", cls: "text-orange-300 border-orange-500/30 bg-orange-500/10" },
+        product_price: { label: "Price",       icon: "💲", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
+        product_qty:   { label: "Qty",         icon: "📦", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
+        sku_unknown:   { label: "Unknown SKU", icon: "❓", cls: "text-rose-300 border-rose-500/30 bg-rose-500/10" },
+        sku_missing:   { label: "Not invoiced",icon: "◻️", cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10" },
+        unexplained:   { label: "Unexplained", icon: "⚠️", cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10" },
+    };
+    const money = (n: number) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
 
     return (
-        <div className="mt-2 border border-amber-500/30 rounded overflow-hidden">
-            {/* Header — what differs, in dollars */}
-            <div className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20">
+        <div className={`mt-2 border rounded overflow-hidden ${variance?.hasBlocking ? "border-rose-500/35" : "border-amber-500/30"}`}>
+            {/* ── COLLAPSED HEADER — click to expand ── */}
+            <button
+                onClick={e => { e.stopPropagation(); onToggle(); }}
+                className={`w-full px-3 py-2 text-left ${variance?.hasBlocking ? "bg-rose-500/10" : "bg-amber-500/10"} hover:brightness-125 transition-all`}
+            >
                 <div className="flex items-center gap-2">
-                    <span className="text-[11px]">⚠️</span>
-                    <span className="text-[11px] font-mono text-amber-200 font-semibold flex-1 min-w-0">
-                        PO {po.orderId} vs Invoice {invNum ? `#${invNum}` : "(no number)"} — needs review
+                    <span className="text-[10px] text-zinc-500 shrink-0">{expanded ? "▾" : "▸"}</span>
+                    <span className="text-[11px] shrink-0">{variance?.hasBlocking ? "🚫" : "⚠️"}</span>
+                    <span className={`text-[11px] font-mono font-semibold flex-1 min-w-0 truncate ${variance?.hasBlocking ? "text-rose-200" : "text-amber-200"}`}>
+                        PO {po.orderId} vs Inv {invNum ? `#${invNum}` : "(no #)"}
                     </span>
-                    {twm.totalDollarImpact > 0 && (
-                        <span className="text-[11px] font-mono text-rose-300 font-semibold shrink-0">
-                            ${twm.totalDollarImpact.toFixed(2)}
+                    {variance && Math.abs(variance.netDelta) > 0.01 && (
+                        <span className={`text-[11px] font-mono font-bold shrink-0 ${variance.netDelta > 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                            {money(variance.netDelta)}
                         </span>
                     )}
                 </div>
-                <div className="mt-1 text-[10px] font-mono text-amber-200/70 leading-relaxed">{twm.summary}</div>
-            </div>
 
-            {/* Totals — always relevant, 3 numbers */}
-            {cc && (
-                <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/40 flex items-center gap-4 text-[10px] font-mono">
-                    <span className="text-zinc-500">PO <span className="text-zinc-200">${(cc.po.subtotal || cc.po.total).toFixed(2)}</span></span>
-                    <span className="text-zinc-500">Invoice <span className="text-zinc-200">${(cc.invoice.total || cc.invoice.subtotal).toFixed(2)}</span></span>
-                    {cc.invoice.freight > 0 && <span className="text-zinc-500">Freight <span className="text-zinc-200">${cc.invoice.freight.toFixed(2)}</span></span>}
-                    {cc.invoice.tax > 0 && <span className="text-zinc-500">Tax <span className="text-zinc-200">${cc.invoice.tax.toFixed(2)}</span></span>}
-                    {Math.abs(cc.diffs.total) > 0.01 && (
-                        <span className={cc.diffs.total > 0 ? "text-rose-300" : "text-amber-300"}>
-                            Δ {cc.diffs.total > 0 ? "+" : ""}${cc.diffs.total.toFixed(2)}
-                        </span>
-                    )}
-                </div>
-            )}
+                {/* Per-kind chips — WHICH bucket moved, without expanding */}
+                {variance && Object.keys(variance.byKind).length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1 pl-[18px]">
+                        {Object.entries(variance.byKind).map(([kind, amt]) => {
+                            const ui = KIND_UI[kind] || KIND_UI.unexplained;
+                            return (
+                                <span key={kind} className={`px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
+                                    {ui.icon} {ui.label} {Math.abs(amt as number) > 0.01 ? money(amt as number) : ""}
+                                </span>
+                            );
+                        })}
+                    </div>
+                )}
+            </button>
 
-            {/* Only the lines that actually differ */}
-            {lines.length > 0 && (
-                <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/20">
-                    <table className="w-full text-[10px] font-mono">
-                        <thead>
-                            <tr className="text-zinc-600">
-                                <th className="text-left py-0.5 pr-2">SKU</th>
-                                <th className="text-right py-0.5 px-1">PO</th>
-                                <th className="text-right py-0.5 px-1">Invoice</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {lines.map((l: any) => (
-                                <tr key={l.productId} className={l.status === "blocking" ? "text-rose-200" : "text-amber-200"}>
-                                    <td className="py-0.5 pr-2 truncate max-w-[110px]" title={l.productId}>{l.productId}</td>
-                                    <td className="text-right py-0.5 px-1">{fmtQty(l.poQty)} @ ${(l.poUnitPrice ?? 0).toFixed(2)}</td>
-                                    <td className="text-right py-0.5 px-1">{fmtQty(l.invoiceQty)} @ ${(l.invoiceUnitPrice ?? 0).toFixed(2)}</td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                </div>
-            )}
-
-            {/* Plain-language discrepancy list */}
-            {discrepancies.length > 0 && (
-                <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/30 space-y-0.5">
-                    {discrepancies.map((d: any, i: number) => (
-                        <div key={i} className={`text-[10px] font-mono leading-relaxed ${d.blocking ? "text-rose-300" : "text-amber-300/90"}`}>
-                            {d.blocking ? "🚫" : "•"} {d.message}
+            {/* ── EXPANDED — itemized causes ── */}
+            {expanded && (
+                <>
+                    {/* Money row */}
+                    {cc && (
+                        <div className="px-3 py-1.5 border-t border-zinc-800/40 bg-zinc-950/50 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] font-mono">
+                            <span className="text-zinc-500">PO goods <span className="text-zinc-200">${(cc.po.subtotal || cc.po.total).toFixed(2)}</span></span>
+                            <span className="text-zinc-500">Invoice <span className="text-zinc-200">${(cc.invoice.total || cc.invoice.subtotal).toFixed(2)}</span></span>
+                            {cc.invoice.freight > 0 && <span className="text-sky-400/80">🚚 ${cc.invoice.freight.toFixed(2)}</span>}
+                            {cc.invoice.tax > 0 && <span className="text-violet-400/80">🧾 ${cc.invoice.tax.toFixed(2)}</span>}
+                            {cc.po.tariffs > 0 && <span className="text-violet-400/80">🛃 ${cc.po.tariffs.toFixed(2)}</span>}
                         </div>
-                    ))}
-                </div>
-            )}
+                    )}
 
-            <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/50">
-                <a
-                    href={po.finaleUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    onClick={e => e.stopPropagation()}
-                    className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 mr-auto"
-                >
-                    Open PO in Finale
-                </a>
-                <button
-                    onClick={e => { e.stopPropagation(); onComplete(); }}
-                    className="px-3 py-1 rounded text-[10px] font-mono font-semibold bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer transition-colors"
-                >
-                    Apply Invoice &amp; Complete
-                </button>
-            </div>
+                    {/* One row per classified difference */}
+                    {items.length > 0 && (
+                        <div className="border-t border-zinc-800/40 bg-zinc-950/30 divide-y divide-zinc-800/30">
+                            {items.map((it, i) => {
+                                const ui = KIND_UI[it.kind] || KIND_UI.unexplained;
+                                return (
+                                    <div key={i} className="px-3 py-1.5">
+                                        <div className="flex items-start gap-2">
+                                            <span className={`shrink-0 px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
+                                                {ui.icon} {ui.label}
+                                            </span>
+                                            <span className="text-[10px] font-mono text-zinc-300 font-semibold truncate min-w-0" title={it.label}>
+                                                {it.label}
+                                            </span>
+                                            <div className="flex-1" />
+                                            {it.poAmount != null && it.invoiceAmount != null && (
+                                                <span className="text-[9px] font-mono text-zinc-500 shrink-0">
+                                                    {it.poAmount} → {it.invoiceAmount}
+                                                </span>
+                                            )}
+                                            {Math.abs(it.delta) > 0.01 && (
+                                                <span className={`text-[10px] font-mono font-semibold shrink-0 ${it.delta > 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                                                    {money(it.delta)}
+                                                </span>
+                                            )}
+                                            {it.blocking && <span className="text-[9px] font-mono text-rose-400 shrink-0">BLOCK</span>}
+                                        </div>
+                                        <div className="mt-0.5 text-[9px] font-mono text-zinc-500 leading-relaxed pl-1">
+                                            {it.message}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+
+                    <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/60 border-t border-zinc-800/40">
+                        <a
+                            href={po.finaleUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={e => e.stopPropagation()}
+                            className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 mr-auto"
+                        >
+                            Open PO in Finale
+                        </a>
+                        <button
+                            onClick={e => { e.stopPropagation(); onComplete(); }}
+                            disabled={saving}
+                            className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${
+                                saving
+                                    ? "bg-zinc-700/20 text-zinc-500 border border-zinc-700/40 cursor-wait"
+                                    : variance?.hasBlocking
+                                    ? "bg-rose-500/15 border border-rose-500/40 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
+                                    : "bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer"
+                            }`}
+                        >
+                            {saving ? "Applying..." : "Apply Invoice & Complete"}
+                        </button>
+                    </div>
+                </>
+            )}
         </div>
     );
 }
