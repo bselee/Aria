@@ -1,11 +1,65 @@
 "use client";
 
+/**
+ * @file    ReceivedItemsPanel.tsx
+ * @purpose One-column expandable Receivings panel (Bill 2026-08-11):
+ *          - ONE actionable list, sorted action-first: review → ready → match.
+ *            No split-panel InvoicePOMatcher, no "▶ Received POs" secondary toggle.
+ *          - Complete PO gives visible feedback: green success toast, block toast
+ *            on 3-way gate 409, red toast on error; button shows "Completing…".
+ *          - Invoice PDF link + hover preview (iframe) on discrepancy rows only,
+ *            gated to the Receivings PDF vendor allowlist (list B) + file on disk.
+ *          - Expand bodies: review = variance items + money row + Finale link +
+ *            Apply & Complete; ready = Complete on the row; match = candidates +
+ *            manual PO input.
+ * @author  Aria Dashboard
+ * @created 2026-08-11
+ * @deps    react, lucide-react, PurchasingLifecycleContext, receivings-pdf-vendors
+ */
+
 import React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown } from "lucide-react";
-import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
-import InvoicePOMatcher from "./InvoicePOMatcher";
+import { isReceivingsPdfVendor } from "@/config/receivings-pdf-vendors";
+
+// ── Types ─────────────────────────────────────────────────────────────────
+
+/** Matched invoice as forwarded by /api/dashboard/receivings GET. */
+type MatchedInvoice = {
+    id?: string;
+    invoice_number: string;
+    vendor_name?: string;
+    subtotal: number;
+    freight: number;
+    tax: number;
+    total: number;
+    status: string;
+    pdf_storage_path?: string | null;
+    pdfAvailable?: boolean;
+    source_ref?: string | null;
+};
+
+/** One classified difference between PO and invoice (mirrors receivings-enrichment). */
+type VarianceItem = {
+    kind: string;
+    label: string;
+    poAmount: number | null;
+    invoiceAmount: number | null;
+    delta: number;
+    blocking: boolean;
+    message: string;
+};
+
+/** Roll-up of all variance items (mirrors receivings-enrichment). */
+type VarianceSummary = {
+    netDelta: number;
+    byKind: Record<string, number>;
+    clean: boolean;
+    hasBlocking: boolean;
+    headline: string;
+    items: VarianceItem[];
+};
 
 type ReceivedPO = {
     orderId: string;
@@ -16,6 +70,7 @@ type ReceivedPO = {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
+    subtotal?: number;
     items: Array<{
         productId: string;
         quantity: number;
@@ -37,14 +92,28 @@ type ReceivedPO = {
         outcomes: Array<{ outcome: string; created_at: string; resolved_at: string | null }>;
         hasPendingApproval: boolean;
         hasAutoApplied: boolean;
-        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null } | null;
+        matchedInvoice: MatchedInvoice | null;
+        matchStatus?: "match" | "possible_match" | "no_match";
+        threeWayMatch?: { canApprove?: boolean; summary?: string } | null;
+        chargesComparison?: {
+            po?: { subtotal?: number; freight?: number; tax?: number; tariffs?: number; total?: number };
+            invoice?: { subtotal?: number; freight?: number; tax?: number; tariffs?: number; total?: number };
+            diffs?: Record<string, number>;
+        } | null;
+        variance?: VarianceSummary | null;
     };
 };
 
-type TrackingTodaySummary = {
-    headline: string;
-    lines: string[];
-} | null;
+type MatchCandidate = {
+    orderId: string;
+    vendorName: string;
+    orderDate: string;
+    total: number;
+    status: string;
+    score: number;
+    reasons: string[];
+    isOpen: boolean;
+};
 
 type MatchSuggestion = {
     invoiceId: string;
@@ -52,30 +121,34 @@ type MatchSuggestion = {
     vendorName: string;
     invoiceTotal: number;
     invoiceDate?: string;
-    candidates: Array<{
-        orderId: string;
-        vendorName: string;
-        orderDate: string;
-        total: number;
-        status: string;
-        score: number;
-        reasons: string[];
-        isOpen: boolean;
-    }>;
+    pdfStoragePath?: string | null;
+    pdfAvailable?: boolean;
+    candidates: MatchCandidate[];
     autoApplyReady: boolean;
-    autoMatched?: boolean;
+    fromCache?: boolean;
+    timedOut?: boolean;
 };
 
-type FreightClass = {
-    pattern: string;
-    confidence: string;
-    sampleCount: number;
-    source: string;
-    autonomousReady: boolean;
-};
+/**
+ * One row = one decision in the Receivings column.
+ * review: variance to resolve (Apply & Complete after expand).
+ * ready:  clean 3-way match — Complete right on the row.
+ * match:  unmatched invoice with PO candidates (or manual input).
+ */
+type ActionRow =
+    | { kind: "review"; key: string; po: ReceivedPO; inv: MatchedInvoice; variance: VarianceSummary | null }
+    | { kind: "ready"; key: string; po: ReceivedPO; inv: MatchedInvoice }
+    | { kind: "match"; key: string; suggestion: MatchSuggestion };
 
-// Real AP status keyed by Finale orderId
-type ApStatusMap = Record<string, { label: string; cls: string }>;
+type TrackingTodaySummary = {
+    headline: string;
+    lines: string[];
+} | null;
+
+/** Complete-feedback toast. */
+type ActionToast = { kind: "ok" | "err" | "block"; text: string } | null;
+
+// ── Helpers ───────────────────────────────────────────────────────────────
 
 function parseDenverDate(s: string): Date | null {
     if (!s) return null;
@@ -97,6 +170,10 @@ function fmtDateTime(s: string): string {
 function fmtDollars(n: number): string {
     if (!n || n <= 1) return '';   // skip $0 and $1 placeholder totals
     return '$' + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+function fmtQty(n: number | null | undefined): string {
+    return Number(n || 0).toLocaleString();
 }
 
 function getDynamicReceiptStatus(po: ReceivedPO): "full" | "partial" | "received" {
@@ -134,12 +211,12 @@ function receiveSortValue(po: ReceivedPO): number {
 function partialDiscrepancy(po: ReceivedPO): string | null {
     const status = getDynamicReceiptStatus(po);
     if (status !== "partial" || po.items.length === 0) return null;
-    
+
     const shortItems = po.items
         .filter(item => item.openQuantity == null || item.openQuantity > 0);
-    
+
     if (shortItems.length === 0) return "partial receipt";
-    
+
     const details = shortItems.slice(0, 2).map(item => {
         const ordered = item.orderedQuantity ?? item.quantity;
         const open = item.openQuantity;
@@ -148,262 +225,148 @@ function partialDiscrepancy(po: ReceivedPO): string | null {
         }
         return `${item.productId} ×${fmtQty(ordered)}`;
     });
-    
+
     let result = details.join(", ");
     if (shortItems.length > 2) result += ` +${shortItems.length - 2} more`;
     return result;
 }
 
-function fmtQty(n: number | null | undefined): string {
-    return Number(n || 0).toLocaleString();
-}
-
-function getNextActionText(po: ReceivedPO, apLabel: string): string {
-    const receiptStatus = getDynamicReceiptStatus(po);
-    const isPartial = receiptStatus === "partial";
-    const hasOpenQty = po.items.some(i => (i.openQuantity ?? 0) > 0);
-    const hasInvoice = apLabel !== "UNMATCHED" && apLabel !== "";
-    const isReconciled = apLabel === "RECONCILED" || apLabel === "RECONCILED ±" || receiptStatus === "full" && apLabel === "RECONCILED";
-    const isPendingReview = apLabel === "PENDING";
-    const hasDiscrepancy = apLabel === "RECONCILED ±";
-    const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
-
-    if (isComplete) return "✅ PO closed — no action needed";
-    if (hasDiscrepancy && isReconciled) return "⚠️ Reconciled with pricing differences — verify final amounts";
-    if (hasDiscrepancy) return "⚠️ Invoice $ differs from PO $ — resolve with vendor";
-    if (isPendingReview) return "🔍 Invoice matched — review & approve reconciliation";
-    if (isPartial && hasOpenQty) return "🔄 Partial receipt — backorder remains";
-    if (hasInvoice) return "📋 Verify invoice matches PO qty & price";
-    return "📋 Awaiting invoice match";
-}
-
-function daysSince(dateStr: string | undefined | null): number | null {
-    if (!dateStr) return null;
-    const d = parseDenverDate(dateStr);
-    if (!d) return null;
-    const now = new Date();
-    const diff = now.getTime() - d.getTime();
-    return Math.floor(diff / (1000 * 60 * 60 * 24));
-}
-
-function hasPartialLineQuantities(po: ReceivedPO): boolean {
-    return po.items.some(item => item.receivedQuantity !== undefined || item.receivedInWindow !== undefined);
-}
-
-function receiptItemsText(items: Array<{ productId: string; quantity: number }>): string {
-    if (items.length === 0) return "receipt recorded; line quantities unavailable";
-    return items.map(item => `${item.productId} ×${fmtQty(item.quantity)}`).join(", ");
-}
-
-// ── Match Status (review-before-commit) ─────────────────────────────────────
-
-type MatchStatus = "match" | "possible_match" | "no_match";
-
-function computeMatchStatus(apLabel: string): MatchStatus {
-    if (apLabel === "RECONCILED") return "match";
-    if (apLabel === "RECONCILED ±" || apLabel === "PENDING") return "possible_match";
-    return "no_match";
-}
-
-const matchStatusConfig: Record<MatchStatus, { label: string; emoji: string; cls: string }> = {
-    match:          { label: "Match",          emoji: "✅", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" },
-    possible_match: { label: "Possible Match", emoji: "⚠️", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-    no_match:       { label: "No Match",       emoji: "🔍", cls: "text-zinc-400 border-zinc-500/30 bg-zinc-500/10" },
+/** Per-kind visual language — which variance bucket moved, at a glance. */
+const KIND_UI: Record<string, { label: string; icon: string; cls: string }> = {
+    freight:       { label: "Freight",     icon: "🚚", cls: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
+    tax:           { label: "Tax",         icon: "🧾", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
+    tariff:        { label: "Tariff",      icon: "🛃", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
+    fee:           { label: "Fees",        icon: "➕", cls: "text-orange-300 border-orange-500/30 bg-orange-500/10" },
+    product_price: { label: "Price",       icon: "💲", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
+    product_qty:   { label: "Qty",         icon: "📦", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
+    sku_unknown:   { label: "Unknown SKU", icon: "❓", cls: "text-rose-300 border-rose-500/30 bg-rose-500/10" },
+    sku_missing:   { label: "Not invoiced",icon: "◻️", cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10" },
+    unexplained:   { label: "Unexplained", icon: "⚠️", cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10" },
 };
 
+const money = (n: number) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
+
+/** Safe error-message extraction for catch blocks. */
+function errMsg(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+}
+
 /**
- * Render the pre-completion match comparison view for a PO.
- * Shows line-item comparison, charges comparison, proposed changes,
- * and a match-status-aware complete button.
+ * PDF route URL for a matched invoice — ONLY when the invoice is on an
+ * allowlisted vendor (list B) AND a file is on disk. Returns null otherwise
+ * so no dead link is ever rendered.
  */
-function MatchComparisonView({
-    po,
-    apLabel,
-    diff,
-    loading,
-    error,
-    saving,
-    onToggle,
-    onComplete,
-    onApply,
-}: {
-    po: ReceivedPO;
-    apLabel: string;
-    diff: any;
-    loading: boolean;
-    error?: string;
-    saving?: boolean;
-    onToggle: () => void;
-    onComplete: () => void;
-    onApply: (adjustments: any[], freight: number | null) => void;
+function invoicePdfUrl(inv: MatchedInvoice): string | null {
+    if (!inv?.id) return null;
+    const allowed = inv.pdfAvailable || !!(inv.pdf_storage_path && isReceivingsPdfVendor(inv.vendor_name));
+    if (!allowed) return null;
+    return `/api/storage/invoice-pdf?id=${encodeURIComponent(inv.id)}`;
+}
+
+/** Same gate for match suggestions (id + allowlist + path). */
+function suggestionPdfUrl(s: MatchSuggestion): string | null {
+    if (!s?.invoiceId) return null;
+    const allowed = s.pdfAvailable || !!(s.pdfStoragePath && isReceivingsPdfVendor(s.vendorName));
+    if (!allowed) return null;
+    return `/api/storage/invoice-pdf?id=${encodeURIComponent(s.invoiceId)}`;
+}
+
+/**
+ * PDF link control. Click opens the full PDF in a new tab. When `withHover`
+ * is set (discrepancy rows only), hovering mounts a lightweight iframe preview
+ * — the iframe is ONLY rendered while hovered so N rows never open N PDFs.
+ */
+function InvoicePdfLink({ id, number, withHover = false, hovered = false, onHoverChange }: {
+    id: string;
+    number?: string;
+    withHover?: boolean;
+    hovered?: boolean;
+    onHoverChange?: (id: string | null) => void;
 }) {
-    const status = computeMatchStatus(apLabel);
-    const cfg = matchStatusConfig[status];
-    const rec = po._reconciliation;
-    const matchedInv = rec?.matchedInvoice;
-    const twm = rec?.threeWayMatch;
-    const invNum = matchedInv?.invoice_number;
-
-    // Nothing matched — the Invoices-to-Match list above handles those.
-    if (!matchedInv || !twm) return null;
-
-    // ── CLEAN MATCH: one line, no tables ──────────────────────────────────────
-    // Bill(2026-08-11): "If they are received and clearly match invoices, call
-    // it — PO#XXXXXX matched with Invoice #? ready for completion in Finale."
-    if (twm.canApprove) {
-        return (
-            <div className="mt-2 px-3 py-2 border border-emerald-500/25 bg-emerald-500/5 rounded flex items-center gap-2">
-                <span className="text-[11px]">✅</span>
-                <span className="text-[11px] font-mono text-emerald-200/90 flex-1 min-w-0">
-                    PO {po.orderId} matched with Invoice {invNum ? `#${invNum}` : "(no number)"} — ready for completion in Finale
-                </span>
-                <button
-                    onClick={e => { e.stopPropagation(); onComplete(); }}
-                    className="shrink-0 px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
-                >
-                    Complete PO
-                </button>
-            </div>
-        );
-    }
-
-    // ── DIFFERS FROM INVOICE: collapsed row, expand for the breakdown ─────────
-    // Bill(2026-08-11): "should be expandable card" + "needs to discern
-    // shipping, taxes fees, and sku or product variences to make a decision".
-    // Collapsed = verdict + per-kind chips. Expanded = itemized causes.
-    const variance = rec?.variance;
-    const items: any[] = variance?.items || [];
-    const cc = rec?.chargesComparison;
-    const expanded = !!diff;
-
-    // Per-kind visual language so the bucket is identifiable at a glance
-    const KIND_UI: Record<string, { label: string; icon: string; cls: string }> = {
-        freight:       { label: "Freight",     icon: "🚚", cls: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
-        tax:           { label: "Tax",         icon: "🧾", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
-        tariff:        { label: "Tariff",      icon: "🛃", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
-        fee:           { label: "Fees",        icon: "➕", cls: "text-orange-300 border-orange-500/30 bg-orange-500/10" },
-        product_price: { label: "Price",       icon: "💲", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-        product_qty:   { label: "Qty",         icon: "📦", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-        sku_unknown:   { label: "Unknown SKU", icon: "❓", cls: "text-rose-300 border-rose-500/30 bg-rose-500/10" },
-        sku_missing:   { label: "Not invoiced",icon: "◻️", cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10" },
-        unexplained:   { label: "Unexplained", icon: "⚠️", cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10" },
-    };
-    const money = (n: number) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
-
+    const href = `/api/storage/invoice-pdf?id=${encodeURIComponent(id)}`;
+    const link = (
+        <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            onClick={e => e.stopPropagation()}
+            title={`Invoice ${number ?? ""} PDF (opens in new tab)`}
+            className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 shrink-0"
+        >
+            PDF
+        </a>
+    );
+    if (!withHover) return link;
     return (
-        <div className={`mt-2 border rounded overflow-hidden ${variance?.hasBlocking ? "border-rose-500/35" : "border-amber-500/30"}`}>
-            {/* ── COLLAPSED HEADER — click to expand ── */}
-            <button
-                onClick={e => { e.stopPropagation(); onToggle(); }}
-                className={`w-full px-3 py-2 text-left ${variance?.hasBlocking ? "bg-rose-500/10" : "bg-amber-500/10"} hover:brightness-125 transition-all`}
-            >
-                <div className="flex items-center gap-2">
-                    <span className="text-[10px] text-zinc-500 shrink-0">{expanded ? "▾" : "▸"}</span>
-                    <span className="text-[11px] shrink-0">{variance?.hasBlocking ? "🚫" : "⚠️"}</span>
-                    <span className={`text-[11px] font-mono font-semibold flex-1 min-w-0 truncate ${variance?.hasBlocking ? "text-rose-200" : "text-amber-200"}`}>
-                        PO {po.orderId} vs Inv {invNum ? `#${invNum}` : "(no #)"}
-                    </span>
-                    {variance && Math.abs(variance.netDelta) > 0.01 && (
-                        <span className={`text-[11px] font-mono font-bold shrink-0 ${variance.netDelta > 0 ? "text-rose-300" : "text-emerald-300"}`}>
-                            {money(variance.netDelta)}
-                        </span>
-                    )}
-                </div>
-
-                {/* Per-kind chips — WHICH bucket moved, without expanding */}
-                {variance && Object.keys(variance.byKind).length > 0 && (
-                    <div className="mt-1.5 flex flex-wrap items-center gap-1 pl-[18px]">
-                        {Object.entries(variance.byKind).map(([kind, amt]) => {
-                            const ui = KIND_UI[kind] || KIND_UI.unexplained;
-                            return (
-                                <span key={kind} className={`px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
-                                    {ui.icon} {ui.label} {Math.abs(amt as number) > 0.01 ? money(amt as number) : ""}
-                                </span>
-                            );
-                        })}
-                    </div>
-                )}
-            </button>
-
-            {/* ── EXPANDED — itemized causes ── */}
-            {expanded && (
-                <>
-                    {/* Money row */}
-                    {cc && (
-                        <div className="px-3 py-1.5 border-t border-zinc-800/40 bg-zinc-950/50 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] font-mono">
-                            <span className="text-zinc-500">PO goods <span className="text-zinc-200">${(cc.po.subtotal || cc.po.total).toFixed(2)}</span></span>
-                            <span className="text-zinc-500">Invoice <span className="text-zinc-200">${(cc.invoice.total || cc.invoice.subtotal).toFixed(2)}</span></span>
-                            {cc.invoice.freight > 0 && <span className="text-sky-400/80">🚚 ${cc.invoice.freight.toFixed(2)}</span>}
-                            {cc.invoice.tax > 0 && <span className="text-violet-400/80">🧾 ${cc.invoice.tax.toFixed(2)}</span>}
-                            {cc.po.tariffs > 0 && <span className="text-violet-400/80">🛃 ${cc.po.tariffs.toFixed(2)}</span>}
-                        </div>
-                    )}
-
-                    {/* One row per classified difference */}
-                    {items.length > 0 && (
-                        <div className="border-t border-zinc-800/40 bg-zinc-950/30 divide-y divide-zinc-800/30">
-                            {items.map((it, i) => {
-                                const ui = KIND_UI[it.kind] || KIND_UI.unexplained;
-                                return (
-                                    <div key={i} className="px-3 py-1.5">
-                                        <div className="flex items-start gap-2">
-                                            <span className={`shrink-0 px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
-                                                {ui.icon} {ui.label}
-                                            </span>
-                                            <span className="text-[10px] font-mono text-zinc-300 font-semibold truncate min-w-0" title={it.label}>
-                                                {it.label}
-                                            </span>
-                                            <div className="flex-1" />
-                                            {it.poAmount != null && it.invoiceAmount != null && (
-                                                <span className="text-[9px] font-mono text-zinc-500 shrink-0">
-                                                    {it.poAmount} → {it.invoiceAmount}
-                                                </span>
-                                            )}
-                                            {Math.abs(it.delta) > 0.01 && (
-                                                <span className={`text-[10px] font-mono font-semibold shrink-0 ${it.delta > 0 ? "text-rose-300" : "text-emerald-300"}`}>
-                                                    {money(it.delta)}
-                                                </span>
-                                            )}
-                                            {it.blocking && <span className="text-[9px] font-mono text-rose-400 shrink-0">BLOCK</span>}
-                                        </div>
-                                        <div className="mt-0.5 text-[9px] font-mono text-zinc-500 leading-relaxed pl-1">
-                                            {it.message}
-                                        </div>
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    )}
-
-                    <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/60 border-t border-zinc-800/40">
-                        <a
-                            href={po.finaleUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            onClick={e => e.stopPropagation()}
-                            className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 mr-auto"
-                        >
-                            Open PO in Finale
-                        </a>
-                        <button
-                            onClick={e => { e.stopPropagation(); onComplete(); }}
-                            disabled={saving}
-                            className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${
-                                saving
-                                    ? "bg-zinc-700/20 text-zinc-500 border border-zinc-700/40 cursor-wait"
-                                    : variance?.hasBlocking
-                                    ? "bg-rose-500/15 border border-rose-500/40 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
-                                    : "bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer"
-                            }`}
-                        >
-                            {saving ? "Applying..." : "Apply Invoice & Complete"}
-                        </button>
-                    </div>
-                </>
+        <span
+            className="relative inline-flex shrink-0"
+            onMouseEnter={() => onHoverChange?.(id)}
+            onMouseLeave={() => onHoverChange?.(null)}
+        >
+            {link}
+            {hovered && (
+                <span className="pointer-events-none absolute left-0 top-full z-50 mt-1 rounded border border-zinc-700 shadow-xl bg-zinc-950 overflow-hidden">
+                    <iframe
+                        src={`${href}#page=1`}
+                        className="w-[280px] h-[360px] border-0"
+                        title={`Invoice ${number ?? ""} PDF preview`}
+                    />
+                </span>
             )}
-        </div>
+        </span>
     );
 }
+
+const ACTION_ORDER: Record<ActionRow["kind"], number> = { review: 0, ready: 1, match: 2 };
+
+/**
+ * Build the ONE actionable list from the payload, sorted action-first:
+ * 1. review — variance blocking first, then by |net delta| desc
+ * 2. ready — clean match (twm.canApprove / variance.clean), newest receipt first
+ * 3. match — suggestions (DropshipPO candidates already stripped by the API),
+ *    highest score first
+ * POs with no matched invoice are excluded — they land in the settled dump.
+ */
+function buildActionRows(pos: ReceivedPO[], suggestions: MatchSuggestion[]): ActionRow[] {
+    const rows: ActionRow[] = [];
+    for (const po of pos) {
+        const rec = po._reconciliation;
+        const inv = rec?.matchedInvoice ?? null;
+        if (!inv) continue; // no invoice → no in-panel decision (settled dump)
+        const variance = rec?.variance ?? null;
+        const twm = rec?.threeWayMatch;
+        const clean = !!variance && variance.clean;
+        if (clean || twm?.canApprove) {
+            rows.push({ kind: "ready", key: `ready-${po.orderId}`, po, inv });
+        } else {
+            rows.push({ kind: "review", key: `review-${po.orderId}`, po, inv, variance });
+        }
+    }
+    for (const s of suggestions) {
+        rows.push({ kind: "match", key: `match-${s.invoiceId}`, suggestion: s });
+    }
+    rows.sort((a, b) => {
+        const ao = ACTION_ORDER[a.kind];
+        const bo = ACTION_ORDER[b.kind];
+        if (ao !== bo) return ao - bo;
+        if (a.kind === "review" && b.kind === "review") {
+            const abl = a.variance?.hasBlocking ?? false;
+            const bbl = b.variance?.hasBlocking ?? false;
+            if (abl !== bbl) return abl ? -1 : 1;
+            return Math.abs(b.variance?.netDelta ?? 0) - Math.abs(a.variance?.netDelta ?? 0);
+        }
+        if (a.kind === "match" && b.kind === "match") {
+            return (b.suggestion.candidates[0]?.score ?? 0) - (a.suggestion.candidates[0]?.score ?? 0);
+        }
+        if (a.kind === "ready" && b.kind === "ready") {
+            return receiveSortValue(b.po) - receiveSortValue(a.po);
+        }
+        return 0;
+    });
+    return rows;
+}
+
+// ── Component ─────────────────────────────────────────────────────────────
 
 export type ReceivedItemsPanelProps = {
     /** Lifecycle column mode: fill height, no card collapse/resize. */
@@ -412,342 +375,52 @@ export type ReceivedItemsPanelProps = {
 
 export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPanelProps = {}) {
     const lifecycle = usePurchasingLifecycle();
-        const [pos, setPos] = useState<ReceivedPO[]>([]);
-        const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
-        const [freightClasses, setFreightClasses] = useState<Record<string, FreightClass>>({});
-        const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
-        const [cachedAt, setCachedAt] = useState<string | null>(null);
-        const [apMap, setApMap] = useState<ApStatusMap>({});
-        const [loading, setLoading] = useState(true);
-        const [refreshing, setRefreshing] = useState(false);
-        const [error, setError] = useState<string | null>(null);
-        const [approvingReconcile, setApprovingReconcile] = useState<Set<string>>(new Set());
-        /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
-        const knownReceiptIdsRef = useRef<Set<string>>(new Set());
-        /** Keep last-painted rows so silent refresh never blanks the panel. */
-        const posRef = useRef<ReceivedPO[]>([]);
-        posRef.current = pos;
-        /**
-         * HERMIA(2026-07-28): lifecycle context value changes on every hover/focus
-         * event (focus is in the useMemo deps). If fetchReceivings closes over
-         * `lifecycle`, its identity churns → the mount effect re-fires →
-         * setLoading(true) → skeleton blank. Hold notifyReceipt in a ref instead.
-         */
-        const notifyReceiptRef = useRef(lifecycle.notifyReceipt);
-        notifyReceiptRef.current = lifecycle.notifyReceipt;
-    /** Gate refusal message per PO — set when complete_po returns 409 */
-        const [gateBlockReason, setGateBlockReason] = useState<Map<string, string>>(new Map());
-        /** PO modification state: orderId → expanded & diff data */
-        const [modifyingPO, setModifyingPO] = useState<Map<string, {
-            loading: boolean;
-            diff?: any;
-            error?: string;
-            saving?: boolean;
-        }>>(new Map());
-        const [modifySuccess, setModifySuccess] = useState<string | null>(null);
-    /** Unmatched POs check state */
-    const [unmatchedData, setUnmatchedData] = useState<{
-        unmatchedPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string }>;
-        unreconciledPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string; lifecycleState: string }>;
-    } | null>(null);
-    const [unmatchedLoading, setUnmatchedLoading] = useState(false);
-    /** Show all received POs toggle (default: only exceptions) */
+    const [pos, setPos] = useState<ReceivedPO[]>([]);
+    const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
+    const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
+    const [loading, setLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    /** Complete feedback toast — sticky at top of the panel body. */
+    const [actionToast, setActionToast] = useState<ActionToast>(null);
+    /** PO currently completing — button shows "Completing…" while in flight. */
+    const [completingId, setCompletingId] = useState<string | null>(null);
+    /** Which ActionRow is expanded (single-expand accordion). */
+    const [expandedRow, setExpandedRow] = useState<string | null>(null);
+    /** Invoice id being hovered for the PDF preview iframe (null = none mounted). */
+    const [hoverPdfId, setHoverPdfId] = useState<string | null>(null);
+    /** 3-way gate refusal per PO — set when complete_po returns 409. */
+    const [gateBlockReason, setGateBlockReason] = useState<Map<string, string>>(new Map());
+    /** Manual match state: invoiceId → manual PO input. */
+    const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
+    /** Settled dump toggle — not the default path. */
     const [showAllReceived, setShowAllReceived] = useState(false);
-    /** Collapse received PO list when there are invoices to match. */
-    const [showReceivedPOs, setShowReceivedPOs] = useState(false);
-    const [showCompleted, setShowCompleted] = useState(false);
+    /**
+     * POs completed this session. Finale still lists completed POs in the
+     * 30-day received window, so a plain refetch would resurrect them —
+     * defeating the "row disappears" feedback. These stay hidden for the
+     * session even after refetch (backend exclusion is a separate task).
+     */
+    const [completedIds, setCompletedIds] = useState<Set<string>>(new Set());
+    /** Match suggestions resolved this session — same refetch-resurrection guard. */
+    const [matchedInvoiceIds, setMatchedInvoiceIds] = useState<Set<string>>(new Set());
     const [recentAutoCompletions, setRecentAutoCompletions] = useState<Array<{
         intent: string; poNumber?: string; invoiceNumber?: string; vendorName?: string; createdAt: string;
     }>>([]);
-    /** Computed: count of POs needing human attention */
-    const needsReviewCount = pos.filter(p => {
-        const lbl = apMap[p.orderId]?.label || "";
-        return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
-    }).length;
-    /** Manual match state: invoiceId → manual PO input */
-        const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
 
-        /** Pre-completion comparison: which POs have their MatchComparisonView expanded */
-        const [comparisonPO, setComparisonPO] = useState<Set<string>>(new Set());
-
-        /** Toggle the comparison view open/closed for a PO and lazy-load the diff. */
-        function toggleComparison(orderId: string) {
-            setComparisonPO(prev => {
-                const next = new Set(prev);
-                if (next.has(orderId)) {
-                    next.delete(orderId);
-                } else {
-                    next.add(orderId);
-                    // Lazy-load the diff if not already loaded
-                    const existing = modifyingPO.get(orderId);
-                    if (!existing || (!existing.loading && existing.diff === undefined && !existing.error)) {
-                        // Use the existing loadPOInvoiceDiff
-                        loadPOInvoiceDiff(orderId, pos.find(p => p.orderId === orderId)?._reconciliation?.matchedInvoice?.invoice_number);
-                    }
-                }
-                return next;
-            });
-        }
-
-    /** Update manual PO input for a given invoice. */
-    function handleManualInputChange(invoiceId: string, value: string) {
-        setManuallyMatching(prev => {
-            const next = new Map(prev);
-            const existing = next.get(invoiceId);
-            next.set(invoiceId, { poNumber: value, loading: existing?.loading ?? false });
-            return next;
-        });
-    }
-
-    async function handleMatchInvoice(invoiceId: string, poNumber: string) {
-        try {
-            const res = await fetch("/api/dashboard/receivings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber }),
-            });
-            if (res.ok) {
-                // Remove from suggestions
-                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
-            }
-        } catch (e: any) {
-            console.error("Match invoice error:", e.message);
-        }
-    }
-
-    async function handleCompletePO(orderId: string, vendorName: string) {
-            try {
-                const res = await fetch("/api/dashboard/receivings", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ action: "complete_po", orderId, vendorName }),
-                });
-                const json = await res.json();
-                if (res.ok) {
-                    // Clear any previous gate refusal for this PO
-                    setGateBlockReason(prev => { const next = new Map(prev); next.delete(orderId); return next; });
-                    fetchReceivings(true);
-                } else if (res.status === 409 && json.detail) {
-                    // Gate refused — show the 3-way match summary inline
-                    setGateBlockReason(prev => { const next = new Map(prev); next.set(orderId, json.detail); return next; });
-                    console.warn(`[ReceivedItems] complete_po ${orderId} blocked by 3-way gate: ${json.detail}`);
-                } else {
-                    throw new Error(json.error || `HTTP ${res.status}`);
-                }
-            } catch (e: any) {
-                console.error("Complete PO error:", e.message);
-            }
-        }
-
-    async function handleManualMatch(invoiceId: string) {
-        const state = manuallyMatching.get(invoiceId);
-        if (!state || !state.poNumber.trim()) return;
-        setManuallyMatching(prev => {
-            const next = new Map(prev);
-            next.set(invoiceId, { ...state, loading: true });
-            return next;
-        });
-        try {
-            const res = await fetch("/api/dashboard/receivings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber: state.poNumber.trim() }),
-            });
-            if (res.ok) {
-                setManuallyMatching(prev => { const next = new Map(prev); next.delete(invoiceId); return next; });
-                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
-                fetchReceivings(true);
-            } else {
-                const err = await res.text();
-                console.error("Manual match failed:", err);
-                setManuallyMatching(prev => {
-                    const next = new Map(prev);
-                    next.set(invoiceId, { ...manuallyMatching.get(invoiceId)!, loading: false });
-                    return next;
-                });
-            }
-        } catch (e: any) {
-            console.error("Manual match error:", e.message);
-            setManuallyMatching(prev => {
-                const next = new Map(prev);
-                next.set(invoiceId, { ...manuallyMatching.get(invoiceId)!, loading: false });
-                return next;
-            });
-        }
-    }
-
-    async function approveReconciliation(orderId: string, invoiceId?: string) {
-        setApprovingReconcile(prev => new Set(prev).add(orderId));
-        try {
-            const res = await fetch("/api/dashboard/active-purchases", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    action: "approve_reconciliation",
-                    orderId,
-                    invoiceId,
-                }),
-            });
-            const json = await res.json();
-            if (!res.ok) throw new Error(json.error || "Failed to approve reconciliation");
-            // Update local apMap
-            setApMap(prev => ({
-                ...prev,
-                [orderId]: { label: "Approved ✓", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" },
-            }));
-        } catch (e: any) {
-            console.error("Approve reconciliation error:", e.message);
-        } finally {
-            setApprovingReconcile(prev => {
-                const next = new Set(prev);
-                next.delete(orderId);
-                return next;
-            });
-        }
-    }
-
-    /** Load PO-invoice diff from the po-modify API and expand the modifier UI. */
-    async function loadPOInvoiceDiff(orderId: string, invoiceId?: string) {
-        setModifyingPO(prev => {
-            const next = new Map(prev);
-            next.set(orderId, { loading: true });
-            return next;
-        });
-
-        try {
-            const params = new URLSearchParams({ orderId });
-            if (invoiceId) params.set("invoiceId", invoiceId);
-            const res = await fetch(`/api/dashboard/po-modify?${params}`);
-            if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-            const data = await res.json();
-
-            setModifyingPO(prev => {
-                const next = new Map(prev);
-                next.set(orderId, { loading: false, diff: data.diff, error: undefined });
-                return next;
-            });
-        } catch (e: any) {
-            setModifyingPO(prev => {
-                const next = new Map(prev);
-                next.set(orderId, { loading: false, error: e.message });
-                return next;
-            });
-        }
-    }
-
-    /** Apply PO modifications from the modifier UI. */
-    async function applyPOInvoiceModification(orderId: string, adjustments: any[], freightAdjustment?: number | null) {
-        setModifyingPO(prev => {
-            const next = new Map(prev);
-            const existing = next.get(orderId) || { loading: false };
-            next.set(orderId, { ...existing, saving: true });
-            return next;
-        });
-        setModifySuccess(null);
-
-        try {
-            // Find invoiceId from the invoice number in diff data
-            const state = modifyingPO.get(orderId);
-            let invoiceId: string | undefined;
-            if (state?.diff?.invoiceNumber) {
-                // Look up the first matching invoice from PO's reconciliation data
-                const po = pos.find(p => p.orderId === orderId);
-                const inv = po?._reconciliation?.invoices?.find(
-                    i => i.invoice_number === state.diff.invoiceNumber,
-                );
-                if (inv) invoiceId = inv.invoice_number;
-            }
-
-            const payload: any = {
-                orderId,
-                invoiceId,
-                adjustments,
-                freightAdjustment: freightAdjustment ?? null,
-                notes: "Manual adjustment from Receivings panel",
-            };
-
-            const res = await fetch("/api/dashboard/po-modify", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            });
-
-            if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-            const result = await res.json();
-
-            if (result.success) {
-                setModifySuccess(`PO ${orderId} modified: ${result.adjustmentsApplied} line(s) adjusted${result.freightApplied ? ", freight updated" : ""}`);
-                // Close the modifier
-                setModifyingPO(prev => {
-                    const next = new Map(prev);
-                    next.delete(orderId);
-                    return next;
-                });
-                // Refresh after a moment
-                setTimeout(() => fetchReceivings(true), 1500);
-            } else {
-                throw new Error(result.errors?.join("; ") || "Modification failed");
-            }
-        } catch (e: any) {
-            setModifyingPO(prev => {
-                const next = new Map(prev);
-                const existing = next.get(orderId) || { loading: false };
-                next.set(orderId, { ...existing, saving: false, error: e.message });
-                return next;
-            });
-        }
-    }
-
-    // ── Resend PO email ─────────────────────────────────────────────────────
-    async function resendPOEmail(orderId: string) {
-        try {
-            const res = await fetch("/api/dashboard/active-purchases", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "resend_po_email", orderId }),
-            });
-            if (!res.ok) throw new Error(await res.text());
-            setModifySuccess(`PO ${orderId} email re-sent`);
-        } catch (e: any) {
-            setError(`Resend failed: ${e.message}`);
-        }
-    }
-
-    /** Toggle the PO modifier UI open/closed for a given orderId. */
-    function toggleModifier(orderId: string, invoiceId?: string) {
-        if (modifyingPO.has(orderId)) {
-            setModifyingPO(prev => {
-                const next = new Map(prev);
-                next.delete(orderId);
-                return next;
-            });
-        } else {
-            loadPOInvoiceDiff(orderId, invoiceId);
-        }
-    }
-
-    /** Check for POs without matched invoices. */
-    async function checkUnmatchedPOs() {
-        setUnmatchedLoading(true);
-        try {
-            const res = await fetch("/api/dashboard/po-modify", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "check_unmatched" }),
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            setUnmatchedData(data);
-        } catch (e: any) {
-            console.error("Failed to check unmatched POs:", e);
-            setUnmatchedData({
-                unmatchedPos: [],
-                unreconciledPos: [],
-            });
-        } finally {
-            setUnmatchedLoading(false);
-        }
-    }
+    /** Tracks known receipt orderIds so new arrivals can bust Ordering cache. */
+    const knownReceiptIdsRef = useRef<Set<string>>(new Set());
+    /** Keep last-painted rows so silent refresh never blanks the panel. */
+    const posRef = useRef<ReceivedPO[]>([]);
+    posRef.current = pos;
+    /**
+     * HERMIA(2026-07-28): lifecycle context value changes on every hover/focus
+     * event (focus is in the useMemo deps). If fetchReceivings closes over
+     * `lifecycle`, its identity churns → the mount effect re-fires →
+     * setLoading(true) → skeleton blank. Hold notifyReceipt in a ref instead.
+     */
+    const notifyReceiptRef = useRef(lifecycle.notifyReceipt);
+    notifyReceiptRef.current = lifecycle.notifyReceipt;
 
     // Resizable height — persisted
     const containerRef = useRef<HTMLDivElement>(null);
@@ -784,144 +457,525 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         window.addEventListener('mouseup', onUp);
     }, [bodyHeight]);
 
-    // Fetch real AP status directly from the invoices table (single source of truth)
+    /** Auto-clear the complete toast after 5s. */
     useEffect(() => {
-        const supabase = createBrowserClient();
-        supabase
-            .from("invoices")
-            .select("po_number, status, discrepancies")
-            .not("po_number", "is", null)
-            .order("created_at", { ascending: false })
-            .limit(200)
-            .then((res: { data: Array<{ po_number: string; status: string; discrepancies: any[] }> | null }) => {
-                const data = res.data;
-                if (!data) return;
-                const map: ApStatusMap = {};
-                for (const row of data) {
-                    const id = row.po_number;
-                    if (!id || map[id]) continue;  // first (most recent) wins
-
-                    const st = row.status || "unmatched";
-                    let label = "UNMATCHED";
-                    let cls = "text-zinc-500 border-zinc-700 bg-zinc-800/20";
-
-                    if (st === "matched_review") {
-                        label = "PENDING";
-                        cls = "text-amber-300 border-amber-500/30 bg-amber-500/10";
-                    } else if (st === "reconciled" || st === "matched_approved") {
-                        const hasChanges = row.discrepancies && row.discrepancies.length > 0;
-                        label = hasChanges ? "RECONCILED ±" : "RECONCILED";
-                        cls = hasChanges
-                            ? "text-blue-400 border-blue-500/30 bg-blue-500/10"
-                            : "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
-                    } else if (st === "unmatched") {
-                        label = "UNMATCHED";
-                        cls = "text-zinc-400 border-zinc-500/30 bg-zinc-500/10";
-                    }
-
-                    map[id] = { label, cls };
-                }
-                setApMap(map);
-
-                // Also fetch pending approvals from ap_pending_approvals
-                supabase
-                    .from("ap_pending_approvals")
-                    .select("order_id, invoice_number, vendor_name, status")
-                    .eq("status", "pending")
-                    .order("created_at", { ascending: false })
-                    .limit(30)
-                    .then(paRes => {
-                        const paData = (paRes as any).data;
-                        if (!paData) return;
-                        const paMap: ApStatusMap = {};
-                        for (const pa of paData) {
-                            if (!pa.order_id || paMap[pa.order_id]) continue;
-                            paMap[pa.order_id] = {
-                                label: "PENDING",
-                                cls: "text-amber-300 border-amber-500/40 bg-amber-500/10",
-                            };
-                        }
-                        // Merge: pending approvals override invoice status
-                        setApMap(prev => ({ ...prev, ...paMap }));
-                    });
-            });
-    }, []);
+        if (!actionToast) return;
+        const t = setTimeout(() => setActionToast(null), 5000);
+        return () => clearTimeout(t);
+    }, [actionToast]);
 
     const fetchReceivings = useCallback(async (silent = false) => {
-                // HERMIA(2026-07-28): Never blank painted rows. Skeleton only on first paint
-                // (no rows yet). Background / interval / post-action reloads use the spinner
-                // flag only — previous POs stay visible until the new payload lands.
-                const hasRows = posRef.current.length > 0;
-                if (silent || hasRows) setRefreshing(true);
-                else setLoading(true);
-                setError(null);
-                try {
-                    // HERMIA(2026-08-06): Abort after 18s so the panel cannot spin forever.
-                    // API has its own 20s guard + 3min cache; client must not hang longer.
-                    const ctrl = new AbortController();
-                    const kill = setTimeout(() => ctrl.abort(), 18_000);
-                    let receivingsRes: Response;
-                    let trackingRes: Response | null = null;
-                    try {
-                        [receivingsRes, trackingRes] = await Promise.all([
-                            fetch('/api/dashboard/receivings', { signal: ctrl.signal }),
-                            fetch('/api/dashboard/tracking', { signal: ctrl.signal }).catch(() => null),
-                        ]);
-                    } finally {
-                        clearTimeout(kill);
-                    }
+        // HERMIA(2026-07-28): Never blank painted rows. Skeleton only on first paint
+        // (no rows yet). Background / interval / post-action reloads use the spinner
+        // flag only — previous POs stay visible until the new payload lands.
+        const hasRows = posRef.current.length > 0;
+        if (silent || hasRows) setRefreshing(true);
+        else setLoading(true);
+        setError(null);
+        try {
+            // HERMIA(2026-08-06): Abort after 18s so the panel cannot spin forever.
+            const ctrl = new AbortController();
+            const kill = setTimeout(() => ctrl.abort(), 18_000);
+            let receivingsRes: Response;
+            let trackingRes: Response | null = null;
+            try {
+                [receivingsRes, trackingRes] = await Promise.all([
+                    fetch('/api/dashboard/receivings', { signal: ctrl.signal }),
+                    fetch('/api/dashboard/tracking', { signal: ctrl.signal }).catch(() => null),
+                ]);
+            } finally {
+                clearTimeout(kill);
+            }
 
-                    if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
-                    const data = await receivingsRes.json();
-                    if (data.error && !(data.received?.length)) throw new Error(data.error);
-                    const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
+            if (!receivingsRes.ok) throw new Error(`HTTP ${receivingsRes.status}`);
+            const data = await receivingsRes.json();
+            if (data.error && !(data.received?.length)) throw new Error(data.error);
+            const sorted = [...(data.received || [])].sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
 
-                    // Notify Ordering when new receipt IDs appear so purchasing cache busts.
-                    const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
-                    const prev = knownReceiptIdsRef.current;
-                    if (prev.size > 0) {
-                        const fresh = nextIds.filter((id: string) => !prev.has(id));
-                        if (fresh.length > 0) {
-                            notifyReceiptRef.current(fresh);
-                        }
-                    }
-                    knownReceiptIdsRef.current = new Set(nextIds);
-                    setPos(sorted);
-                    setMatchSuggestions(data.matchSuggestions || []);
-                    setRecentAutoCompletions(data.recentAutoCompletions || []);
-                    setFreightClasses(data.freightClasses || {});
-
-                    if (trackingRes && trackingRes.ok) {
-                        const trackingData = await trackingRes.json();
-                        setTodaySummary(trackingData.todaySummary || null);
-                    } else if (!hasRows) {
-                        setTodaySummary(null);
-                    }
-                } catch (e: any) {
-                    // Keep painted rows on timeout/abort — only surface error when empty
-                    if (!posRef.current.length) {
-                        const msg = e?.name === 'AbortError' ? 'Receivings timed out — retry' : e.message;
-                        setError(msg);
-                    }
-                } finally {
-                    setLoading(false);
-                    setRefreshing(false);
+            // Notify Ordering when new receipt IDs appear so purchasing cache busts.
+            const nextIds = sorted.map((p: ReceivedPO) => String(p.orderId)).filter(Boolean);
+            const prev = knownReceiptIdsRef.current;
+            if (prev.size > 0) {
+                const fresh = nextIds.filter((id: string) => !prev.has(id));
+                if (fresh.length > 0) {
+                    notifyReceiptRef.current(fresh);
                 }
-            }, []);
+            }
+            knownReceiptIdsRef.current = new Set(nextIds);
+            setPos(sorted);
+            setMatchSuggestions(data.matchSuggestions || []);
+            setRecentAutoCompletions(data.recentAutoCompletions || []);
 
-        useEffect(() => {
-            fetchReceivings();
-            const t = setInterval(() => fetchReceivings(true), 30 * 60 * 1000);
-            return () => clearInterval(t);
-        }, [fetchReceivings]);
+            if (trackingRes && trackingRes.ok) {
+                const trackingData = await trackingRes.json();
+                setTodaySummary(trackingData.todaySummary || null);
+            } else if (!hasRows) {
+                setTodaySummary(null);
+            }
+        } catch (e: unknown) {
+            // Keep painted rows on timeout/abort — only surface error when empty
+            if (!posRef.current.length) {
+                const aborted = e instanceof Error && e.name === 'AbortError';
+                const msg = aborted ? 'Receivings timed out — retry' : errMsg(e);
+                setError(msg);
+            }
+        } finally {
+            setLoading(false);
+            setRefreshing(false);
+        }
+    }, []);
 
-    const matchDollars = matchSuggestions.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
-    const exceptionCount = pos.filter(po => {
-        const lbl = (apMap[po.orderId]?.label || "").toLowerCase();
-        if (lbl.includes("unmatched") || lbl.includes("review")) return true;
-        if ((po as any).receiptStatus === "partial") return true;
-        return false;
-    }).length;
+    useEffect(() => {
+        fetchReceivings();
+        const t = setInterval(() => fetchReceivings(true), 30 * 60 * 1000);
+        return () => clearInterval(t);
+    }, [fetchReceivings]);
+
+    /** Match an invoice to a PO from a suggestion (row-level Match button). */
+    async function handleMatchInvoice(invoiceId: string, poNumber: string) {
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber }),
+            });
+            if (res.ok) {
+                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
+                setMatchedInvoiceIds(prev => new Set(prev).add(invoiceId));
+                fetchReceivings(true);
+            } else {
+                const err = await res.text();
+                setActionToast({ kind: "err", text: `Match failed: ${err.slice(0, 160)}` });
+            }
+        } catch (e: unknown) {
+            setActionToast({ kind: "err", text: `Match failed: ${errMsg(e)}` });
+        }
+    }
+
+    /** Manual PO input change for a match suggestion. */
+    function handleManualInputChange(invoiceId: string, value: string) {
+        setManuallyMatching(prev => {
+            const next = new Map(prev);
+            const existing = next.get(invoiceId);
+            next.set(invoiceId, { poNumber: value, loading: existing?.loading ?? false });
+            return next;
+        });
+    }
+
+    /** Manual match: bind an invoice to a PO typed by the operator. */
+    async function handleManualMatch(invoiceId: string) {
+        const state = manuallyMatching.get(invoiceId);
+        if (!state || !state.poNumber.trim()) return;
+        setManuallyMatching(prev => {
+            const next = new Map(prev);
+            next.set(invoiceId, { ...state, loading: true });
+            return next;
+        });
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber: state.poNumber.trim() }),
+            });
+            if (res.ok) {
+                setManuallyMatching(prev => { const next = new Map(prev); next.delete(invoiceId); return next; });
+                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
+                setMatchedInvoiceIds(prev => new Set(prev).add(invoiceId));
+                setActionToast({ kind: "ok", text: `Invoice matched to PO ${state.poNumber.trim()}` });
+                fetchReceivings(true);
+            } else {
+                const err = await res.text();
+                setActionToast({ kind: "err", text: `Match failed: ${err.slice(0, 160)}` });
+                setManuallyMatching(prev => {
+                    const next = new Map(prev);
+                    next.set(invoiceId, { ...manuallyMatching.get(invoiceId)!, loading: false });
+                    return next;
+                });
+            }
+        } catch (e: unknown) {
+            setActionToast({ kind: "err", text: `Match failed: ${errMsg(e)}` });
+            setManuallyMatching(prev => {
+                const next = new Map(prev);
+                next.set(invoiceId, { ...manuallyMatching.get(invoiceId)!, loading: false });
+                return next;
+            });
+        }
+    }
+
+    /**
+     * Complete a PO through the gate-checked API. Every outcome is visible:
+     * success → green toast + optimistic remove + refresh,
+     * 409 gate → block toast with the gate's detail (persistent row banner too),
+     * other error → red toast. Button shows "Completing…" while in flight.
+     */
+    async function handleCompletePO(orderId: string, vendorName: string) {
+        setCompletingId(orderId);
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "complete_po", orderId, vendorName }),
+            });
+            const json = await res.json();
+            if (res.ok) {
+                // Clear any previous gate refusal for this PO
+                setGateBlockReason(prev => { const next = new Map(prev); next.delete(orderId); return next; });
+                // Optimistic remove — the PO left the actionable list. Also record
+                // it so the follow-up refetch cannot resurrect it (Finale still
+                // lists completed POs inside the 30-day received window).
+                setPos(prev => prev.filter(p => p.orderId !== orderId));
+                setCompletedIds(prev => new Set(prev).add(orderId));
+                setActionToast({ kind: "ok", text: `PO ${orderId} completed in Finale` });
+                fetchReceivings(true);
+            } else if (res.status === 409 && json.detail) {
+                // Gate refused — block toast with the 3-way match summary
+                setGateBlockReason(prev => { const next = new Map(prev); next.set(orderId, String(json.detail)); return next; });
+                setActionToast({ kind: "block", text: String(json.detail) });
+            } else {
+                throw new Error(json.error || `HTTP ${res.status}`);
+            }
+        } catch (e: unknown) {
+            setActionToast({ kind: "err", text: errMsg(e) || "Complete failed" });
+        } finally {
+            setCompletingId(null);
+        }
+    }
+
+    // ── Derived: the ONE actionable list + counts ──────────────────────────
+    const filteredSuggestions = useMemo(
+        () => matchSuggestions.filter(s =>
+            s.candidates.every(c => !/DropshipPO/i.test(String(c.orderId || "")))
+        ),
+        [matchSuggestions],
+    );
+    /** Rows hidden by actions taken this session (completed POs / matched invoices). */
+    const visiblePos = useMemo(
+        () => pos.filter(p => !completedIds.has(p.orderId)),
+        [pos, completedIds],
+    );
+    const visibleSuggestions = useMemo(
+        () => filteredSuggestions.filter(s => !matchedInvoiceIds.has(s.invoiceId)),
+        [filteredSuggestions, matchedInvoiceIds],
+    );
+    const actionRows = useMemo(() => buildActionRows(visiblePos, visibleSuggestions), [visiblePos, visibleSuggestions]);
+    const reviewCount = actionRows.filter(r => r.kind === "review").length;
+    const readyCount = actionRows.filter(r => r.kind === "ready").length;
+    const matchCount = visibleSuggestions.length;
+    const matchDollars = visibleSuggestions.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
+    const actionPoIds = useMemo(
+        () => new Set(actionRows.filter(r => r.kind !== "match").map(r => r.po.orderId)),
+        [actionRows],
+    );
+    const settledPos = visiblePos.filter(p => !actionPoIds.has(p.orderId));
+
+    // ── Row renderers (inside component for state access) ──────────────────
+
+    const toggleExpand = (key: string) => setExpandedRow(prev => (prev === key ? null : key));
+
+    /** Review row — collapsed: ⚠️ verdict + kind chips + PDF hover; expanded: variance body. */
+    function renderReviewRow(row: Extract<ActionRow, { kind: "review" }>) {
+        const expanded = expandedRow === row.key;
+        const variance = row.variance;
+        const hasBlocking = variance?.hasBlocking ?? false;
+        const pdfUrl = invoicePdfUrl(row.inv);
+        const poProductIds = row.po.items.map(item => item.productId);
+        const cc = row.po._reconciliation?.chargesComparison;
+        const items = variance?.items || [];
+        const gateReason = gateBlockReason.get(row.po.orderId);
+        const completing = completingId === row.po.orderId;
+
+        return (
+            <div key={row.key} className={`border-b border-zinc-800/40 ${hasBlocking ? "bg-rose-500/[0.03]" : "bg-amber-500/[0.02]"}`}>
+                {/* Collapsed header — click to expand */}
+                <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={e => {
+                        const t = e.target as HTMLElement;
+                        if (t.closest("a") || t.closest("button") || t.closest("input")) return;
+                        toggleExpand(row.key);
+                        lifecycle.setLockedFocus({ source: "rcv", vendorName: row.po.supplier, orderId: row.po.orderId, productIds: poProductIds });
+                    }}
+                    onKeyDown={e => {
+                        if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            toggleExpand(row.key);
+                        }
+                    }}
+                    className="w-full px-4 py-2.5 text-left cursor-pointer hover:bg-zinc-800/20 transition-colors"
+                >
+                    <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-[10px] text-zinc-500 shrink-0">{expanded ? "▾" : "▸"}</span>
+                        <span className="text-[11px] shrink-0">{hasBlocking ? "🚫" : "⚠️"}</span>
+                        <span className="text-[11px] font-mono font-semibold text-zinc-100 shrink-0">PO {row.po.orderId}</span>
+                        <span className="text-[10px] font-mono text-zinc-500 truncate hidden sm:inline">{row.po.supplier}</span>
+                        <span className="text-[11px] font-mono text-zinc-400 shrink-0">Inv #{row.inv.invoice_number || "—"}</span>
+                        {variance && Math.abs(variance.netDelta) > 0.01 && (
+                            <span className={`text-[11px] font-mono font-bold shrink-0 ${variance.netDelta > 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                                {money(variance.netDelta)}
+                            </span>
+                        )}
+                        <div className="flex-1" />
+                        {pdfUrl && (
+                            <InvoicePdfLink
+                                id={row.inv.id!}
+                                number={row.inv.invoice_number}
+                                withHover
+                                hovered={hoverPdfId === row.inv.id}
+                                onHoverChange={setHoverPdfId}
+                            />
+                        )}
+                    </div>
+                    {/* Per-kind chips — WHICH bucket moved, without expanding */}
+                    {variance && Object.keys(variance.byKind).length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1 pl-[18px]">
+                            {Object.entries(variance.byKind).map(([kind, amt]) => {
+                                const ui = KIND_UI[kind] || KIND_UI.unexplained;
+                                return (
+                                    <span key={kind} className={`px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
+                                        {ui.icon} {ui.label} {Math.abs(amt as number) > 0.01 ? money(amt as number) : ""}
+                                    </span>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+
+                {/* Expanded — variance breakdown + actions */}
+                {expanded && (
+                    <div className="border-t border-zinc-800/40 bg-zinc-950/40">
+                        {/* Money row */}
+                        {cc && (
+                            <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/50 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] font-mono">
+                                <span className="text-zinc-500">PO goods <span className="text-zinc-200">${(cc.po?.subtotal || cc.po?.total || 0).toFixed(2)}</span></span>
+                                <span className="text-zinc-500">Invoice <span className="text-zinc-200">${(cc.invoice?.total || cc.invoice?.subtotal || 0).toFixed(2)}</span></span>
+                                {cc.invoice?.freight > 0 && <span className="text-sky-400/80">🚚 ${cc.invoice.freight.toFixed(2)}</span>}
+                                {cc.invoice?.tax > 0 && <span className="text-violet-400/80">🧾 ${cc.invoice.tax.toFixed(2)}</span>}
+                                {cc.po?.tariffs > 0 && <span className="text-violet-400/80">🛃 ${cc.po.tariffs.toFixed(2)}</span>}
+                            </div>
+                        )}
+
+                        {/* One row per classified difference */}
+                        {items.length > 0 ? (
+                            <div className="border-b border-zinc-800/40 bg-zinc-950/30 divide-y divide-zinc-800/30">
+                                {items.map((it, i) => {
+                                    const ui = KIND_UI[it.kind] || KIND_UI.unexplained;
+                                    return (
+                                        <div key={i} className="px-3 py-1.5">
+                                            <div className="flex items-start gap-2">
+                                                <span className={`shrink-0 px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
+                                                    {ui.icon} {ui.label}
+                                                </span>
+                                                <span className="text-[10px] font-mono text-zinc-300 font-semibold truncate min-w-0" title={it.label}>
+                                                    {it.label}
+                                                </span>
+                                                <div className="flex-1" />
+                                                {it.poAmount != null && it.invoiceAmount != null && (
+                                                    <span className="text-[9px] font-mono text-zinc-500 shrink-0">
+                                                        {it.poAmount} → {it.invoiceAmount}
+                                                    </span>
+                                                )}
+                                                {Math.abs(it.delta) > 0.01 && (
+                                                    <span className={`text-[10px] font-mono font-semibold shrink-0 ${it.delta > 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                                                        {money(it.delta)}
+                                                    </span>
+                                                )}
+                                                {it.blocking && <span className="text-[9px] font-mono text-rose-400 shrink-0">BLOCK</span>}
+                                            </div>
+                                            <div className="mt-0.5 text-[9px] font-mono text-zinc-500 leading-relaxed pl-1">
+                                                {it.message}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        ) : (
+                            !variance && (
+                                <div className="px-3 py-2 text-[10px] font-mono text-zinc-500 border-b border-zinc-800/40">
+                                    No variance breakdown available — review totals in Finale before completing.
+                                </div>
+                            )
+                        )}
+
+                        {/* 3-way gate refusal banner (persistent per-row detail) */}
+                        {gateReason && (
+                            <div className="mx-3 mt-2 px-3 py-2.5 border border-rose-500/30 bg-rose-950/15 rounded flex items-start gap-2">
+                                <span className="text-rose-400 text-[11px] mt-0.5 shrink-0">🚫</span>
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-[10px] font-mono text-rose-400 font-semibold uppercase tracking-wider mb-0.5">3-Way Match Gate Refused</div>
+                                    <div className="text-[11px] font-mono text-rose-200/90 leading-relaxed">{gateReason}</div>
+                                </div>
+                                <button
+                                    onClick={() => setGateBlockReason(prev => { const next = new Map(prev); next.delete(row.po.orderId); return next; })}
+                                    className="text-rose-400/40 hover:text-rose-300 shrink-0 text-[11px]"
+                                >✕</button>
+                            </div>
+                        )}
+
+                        {/* Footer: Finale link + Apply & Complete */}
+                        <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/60 border-t border-zinc-800/40">
+                            <a
+                                href={row.po.finaleUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 mr-auto"
+                            >
+                                Open PO in Finale
+                            </a>
+                            <button
+                                onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
+                                disabled={completing}
+                                className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${
+                                    completing
+                                        ? "bg-zinc-700/20 text-zinc-500 border border-zinc-700/40 cursor-wait"
+                                        : hasBlocking
+                                        ? "bg-rose-500/15 border border-rose-500/40 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
+                                        : "bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer"
+                                }`}
+                            >
+                                {completing ? "Completing…" : "Apply Invoice & Complete"}
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    /** Ready row — one green line, Complete right on the row (no expand needed). */
+    function renderReadyRow(row: Extract<ActionRow, { kind: "ready" }>) {
+        const pdfUrl = invoicePdfUrl(row.inv);
+        const completing = completingId === row.po.orderId;
+        return (
+            <div key={row.key} className="px-4 py-2.5 border-b border-zinc-800/40 flex items-center gap-2 hover:bg-zinc-800/10 transition-colors">
+                <span className="text-[11px] shrink-0">✅</span>
+                <span className="text-[11px] font-mono text-emerald-200/90 flex-1 min-w-0 truncate">
+                    PO {row.po.orderId} <span className="text-zinc-500">{row.po.supplier}</span> matched Inv #{row.inv.invoice_number || "—"} — ready
+                </span>
+                {pdfUrl && <InvoicePdfLink id={row.inv.id!} number={row.inv.invoice_number} />}
+                <button
+                    onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
+                    disabled={completing}
+                    className="shrink-0 px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-wait"
+                >
+                    {completing ? "Completing…" : "Complete"}
+                </button>
+            </div>
+        );
+    }
+
+    /** Match row — collapsed: top candidate + Match; expanded: all candidates + manual input. */
+    function renderMatchRow(row: Extract<ActionRow, { kind: "match" }>) {
+        const expanded = expandedRow === row.key;
+        const s = row.suggestion;
+        const best = s.candidates[0];
+        const pdfUrl = suggestionPdfUrl(s);
+        const manual = manuallyMatching.get(s.invoiceId);
+
+        return (
+            <div key={row.key} className="border-b border-zinc-800/40">
+                {/* Collapsed header — click to expand */}
+                <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={e => {
+                        const t = e.target as HTMLElement;
+                        if (t.closest("a") || t.closest("button") || t.closest("input")) return;
+                        toggleExpand(row.key);
+                    }}
+                    onKeyDown={e => {
+                        if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            toggleExpand(row.key);
+                        }
+                    }}
+                    className="w-full px-4 py-2.5 text-left cursor-pointer hover:bg-zinc-800/20 transition-colors"
+                >
+                    <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-[10px] text-zinc-500 shrink-0">{expanded ? "▾" : "▸"}</span>
+                        <span className="text-[11px] shrink-0">🔍</span>
+                        <span className="text-[11px] font-mono font-semibold text-zinc-100 shrink-0">Inv {s.invoiceNumber || "—"}</span>
+                        <span className="text-[10px] font-mono text-zinc-500 truncate hidden sm:inline">{s.vendorName}</span>
+                        {s.invoiceTotal > 0 ? (
+                            <span className="text-[10px] font-mono text-zinc-400 shrink-0">{fmtDollars(s.invoiceTotal)}</span>
+                        ) : (
+                            <span className="text-[9px] font-mono text-amber-500/60 shrink-0" title="OCR could not read invoice total">$?</span>
+                        )}
+                        {best && (
+                            <span className="text-[10px] font-mono text-zinc-500 shrink-0">→ {best.orderId}</span>
+                        )}
+                        <div className="flex-1" />
+                        {pdfUrl && <InvoicePdfLink id={s.invoiceId} number={s.invoiceNumber} />}
+                        {best && (
+                            <button
+                                onClick={e => { e.stopPropagation(); handleMatchInvoice(s.invoiceId, best.orderId); }}
+                                className="shrink-0 px-2.5 py-1 rounded text-[10px] font-mono font-semibold border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 cursor-pointer transition-colors"
+                            >
+                                Match
+                            </button>
+                        )}
+                    </div>
+                </div>
+
+                {/* Expanded — candidates + manual PO input */}
+                {expanded && (
+                    <div className="px-4 py-2 border-t border-zinc-800/40 bg-zinc-950/40 space-y-1.5">
+                        {s.candidates.length > 0 && (
+                            <>
+                                <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-600">Candidates</div>
+                                {s.candidates.slice(0, 3).map(c => (
+                                    <div key={c.orderId} className="flex items-center gap-2 text-[10px] font-mono">
+                                        <span className="text-zinc-200 font-semibold shrink-0">{c.orderId}</span>
+                                        <span className="text-zinc-500 truncate hidden sm:inline">{c.vendorName}</span>
+                                        <span className="text-zinc-400 shrink-0">{fmtDollars(c.total)}</span>
+                                        <span className={`shrink-0 ${c.score >= 70 ? "text-emerald-400" : c.score >= 50 ? "text-amber-300" : "text-zinc-500"}`}>
+                                            {c.score}%
+                                        </span>
+                                        {c.reasons?.[0] && (
+                                            <span className="text-zinc-600 truncate hidden md:inline">{c.reasons[0]}</span>
+                                        )}
+                                        <button
+                                            onClick={() => handleMatchInvoice(s.invoiceId, c.orderId)}
+                                            className="ml-auto shrink-0 px-2 py-0.5 rounded text-[9px] font-mono border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 cursor-pointer transition-colors"
+                                        >
+                                            Match
+                                        </button>
+                                    </div>
+                                ))}
+                            </>
+                        )}
+                        {/* Manual PO input — one line under expand */}
+                        <div className="flex items-center gap-1.5 pt-1.5 border-t border-zinc-800/30">
+                            <span className="text-[9px] font-mono text-zinc-600 shrink-0">Manual:</span>
+                            <input
+                                type="text"
+                                placeholder="PO #"
+                                value={manual?.poNumber ?? ""}
+                                onChange={e => handleManualInputChange(s.invoiceId, e.target.value)}
+                                onKeyDown={e => { if (e.key === "Enter") handleManualMatch(s.invoiceId); }}
+                                className="w-24 px-1.5 py-0.5 rounded text-[10px] font-mono bg-zinc-800/60 border border-zinc-700/50 text-zinc-200 placeholder-zinc-600"
+                            />
+                            <button
+                                onClick={() => handleManualMatch(s.invoiceId)}
+                                disabled={!manual?.poNumber?.trim() || !!manual?.loading}
+                                className="text-[10px] font-mono px-2 py-0.5 rounded border border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                                {manual?.loading ? "Matching…" : "Go"}
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    function renderActionRow(row: ActionRow) {
+        if (row.kind === "review") return renderReviewRow(row);
+        if (row.kind === "ready") return renderReadyRow(row);
+        return renderMatchRow(row);
+    }
+
+    // ── Render ─────────────────────────────────────────────────────────────
 
     return (
         <div
@@ -931,18 +985,19 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             }
             ref={containerRef}
         >
+            {/* Header */}
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
                 <span className="text-[10px] text-[var(--dash-ts)] font-mono">30d</span>
-                                {matchSuggestions.length > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                        {matchSuggestions.length} match{matchSuggestions.length > 1 ? "es" : ""}
-                                    </span>
-                                )}
-                                <div className="flex-1" />
-                {!loading && pos.length > 0 && (
-                    <span className="text-xs font-mono text-zinc-500">{pos.length} POs</span>
+                {actionRows.length > 0 && (
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                        {actionRows.length} action
+                    </span>
+                )}
+                <div className="flex-1" />
+                {!loading && visiblePos.length > 0 && (
+                    <span className="text-xs font-mono text-zinc-500">{visiblePos.length} POs</span>
                 )}
                 <button onClick={() => fetchReceivings(true)} disabled={refreshing}
                     className="ml-2 text-zinc-700 hover:text-zinc-400 transition-colors disabled:opacity-40">
@@ -956,13 +1011,13 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 </button>
             </div>
 
-            {/* Accounting status — Receivings (separate from Ordering / Active) */}
+            {/* AP status strip */}
             {!effectivelyCollapsed && !loading && (
                 <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
                     <span className="text-zinc-600 uppercase tracking-wider shrink-0">AP</span>
-                    {matchSuggestions.length > 0 ? (
+                    {matchCount > 0 ? (
                         <>
-                            <span className="text-amber-300">{matchSuggestions.length} match{matchSuggestions.length === 1 ? "" : "es"}</span>
+                            <span className="text-amber-300">{matchCount} match{matchCount === 1 ? "" : "es"}</span>
                             {matchDollars > 0 && (
                                 <span className="text-amber-200/90">${Math.round(matchDollars).toLocaleString()}</span>
                             )}
@@ -971,11 +1026,17 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         <span className="text-emerald-400/80">0 open matches</span>
                     )}
                     <span className="text-zinc-700">·</span>
-                    <span>{pos.length} receipt{pos.length === 1 ? "" : "s"}</span>
-                    {exceptionCount > 0 && (
+                    <span>{visiblePos.length} receipt{visiblePos.length === 1 ? "" : "s"}</span>
+                    {reviewCount > 0 && (
                         <>
                             <span className="text-zinc-700">·</span>
-                            <span className="text-rose-300">{exceptionCount} need review</span>
+                            <span className="text-rose-300">{reviewCount} need review</span>
+                        </>
+                    )}
+                    {readyCount > 0 && (
+                        <>
+                            <span className="text-zinc-700">·</span>
+                            <span className="text-emerald-400/80">{readyCount} ready</span>
                         </>
                     )}
                 </div>
@@ -983,55 +1044,51 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
 
             {!effectivelyCollapsed && (
                 <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
-                    {modifySuccess && (
-                        <div className="px-4 py-2 border-b border-emerald-500/30 bg-emerald-500/10 text-[11px] font-mono text-emerald-400 flex items-center gap-2">
-                            <span>✅</span>
-                            <span className="flex-1">{modifySuccess}</span>
-                            <button onClick={() => setModifySuccess(null)} className="text-emerald-400/50 hover:text-emerald-300">✕</button>
+                    {/* Action chips */}
+                    {!loading && !error && visiblePos.length > 0 && (
+                        <div className="px-4 py-1.5 flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/30">
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                                {actionRows.length} Action
+                            </span>
+                            {readyCount > 0 && (
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+                                    {readyCount} Ready
+                                </span>
+                            )}
+                            {reviewCount > 0 && (
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-500/10 border border-rose-500/30 text-rose-300">
+                                    {reviewCount} Review
+                                </span>
+                            )}
+                            {matchCount > 0 && (
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300">
+                                    {matchCount} Match
+                                </span>
+                            )}
+                            {settledPos.length > 0 && (
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/40 border border-zinc-700/30 text-zinc-500">
+                                    {settledPos.length} Settled
+                                </span>
+                            )}
                         </div>
                     )}
-                    {!loading && !error && pos.length > 0 && (() => {
-                        const unmatched = pos.filter(p => {
-                            const lbl = apMap[p.orderId]?.label || "";
-                            return lbl === "UNMATCHED" || lbl === "";
-                        }).length;
-                        const partialCount = pos.filter(p => getDynamicReceiptStatus(p) === "partial").length;
-                        const discrepancyCount = pos.filter(p => {
-                            const lbl = apMap[p.orderId]?.label || "";
-                            return lbl === "RECONCILED ±";
-                        }).length;
-                        const pendingCount = pos.filter(p => {
-                            const lbl = apMap[p.orderId]?.label || "";
-                            return lbl === "PENDING";
-                        }).length;
-                        return (
-                            <div className="px-4 py-1.5 flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/30">
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                    {pos.length} Received
-                                </span>
-                                {unmatched > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-rose-400 font-semibold">{unmatched}</span> Unmatched
-                                    </span>
-                                )}
-                                {partialCount > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-amber-300 font-semibold">{partialCount}</span> Partial
-                                    </span>
-                                )}
-                                {discrepancyCount > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-blue-400 font-semibold">{discrepancyCount}</span> Discrepancy
-                                    </span>
-                                )}
-                                {pendingCount > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-amber-300 font-semibold">{pendingCount}</span> Pending Approval
-                                    </span>
-                                )}
-                            </div>
-                        );
-                    })()}
+
+                    {/* Complete feedback toast — always visible (also when the
+                        optimistic remove briefly empties the list) */}
+                    {actionToast && (
+                        <div className={`sticky top-0 z-30 px-4 py-2 border-b text-[11px] font-mono flex items-center gap-2 ${
+                            actionToast.kind === "ok"
+                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                                : actionToast.kind === "block"
+                                ? "bg-amber-500/10 border-amber-500/30 text-amber-300"
+                                : "bg-rose-500/10 border-rose-500/30 text-rose-300"
+                        }`}>
+                            <span>{actionToast.kind === "ok" ? "✅" : actionToast.kind === "block" ? "🚫" : "❌"}</span>
+                            <span className="flex-1 min-w-0">{actionToast.text}</span>
+                            <button onClick={() => setActionToast(null)} className="shrink-0 opacity-60 hover:opacity-100">✕</button>
+                        </div>
+                    )}
+
                     {loading ? (
                         <div className="px-4 py-3 space-y-2.5">
                             <div className="text-[10px] font-mono text-zinc-600 mb-1.5 animate-pulse">Loading received POs...</div>
@@ -1044,7 +1101,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         </div>
                     ) : error ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
-                    ) : pos.length === 0 ? (
+                    ) : visiblePos.length === 0 && matchCount === 0 ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-500">No receipts in the last 30 days — all received POs have been processed</span></div>
                     ) : (
                         <div
@@ -1072,108 +1129,17 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 </div>
                             )}
 
-                            {/* ── Split-panel Invoice → PO Matcher ── */}
-                            <InvoicePOMatcher
-                                suggestions={matchSuggestions.filter(s =>
-                                    s.candidates.every(c => !/DropshipPO/i.test(String(c.orderId || "")))
-                                )}
-                                receivedPOs={pos}
-                                onMatch={handleMatchInvoice}
-                                onManualMatch={handleManualMatch}
-                                onApproveReconciliation={approveReconciliation}
-                                approvingReconcile={approvingReconcile}
-                                manuallyMatching={manuallyMatching}
-                                onManualInputChange={handleManualInputChange}
-                            />
-
-                            {/* ── Received POs toggle ── */}
-                            {matchSuggestions.length > 0 && (
-                                <button
-                                    onClick={() => setShowReceivedPOs(!showReceivedPOs)}
-                                    className="w-full px-4 py-1.5 text-[10px] font-mono text-zinc-500 hover:text-zinc-300 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1.5"
-                                >
-                                    <span>{showReceivedPOs ? "▼" : "▶"}</span>
-                                    <span>Received POs ({pos.length})</span>
-                                    {needsReviewCount > 0 && (
-                                        <span className="text-rose-400/70">· {needsReviewCount} need review</span>
-                                    )}
-                                </button>
-                            )}
-                            {(!matchSuggestions.length || showReceivedPOs) && (
-                            <div>
-
-                            {/* ── Unmatched POs Check ── */}
-                            <div className="border-b border-zinc-800/40">
-                                <div className="px-4 py-2 flex items-center gap-2">
-                                    <span className="text-[10px] font-mono text-zinc-500">
-                                        {unmatchedData
-                                            ? `${unmatchedData.unmatchedPos.length + unmatchedData.unreconciledPos.length} POs need review`
-                                            : `PO-invoice match status unknown`}
-                                    </span>
-                                    <div className="flex-1" />
-                                    <button
-                                        onClick={e => { e.stopPropagation(); checkUnmatchedPOs(); }}
-                                        disabled={unmatchedLoading}
-                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-zinc-700/40 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors disabled:opacity-40"
-                                    >
-                                        {unmatchedLoading ? "checking..." : "Check Match Status"}
-                                    </button>
+                            {/* ── ONE actionable list: review → ready → match ── */}
+                            {actionRows.length > 0 ? (
+                                <div>
+                                    {actionRows.map(row => renderActionRow(row))}
                                 </div>
-                                {unmatchedData && (unmatchedData.unmatchedPos.length > 0 || unmatchedData.unreconciledPos.length > 0) && (
-                                    <div className="px-4 py-1.5 space-y-1 pb-2">
-                                        {unmatchedData.unmatchedPos.map(po => (
-                                            <div key={`u-${po.orderId}`} className="flex items-center gap-2 text-[10px] font-mono text-rose-300">
-                                                <span className="w-1 h-1 rounded-full bg-rose-500 shrink-0" />
-                                                <span className="font-semibold">{po.orderId}</span>
-                                                <span className="text-zinc-400 truncate">{po.vendorName}</span>
-                                                <span className="text-zinc-600">· no invoice</span>
-                                                <span className="ml-auto text-zinc-500">{po.date ? new Date(po.date).toLocaleDateString() : ''}</span>
-                                            </div>
-                                        ))}
-                                        {unmatchedData.unreconciledPos.slice(0, 10).map(po => (
-                                            <div key={`r-${po.orderId}`} className="flex items-center gap-2 text-[10px] font-mono text-amber-300">
-                                                <span className="w-1 h-1 rounded-full bg-amber-500 shrink-0" />
-                                                <span className="font-semibold">{po.orderId}</span>
-                                                <span className="text-zinc-400 truncate">{po.vendorName}</span>
-                                                <span className="text-zinc-600">· {po.lifecycleState || 'unknown'}</span>
-                                                <span className="ml-auto text-zinc-500">{po.date ? new Date(po.date).toLocaleDateString() : ''}</span>
-                                            </div>
-                                        ))}
-                                        {(unmatchedData.unreconciledPos.length > 10) && (
-                                            <div className="text-[10px] font-mono text-zinc-600 pl-3">
-                                                +{unmatchedData.unreconciledPos.length - 10} more
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
-                                {unmatchedData && unmatchedData.unmatchedPos.length === 0 && unmatchedData.unreconciledPos.length === 0 && (
-                                    <div className="px-4 py-1.5 text-[10px] font-mono text-emerald-400/70 pb-2">
-                                        ✅ All POs have matched invoices or are reconciled
-                                    </div>
-                                )}
-                            </div>
-
-                            {/* ── Needs Review / All Received split ── */}
-                            {needsReviewCount > 0 && (
-                                <div className="px-4 py-1.5 border-b border-rose-500/20 bg-rose-500/5 flex items-center gap-2">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-                                    <span className="text-[10px] font-mono text-rose-300/90 uppercase tracking-wider">
-                                        {needsReviewCount} need{needsReviewCount > 1 ? "" : "s"} review
-                                    </span>
-                                    <div className="flex-1" />
-                                    <span className="text-[9px] font-mono text-zinc-600">
-                                        {pos.length - needsReviewCount} auto-processed
+                            ) : (
+                                <div className="px-4 py-6 text-center">
+                                    <span className="text-xs font-mono text-emerald-400/70">
+                                        ✅ All invoices matched — nothing needs attention
                                     </span>
                                 </div>
-                            )}
-                            {pos.length > needsReviewCount && (
-                                <button
-                                    onClick={() => setShowAllReceived(!showAllReceived)}
-                                    className="w-full px-4 py-1 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1"
-                                >
-                                    {showAllReceived ? "−" : "+"}
-                                    <span>{showAllReceived ? "Show only items needing review" : `Show all ${pos.length} received POs`}</span>
-                                </button>
                             )}
 
                             {/* ── Auto-processed summary — full trail in Activity tab ── */}
@@ -1184,411 +1150,60 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                         {recentAutoCompletions.length} auto-completed
                                     </span>
                                     <button
-                                        onClick={() => document.querySelector('[role="tab"][aria-label="Activity"]')?.click()}
+                                        onClick={() => (document.querySelector('[role="tab"][aria-label="Activity"]') as HTMLElement | null)?.click()}
                                         className="text-[9px] font-mono text-blue-500/50 hover:text-blue-400 underline underline-offset-2 decoration-blue-500/20 transition-colors"
                                     >
                                         view in Activity
                                     </button>
                                 </div>
                             )}
-                            {pos
-                                .filter(po => {
-                                    if (showAllReceived) return true;
-                                    const lbl = apMap[po.orderId]?.label || "";
-                                    // Always show POs with match data so line-item/charges comparison is visible
-                                    const recStatus = (po as any)._reconciliation?.matchStatus;
-                                    if (recStatus === "match" || recStatus === "possible_match") return true;
-                                    return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
-                                })
-                                .map(po => {
-                                const apStatus = apMap[po.orderId];
-                                const dollars = fmtDollars(po.total);
-                                const discrepancy = partialDiscrepancy(po);
-                                const poProductIds = po.items.map(item => item.productId);
-                                const rcvMatch = lifecycle.checkMatchDetails({
-                                    vendorName: po.supplier,
-                                    orderId: po.orderId,
-                                    productIds: poProductIds,
-                                });
-                                const rcvBg = rcvMatch.isLockedDirect
-                                    ? "bg-amber-500/10 ring-2 ring-inset ring-amber-500/50"
-                                    : rcvMatch.isLockedBom
-                                    ? "bg-amber-500/5 ring-1 ring-dashed ring-amber-500/30"
-                                    : rcvMatch.isDirect
-                                    ? "bg-cyan-500/8 ring-1 ring-inset ring-cyan-500/35"
-                                    : rcvMatch.isBom
-                                    ? "bg-cyan-500/4 ring-1 ring-dashed ring-cyan-500/25"
-                                    : "";
-                                return (
-                                    <div
-                                        key={po.orderId}
-                                        onClick={(e) => {
-                                            const target = e.target as HTMLElement;
-                                            if (target.closest("button") || target.closest("input") || target.closest("select") || target.closest("a")) return;
-                                            lifecycle.setLockedFocus({ source: "rcv", vendorName: po.supplier, orderId: po.orderId, productIds: poProductIds });
-                                        }}
-                                        className={`px-4 py-2.5 border-b border-zinc-800/40 cursor-pointer transition-colors ${rcvBg ? rcvBg : "hover:bg-zinc-800/20"}`}
+
+                            {/* ── Settled dump — hidden by default ── */}
+                            {settledPos.length > 0 && (
+                                <div>
+                                    <button
+                                        onClick={() => setShowAllReceived(!showAllReceived)}
+                                        className="w-full px-4 py-1 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1"
                                     >
-                                        {/* Line 1: date · vendor · AP status · total */}
-                                        <div className="flex items-center gap-2 min-w-0">
-                                                                                    <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
-                                                                                    {(() => {
-                                                                                        const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
-                                                                                        const ordDays = daysSince(po.orderDate);
-                                                                                        const chips: string[] = [];
-                                                                                        if (rcvDays !== null) chips.push(`rcv ${rcvDays}d`);
-                                                                                        if (ordDays !== null) chips.push(`ord ${ordDays}d`);
-                                                                                        if (chips.length === 0) return null;
-                                                                                        return (
-                                                                                            <span className="text-[10px] font-mono text-zinc-600 shrink-0">
-                                                                                                · {chips.join(" · ")}
-                                                                                            </span>
-                                                                                        );
-                                                                                    })()}
-                                                                                    <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
-                                            {receiptBadge(po) && (
-                                                                                            <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${receiptBadge(po)!.cls}`}>
-                                                                                                {receiptBadge(po)!.label}
-                                                                                            </span>
-                                                                                        )}
-                                                                                        {(() => {
-                                                                                            const ms = computeMatchStatus(apStatus?.label || "");
-                                                                                            const mc = matchStatusConfig[ms];
-                                                                                            return (
-                                                                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${mc.cls}`}
-                                                                                                    title={mc.label}>
-                                                                                                    {mc.label}
-                                                                                                </span>
-                                                                                            );
-                                                                                        })()}
-                                                                                        {dollars && <span className="text-xs font-mono text-emerald-400 shrink-0 ml-auto">{dollars}</span>}
-                                        </div>
-                                        {/* Line 2: PO# + SKUs */}
-                                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                                            <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
-                                                className="text-xs font-mono text-blue-500 hover:text-blue-300 transition-colors shrink-0">
-                                                {po.orderId}
-                                            </a>
-                                            {po.receivedBy && (
-                                                <>
-                                                    <span className="text-zinc-700 text-xs">·</span>
-                                                    <span className="text-[10px] font-mono text-cyan-300/80">rcvd by {po.receivedBy}</span>
-                                                </>
-                                            )}
-                                            {discrepancy && (
-                                                <>
-                                                    <span className="text-zinc-700 text-xs">·</span>
-                                                    <span className="text-[10px] font-mono text-amber-300/80">{discrepancy}</span>
-                                                </>
-                                            )}
-                                            <span className="text-zinc-700 text-xs">·</span>
-                                            {po.items.map((item, index) => {
-                                                const badgeMatch = lifecycle.checkMatchDetails({ productIds: [item.productId] });
-                                                const badgeColor = badgeMatch.isLockedDirect
-                                                    ? "text-amber-300 font-bold"
-                                                    : badgeMatch.isLockedBom
-                                                    ? "text-amber-400/90 font-semibold"
-                                                    : badgeMatch.isDirect
-                                                    ? "text-cyan-300 font-semibold"
-                                                    : badgeMatch.isBom
-                                                    ? "text-cyan-400/90 font-medium"
-                                                    : "text-zinc-200";
-                                                const displayQty = item.receivedInWindow !== undefined ? item.receivedInWindow : (item.receivedQuantity ?? item.quantity);
-                                                return (
-                                                    <span key={`${item.productId}-${index}`} className={`text-sm font-mono ${badgeColor}`}>
-                                                        {item.productId}
-                                                        <span className="text-zinc-400 ml-0.5">×{displayQty.toLocaleString()}</span>
-                                                    </span>
-                                                );
-                                            })}
-                                        </div>
-                                        {/* For PARTIAL receipts: show per-item detail breakdown */}
-                                        {getDynamicReceiptStatus(po) === "partial" && po.items.length > 0 && (
-                                            <div className="mt-1.5 space-y-0.5">
-                                                {po.items.map((item) => {
-                                                    const ordered = item.orderedQuantity ?? item.quantity;
-                                                    const received = item.receivedQuantity;
-                                                    const open = item.openQuantity;
-                                                    const hasReceivedData = received !== undefined;
-                                                    return (
-                                                        <div key={`${po.orderId}-${item.productId}-detail`} className="text-[10.5px] font-mono">
-                                                            <span className="text-zinc-200">{item.productId}</span>
-                                                            <span className="text-zinc-500"> ordered </span>
-                                                            <span className="text-zinc-300">{fmtQty(ordered)}</span>
-                                                            {hasReceivedData ? (
-                                                                <>
-                                                                    <span className="text-zinc-500"> · received </span>
-                                                                    <span className="text-cyan-300">{fmtQty(received)}</span>
-                                                                    {(open ?? 0) > 0 && (
-                                                                        <>
-                                                                            <span className="text-zinc-500"> · </span>
-                                                                            <span className="text-rose-300">short {fmtQty(open)}</span>
-                                                                        </>
-                                                                    )}
-                                                                </>
-                                                            ) : (
-                                                                <span className="text-zinc-600"> · received unknown</span>
-                                                            )}
-                                                        </div>
-                                                    );
-                                                })}
-                                            </div>
-                                        )}
-                                        {po.receiptHistory && po.receiptHistory.length > 0 && (
-                                            <div className="mt-1 space-y-0.5 border-l border-amber-500/30 pl-2">
-                                                {po.receiptHistory.map((receipt, index) => (
-                                                    <div key={`${po.orderId}-${receipt.shipmentId || index}`} className="text-[10.5px] font-mono text-zinc-400">
-                                                        <span className="text-amber-300">rcv{index + 1} {fmtDateTime(receipt.receiveDateTime || receipt.receiveDate)}</span>
-                                                        {receipt.receivedBy && <span className="text-cyan-300/70"> by {receipt.receivedBy}</span>}
-                                                        <span className="text-zinc-600"> · </span>
-                                                        <span className="text-zinc-300">{receiptItemsText(receipt.items)}</span>
+                                        {showAllReceived ? "−" : "+"}
+                                        <span>{showAllReceived ? "Hide settled POs" : `Show all ${settledPos.length} settled POs`}</span>
+                                    </button>
+                                    {showAllReceived && settledPos.map(po => {
+                                        const discrepancy = partialDiscrepancy(po);
+                                        const badge = receiptBadge(po);
+                                        return (
+                                            <div key={po.orderId} className="border-b border-zinc-800/30">
+                                                <div className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono hover:bg-zinc-800/10 transition-colors">
+                                                    <span className="text-zinc-500 shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
+                                                    <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
+                                                        className="text-blue-500 hover:text-blue-300 shrink-0 font-semibold">
+                                                        {po.orderId}
+                                                    </a>
+                                                    <span className="text-zinc-300 truncate">{po.supplier}</span>
+                                                    {badge && (
+                                                        <span className={`text-[9px] font-mono px-1 py-px rounded border shrink-0 ${badge.cls}`}>
+                                                            {badge.label}
+                                                        </span>
+                                                    )}
+                                                    <span className="text-zinc-500 shrink-0 ml-auto">{fmtDollars(po.total)}</span>
+                                                </div>
+                                                {discrepancy && (
+                                                    <div className="px-4 pb-1.5 text-[10px] font-mono text-amber-300/80 -mt-0.5">
+                                                        {discrepancy}
                                                     </div>
-                                                ))}
+                                                )}
                                             </div>
-                                        )}
-                                        {/* ── Pre-completion Match Comparison View ── */}
-                                                                                <div className="mt-2.5 pt-2 border-t border-zinc-800/50 bg-zinc-900/10 px-2.5 py-2 rounded">
-                                                                                    {/* Document Reference Links */}
-                                                                                    {(() => {
-                                                                                        const rec = po._reconciliation;
-                                                                                        const apLabel = apStatus?.label || "";
-                                                                                        const isComplete = apLabel === "RECONCILED" && getDynamicReceiptStatus(po) === "full";
-                                                                                        return (
-                                                                                            <>
-                                                                                                {rec?.matchedInvoice && !isComplete && (
-                                                                                                    <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono mb-2">
-                                                                                                        <span className="text-zinc-600">📎</span>
-                                                                                                        <span className="text-zinc-500">{rec.matchedInvoice.invoice_number}</span>
-                                                                                                        {rec.matchedInvoice.pdf_storage_path && (
-                                                                                                            <a
-                                                                                                                href={`/api/storage/invoice-pdf?id=${encodeURIComponent(rec.matchedInvoice.invoice_number)}`}
-                                                                                                                target="_blank"
-                                                                                                                rel="noopener noreferrer"
-                                                                                                                onClick={e => e.stopPropagation()}
-                                                                                                                className="text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30"
-                                                                                                            >
-                                                                                                                View Invoice PDF
-                                                                                                            </a>
-                                                                                                        )}
-                                                                                                        {rec.matchedInvoice.source_ref && (
-                                                                                                            <a
-                                                                                                                href={`https://mail.google.com/mail/u/0/#inbox/${rec.matchedInvoice.source_ref}`}
-                                                                                                                target="_blank"
-                                                                                                                rel="noopener noreferrer"
-                                                                                                                onClick={e => e.stopPropagation()}
-                                                                                                                className="text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30"
-                                                                                                            >
-                                                                                                                View in Gmail
-                                                                                                            </a>
-                                                                                                        )}
-                                                                                                        <a
-                                                                                                            href={po.finaleUrl}
-                                                                                                            target="_blank"
-                                                                                                            rel="noopener noreferrer"
-                                                                                                            onClick={e => e.stopPropagation()}
-                                                                                                            className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 decoration-emerald-500/30"
-                                                                                                        >
-                                                                                                            View PO in Finale
-                                                                                                        </a>
-                                                                                                    </div>
-                                                                                                )}
-
-                                                                                                {/* Next-action badge */}
-                                                                                                {!isComplete && (
-                                                                                                    <div className="mb-2">
-                                                                                                        <span className="text-[10px] font-mono text-zinc-500">
-                                                                                                            {getNextActionText(po, apLabel)}
-                                                                                                        </span>
-                                                                                                    </div>
-                                                                                                )}
-                                                                                            </>
-                                                                                        );
-                                                                                    })()}
-
-                                                                                    {/* MatchComparisonView */}
-                                                                                    <MatchComparisonView
-                                                                                        po={po}
-                                                                                        apLabel={apStatus?.label || ""}
-                                                                                        diff={comparisonPO.has(po.orderId) ? modifyingPO.get(po.orderId)?.diff : undefined}
-                                                                                        loading={comparisonPO.has(po.orderId) && (modifyingPO.get(po.orderId)?.loading ?? false)}
-                                                                                        error={comparisonPO.has(po.orderId) ? modifyingPO.get(po.orderId)?.error : undefined}
-                                                                                        saving={modifyingPO.get(po.orderId)?.saving ?? false}
-                                                                                        onToggle={() => toggleComparison(po.orderId)}
-                                                                                        onComplete={() => handleCompletePO(po.orderId, po.supplier)}
-                                                                                        onApply={(adjustments, freight) => {
-                                                                                            applyPOInvoiceModification(po.orderId, adjustments, freight);
-                                                                                        }}
-                                                                                    />
-                                                                                </div>
-
-                                                                                {/* ── Gate Refusal Banner ── */}
-                                                                                {gateBlockReason.has(po.orderId) && (() => {
-                                                                                    const reason = gateBlockReason.get(po.orderId)!;
-                                                                                    return (
-                                                                                        <div className="mt-2 px-3 py-2.5 border border-rose-500/30 bg-rose-950/15 rounded flex items-start gap-2">
-                                                                                            <span className="text-rose-400 text-[11px] mt-0.5 shrink-0">🚫</span>
-                                                                                            <div className="flex-1 min-w-0">
-                                                                                                <div className="text-[10px] font-mono text-rose-400 font-semibold uppercase tracking-wider mb-0.5">3-Way Match Gate Refused</div>
-                                                                                                <div className="text-[11px] font-mono text-rose-200/90 leading-relaxed">{reason}</div>
-                                                                                            </div>
-                                                                                            <button
-                                                                                                onClick={() => setGateBlockReason(prev => { const next = new Map(prev); next.delete(po.orderId); return next; })}
-                                                                                                className="text-rose-400/40 hover:text-rose-300 shrink-0 text-[11px]"
-                                                                                            >✕</button>
-                                                                                        </div>
-                                                                                    );
-                                                                                })()}
-
-                                                                                                {/* ── PO Modifier Inline Expansion ── */}
-                                                        {modifyingPO.has(po.orderId) && (() => {
-                                                        const m = modifyingPO.get(po.orderId)!;
-                                                        if (m.loading) {
-                                                        return (
-                                                            <div className="mt-2 px-3 py-3 border border-cyan-500/20 bg-cyan-950/10 rounded">
-                                                                <span className="text-[11px] font-mono text-cyan-300/70 animate-pulse">Loading invoice-PO diff...</span>
-                                                            </div>
-                                                        );
-                                                        }
-                                                        if (m.error) {
-                                                        return (
-                                                            <div className="mt-2 px-3 py-3 border border-rose-500/30 bg-rose-950/10 rounded">
-                                                                <span className="text-[11px] font-mono text-rose-400">⚠ {m.error}</span>
-                                                                <button onClick={() => toggleModifier(po.orderId)} className="ml-2 text-[10px] font-mono text-zinc-500 hover:text-zinc-300">Close</button>
-                                                            </div>
-                                                        );
-                                                        }
-                                                        const diff = m.diff;
-                                                        if (!diff || !diff.hasChanges) {
-                                                        return (
-                                                            <div className="mt-2 px-3 py-3 border border-emerald-500/20 bg-emerald-950/10 rounded">
-                                                                <div className="flex items-center justify-between">
-                                                                    <span className="text-[11px] font-mono text-emerald-400">✅ PO matches invoice — no adjustments needed</span>
-                                                                    <div className="flex items-center gap-2">
-                                                                                                                                                <button
-                                                                                                                                                    onClick={e => {
-                                                                                                                                                        e.stopPropagation();
-                                                                                                                                                        handleCompletePO(po.orderId, po.supplier);
-                                                                                                                                                    }}
-                                                                                                                                                    className="px-2 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors"
-                                                                                                                                                >
-                                                                                                                                                    Complete PO
-                                                                                                                                                </button>
-                                                                        <button onClick={() => toggleModifier(po.orderId)} className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300">Close</button>
-                                                                    </div>
-                                                                </div>
-                                                            </div>
-                                                        );
-                                                        }
-                                                        // Has changes: show diff table + apply button
-                                                        const hasVerifiedStep = diff.totalDiff != null && Math.abs(diff.totalDiff) < 0.01;
-                                                        return (
-                                                        <div className="mt-2 border border-amber-500/30 bg-amber-950/10 rounded overflow-hidden">
-                                                            <div className="px-3 py-2 border-b border-amber-500/20 flex items-center justify-between">
-                                                                <span className="text-[10px] font-mono uppercase tracking-wider text-amber-300/80">PO-Invoice Variance</span>
-                                                                <span className="text-[10px] font-mono text-zinc-500">
-                                                                    Total: PO ${diff.poTotal.toFixed(2)} → Invoice ${(diff.invoiceTotal ?? diff.poTotal).toFixed(2)}
-                                                                    {diff.totalDiff != null && (
-                                                                        <span className={`ml-1 ${diff.totalDiff > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                                                                            ({diff.totalDiff > 0 ? '+' : ''}{diff.totalDiff.toFixed(2)})
-                                                                        </span>
-                                                                    )}
-                                                                </span>
-                                                            </div>
-                                                            {/* Per-line-item diff table */}
-                                                            <div className="px-3 py-2 space-y-1.5">
-                                                                {diff.lineItems.filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null).map((li: any) => (
-                                                                    <div key={li.productId} className="flex items-center gap-2 text-[10px] font-mono">
-                                                                        <span className="w-16 truncate text-zinc-200 font-semibold">{li.productId}</span>
-                                                                        {li.quantityDiff !== null && (
-                                                                            <span className={li.quantityDiff > 0 ? 'text-rose-300' : 'text-emerald-300'}>
-                                                                                qty: {li.poQuantity} → {li.invoiceQuantity}
-                                                                                <span className="text-zinc-600 ml-0.5">({li.quantityDiff > 0 ? '+' : ''}{li.quantityDiff})</span>
-                                                                            </span>
-                                                                        )}
-                                                                        {li.priceDiff !== null && (
-                                                                            <span className={li.priceDiff > 0 ? 'text-rose-300' : 'text-emerald-300'}>
-                                                                                ${li.poUnitPrice.toFixed(2)} → ${li.invoiceUnitPrice?.toFixed(2)}
-                                                                                <span className="text-zinc-600 ml-0.5">({li.priceDiff > 0 ? '+' : ''}${li.priceDiff.toFixed(2)})</span>
-                                                                            </span>
-                                                                        )}
-                                                                    </div>
-                                                                ))}
-                                                                {diff.freightDiff != null && (
-                                                                    <div className="flex items-center gap-2 text-[10px] font-mono pt-1 border-t border-zinc-700/40">
-                                                                        <span className="text-zinc-400">Freight</span>
-                                                                        <span className={diff.freightDiff > 0 ? 'text-rose-300' : 'text-emerald-300'}>
-                                                                            ${diff.poFreight.toFixed(2)} → ${(diff.invoiceFreight ?? 0).toFixed(2)}
-                                                                            <span className="text-zinc-600 ml-0.5">({diff.freightDiff > 0 ? '+' : ''}${diff.freightDiff.toFixed(2)})</span>
-                                                                        </span>
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                            {/* Apply / Cancel buttons */}
-                                                            <div className="px-3 py-2 border-t border-amber-500/20 flex items-center gap-2 justify-end">
-                                                                <button
-                                                                    onClick={() => toggleModifier(po.orderId)}
-                                                                    className="px-2 py-1 rounded text-[10px] font-mono text-zinc-400 hover:text-zinc-200 border border-zinc-700/40 hover:border-zinc-600 transition-colors"
-                                                                >
-                                                                    Cancel
-                                                                </button>
-                                                                <button
-                                                                    onClick={e => {
-                                                                        e.stopPropagation();
-                                                                        const adjustments = diff.lineItems
-                                                                            .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                                                            .map((li: any) => ({
-                                                                                productId: li.productId,
-                                                                                newQuantity: li.invoiceQuantity ?? undefined,
-                                                                                newUnitPrice: li.invoiceUnitPrice ?? undefined,
-                                                                            }));
-                                                                        applyPOInvoiceModification(po.orderId, adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null);
-                                                                        }}
-                                                                        disabled={m.saving}
-                                                                        className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${m.saving
-                                                                            ? 'bg-amber-500/10 text-amber-400/50 border border-amber-500/30 cursor-wait'
-                                                                            : 'bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer'
-                                                                        }`}
-                                                                        >
-                                                                        {m.saving ? 'Applying...' : 'Apply Changes to PO'}
-                                                                        </button>
-                                                                        /* Apply & Complete — apply modifications, then complete through gate-checked API */
-                                                                                                                                                <button
-                                                                                                                                                onClick={e => {
-                                                                                                                                                    e.stopPropagation();
-                                                                                                                                                    const adjustments = diff.lineItems
-                                                                                                                                                        .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                                                                                                                                        .map((li: any) => ({
-                                                                                                                                                            productId: li.productId,
-                                                                                                                                                            newQuantity: li.invoiceQuantity ?? undefined,
-                                                                                                                                                            newUnitPrice: li.invoiceUnitPrice ?? undefined,
-                                                                                                                                                        }));
-                                                                                                                                                    // Apply modifications first, then complete through gate
-                                                                                                                                                    applyPOInvoiceModification(po.orderId, adjustments, diff.invoiceFreight != null ? diff.invoiceFreight : null)
-                                                                                                                                                        .then(() => {
-                                                                                                                                                            handleCompletePO(po.orderId, po.supplier);
-                                                                                                                                                        });
-                                                                                                                                                }}
-                                                                        disabled={m.saving}
-                                                                        className="px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer"
-                                                                        >
-                                                                        Apply & Complete PO
-                                                                        </button>
-                                                            </div>
-                                                        </div>
-                                                        );
-                                                        })()}
-                                    </div>
-                                );
-                            })}
+                                        );
+                                    })}
+                                </div>
+                            )}
                         </div>
                     )}
 
-                    {!embedded && !loading && !error && pos.length > 0 && (
+                    {!embedded && !loading && !error && visiblePos.length > 0 && (
                         <div onMouseDown={startResize}
                             className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
                     )}
-                            </div>
-                            )}
                 </div>
             )}
         </div>
