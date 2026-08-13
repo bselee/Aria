@@ -316,6 +316,19 @@ export async function importInbox(): Promise<void> {
   console.log(`[billcom-import] ✓ inbox done. Table total: ${total} rows.`);
 }
 
+export async function importCsvFile(csvPath: string): Promise<void> {
+  if (!fs.existsSync(csvPath)) {
+    throw new Error(`CSV not found: ${csvPath}`);
+  }
+  const rows = parseCSV(csvPath);
+  const result = importRows(rows);
+  const db = getLocalDb();
+  const total = (db.prepare("SELECT COUNT(*) AS cnt FROM billcom_bills_ref").get() as { cnt: number }).cnt;
+  console.log(
+    `[billcom-import] ${csvPath}: wrote ${result.inserted + result.updated} (err ${result.errors}). Table total: ${total}`,
+  );
+}
+
 export async function main(): Promise<void> {
   console.log(`[billcom-import] Importing Bill.com reference data...`);
 

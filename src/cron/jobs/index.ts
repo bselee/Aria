@@ -1329,8 +1329,10 @@ defineJob({
     onFail: "log",
     description: "Reconcile forwarded invoices against billcom_bills_ref; alert on any that never landed in Bill.com.",
     handler: async () => {
+        const { importInbox } = await import("@/cli/import-billcom-ref");
+        await importInbox();
         const { runForwardVerificationSweep } = await import("@/lib/intelligence/ap/billcom-verify");
-        const result = runForwardVerificationSweep();
+        const result = runForwardVerificationSweep({ staleHours: 240, lookbackDays: 14 });
 
         if (result.refStale) {
             const age = result.refAgeHours !== null ? `${result.refAgeHours.toFixed(1)}h` : "unknown (table empty)";
