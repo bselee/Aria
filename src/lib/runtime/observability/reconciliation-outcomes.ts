@@ -22,7 +22,11 @@ export type ReconciliationOutcome =
     | "expired"            // pending approval hit 24h TTL with no decision
     | "match_failed"       // invoice arrived but no PO match found
     | "rejected_10x"       // ≥10× magnitude guardrail blocked the write
-    | "rejected_invariant"; // subtotal mismatch or price-reasonableness check failed
+    | "rejected_invariant" // subtotal mismatch or price-reasonableness check failed
+    | "three_way_matched"     // PO + receipt + invoice agree within tolerance
+    | "three_way_variance"    // within review band — informational variances noted
+    | "three_way_exception"   // blocking discrepancy (over-bill / price / unknown SKU)
+    | "three_way_incomplete"; // a document leg is missing (e.g. no receipt yet)
 
 export interface OutcomeWrite {
     /** UUID — reuse the ReconciliationRun.id when present; otherwise a fresh UUID */

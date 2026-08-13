@@ -475,12 +475,20 @@ defineJob({
 
 // KAIZEN(2026-06-01): Post-reconciliation receiving check. When goods arrive
 // after an invoice was reconciled, re-checks quantities and alerts if short.
+// KAIZEN(2026-08-12): Also syncs Finale receipt data into po_receipt_data
+// (the receiving leg for three-way match / variance views) before re-checking.
 defineJob({
     name: "po-receipt-recheck",
     schedule: "*/30 8-17 * * 1-5",  // KAIZEN (2026-07-23): weekdays only. No goods arrive off-hours.
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Re-check reconciled invoices against newly received goods (every 30m).",
+    description: "Re-check reconciled invoices against newly received goods + sync Finale receipts (every 30m).",
     handler: async () => {
+        const { syncFinaleReceiptData } = await import("@/lib/purchasing/finale-receipt-sync");
+        const syncResult = await syncFinaleReceiptData();
+        if (syncResult.errors > 0) {
+            console.warn(`[po-receipt-recheck] receipt sync had ${syncResult.errors} error(s)`);
+        }
+
         const { recheckReconciledInvoices } = await import("@/lib/purchasing/po-receipt-recheck");
         await recheckReconciledInvoices();
     },
@@ -1368,6 +1376,27 @@ defineJob({
                 `[invoice-po-auto-match] auto-matched=${result.autoMatched.length}, ` +
                 `needs-review=${result.needsReview}`
             );
+        }
+
+        // HERMIA(2026-08-12): post-pass — run the 3-way match automation over
+        // matched invoices (the ones just assigned plus any backlog). Loads
+        // PO + receipt + invoice, writes three_way_* outcomes, and records
+        // clean matches in confirmed_po_matches so the matcher learns them.
+        try {
+            const { runThreeWayMatchAutomation } = await import(
+                "@/lib/purchasing/three-way-match-runner"
+            );
+            const tw = await runThreeWayMatchAutomation();
+            if (tw.processed > 0) {
+                console.log(
+                    `[three-way-match] processed=${tw.processed} matched=${tw.matched} ` +
+                    `variance=${tw.variance} exception=${tw.exception} ` +
+                    `incomplete=${tw.incomplete} confirmed=${tw.confirmed} ` +
+                    `skipped=${tw.skippedExisting} errors=${tw.errors}`
+                );
+            }
+        } catch (err: any) {
+            console.warn(`[three-way-match] run failed: ${err?.message ?? err}`);
         }
     },
     budget: { durationMs: 120_000 },
