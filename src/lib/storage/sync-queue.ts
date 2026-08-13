@@ -182,6 +182,45 @@ async function executeSyncTask(task: {
             return true; // Not an error — nothing to sync
         }
 
+        // ── Lifecycle re-corruption guard (2026-08-12) ─────────────────────
+        // The PO lifecycle columns are owned by the state machine
+        // (transitionLifecycleState), NOT by this sync. Any payload that still
+        // carries a lifecycle_state/lifecycle_stage (e.g. an explicit payload_json
+        // from a caller) must pass assertValidTransition before it may overwrite
+        // the canonical state; otherwise it is stripped so the self-heal can
+        // never re-stamp RECEIVED the way the 2026-07-27 unfiltered-PATCH did.
+        if (table === "purchase_orders" && payload) {
+            const p = payload as Record<string, unknown>;
+            const incomingState = p.lifecycle_state as string | null | undefined;
+            // Validate BEFORE the self-heal would overwrite (defense-in-depth):
+            // a payload that still carries a lifecycle_state must pass
+            // assertValidTransition, otherwise the transition is logged and
+            // the field is dropped below.
+            if (incomingState) {
+                try {
+                    const { data: cur } = await db
+                        .from("purchase_orders")
+                        .select("lifecycle_state")
+                        .eq(getPKColumn(table), id)
+                        .maybeSingle();
+                    const currentState = (cur as { lifecycle_state?: string | null } | null)
+                        ?.lifecycle_state ?? null;
+                    const { assertValidTransition } = await import(
+                        "@/lib/purchasing/po-lifecycle"
+                    );
+                    assertValidTransition(currentState, incomingState);
+                } catch (guardErr) {
+                    console.warn(
+                        `[sync-queue] BLOCKED lifecycle transition for ${id}: ` +
+                            `${(guardErr as Error).message} — lifecycle field dropped from sync`
+                    );
+                }
+            }
+            // Aria owns lifecycle columns — never let this sync write them.
+            delete p.lifecycle_state;
+            delete p.lifecycle_stage;
+        }
+
         await db.from(table).upsert(payload, { onConflict: getPKColumn(table) });
         return true;
     } catch (err: any) {
@@ -222,13 +261,17 @@ function fetchRecordFromCache(table: string, id: string): Record<string, unknown
                     `SELECT * FROM po_cache WHERE po_number = ?`
                 ).get(id) as any;
                 if (!row) return null;
+                // NOTE: lifecycle_state / lifecycle_stage are deliberately OMITTED.
+                // The lifecycle columns are owned by the PO state machine
+                // (transitionLifecycleState), not by the Finale sync. Syncing them
+                // here is how the 2026-07-27 unfiltered-PATCH bug re-stamped
+                // lifecycle_state=RECEIVED across the table. See executeSyncTask().
                 return {
                     po_number: row.po_number,
                     vendor_name: row.vendor_name,
                     status: row.status,
                     total_amount: row.total_amount,
                     line_items: row.line_items,
-                    lifecycle_state: row.lifecycle_state,
                     estimated_eta: row.estimated_eta,
                     updated_at: row.updated_at,
                 };
