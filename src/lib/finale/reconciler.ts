@@ -500,7 +500,7 @@ export async function approvePendingReconciliation(id: string): Promise<{
             }
 
             // Update structured invoice state
-            await db.from("invoices").update({
+            await db.from("vendor_invoices").update({
                 status: "reconciled"
             })
                 .eq("invoice_number", entry.result.invoiceNumber)
@@ -668,7 +668,7 @@ export async function rejectPendingReconciliation(id: string): Promise<string> {
             });
 
             // Update structured invoice state
-            await db.from("invoices").update({
+            await db.from("vendor_invoices").update({
                 status: "matched_review"
             })
                 .eq("invoice_number", entry.result.invoiceNumber)
@@ -2767,7 +2767,7 @@ async function deduplicateTrackingNumbers(
 
         // Check which tracking numbers already exist in any invoice record
         const { data: existingInvoices } = await db
-            .from("invoices")
+            .from("vendor_invoices")
             .select("tracking_numbers")
             .overlaps("tracking_numbers", trackingNumbers);
 
@@ -2818,14 +2818,14 @@ async function saveTrackingNumbers(
         // Use RPC to merge arrays via array_append to avoid clobbering existing tracking data.
         // Fallback: read existing, merge, write back.
         const { data: existing } = await db
-            .from("invoices")
+            .from("vendor_invoices")
             .select("tracking_numbers")
             .eq("invoice_number", invoiceNumber)
             .maybeSingle();
         const existingTracking = (existing as any)?.tracking_numbers as string[] || [];
         const merged = [...new Set([...existingTracking, ...trackingNumbers])];
         await db
-            .from("invoices")
+            .from("vendor_invoices")
             .update({ tracking_numbers: merged })
             .eq("invoice_number", invoiceNumber);
     } catch (err: any) {

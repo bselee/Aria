@@ -499,9 +499,10 @@ export async function POST(req: Request) {
                 .update({ status: "approved", updated_at: now })
                 .eq("id", (approval as any).id);
 
-            // 3. Update invoices table: status = 'matched_approved' where po_number = orderId
+            // 3. Update vendor_invoices table: status = 'matched_approved' where po_number = orderId
+            //    (legacy `invoices` is now a read-only view over vendor_invoices)
             const { error: invErr } = await db
-                .from("invoices")
+                .from("vendor_invoices")
                 .update({ status: "matched_approved", updated_at: now })
                 .eq("po_number", orderId);
 

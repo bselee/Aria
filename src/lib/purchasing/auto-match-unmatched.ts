@@ -251,9 +251,11 @@ export async function runAutoMatchUnmatched(
             }
 
             // ── Apply the match ───────────────────────────────────────────
-            // Always assign po_number to invoices table
+            // Always assign po_number. `invoices` is now a read-only VIEW over
+            // vendor_invoices (20260812_invoice_consolidation) — write the
+            // source table directly; the view carries the same id.
             await db
-                .from("invoices")
+                .from("vendor_invoices")
                 .update({
                     po_number: poToAssign,
                     status: "matched_unreconciled",
@@ -387,9 +389,11 @@ export async function applyPOCandidate(
 
     const now = new Date().toISOString();
 
-    // Update invoices table
+    // Update invoice record — `invoices` is now a read-only VIEW over
+    // vendor_invoices (20260812_invoice_consolidation); the view's id IS the
+    // vendor_invoices id, so write the source table.
     await db
-        .from("invoices")
+        .from("vendor_invoices")
         .update({
             po_number: poNumber.trim(),
             status: "matched_unreconciled",
@@ -510,8 +514,9 @@ export async function approveCloseMatchUnreconciled(): Promise<{
 
             if (variance <= 0.02) {
                 // Within 2% — auto-approve
+                // (`invoices` is now a read-only VIEW over vendor_invoices)
                 await db
-                    .from("invoices")
+                    .from("vendor_invoices")
                     .update({
                         status: "auto_approved",
                     })

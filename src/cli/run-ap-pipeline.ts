@@ -372,13 +372,12 @@ async function main() {
                 console.error("   ❌ Document insert failed:", docError.message);
             }
 
-            const { error: invError } = await db.from("invoices").upsert({
+            const { error: invError } = await db.from("vendor_invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber || null,
                 invoice_date: invoiceData.invoiceDate,
                 due_date: invoiceData.dueDate || invoiceData.invoiceDate,
-                payment_terms: invoiceData.paymentTerms,
                 subtotal: invoiceData.subtotal,
                 freight: invoiceData.freight || 0,
                 tax: invoiceData.tax || 0,
@@ -386,11 +385,11 @@ async function main() {
                 labor: invoiceData.labor || 0,
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
-                amount_due: invoiceData.amountDue,
                 status: matched ? "matched_review" : "unmatched",
-                document_id: documentId,
+                source: "email_attachment",
+                source_ref: String(documentId ?? ""),
                 raw_data: invoiceData,
-            }, { onConflict: "invoice_number" }).select("id").single();
+            }, { onConflict: "vendor_name,invoice_number" }).select("id").single();
 
             if (invError) {
                 console.error("   ❌ Invoice upsert failed:", invError.message);
