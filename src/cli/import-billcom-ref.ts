@@ -301,7 +301,8 @@ function importRows(rows: ParsedRow[]): { inserted: number; updated: number; err
 export async function importInbox(): Promise<void> {
   const files = listBillComInboxCsvs().filter((f) => (f.vendorCount ?? 0) > 1);
   if (files.length === 0) {
-    throw new Error("no multi-vendor CSVs in Downloads/Aria-Ingest/billcom/");
+    console.log("[billcom-import] inbox empty — drop AllBillsPage.csv in Downloads/Aria-Ingest/billcom/ then re-run");
+    return;
   }
   console.log(`[billcom-import] inbox: ${files.length} multi-vendor file(s)`);
   for (const f of files) {

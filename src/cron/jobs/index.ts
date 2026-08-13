@@ -1294,16 +1294,16 @@ defineJob({
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// HERMIA(2026-08-13): Import weekly CUA/manual All Bills CSVs from
-// ~/Downloads/Aria-Ingest/billcom/. Playwright download is retired — login
-// cookies die and filtered exports poisoned the ref table. CUA (or Bill)
-// drops the current All Bills page (~100 active) into that folder.
+// HERMIA(2026-08-13): Import All Bills CSVs from ~/Downloads/Aria-Ingest/billcom/.
+// No Playwright. No unattended CUA (Chrome will not be on Bill.com).
+// Source of files: Bill (or a live session) drops the current ~100-row export.
+// Empty inbox = skip, not a crash.
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "billcom-ref-import",
-    schedule: "30 7 * * 1",  // Monday 7:30 AM — after CUA drop
+    schedule: "30 7 * * 1",  // Monday 7:30 AM
     onFail: "log",
-    description: "Monday 7:30 AM: import multi-vendor AllBills CSVs from Aria-Ingest/billcom (no Playwright).",
+    description: "Monday 7:30 AM: import multi-vendor AllBills CSVs from Aria-Ingest/billcom if present.",
     handler: async () => {
         const { importInbox } = await import("@/cli/import-billcom-ref");
         await importInbox();
