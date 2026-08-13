@@ -244,9 +244,21 @@ function fetchRecordFromCache(table: string, id: string): Record<string, unknown
                     `SELECT * FROM shipments_cache WHERE tracking_number = ?`
                 ).get(id) as any;
                 if (!row) return null;
+                // KAIZEN(2026-08-12, t_1cb3c67c): po_numbers is stored as a JSON
+                // string in SQLite but must reach PostgREST as a real text[]
+                // array. Legacy payloads passed the raw string, which PostgREST
+                // could not cast → PO refs silently dropped from shipments.
+                let poNumbers: string[] = [];
+                try {
+                    const parsed = JSON.parse(row.po_numbers || "[]");
+                    if (Array.isArray(parsed)) poNumbers = parsed.map(String);
+                } catch { /* non-JSON → empty */ }
                 return {
                     tracking_number: row.tracking_number,
-                    po_numbers: row.po_numbers,
+                    tracking_key: row.tracking_number.includes(":::")
+                        ? `${row.tracking_number.split(":::", 1)[0].trim().toLowerCase()}:${row.tracking_number.split(":::", 2)[1].trim().toLowerCase()}`
+                        : `unknown:${row.tracking_number.toLowerCase()}`,
+                    po_numbers: poNumbers,
                     status_category: row.status_category,
                     status_display: row.status_display,
                     estimated_delivery_at: row.estimated_delivery_at,

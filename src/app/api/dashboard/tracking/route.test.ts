@@ -15,6 +15,13 @@ vi.mock("@/lib/tracking/shipment-intelligence", () => ({
     })),
     getDashboardTrackingBoard: boardMock,
     getBestTrackingAnswerForQuery: answerMock,
+    getOpenPOTrackingCoverage: vi.fn().mockResolvedValue({
+        totalOpen: 0,
+        withTrackingIntel: 0,
+        withoutTracking: [],
+        coveragePct: 0,
+        asOf: "2026-04-02T15:00:00.000Z",
+    }),
 }));
 
 import { GET } from "./route";
