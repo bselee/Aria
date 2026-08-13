@@ -1357,6 +1357,71 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Forward → Bill.com verification sweep (HERMIA 2026-08-13).
+// forwardInvoiceOnce marks a row FORWARDED the instant Gmail accepts the
+// message — nothing ever confirms Bill.com parsed the PDF into a bill (AAA
+// Cooper freight: 5 weeks of "successfully forwarded" while ~$35K went
+// unpaid). This job reconciles ap_local_forwards against billcom_bills_ref,
+// writes verified=1 on confirmations, and alerts Bill about forwards that
+// never landed. When the ref table is stale (billcom-ref-import failing
+// silently since 2026-07-05), it logs the staleness and skips alerting —
+// flagging against stale data would produce a wall of false positives.
+// Runs at 9 AM MT, after the 7 AM billcom-ref-import refresh.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "ap-forward-verification",
+    schedule: "0 9 * * *",  // 9 AM MT — after the 7 AM ref import
+    onFail: "log",
+    description: "Reconcile forwarded invoices against billcom_bills_ref; alert on any that never landed in Bill.com.",
+    handler: async () => {
+        const { runForwardVerificationSweep } = await import("@/lib/intelligence/ap/billcom-verify");
+        const result = runForwardVerificationSweep();
+
+        if (result.refStale) {
+            const age = result.refAgeHours !== null ? `${result.refAgeHours.toFixed(1)}h` : "unknown (table empty)";
+            console.warn(
+                `[ap-forward-verification] SKIPPING verification: billcom_bills_ref is stale ` +
+                `(${age} old) — cannot trust it to confirm forwards. Fix billcom-ref-import first.`
+            );
+            return;
+        }
+
+        console.log(
+            `[ap-forward-verification] checked=${result.checked}, verified=${result.verified}, ` +
+            `alreadyVerified=${result.alreadyVerified}, unadjudicable=${result.unadjudicable}, ` +
+            `unconfirmed=${result.unconfirmed.length}, refCoverageStart=${result.refCoverageStart ?? "n/a"}`
+        );
+
+        if (result.unconfirmed.length === 0) return;
+
+        // ONE consolidated message — never one per item. Truncate only if the
+        // list would overflow Telegram's message size; the count is always exact.
+        const MAX_LINES = 40;
+        const lines = result.unconfirmed.slice(0, MAX_LINES).map(
+            (r) => `• ${r.vendorName ?? "(unknown vendor)"} — ${r.invoiceNumber ?? "(no invoice#)"} — ${r.pdfFilename} (${r.ageHours.toFixed(0)}h ago)`
+        );
+        if (result.unconfirmed.length > MAX_LINES) {
+            lines.push(`…and ${result.unconfirmed.length - MAX_LINES} more`);
+        }
+        const text = [
+            `🔴 *${result.unconfirmed.length} forwarded invoice(s) never landed in Bill.com*`,
+            "",
+            ...lines,
+            "",
+            "Check Bill.com and re-forward or pay manually.",
+        ].join("\n");
+
+        try {
+            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            await sendTelegramNotify(text);
+        } catch (err: any) {
+            console.error(`[ap-forward-verification] Telegram notify failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 60_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Invoice → PO Auto-Matcher — finds unmatched invoices and suggests PO matches.
 // Runs every 30 min. Auto-applies matches scoring ≥80 with exactly one candidate.
 // Lower-confidence matches queue for human review in the receivings panel.
