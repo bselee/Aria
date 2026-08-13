@@ -122,6 +122,24 @@ describe("evaluateCompletionGate — unknown SKU (the PO 125051 regression)", ()
         expect(r.blockReason).toMatch(/not present on the PO/);
     });
 
+    it("does NOT false-block a sku-less invoice line that matches by description (2026-08-13 regression)", () => {
+        // Review found: a clean agreement (qty 10/10, price 5/5, matching
+        // description, sku absent on the invoice line) returned ok:false with
+        // "UNKNOWN (Widget): invoiced but not present on the PO" — the sku-less
+        // line was consumed by the description match AND re-emitted in the
+        // invoice-only pass. Fail-open policy: no SKU -> cannot attribute to a
+        // missing PO product.
+        const r = evaluateCompletionGate(
+            gateInput({
+                poLines: [{ productId: "SKU-1", description: "Widget", quantity: 10, unitPrice: 5 }],
+                invoiceLines: [{ sku: "", description: "Widget", qty: 10, unitPrice: 5 }],
+                receivedQtys: { "SKU-1": 10 },
+            }),
+        );
+        expect(r.ok).toBe(true);
+        expect(r.summary).not.toMatch(/UNKNOWN/);
+    });
+
     it("still blocks when the PO line has a missing unitPrice (local cache strips prices)", () => {
         const r = evaluateCompletionGate(
             gateInput({

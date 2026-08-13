@@ -270,9 +270,10 @@ export async function transitionLifecycleState(
             // before corrections posted, if at all.
             //
             // Gate policy per target state:
-            //   - COMPLETED: always gate. A missing receipt/invoice leg is
-            //     "incomplete" and blocks completion — you can't complete
-            //     without all three documents agreeing.
+            //   - COMPLETED: always gate. FAIL-OPEN when line-item data is
+            //     missing (most OCR rows have empty line_items — fail-closed
+            //     would brick completion); blocks only on a GENUINE mismatch
+            //     once both sides have lines.
             //   - RECONCILED: gate ONLY when a matched invoice AND concrete
             //     receipt evidence both exist. Reconciliation legitimately
             //     precedes physical receipt in the normal AP flow (invoice

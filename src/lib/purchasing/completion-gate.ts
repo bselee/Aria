@@ -166,12 +166,21 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
 export function buildThreeWayLines(input: CompletionGateInput): ThreeWayLine[] {
     const lines: ThreeWayLine[] = [];
     const matchedInvSkus = new Set<string>();
+    // Identity set of consumed invoice lines. lineMatches can pair an invoice
+    // line by DESCRIPTION when it carries no SKU — tracking only sku strings
+    // let such lines get double-emitted below as a blocking UNKNOWN, so track
+    // the index instead (identity is stable within one buildThreeWayLines call).
+    const consumedInvIdx = new Set<number>();
 
     // PO lines first (each matched against its invoice line, if any).
     for (const pl of input.poLines) {
         const sku = pl.productId ?? "";
-        const il = input.invoiceLines.find((l) => lineMatches(l, pl));
-        if (il && il.sku) matchedInvSkus.add(il.sku);
+        const ilIdx = input.invoiceLines.findIndex((l) => lineMatches(l, pl));
+        const il = ilIdx >= 0 ? input.invoiceLines[ilIdx] : undefined;
+        if (il) {
+            consumedInvIdx.add(ilIdx);
+            if (il.sku) matchedInvSkus.add(il.sku);
+        }
         const receivedQty =
             input.receivedQtys[sku] !== undefined
                 ? input.receivedQtys[sku]
@@ -192,11 +201,15 @@ export function buildThreeWayLines(input: CompletionGateInput): ThreeWayLine[] {
     }
 
     // Invoice-only lines → "line_not_on_po" (blocking) when the PO never lists them.
-    for (const il of input.invoiceLines) {
+    // FAIL-OPEN rule: a line with no SKU cannot be attributed to a missing PO
+    // product — skip it. It was either consumed above (description match) or is
+    // unidentifiable OCR; both belong in the totals-only unexplained view, not
+    // a hard block.
+    input.invoiceLines.forEach((il, idx) => {
         const sku = il.sku ?? "";
-        if (sku && matchedInvSkus.has(sku)) continue;
+        if (!sku || consumedInvIdx.has(idx) || matchedInvSkus.has(sku)) return;
         lines.push({
-            productId: sku || "UNKNOWN",
+            productId: sku,
             description: il.description,
             poQty: 0,
             poUnitPrice: 0,
@@ -204,7 +217,7 @@ export function buildThreeWayLines(input: CompletionGateInput): ThreeWayLine[] {
             invoiceQty: il.qty ?? 0,
             invoiceUnitPrice: il.unitPrice ?? 0,
         });
-    }
+    });
 
     return lines;
 }
