@@ -190,6 +190,12 @@ export function extractTrackingNumbers(text: string): Array<{ carrier: string; t
             const trackingNumber = (match[1] || match[0] || "").trim();
             if (!trackingNumber || trackingNumber.length < 8) continue;
 
+            // HERMIA(2026-08-13): Reject pure-alpha captures (e.g. "Shipment" from
+            // "Track: Shipment" link text). Every real tracking format contains at
+            // least one digit (1Z…, JD…, PRO/BOL digits, digits-digits, 12/15-digit).
+            // The only pattern able to capture pure-alpha is `trk`.
+            if (!/\d/.test(trackingNumber)) continue;
+
             const index = match.index ?? 0;
             let score = CARRIER_BASE[carrier] ?? 40;
 
