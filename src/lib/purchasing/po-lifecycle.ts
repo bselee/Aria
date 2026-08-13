@@ -15,6 +15,11 @@
 
 import { createClient } from "@/lib/db";
 import { getLocalDb } from "@/lib/storage/local-db";
+import {
+    evaluateCompletionGate,
+    extractInvoiceLines,
+    type GatePoLine,
+} from "./completion-gate";
 
 /** Valid lifecycle states */
 export const PO_LIFECYCLE_STATES = [
@@ -115,6 +120,29 @@ function resolveState(state: string | null): POLifecycleState {
 }
 
 /**
+ * Map a canonical lifecycle stage to the simple 3-value `status` enum
+ * (open / closed / received) that purchase_orders.status uses. Aligns the two
+ * enums so dashboard "simple status" views stay consistent with lifecycle.
+ *
+ *   - RECEIVED                    -> "received"
+ *   - CANCELLED / COMPLETED       -> "closed"
+ *   - everything else             -> "open"
+ */
+export function statusForLifecycleStage(
+    stage: POLifecycleState | string
+): string {
+    switch (stage) {
+        case "RECEIVED":
+            return "received";
+        case "CANCELLED":
+        case "COMPLETED":
+            return "closed";
+        default:
+            return "open";
+    }
+}
+
+/**
  * Assert that a state transition is valid.
  * @throws Error if the transition is invalid
  * @internal
@@ -156,6 +184,33 @@ export async function getLifecycleState(
         );
         return null;
     }
+}
+
+/**
+ * Classify a gate error as transient (DB/network) vs structural (import/type).
+ *
+ * HERMIA(2026-08-12): the 3-way gate used to fail-open on EVERY error — a
+ * broken import or a type error in the gate silently allowed POs through
+ * unverified. A transient failure (DB down, timeout) is not evidence the
+ * documents disagree, so it stays fail-open. A structural failure means the
+ * gate itself is broken, so it fails closed (blocks the transition).
+ *
+ * @param err The thrown error.
+ * @returns true when the error is transient (network/DB) and should fail-open.
+ */
+export function isTransientGateError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false; // non-Error → structural
+    const msg = err.message || "";
+    if (
+        /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|EAI_AGAIN|EAI_NODATA|network|fetch failed|timed out|timeout|PGRST|connection|aborted|supabase/i.test(
+            msg,
+        )
+    ) {
+        return true;
+    }
+    const status = (err as any).status ?? (err as any).statusCode;
+    if (typeof status === "number" && status >= 500) return true;
+    return false;
 }
 
 /**
@@ -203,24 +258,27 @@ export async function transitionLifecycleState(
                 return { ok: false, blockReason: (valErr as Error).message };
             }
 
-            // ── HERMIA(2026-08-11): 3-way match gate on RECONCILED/RECEIVED → COMPLETED ─
-            // A transition to COMPLETED means the PO, receipt, and invoice are all
-            // in. We must verify that the three documents actually agree before
-            // claiming completion.
+            // ── HERMIA(2026-08-11): 3-way match gate ─────────────────────────
+            // A transition to COMPLETED means the PO, receipt, and invoice are
+            // all in; a transition to RECONCILED means the invoice has been
+            // matched to the PO. We verify the three documents actually agree
+            // before claiming either.
             //
             // This gate is load-bearing: before it existed, both dashboard
             // "Approve" handlers wrote lifecycle_stage='reconciled' to four
             // tables without ever calling Finale, and POs were marked complete
-            // before corrections posted, if at all. Now:
-            //   - The gate checks line-item agreement.
-            //   - Failure returns — the PO stays at its current state with a clear log.
-            //   - The caller (complete_po / approve handler) surfaces the refusal.
+            // before corrections posted, if at all.
             //
-            // HERMIA(2026-08-11): The gate now accepts real per-line received
-            // quantities from the caller (via metadata.receivedQtys) instead of
-            // faking receivedQty = poQty. It also loads pack sizes from
-            // sku_pack_sizes to normalize case-billed invoices.
-            if (toState === "COMPLETED") {
+            // Gate policy per target state:
+            //   - COMPLETED: always gate. A missing receipt/invoice leg is
+            //     "incomplete" and blocks completion — you can't complete
+            //     without all three documents agreeing.
+            //   - RECONCILED: gate ONLY when a matched invoice AND concrete
+            //     receipt evidence both exist. Reconciliation legitimately
+            //     precedes physical receipt in the normal AP flow (invoice
+            //     arrives before goods), so a missing receipt here is
+            //     "incomplete", not a block — the gate simply waits.
+            if (toState === "COMPLETED" || toState === "RECONCILED") {
                 try {
                 // Use createClient() for the 3-way gate — this runs before
                 // Phase 2's supabase handle is initialized.
@@ -228,41 +286,85 @@ export async function transitionLifecycleState(
                 if (!gateDb) {
                     console.log("[po-lifecycle] 3-way match skipped: DB unavailable");
                 } else {
-                    const [poRes, invRes] = await Promise.all([
+                    // Load PO lines + the matched invoice from vendor_invoices (the
+                    // single source of truth for OCR invoice lines) + the receipt
+                    // leg from po_receipt_data (Finale shipment receipt items).
+                    const [poRes, invRes, receiptRes] = await Promise.all([
                         gateDb
                             .from("purchase_orders")
                             .select("line_items, total, status, receive_date")
                             .eq("po_number", poNumber)
                             .maybeSingle(),
                         gateDb
-                            .from("invoices")
-                            .select("line_items, total, status")
+                            .from("vendor_invoices")
+                            .select("line_items, raw_data, total, status")
                             .eq("po_number", poNumber)
                             .order("created_at", { ascending: false })
                             .limit(1)
+                            .maybeSingle(),
+                        gateDb
+                            .from("po_receipt_data")
+                            .select("total_received, fully_received, line_items")
+                            .eq("po_number", poNumber)
                             .maybeSingle(),
                     ]);
 
                     const poData = (poRes as any)?.data;
                     const invoiceData = (invRes as any)?.data;
-                    const hasReceipt = !!(poData as any)?.receive_date
-                        && new Date((poData as any).receive_date).getTime() < Date.now();
+                    const receiptData = (receiptRes as any)?.data;
 
-                    // Extract real received quantities from metadata (provided by caller)
-                    const receivedQtys: Record<string, number> =
-                        (metadata?.receivedQtys as Record<string, number>) ?? {};
+                    // Concrete receipt evidence: a past receive_date OR actual
+                    // receipt quantities from the Finale receipt leg.
+                    const poReceiveDatePast =
+                        !!(poData as any)?.receive_date &&
+                        new Date((poData as any).receive_date).getTime() < Date.now();
+                    const hasReceipt =
+                        poReceiveDatePast ||
+                        (!!receiptData &&
+                            (Number(receiptData.total_received) > 0 ||
+                                receiptData.fully_received === true));
+                    const hasInvoice = !!invoiceData;
 
-                    // Extract pack multipliers from metadata (caller-provided) or load from DB
-                    const metadataPackMultipliers: Record<string, number> =
-                        (metadata?.packMultipliers as Record<string, number>) ?? {};
+                    // RECONCILED gate fires only when BOTH receipt and invoice
+                    // exist. Otherwise the verification is genuinely incomplete
+                    // (not failed) — skip rather than block.
+                    if (toState === "RECONCILED" && !(hasInvoice && hasReceipt)) {
+                        console.log(
+                            `[po-lifecycle] 3-way match SKIPPED for ${poNumber} → RECONCILED ` +
+                                `(receipt=${hasReceipt}, invoice=${hasInvoice}) — incomplete, not failed`,
+                        );
+                    } else {
+                        // Extract received quantities: caller-provided (metadata)
+                        // first, then the receipt leg line_items fallback.
+                        const receivedQtys: Record<string, number> =
+                            (metadata?.receivedQtys as Record<string, number>) ?? {};
+                        for (const rl of ((receiptData?.line_items ?? []) as any[])) {
+                            if (rl.sku != null && receivedQtys[String(rl.sku)] === undefined) {
+                                receivedQtys[String(rl.sku)] = Number(rl.received ?? 0);
+                            }
+                        }
 
-                    if (invoiceData?.line_items && poData?.line_items) {
+                        // Pack multipliers: caller-provided > DB-derived (sku_pack_sizes)
+                        const metadataPackMultipliers: Record<string, number> =
+                            (metadata?.packMultipliers as Record<string, number>) ?? {};
+
+                        const invoiceLines = extractInvoiceLines(invoiceData);
+                        const poLines: GatePoLine[] = ((poData?.line_items ?? []) as any[]).map(
+                            (pi: any) => ({
+                                productId: pi.productId ?? pi.sku ?? pi.description ?? "UNKNOWN",
+                                description: pi.description,
+                                quantity: Number(pi.quantity ?? 0),
+                                unitPrice: Number(pi.unitPrice ?? 0),
+                                receivedQty: pi.receivedQty ?? null,
+                            }),
+                        );
+
                         // ── Load pack sizes from sku_pack_sizes for UOM normalization ─
-                        let dbPackSizes = new Map<string, number>();
+                        const dbPackSizes = new Map<string, number>();
                         try {
                             const allSkus = [...new Set([
-                                ...(poData.line_items ?? []).map((li: any) => li.productId ?? li.sku),
-                                ...(invoiceData.line_items ?? []).map((li: any) => li.sku ?? li.productId),
+                                ...poLines.map((l) => l.productId),
+                                ...invoiceLines.map((l) => l.sku),
                             ])].filter(Boolean) as string[];
                             if (allSkus.length > 0) {
                                 const { getPackSizes } = await import("./pack-size-registry");
@@ -277,70 +379,55 @@ export async function transitionLifecycleState(
                             // pack sizes are optional — proceed without them
                         }
 
-                        const { evaluateThreeWayMatch } = await import("./three-way-match");
-                        const match = evaluateThreeWayMatch({
+                        const packMultipliers: Record<string, number> = {};
+                        for (const [sku, mult] of dbPackSizes) packMultipliers[sku] = mult;
+                        for (const [sku, mult] of Object.entries(metadataPackMultipliers)) {
+                            packMultipliers[sku] = mult;
+                        }
+
+                        const gateResult = evaluateCompletionGate({
                             orderId: poNumber,
-                            hasPurchaseOrder: !!poData,
                             hasReceipt,
-                            hasInvoice: !!invoiceData,
-                            lines: (poData.line_items ?? []).map((pi: any) => {
-                                const sku = pi.productId ?? pi.sku ?? pi.description ?? "UNKNOWN";
-                                const il = (invoiceData.line_items ?? []).find(
-                                    (l: any) =>
-                                        l.sku === pi.productId ||
-                                        l.sku === sku ||
-                                        l.description === pi.description,
-                                );
-
-                                // Real received quantity: caller-provided > DB-derived > null
-                                const realReceivedQty = receivedQtys[sku] ?? receivedQtys[pi.productId];
-                                const receivedQty = realReceivedQty !== undefined
-                                    ? realReceivedQty
-                                    : (hasReceipt ? (pi.receivedQty ?? pi.quantity ?? null) : null);
-
-                                // Pack multiplier: caller-provided > DB > undefined
-                                const packMultiplier = metadataPackMultipliers[sku]
-                                    ?? metadataPackMultipliers[pi.productId]
-                                    ?? dbPackSizes.get(sku)
-                                    ?? dbPackSizes.get(pi.productId)
-                                    ?? undefined;
-
-                                return {
-                                    productId:
-                                        pi.productId ?? pi.sku ?? pi.description ?? "UNKNOWN",
-                                    poQty: pi.quantity ?? 0,
-                                    poUnitPrice: pi.unitPrice ?? 0,
-                                    receivedQty,
-                                    invoiceQty: il?.qty ?? 0,
-                                    invoiceUnitPrice: il?.unitPrice ?? 0,
-                                    ...(packMultiplier ? { packMultiplier } : {}),
-                                };
-                            }),
+                            hasInvoice,
+                            poLines,
+                            invoiceLines,
+                            receivedQtys,
+                            packMultipliers,
                         });
 
-                        if (!match.canApprove) {
+                        if (!gateResult.ok) {
                             console.warn(
-                                `[po-lifecycle] 3-way match BLOCKED RECONCILED/RECEIVED → COMPLETED for ${poNumber}: ` +
-                                    match.summary,
+                                `[po-lifecycle] 3-way match BLOCKED → ${toState} for ${poNumber}: ` +
+                                    gateResult.blockReason,
                             );
-                            return { ok: false, blockReason: match.summary };
+                            return { ok: false, blockReason: gateResult.blockReason };
                         }
                         console.log(
-                            `[po-lifecycle] 3-way match PASSED for ${poNumber}: ` +
-                                match.summary,
+                            `[po-lifecycle] 3-way match PASSED for ${poNumber} → ${toState}: ` +
+                                gateResult.summary,
+                        );
+                    }
+                    }
+                } catch (gateErr: unknown) {
+                    // HERMIA(2026-08-12): distinguish transient failures from
+                    // structural ones. A DB-down/network error means the gate
+                    // couldn't run — fail-open (log + allow). An import/type
+                    // error means the gate itself is broken — fail-closed
+                    // (block the transition) so a silently-broken gate can't
+                    // stamp POs RECONCILED/COMPLETED unverified.
+                    if (isTransientGateError(gateErr)) {
+                        console.warn(
+                            `[po-lifecycle] 3-way match transient error for ${poNumber} — ` +
+                                `allowing transition (belt, not suspenders): ` +
+                                `${(gateErr as Error)?.message ?? gateErr}`,
                         );
                     } else {
-                        console.log(
-                            `[po-lifecycle] 3-way match skipped for ${poNumber}: ` +
-                                `no line-item data (po=${!!poData?.line_items}, inv=${!!invoiceData?.line_items})`,
+                        const msg = gateErr instanceof Error ? gateErr.message : String(gateErr);
+                        console.error(
+                            `[po-lifecycle] 3-way match STRUCTURAL error for ${poNumber} — BLOCKING transition: ${msg}`,
                         );
+                        return { ok: false, blockReason: `3-way match gate error: ${msg}` };
                     }
-                    }
-                } catch (gateErr: any) {
-                    console.warn(
-                        `[po-lifecycle] 3-way match check failed for ${poNumber}: ${gateErr.message} — ` +
-                            "allowing transition (belt, not suspenders)",
-                    );
                 }
             }
 
@@ -369,11 +456,16 @@ export async function transitionLifecycleState(
         // Validation already passed in Phase 1 (local SQLite write) — skip duplicate
         const now = new Date().toISOString();
 
-        // Update purchase_orders
+        // Update purchase_orders. Write lifecycle_state AND lifecycle_stage to
+        // resolve the column duality (2026-08-12), and keep the simple `status`
+        // enum aligned with the stage so an "open" PO can never sit at an
+        // impossible stage (RECEIVED/COMPLETED/CANCELLED).
         const { error: updateErr } = await supabase
             .from("purchase_orders")
             .update({
                 lifecycle_state: toState,
+                lifecycle_stage: toState,
+                status: statusForLifecycleStage(toState),
                 updated_at: now,
             })
             .eq("po_number", poNumber);

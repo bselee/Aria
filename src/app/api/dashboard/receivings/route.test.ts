@@ -80,6 +80,11 @@ vi.mock("@/lib/purchasing/three-way-match", () => ({
     evaluateThreeWayMatch: vi.fn().mockReturnValue({ canApprove: true, summary: "" }),
 }));
 
+vi.mock("@/lib/purchasing/completion-gate", () => ({
+    evaluateCompletionGate: vi.fn().mockReturnValue({ ok: true, summary: "" }),
+    extractInvoiceLines: vi.fn().mockReturnValue([]),
+}));
+
 vi.mock("@/lib/purchasing/cache", () => ({
     invalidatePurchasingCaches: vi.fn(),
 }));
@@ -87,6 +92,7 @@ vi.mock("@/lib/purchasing/cache", () => ({
 const { recordFreightEvidence } = await import("@/lib/purchasing/vendor-freight-learning");
 const { transitionLifecycleState } = await import("@/lib/purchasing/po-lifecycle");
 const { invalidatePurchasingCaches } = await import("@/lib/purchasing/cache");
+const { evaluateCompletionGate } = await import("@/lib/purchasing/completion-gate");
 
 import { GET, POST, getDenverWeekStart } from "./route";
 
@@ -97,6 +103,7 @@ describe("dashboard receivings route", () => {
         createClientMock.mockReturnValue(supabaseChain);
         supabaseChain.maybeSingle.mockResolvedValue({ data: null, error: null });
         supabaseChain.single.mockResolvedValue({ data: null, error: null });
+        (evaluateCompletionGate as any).mockReturnValue({ ok: true, summary: "" });
     });
 
     // ── GET tests ───────────────────────────────────────────────────────
@@ -192,18 +199,9 @@ describe("dashboard receivings route", () => {
                 shipmentList: [],
             });
 
-            supabaseChain.maybeSingle.mockResolvedValue({
-                data: {
-                    line_items: [{ productId: "SKU1", quantity: 100, unitPrice: 5.0 }],
-                    receive_date: new Date().toISOString(),
-                },
-                error: null,
-            });
-
-            const { evaluateThreeWayMatch } = await import("@/lib/purchasing/three-way-match");
-            (evaluateThreeWayMatch as any).mockReturnValue({
-                canApprove: false,
-                summary: "Qty mismatch on SKU1: PO=100, Received=80, Invoice=100",
+            (evaluateCompletionGate as any).mockReturnValue({
+                ok: false,
+                blockReason: "Qty mismatch on SKU1: PO=100, Received=80, Invoice=100",
             });
 
             const response = await POST(

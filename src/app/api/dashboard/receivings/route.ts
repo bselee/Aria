@@ -15,6 +15,7 @@ import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
+import { evaluateCompletionGate, extractInvoiceLines, type GatePoLine } from '@/lib/purchasing/completion-gate';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
 import { isReceivingsPdfVendor } from '@/config/receivings-pdf-vendors';
@@ -214,9 +215,32 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
         // Enrich with reconciliation data from local Postgres
         const sb = createClient();
         if (sb && received.length > 0) {
-            const poNumbers = received
+            let poNumbers = received
                 .map((r: any) => r.poNumber || r.orderId)
                 .filter(Boolean);
+
+            // ── Exclude COMPLETED POs (durable fix; mirrors the UI's session-side
+            // completedIds). Finale still lists completed POs in its 30d received
+            // window, but a completed PO has left the actionable receivings list
+            // for good — drop it here so refresh/new sessions never see it back.
+            if (poNumbers.length > 0) {
+                const { data: completedRows } = await sb
+                    .from('purchase_orders')
+                    .select('po_number')
+                    .in('po_number', poNumbers)
+                    .eq('lifecycle_state', 'COMPLETED');
+                const completedPoNums = new Set(
+                    (completedRows || []).map((r: any) => String(r.po_number)),
+                );
+                if (completedPoNums.size > 0) {
+                    received = received.filter(
+                        (r: any) => !completedPoNums.has(String(r.poNumber || r.orderId)),
+                    );
+                    poNumbers = received
+                        .map((r: any) => r.poNumber || r.orderId)
+                        .filter(Boolean);
+                }
+            }
 
             if (poNumbers.length > 0) {
                 const { data: invoices } = await sb
@@ -873,13 +897,9 @@ export async function POST(req: NextRequest) {
                 .eq('po_id', orderId)
                 .is('resolved_at', null);
 
-            // Update invoices status
-            await sb
-                .from('invoices')
-                .update({ status: 'reconciled', updated_at: now })
-                .eq('po_number', orderId);
-
             // Update vendor_invoices status
+            // (legacy `invoices` is now a read-only view over vendor_invoices — this
+            // single write covers what the old invoices + vendor_invoices pair did)
             await sb
                 .from('vendor_invoices')
                 .update({ status: 'reconciled', updated_at: now })
@@ -1061,9 +1081,10 @@ export async function POST(req: NextRequest) {
                         }
                     }
 
-                    // ── Phase 1: Run the 3-way match gate BEFORE touching Finale ──
-            // The gate is a pure evaluation — no side effects. If it blocks,
-            // we return 409 without having modified anything anywhere.
+                    // ── Phase 1: 3-way gate BEFORE completeOrder ──
+            // Pure evaluation. If it blocks we 409 and skip completeOrder.
+            // Phase 0 (operator-approved price/qty/freight) may already have
+            // written Finale — that is intentional (invoice-as-truth on Apply).
             let receivedQtys: Record<string, number> = {};
             let packMultipliers: Record<string, number> = {};
             try {
@@ -1107,8 +1128,8 @@ export async function POST(req: NextRequest) {
                         sb.from('purchase_orders')
                             .select('line_items, receive_date')
                             .eq('po_number', orderId).maybeSingle(),
-                        sb.from('invoices')
-                            .select('line_items')
+                        sb.from('vendor_invoices')
+                            .select('line_items, raw_data')
                             .eq('po_number', orderId)
                             .order('created_at', { ascending: false }).limit(1).maybeSingle(),
                     ]);
@@ -1117,35 +1138,29 @@ export async function POST(req: NextRequest) {
                     const hasReceipt = !!(poData as any)?.receive_date
                         && new Date((poData as any).receive_date).getTime() < Date.now();
 
-                    if (invoiceData?.line_items && poData?.line_items) {
-                        const { evaluateThreeWayMatch } = await import('@/lib/purchasing/three-way-match');
-                        const match = evaluateThreeWayMatch({
-                            orderId,
-                            hasPurchaseOrder: !!poData,
-                            hasReceipt,
-                            hasInvoice: !!invoiceData,
-                            lines: (poData.line_items ?? []).map((pi: any) => {
-                                const sku = pi.productId ?? pi.sku ?? pi.description ?? 'UNKNOWN';
-                                const il = (invoiceData.line_items ?? []).find(
-                                    (l: any) => l.sku === pi.productId || l.sku === sku || l.description === pi.description,
-                                );
-                                const realQty = receivedQtys[sku] ?? receivedQtys[pi.productId];
-                                const receivedQty = realQty !== undefined ? realQty : (hasReceipt ? (pi.receivedQty ?? pi.quantity ?? null) : null);
-                                const pack = packMultipliers[sku] ?? packMultipliers[pi.productId] ?? undefined;
-                                return {
-                                    productId: pi.productId ?? pi.sku ?? pi.description ?? 'UNKNOWN',
-                                    poQty: pi.quantity ?? 0,
-                                    poUnitPrice: pi.unitPrice ?? 0,
-                                    receivedQty,
-                                    invoiceQty: il?.qty ?? 0,
-                                    invoiceUnitPrice: il?.unitPrice ?? 0,
-                                    ...(pack ? { packMultiplier: pack } : {}),
-                                };
-                            }),
-                        });
-                        if (!match.canApprove) {
-                            gateBlockReason = match.summary;
-                        }
+                    const invoiceLines = extractInvoiceLines(invoiceData);
+                    const poLines: GatePoLine[] = ((poData?.line_items ?? []) as any[]).map(
+                        (pi: any) => ({
+                            productId: pi.productId ?? pi.sku ?? pi.description ?? 'UNKNOWN',
+                            description: pi.description,
+                            quantity: Number(pi.quantity ?? 0),
+                            unitPrice: Number(pi.unitPrice ?? 0),
+                            receivedQty: pi.receivedQty ?? null,
+                        }),
+                    );
+
+                    const gateResult = evaluateCompletionGate({
+                        orderId,
+                        hasReceipt,
+                        hasInvoice: !!invoiceData,
+                        poLines,
+                        invoiceLines,
+                        receivedQtys,
+                        packMultipliers,
+                    });
+
+                    if (!gateResult.ok) {
+                        gateBlockReason = gateResult.blockReason ?? '3-way match refused';
                     }
                 }
             } catch (gateErr: any) {
@@ -1219,6 +1234,10 @@ export async function POST(req: NextRequest) {
             // Invalidate caches so Active Purchases drops this PO
             const { invalidatePurchasingCaches } = await import('@/lib/purchasing/cache');
             await invalidatePurchasingCaches();
+
+            // Drop the receivings GET cache so the next paint rebuilds without
+            // this now-COMPLETED PO (the GET filter also excludes it durably).
+            _getCache = null;
 
             return NextResponse.json({ completed: true, orderId, finalStatus });
         }
