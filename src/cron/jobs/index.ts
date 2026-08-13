@@ -1422,6 +1422,78 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AP Gmail Delivery Verification — PRIMARY delivery check, no third-party dep.
+//
+// Asks Gmail (the same API Aria sends with) whether each recorded forward
+// actually exists, was addressed to the Bill.com intake address, and carried
+// its PDF. Every ap_local_forwards row stores billcom_sent_message_id, so
+// coverage is 100% — measured 274/274 delivered on 2026-08-13.
+//
+// This REPLACES billcom_bills_ref as the source of truth for "did it arrive".
+// That table is built by scraping a CSV out of bill.com with Playwright and has
+// three independent failure modes: the login breaks (it did, silently, for 5
+// weeks), the export is often FILTERED to a single vendor, and paid bills age
+// off the report. Each one manufactures false "never landed" alerts — it
+// reported Uline / Abel's / CR Minerals / Evergreen / Logan Labs as missing
+// when all five were fine.
+//
+// An accepted delivery to buildasoilap@bill.com with no bounce IS receipt.
+// Whether Bill.com's OCR finished processing it is a separate question and the
+// only thing the CSV could ever answer.
+//
+// Runs at 8 AM MT, before Bill's 8:30 AM AP health check.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "ap-gmail-delivery-verify",
+    schedule: "0 8 * * *",
+    onFail: "log",
+    description: "Verify AP forwards reached Bill.com using Gmail as source of truth (no scraping).",
+    handler: async () => {
+        const { getAuthenticatedClient } = await import("@/lib/gmail/auth");
+        const { gmail: GmailApi } = await import("@googleapis/gmail");
+        const { runGmailDeliverySweep } = await import("@/lib/intelligence/ap/gmail-delivery-verify");
+
+        const auth = await getAuthenticatedClient("ap");
+        const gmail = GmailApi({ version: "v1", auth: auth as any });
+
+        const result = await runGmailDeliverySweep(gmail as any, { lookbackDays: 45 });
+
+        console.log(
+            `[ap-gmail-delivery-verify] checked=${result.checked}, delivered=${result.delivered}, ` +
+            `alreadyVerified=${result.alreadyVerified}, problems=${result.problems.length}, ` +
+            `verdicts=${JSON.stringify(result.byVerdict)}`
+        );
+
+        if (result.problems.length === 0) return;
+
+        // ONE consolidated message. Only genuine problems reach here —
+        // transient Gmail lookup errors are counted, never alerted.
+        const MAX_LINES = 30;
+        const lines = result.problems.slice(0, MAX_LINES).map(
+            (p) => `• [${p.verdict}] ${p.vendorName ?? "(unknown)"} ${p.invoiceNumber ?? ""} — ${p.detail}`
+        );
+        if (result.problems.length > MAX_LINES) {
+            lines.push(`…and ${result.problems.length - MAX_LINES} more`);
+        }
+        const text = [
+            `🔴 *${result.problems.length} AP forward(s) failed Gmail delivery verification*`,
+            "",
+            ...lines,
+            "",
+            "Gmail is authoritative here: these sends are missing, misaddressed, or lost their PDF.",
+        ].join("\n");
+
+        try {
+            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            await sendTelegramNotify(text);
+        } catch (err: any) {
+            console.error(`[ap-gmail-delivery-verify] Telegram notify failed: ${err?.message ?? err}`);
+        }
+    },
+    budget: { durationMs: 300_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Invoice → PO Auto-Matcher — finds unmatched invoices and suggests PO matches.
 // Runs every 30 min. Auto-applies matches scoring ≥80 with exactly one candidate.
 // Lower-confidence matches queue for human review in the receivings panel.
