@@ -1357,25 +1357,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 gmail_message_id: messageId || null,
             }).select("id").single();
 
-            await supabase.from("invoices").upsert({
-                invoice_number: invoiceData.invoiceNumber,
-                vendor_name: invoiceData.vendorName,
-                po_number: finalePONumber,
-                invoice_date: invoiceData.invoiceDate,
-                due_date: invoiceData.dueDate || invoiceData.invoiceDate,
-                payment_terms: invoiceData.paymentTerms,
-                subtotal: invoiceData.subtotal,
-                freight: invoiceData.freight || 0,
-                tax: invoiceData.tax || 0,
-                tariff: invoiceData.tariff || 0,
-                labor: invoiceData.labor || 0,
-                tracking_numbers: invoiceData.trackingNumbers || [],
-                total: invoiceData.total,
-                amount_due: invoiceData.amountDue,
-                status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
-                document_id: docData?.id || null,
-                raw_data: invoiceData
-            }, { onConflict: "invoice_number" });
+            // Single write path: vendor_invoices only (legacy `invoices` is a read-only view since 2026-08-12)
 
             // 3a. Archive into unified vendor_invoices table (non-blocking)
             try {
@@ -1383,13 +1365,16 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     vendor_name: invoiceData.vendorName,
                     invoice_number: invoiceData.invoiceNumber,
                     invoice_date: invoiceData.invoiceDate,
-                    due_date: invoiceData.dueDate || null,
+                    due_date: invoiceData.dueDate || invoiceData.invoiceDate,
                     po_number: finalePONumber || null,
                     subtotal: invoiceData.subtotal,
                     freight: invoiceData.freight || 0,
                     tax: invoiceData.tax || 0,
+                    tariff: invoiceData.tariff || 0,
+                    labor: invoiceData.labor || 0,
+                    tracking_numbers: invoiceData.trackingNumbers || [],
                     total: invoiceData.total,
-                    status: matched ? 'received' : 'received',
+                    status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
                     source: 'email_attachment',
                     source_ref: messageId || `email-${from}`,
                     pdf_storage_path: pdfStoragePath,
@@ -1867,7 +1852,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                     actual: fc.amount, verdict: fc.verdict, reason: fc.reason
                                 }))
                             ];
-                            await supabase.from("invoices").update({ status: newStatus, discrepancies })
+                            await supabase.from("vendor_invoices").update({ status: newStatus, discrepancies })
                                 .eq("invoice_number", result.invoiceNumber)
                                 .ilike("vendor_name", `%${result.vendorName}%`);
                         } catch {
@@ -2180,7 +2165,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }))
             ];
 
-            await supabase.from("invoices").update({
+            await supabase.from("vendor_invoices").update({
                 status: newStatus,
                 discrepancies: discrepancies
             })

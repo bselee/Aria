@@ -98,6 +98,19 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     if (fromLower.includes("mcinfo@ups.com") && !subjectLower.includes("invoice")) {
         return true;
     }
+    // Payment REMINDERS / past-due notices ≠ invoices. A reminder references an
+    // invoice already in Bill.com — it is NOT a new bill to forward.
+    // Pattern: "Invoice - Reminder: Your payment to X is 11 days due"
+    //          "Invoice reminder: ..." / "Payment reminder: ..."
+    // FIX(2026-08-12, t_3d2c50e0): previously these were parsed as INVOICE with
+    // invoice_number="Reminder" (garbage) and archived with total=0. Now they are
+    // classified non-invoice and never queued/archived as real invoices.
+    if (
+        /\breminder\b/i.test(subjectLower) &&
+        (/\b(?:payment|invoice|pay|due|overdue|past\s*due|outstanding)\b/i.test(subjectLower))
+    ) {
+        return true;
+    }
     // Non-invoice subject classes (belt-and-suspenders with vendor-router skip rules)
     const nonInvoiceSubjects = [
         "shipment notification",
@@ -330,6 +343,42 @@ async function enrichInvoiceForPoMatch(args: {
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
         if (m) norm.poNumber = m[1].padStart(5, "0");
+    }
+
+    // ── Finale cross-ref fallback (2026-08-12, t_3d2c50e0 Phase 1.2) ──────
+    // When the PDF body and email subject yield no PO, cross-reference Finale
+    // POs by supplier + date window + amount proximity (same strategy as the
+    // legacy paid-invoice handler). Target: <25% null po_number on new
+    // invoices. Only accept a confident match (Committed/Open, ±10% amount).
+    // Best-effort — never blocks the Bill.com forward path.
+    if (!norm.poNumber && norm.total > 0 && norm.vendorName && norm.vendorName !== "Unknown Vendor") {
+        try {
+            const { FinaleClient } = await import("@/lib/finale/client");
+            const finaleClient = new FinaleClient();
+            const candidates = await finaleClient.findPOByVendorAndDate(
+                norm.vendorName,
+                norm.invoiceDate || new Date().toISOString().split("T")[0],
+                45,
+            );
+            const plausible = candidates.filter((c: any) =>
+                (c.status === "Committed" || c.status === "Open") &&
+                norm.total > 0 &&
+                Math.abs(c.total - norm.total) / norm.total < 0.10,
+            );
+            if (plausible.length > 0) {
+                plausible.sort((a: any, b: any) =>
+                    Math.abs(a.total - norm.total) - Math.abs(b.total - norm.total),
+                );
+                const best = plausible[0];
+                norm.poNumber = best.orderId;
+                console.log(
+                    `   [AP-Local] Finale cross-ref matched PO ${best.orderId} ` +
+                    `(${best.supplier}, $${best.total}) for ${norm.vendorName} invoice $${norm.total}`,
+                );
+            }
+        } catch (finaleErr: any) {
+            console.warn(`   [AP-Local] Finale PO cross-ref failed: ${finaleErr?.message || finaleErr}`);
+        }
     }
 
     // ── WS2 (2026-08-05): bridge invoice tracking → shipments ──
@@ -1023,6 +1072,12 @@ export async function runReconciliationHandoff(): Promise<{
 /**
  * Mark a Gmail message as processed (remove UNREAD + INBOX, add label).
  * Called after all PDFs in an email have been forwarded to Bill.com.
+ *
+ * NOTE (2026-08-12): removeLabels MUST include "INBOX". Commit eca39c2
+ * dropped it per the 8/10 session preference ("leave forwarded emails in
+ * inbox"), but Bill clarified on 8/12 that only human-review emails (AAA
+ * Cooper routing action) stay in the inbox — normal invoices flow out.
+ * human_review emails bypass this function entirely (label only).
  */
 async function markEmailProcessed(gmail: any, messageId: string): Promise<void> {
     try {
@@ -1030,14 +1085,14 @@ async function markEmailProcessed(gmail: any, messageId: string): Promise<void> 
             gmail,
             gmailMessageId: messageId,
             addLabels: ["Invoice Forward"],
-            removeLabels: ["UNREAD"],
+            removeLabels: ["INBOX", "UNREAD"],
         });
     } catch (e: any) {
         try {
             await gmail.users.messages.modify({
                 userId: "me",
                 id: messageId,
-                requestBody: { removeLabelIds: ["UNREAD"] },
+                requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
             });
         } catch (e2: any) {
             console.warn(`   [AP-Local] Failed to mark email ${messageId} as processed:`, e2.message);
@@ -1131,6 +1186,10 @@ export async function runLocalApForward(): Promise<{
             //   'dropship'     → forward, but skip PO reconciliation later
             //   null (no rule) → forward + PO matching (default)
             let routingRule = checkVendorRouting(from, subject);
+            // Human-review flag derives from the SENDER/SUBJECT rule — set before
+            // the per-file loop so a statement-PDF skip override doesn't unset it.
+            // Past-due/collections/AAA Cooper: forward, leave UNREAD in inbox.
+            let leaveUnreadForReview = routingRule?.action === "human_review";
             for (const att of invoiceAttachments) {
                 const byFile = checkVendorRouting(from, subject, att.filename);
                 if (byFile?.action === "skip") {
@@ -1152,7 +1211,11 @@ export async function runLocalApForward(): Promise<{
                         reason: routingRule.label,
                         vendorRoutingAction: routingRule.action,
                     });
-                    await markEmailProcessed(gmail, gmailMessageId);
+                    // Human-review email whose ATTACHMENT is a statement/skip class —
+                    // still leave the email unread so Bill sees the past-due notice.
+                    if (!leaveUnreadForReview) {
+                        await markEmailProcessed(gmail, gmailMessageId);
+                    }
                     summary.skipped++;
                     continue;
                 }
@@ -1160,10 +1223,16 @@ export async function runLocalApForward(): Promise<{
                     skipReconciliation = true;
                     console.log(`   [AP-Local] Dropship vendor: ${routingRule.label} — will skip PO matching`);
                 }
+                if (routingRule.action === "human_review") {
+                    console.log(
+                        `   [AP-Local] Human-review vendor: ${routingRule.label} — will forward but leave unread in inbox`,
+                    );
+                }
             }
 
             if (invoiceAttachments.length === 0) {
-                // No invoice attachment — not an invoice. Mark read, archive, skip.
+                // No PDF/image invoice — not an invoice. Mark read, archive, skip.
+                // Human-review (past-due/collections): leave unread so Bill sees it.
                 console.log(`   [AP-Local] No PDF/image invoice — skipping: ${subject.slice(0, 50)}`);
                 recordSkippedForward({
                     gmailMessageId,
@@ -1172,7 +1241,9 @@ export async function runLocalApForward(): Promise<{
                     pdfFilename: "(no-attachment)",
                     reason: "no PDF/image invoice attachment",
                 });
-                await markEmailProcessed(gmail, gmailMessageId);
+                if (!leaveUnreadForReview) {
+                    await markEmailProcessed(gmail, gmailMessageId);
+                }
                 summary.skipped++;
                 continue;
             }
@@ -1381,9 +1452,27 @@ export async function runLocalApForward(): Promise<{
                 }
             }
 
-            // Mark email as processed only if all PDFs were forwarded
+            // Mark email as processed only if all PDFs were forwarded.
+            // human_review vendors: leave UNREAD + INBOX so Bill verifies the
+            // forward landed in Bill.com before he archives (2026-08-12).
             if (allPdfsForwarded) {
-                await markEmailProcessed(gmail, gmailMessageId);
+                if (leaveUnreadForReview) {
+                    try {
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId,
+                            addLabels: ["Invoice Forward"],
+                            removeLabels: [],
+                        });
+                        console.log(`   [AP-Local] 🧍 Left unread in inbox for review: ${subject.slice(0, 50)}`);
+                    } catch (labelErr: any) {
+                        console.warn(
+                            `   [AP-Local] Failed to label human-review email ${gmailMessageId}: ${labelErr.message}`,
+                        );
+                    }
+                } else {
+                    await markEmailProcessed(gmail, gmailMessageId);
+                }
             }
         } catch (e: any) {
             console.error(`   [AP-Local] Error processing email ${msg.id}:`, e.message);

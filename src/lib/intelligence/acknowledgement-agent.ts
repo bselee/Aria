@@ -16,11 +16,11 @@ import {
 } from "./vendor-opportunity";
 import { notifyViaTask } from "./notify-via-task";
 import {
-    composeHumanEscalationDraftStub,
     isSimpleVendorConfirmation,
-    composeRoutineDraftBody,
     resolveEmailResponsePolicy,
 } from "./email-response-policy";
+import { resolveDraftAction } from "./draft-correction-watcher";
+import { extractReplyFirstName } from "./email-draft-voice";
 
 /**
  * @file acknowledgement-agent.ts
@@ -123,6 +123,10 @@ export class AcknowledgementAgent {
             /\b(?:buy\s+\d+\s*get|bundle\s*deal|special\s*pricing|member.?only)\b/i,
             /\b(?:you'?re\s*invited|join\s*us|webinar|event\s*registration)\b/i,
             /\b(?:refer\s*a\s*friend|earn\s*\$|rewards?\s*points?|loyalty\s*bonus)\b/i,
+            /\b(?:survey|feedback\s*request|take\s*our\s*(survey|poll)|how\s*did\s*we\s*do|rate\s*your)\b/i,
+            /\b(?:whitepaper|white\s*paper|case\s*study|industry\s*report|market\s*report|thought\s*leadership|insights?\s*report)\b/i,
+            /\b(?:you'?re\s*invited|join\s*us|webinar|event\s*registration|register\s*now|save\s*your\s*seat)\b/i,
+            /\b(?:download\s*our|free\s*(guide|ebook|report|template|toolkit)|ultimate\s*guide)\b/i,
         ];
 
         if (PROMO_SUBJECT_PATTERNS.some(p => p.test(lowerSubject))) {
@@ -245,18 +249,17 @@ Snippet: ${snippet}
 ${memoryContext}
 
 Labels:
-ROUTINE_INFO - Standard vendor updates: order confirmations, tracking numbers, invoice deliveries, or PO acknowledgements. Contains NO questions, NO pricing proposals, NO call offers.
-REQUIRES_HUMAN - The sender is asking a question, reporting a problem (backorder, price change, out of stock), requesting payment/approval, or needs dialogue.
-VENDOR_OPPORTUNITY - Sales/sourcing reply: distributor pricing, quotes, tech sheets, product introductions, partnership pitches, or "schedule a call" after an inquiry. NEVER treat these as ROUTINE_INFO. Bare auto-thanks is wrong.
-PROMOTIONAL - Marketing, spam, newsletters, % off blasts.
-INLINE_INVOICE - The email body contains cost breakdowns, dollar amounts, totals, freight charges, or other invoice-like data but NO PDF is attached. This is a structured cost breakdown (not a casual price mention).
+PROMOTIONAL - Marketing, spam, newsletters, ads, surveys, event invites, whitepapers, industry reports, thought-leadership, "% off" blasts, and anything Bill would not open. This is the DEFAULT for non-business mail. Archive silently.
+ROUTINE_INFO - A real vendor/order update that is part of an active purchase: order confirmation, tracking number, shipment status, PO acknowledgement, invoice delivery. Contains NO questions, NO pricing proposals, NO call offers, and references a real PO/tracking/order context.
+REQUIRES_HUMAN - A real counterparty (vendor, carrier, broker) asking a question, reporting a problem (backorder, price change, out of stock, delivery issue), or requesting payment/approval. NOT generic marketing or surveys.
+VENDOR_OPPORTUNITY - Sales/sourcing reply: distributor pricing, quotes, tech sheets, product introductions, partnership pitches, or "schedule a call" after an inquiry. NEVER treat these as ROUTINE_INFO.
+INLINE_INVOICE - The email body contains cost breakdowns, dollar amounts, totals, freight charges, or other invoice-like data but NO PDF is attached.
 
-NOTE: If you are even slightly unsure if human attention is needed, choose REQUIRES_HUMAN.
-NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
+NOTE: If the email has no PO#, tracking number, order reference, invoice data, or a genuine question from a real business counterpart — it is PROMOTIONAL. Do not create drafts for marketing, surveys, or newsletters. When unsure between PROMOTIONAL and ROUTINE_INFO, choose PROMOTIONAL.`;
 
         try {
             const res = await unifiedObjectGeneration({
-                system: "You are an email triage assistant for a purchasing department. Use maximum caution: if an email might need human attention or is a vendor sales opportunity, do NOT choose ROUTINE_INFO.",
+                system: "You are an email triage assistant for a purchasing department. Default to PROMOTIONAL (archive silently) unless the email is clearly a real vendor/order update, a genuine business question, or a sales/sourcing opportunity. Do not create drafts for marketing, surveys, or newsletters.",
                 prompt,
                 schema,
                 schemaName: "EmailAcknowledgementIntent",
@@ -740,8 +743,11 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                 });
                                 processedCount++;
                             } else if (intent === "ROUTINE_INFO") {
-                                // DECISION(2026-08-05): Draft-only for PO/tracking/routine.
-                                // Never auto-send — Bill reviews drafts before anything goes out.
+                                // DECISION(2026-08-11): Routine tracking/order/PO-ack emails
+                                // get NO draft by default — Bill deletes them en masse. We only
+                                // draft when a learned template rule exists (Bill previously
+                                // taught us his phrasing for this vendor+context) — otherwise
+                                // silent, no draft.
                                 const isNoRep = this.isNoReply(senderEmail);
                                 const isMarketplaceStatus = this.isMarketplaceOrStatusSender(senderEmail, subject);
                                 const isPurchaseThread = this.looksLikePurchaseThread(subject, bodyText);
@@ -767,12 +773,17 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     console.error("     ❌ Policy violation: allowAutoSend on ROUTINE_INFO blocked");
                                 }
 
-                                if (policy.createDraft && myEmail && rfcMessageId) {
-                                    const draftBody = composeRoutineDraftBody({
-                                        from: senderEmail,
-                                        subject,
-                                        bodyText,
-                                    });
+                                // Only a learned template rule produces a routine draft.
+                                const firstName = extractReplyFirstName(senderEmail, bodyText);
+                                const learned = await resolveDraftAction({
+                                    from: senderEmail,
+                                    kind: "routine",
+                                    subject,
+                                    bodyText,
+                                    firstName,
+                                });
+
+                                if (learned.action === "template" && myEmail && rfcMessageId) {
                                     const draftId = await this.createReplyDraft({
                                         gmail,
                                         to: senderEmail,
@@ -780,25 +791,28 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                         subject,
                                         inReplyTo: rfcMessageId,
                                         threadId,
-                                        bodyText: draftBody,
+                                        bodyText: learned.body,
                                     });
                                     if (draftId) {
                                         repliedThreadIds.add(threadId);
-                                        console.log(`     📝 Routine draft ready (${draftId}) — not sent`);
+                                        console.log(`     📝 Routine draft from learned rule (${draftId}) — not sent`);
                                         try {
                                             await recordEmailDraftPrepared({
                                                 gmailMessageId,
                                                 threadId,
                                                 fromEmail: senderEmail,
                                                 subject,
-                                                replyBody: draftBody,
+                                                replyBody: learned.body,
                                                 kind: "routine",
                                                 draftId,
+                                                firstName,
                                             });
                                         } catch { /* non-fatal */ }
                                     }
-                                } else if (policy.action === "SILENT") {
-                                    console.log(`     -> Silent (${policy.reason}) — no draft/send.`);
+                                } else if (learned.action === "no_reply") {
+                                    console.log(`     → Learned no_reply rule for ${senderEmail} — no draft.`);
+                                } else {
+                                    console.log(`     → Silent (${policy.reason}) — no draft.`);
                                 }
 
                                 try {
@@ -841,39 +855,10 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     await this.finalizeQueueStatus(m.id, "failed", err.message);
                                 }
                             } else {
-                                // REQUIRES_HUMAN — draft stub + escalate. Never auto-send.
+                                // REQUIRES_HUMAN — escalate only, no draft. Bill writes the
+                                // real answer himself; a fake "Thanks — I'll follow up shortly"
+                                // stub is worse than nothing. Never auto-send.
                                 const policy = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
-
-                                if (policy.createDraft && myEmail && rfcMessageId) {
-                                    const stub = composeHumanEscalationDraftStub({
-                                        from: senderEmail,
-                                        subject,
-                                        bodyText,
-                                    });
-                                    const draftId = await this.createReplyDraft({
-                                        gmail,
-                                        to: senderEmail,
-                                        from: myEmail,
-                                        subject,
-                                        inReplyTo: rfcMessageId,
-                                        threadId,
-                                        bodyText: stub,
-                                    });
-                                    if (draftId) {
-                                        console.log(`     📝 Human-escalation draft stub (${draftId}) — not sent`);
-                                        try {
-                                            await recordEmailDraftPrepared({
-                                                gmailMessageId,
-                                                threadId,
-                                                fromEmail: senderEmail,
-                                                subject,
-                                                replyBody: stub,
-                                                kind: "human_escalation",
-                                                draftId,
-                                            });
-                                        } catch { /* non-fatal */ }
-                                    }
-                                }
 
                                 try {
                                     await recordHumanReviewRequired({
@@ -888,7 +873,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                 }
 
                                 try {
-                                    await this.addMessageLabels(gmail, gmailMessageId, policy.labels.length ? policy.labels : ["Needs Response", "Draft Ready"]);
+                                    await this.addMessageLabels(gmail, gmailMessageId, policy.labels.length ? policy.labels : ["Needs Response"]);
                                 } catch { /* best effort */ }
 
                                 try {

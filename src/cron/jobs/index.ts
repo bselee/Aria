@@ -1533,3 +1533,43 @@ defineJob({
     },
     budget: { durationMs: 120_000 },
 });
+
+// HERMIA(2026-08-11): Draft correction watcher — polls every 30m so Bill's
+// edits to Aria drafts are learned within the review window, not a day later.
+// Reads un-resolved email_draft_prepared events, detects sent-unchanged /
+// sent-edited / deleted-unsent, and writes learned rules to email_reply_rules.
+// The ACK agent reads those rules before composing any routine draft.
+defineJob({
+    name: "draft-correction-watch",
+    schedule: "*/30 8-18 * * *",
+    onFail: "log",
+    description:
+        "Every 30m: watch threads Aria drafted into → learn Bill's edits/deletes as reply rules.",
+    handler: async () => {
+        try {
+            const { getAuthenticatedClient } = await import("@/lib/gmail/auth");
+            const { gmail: GmailApi } = await import("@googleapis/gmail");
+            const { watchDraftCorrections } = await import(
+                "@/lib/intelligence/draft-correction-watcher"
+            );
+
+            const auth = await getAuthenticatedClient("default");
+            const gmail = GmailApi({ version: "v1", auth });
+
+            const result = await watchDraftCorrections(
+                gmail,
+                "bill.selee@buildasoil.com",
+            );
+
+            if (result.learned > 0) {
+                console.log(
+                    `[draft-correction-watch] ${result.learned} correction(s) learned (${result.noReplyRules} no-reply) out of ${result.scanned} drafts`,
+                );
+            }
+        } catch (err: any) {
+            console.error(`[draft-correction-watch] Failed: ${err?.message ?? err}`);
+            throw err;
+        }
+    },
+    budget: { durationMs: 120_000 },
+});

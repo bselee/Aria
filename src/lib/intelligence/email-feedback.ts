@@ -60,7 +60,7 @@ export async function recordSimpleAutoReply(event: AutoReplyEvent): Promise<void
 }
 
 /** Draft prepared for Bill to review/edit/send — not auto-sent. */
-export async function recordEmailDraftPrepared(event: AutoReplyEvent & { kind: string; draftId?: string | null }): Promise<void> {
+export async function recordEmailDraftPrepared(event: AutoReplyEvent & { kind: string; draftId?: string | null; firstName?: string | null }): Promise<void> {
     await recordFeedback({
         category: "engagement",
         eventType: "email_draft_prepared",
@@ -73,6 +73,7 @@ export async function recordEmailDraftPrepared(event: AutoReplyEvent & { kind: s
             threadId: event.threadId ?? null,
             replyBody: event.replyBody,
             draftId: event.draftId ?? null,
+            firstName: event.firstName ?? null,
         },
         actualOutcome: {
             fromEmail: event.fromEmail,

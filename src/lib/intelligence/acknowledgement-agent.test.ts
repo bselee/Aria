@@ -140,7 +140,7 @@ describe("AcknowledgementAgent", () => {
         notifyViaTaskMock.mockResolvedValue("task-1");
     });
 
-    it("prepares a routine draft and NEVER auto-sends", async () => {
+    it("creates NO routine draft by default (tracking update) and never auto-sends", async () => {
         queueState.messages = [
             {
                 id: 1,
@@ -160,20 +160,8 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
-        expect(gmailModifyMock).toHaveBeenCalledWith({
-            userId: "me",
-            id: "gmail-1",
-            requestBody: {
-                addLabelIds: ["draft-ready-label"],
-            },
-        });
-        expect(recordEmailDraftPreparedMock).toHaveBeenCalledWith(
-            expect.objectContaining({
-                gmailMessageId: "gmail-1",
-                kind: "routine",
-            }),
-        );
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
     });
 
@@ -255,7 +243,7 @@ describe("AcknowledgementAgent", () => {
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("forces multi-turn conversation threads into human review with draft stub + labels", async () => {
+    it("forces multi-turn conversation threads into human review with task only, no draft", async () => {
         queueState.messages = [
             {
                 id: 2,
@@ -275,12 +263,12 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
         expect(gmailModifyMock).toHaveBeenCalledWith({
             userId: "me",
             id: "gmail-2",
             requestBody: {
-                addLabelIds: expect.arrayContaining(["needs-response-label", "draft-ready-label"]),
+                addLabelIds: expect.arrayContaining(["needs-response-label"]),
             },
         });
         expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith({
