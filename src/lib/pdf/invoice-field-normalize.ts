@@ -25,6 +25,27 @@ const BAD_SENTINELS = new Set([
     "—",
 ]);
 
+/**
+ * Is a string plausibly a real invoice number?
+ *
+ * Rejects pure-alpha OCR junk like "oice", "Reminder", "From", "Invoice",
+ * "INVOICE", "Statement", "Attachments" — these are subject tokens or
+ * truncated labels, not invoice numbers. A real invoice number almost always
+ * contains at least one digit, or matches a vendor alphanumeric format
+ * (e.g. APUS-244677, S4O551, 928882, MA-P-M2162, Invoice124424).
+ */
+export function isInvoiceLikeNumber(value: string | null | undefined): boolean {
+    const t = cleanInvoiceField(value);
+    if (!t) return false;
+    if (BAD_SENTINELS.has(t.toLowerCase())) return false;
+    // Pure alpha with spaces (e.g. "Invoice", "From", "Reminder", "Payment",
+    // "Attachments") is never an invoice number.
+    if (/^[a-zA-Z][a-zA-Z -]{1,30}$/.test(t)) return false;
+    // Must contain a digit OR be a known vendor prefix format (APUS-123, S-123).
+    if (/\d/.test(t)) return true;
+    return /^[A-Za-z]{2,6}-\d/.test(t) || /^[A-Za-z]{2,6}\d{3,}/.test(t);
+}
+
 /** Treat model/schema sentinels as missing. */
 export function cleanInvoiceField(value: string | null | undefined): string | null {
     if (value == null) return null;
@@ -32,6 +53,31 @@ export function cleanInvoiceField(value: string | null | undefined): string | nu
     if (!t) return null;
     if (BAD_SENTINELS.has(t.toLowerCase())) return null;
     return t;
+}
+
+export type ExtractionQuality = "complete" | "partial" | "failed";
+
+/**
+ * Gate a normalized invoice record's extraction quality BEFORE it is written.
+ *
+ * failed:  total=0 AND (invoice_number missing OR not invoice-like) — OCR
+ *          garbage, reminders, or statements mis-classified as invoices.
+ *          These rows must never be marked reconciled (DB CHECK enforces).
+ * complete: total>0 AND invoice_number is invoice-like.
+ * partial:  anything else (some usable fields, but not a clean full invoice).
+ */
+export function computeExtractionQuality(args: {
+    total: number;
+    invoiceNumber: string | null | undefined;
+}): ExtractionQuality {
+    const total = Number(args.total) || 0;
+    if (total === 0 && !isInvoiceLikeNumber(args.invoiceNumber)) {
+        return "failed";
+    }
+    if (total > 0 && isInvoiceLikeNumber(args.invoiceNumber)) {
+        return "complete";
+    }
+    return "partial";
 }
 
 /**
@@ -163,8 +209,16 @@ export function normalizeInvoiceForDb(
     lineItems: Array<{ sku: string; description: string; qty: number; unit_price: number; ext_price: number }>;
 } {
     const fb = extractInvoiceFieldsFromOcrText(rawText);
-    const inv = cleanInvoiceField(parsed?.invoiceNumber ?? null) || fb.invoiceNumber;
-    const po = cleanInvoiceField(parsed?.poNumber ?? null) || fb.poNumber;
+    // FIX(2026-08-12, t_3d2c50e0): also reject non-invoice-like numbers
+    // ("oice", "Reminder", "From", "Invoice" — truncated subject tokens the LLM
+    // sometimes emits as invoiceNumber). These poisoned vendor_invoices with
+    // garbage invoice numbers and total=0 rows. If the value isn't
+    // invoice-like, treat it as missing (null) — extraction_quality will be
+    // 'failed' and the row can never be reconciled.
+    const rawInv = cleanInvoiceField(parsed?.invoiceNumber ?? null) || fb.invoiceNumber;
+    const inv = isInvoiceLikeNumber(rawInv) ? rawInv : null;
+    const rawPo = cleanInvoiceField(parsed?.poNumber ?? null) || fb.poNumber;
+    const po = cleanInvoiceField(rawPo);
     let total = Number(parsed?.total) || 0;
     if (!total && fb.total) total = fb.total;
     let invoiceDate = cleanInvoiceField(parsed?.invoiceDate ?? null) || fb.invoiceDate;

@@ -179,9 +179,23 @@ export class TrackingAgent {
             const foundTracking: TrackingFoundResult[] = [];
 
             for (const m of messages) {
+                // FIX(2026-08-12, t_3d2c50e0): advance status to 'processed'
+                // (only when still pending) alongside processed_by_tracking so
+                // rows don't sit at 'unprocessed' forever inflating the queue
+                // counter. Never clobber terminal statuses from ACK/AP.
                 await db.from('email_inbox_queue')
                     .update({ processed_by_tracking: true })
                     .eq('id', m.id);
+                try {
+                    await db.from('email_inbox_queue')
+                        .update({ status: 'processed', updated_at: new Date().toISOString() })
+                        .eq('id', m.id)
+                        .in('status', ['unprocessed', 'processing']);
+                } catch (statusErr: any) {
+                    console.warn(
+                        `   [TrackingAgent] Status advance failed for ${m.id}: ${statusErr?.message || statusErr}`,
+                    );
+                }
 
                 const subject = m.subject || "";
                 const bodyMsg = m.body_snippet || "";

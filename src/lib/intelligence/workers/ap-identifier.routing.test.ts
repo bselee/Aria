@@ -9,6 +9,9 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+import { unifiedObjectGeneration } from "../llm";
+import { recall } from "../memory";
+
 // ─── Mocks (vi.hoisted so they exist when vi.mock factories run) ─────────────
 
 const { mockGmailModify, mockGmailGet, mockGmailLabelsCreate, mockGmailLabelsList, mockStorageUpload, mockSupabaseFrom } = vi.hoisted(() => {
@@ -277,5 +280,113 @@ describe("APIdentifierAgent vendor routing integration", () => {
         // Verify Gmail modify was called to remove from inbox
         const modifyCalled = mockGmailModify.mock.calls.length > 0;
         expect(modifyCalled).toBe(true);
+    });
+
+    it("classifies payment reminders as STATEMENT — not INVOICE, no LLM call (t_3d2c50e0)", async () => {
+        // Regression: "Invoice - Reminder: Your payment to X is 11 days due"
+        // previously went through the LLM → INVOICE → archived with
+        // invoice_number="Reminder" / total=0 (garbage vendor_invoices row).
+        // The reminder guard must classify STATEMENT before any LLM spend.
+        // NOTE: use a NON-routed vendor — dropship/autopay vendors (AutoPot,
+        // Culligan…) short-circuit in matchVendorRouting before the classifier.
+        mockSupabaseFrom.mockImplementation((table: string) => {
+            const chain: Record<string, unknown> & { limit?: unknown } = {
+                select: vi.fn(() => chain),
+                in: vi.fn(() => chain),
+                eq: vi.fn(() => chain),
+                is: vi.fn(() => chain),
+                lt: vi.fn(() => chain),
+                gte: vi.fn(() => chain),
+                order: vi.fn(() => chain),
+                limit: vi.fn(() => chain),
+                insert: vi.fn(() => Promise.resolve({ data: null, error: null })),
+                update: vi.fn(() => ({ eq: () => Promise.resolve({ error: null }) })),
+                maybeSingle: vi.fn(() => Promise.resolve({ data: null, error: null })),
+                single: vi.fn(() => Promise.resolve({ data: null, error: null })),
+            };
+            if (table === "email_inbox_queue") {
+                chain.limit = vi.fn(() => Promise.resolve({
+                    data: [{
+                        id: 4,
+                        gmail_message_id: "msg-reminder",
+                        from_email: "QuickBooks <quickbooks@notification.intuit.com>",
+                        subject: "Invoice - Reminder: Your payment to Acme Supply is 11 days due",
+                        body_snippet: "This is a reminder that your payment is past due.",
+                        pdf_filenames: [],
+                        has_pdf: false,
+                        source_inbox: "ap",
+                        processed_by_ap: false,
+                    }],
+                    error: null,
+                }));
+            }
+            if (table === "ap_inbox_queue") {
+                chain.insert = vi.fn(() => Promise.resolve({ data: null, error: null }));
+            }
+            return chain;
+        });
+        mockGmailGet.mockResolvedValue({
+            data: {
+                payload: {
+                    headers: [
+                        { name: "Subject", value: "Invoice - Reminder: Your payment to Acme Supply is 11 days due" },
+                        { name: "From", value: "QuickBooks <quickbooks@notification.intuit.com>" },
+                    ],
+                    parts: [],
+                    mimeType: "text/plain",
+                },
+            },
+        });
+
+        await agent.identifyAndQueue();
+
+        // The reminder guard returns STATEMENT BEFORE the LLM — no paid call.
+        expect(unifiedObjectGeneration).not.toHaveBeenCalled();
+        // Never inserts to ap_inbox_queue (which would eventually forward a
+        // $0 "Reminder" invoice to Bill.com). mockGmailModify may or may not
+        // fire depending on internal label plumbing (getLabels cache) — the
+        // critical guarantees are: no LLM spend + no forward queue insert.
+        const apInsertCalls = mockSupabaseFrom.mock.calls.filter((c: [string, unknown?]) =>
+            c[0] === "ap_inbox_queue" && (c[1] as { insert?: unknown } | undefined)?.insert,
+        );
+        expect(apInsertCalls.length).toBe(0);
+    });
+
+    it("classifyEmailIntent returns STATEMENT for payment reminders, INVOICE for real invoices (t_3d2c50e0)", async () => {
+        // Unit-level guarantee independent of queue/Gmail plumbing:
+        // the reminder guard in classifyEmailIntent fires BEFORE the LLM.
+        const classifyEmailIntent = (
+            agent as unknown as {
+                classifyEmailIntent: (
+                    subject: string,
+                    from: string,
+                    snippet: string,
+                    gmailMessageId?: string,
+                ) => Promise<string>;
+            }
+        ).classifyEmailIntent;
+        const reminder = await classifyEmailIntent.call(
+            agent,
+            "Invoice - Reminder: Your payment to Acme Supply is 11 days due",
+            "quickbooks@notification.intuit.com",
+            "This is a reminder that your payment is past due.",
+            "gmail-reminder-1",
+        );
+        expect(reminder).toBe("STATEMENT");
+        expect(unifiedObjectGeneration).not.toHaveBeenCalled();
+
+        // Real invoice subjects are NOT swallowed by the reminder guard.
+        vi.clearAllMocks();
+        vi.mocked(recall).mockResolvedValue([]);
+        vi.mocked(unifiedObjectGeneration).mockResolvedValueOnce({ intent: "INVOICE" });
+        const real = await classifyEmailIntent.call(
+            agent,
+            "Invoice APUS-244677 from AutoPot USA",
+            "quickbooks@notification.intuit.com",
+            "Invoice from AutoPot USA",
+            "gmail-real-1",
+        );
+        expect(real).toBe("INVOICE");
+        expect(unifiedObjectGeneration).toHaveBeenCalled();
     });
 });

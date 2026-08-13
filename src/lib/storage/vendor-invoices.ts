@@ -9,6 +9,7 @@
  */
 
 import { createClient } from "../db";
+import { computeExtractionQuality, type ExtractionQuality } from "../pdf/invoice-field-normalize";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -55,6 +56,14 @@ export interface VendorInvoiceRecord {
     reconciled_at?: string | null;
     paid_at?: string | null;
     notes?: string | null;
+    /** Legacy invoice columns mirrored for consolidation (2026-08-12) */
+    tariff?: number;
+    labor?: number;
+    tracking_numbers?: string[];
+    payment_status?: 'unpaid' | 'paid' | 'partial' | 'void';
+    discrepancies?: unknown[];
+    /** Explicit quality override; computed automatically when omitted. */
+    extraction_quality?: ExtractionQuality | null;
 }
 
 // ── Write ─────────────────────────────────────────────────────────────────────
@@ -89,6 +98,27 @@ export async function upsertVendorInvoice(
         }
     }
 
+    // ── Extraction quality gate (2026-08-12, Phase 1.1) ─────────────────────
+    // Compute quality BEFORE the write. total=0 + non-invoice-like number =
+    // OCR garbage / reminder / mis-classified statement → 'failed', and those
+    // rows must never be reconciled (DB CHECK chk_vi_no_reconcile_failed also
+    // enforces this at the constraint level). Explicit overrides (e.g. a
+    // human-verified partial) win over auto-computation.
+    const total = Number(record.total) || 0;
+    const extractionQuality =
+        record.extraction_quality ?? computeExtractionQuality({ total, invoiceNumber });
+
+    // Never let a failed-quality row silently sit in 'reconciled'. The DB
+    // CHECK backs this up, but we also refuse to even WRITE reconciled here.
+    let status = record.status ?? "received";
+    if (extractionQuality === "failed" && status === "reconciled") {
+        console.warn(
+            `[vendor-invoices] Refusing to write failed-quality invoice as reconciled ` +
+            `(${vendorName} #${invoiceNumber || "no-inv#"} total=${total}) — forcing 'received'.`,
+        );
+        status = "received";
+    }
+
     const payload = {
         vendor_name: vendorName,
         invoice_number: invoiceNumber,
@@ -98,8 +128,9 @@ export async function upsertVendorInvoice(
         subtotal: record.subtotal ?? 0,
         freight: record.freight ?? 0,
         tax: record.tax ?? 0,
-        total: record.total ?? 0,
-        status: record.status ?? "received",
+        total,
+        status,
+        extraction_quality: extractionQuality,
         source: record.source,
         source_ref: record.source_ref ?? null,
         pdf_storage_path: record.pdf_storage_path ?? null,
@@ -108,6 +139,11 @@ export async function upsertVendorInvoice(
         reconciled_at: record.reconciled_at ?? null,
         paid_at: record.paid_at ?? null,
         notes: record.notes ?? null,
+        tariff: record.tariff ?? 0,
+        labor: record.labor ?? 0,
+        tracking_numbers: record.tracking_numbers ?? [],
+        payment_status: record.payment_status ?? 'unpaid',
+        discrepancies: record.discrepancies ?? [],
         updated_at: new Date().toISOString(),
     };
 
