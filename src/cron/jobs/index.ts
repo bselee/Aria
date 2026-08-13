@@ -1294,66 +1294,21 @@ defineJob({
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// HERMIA(2026-07-30): Daily bill.com reference data refresh.
-// Step 1: Download AllBillsPage.csv from bill.com via Playwright with persistent
-//         browser profile. If Chrome is unavailable or login fails, logs a
-//         warning and re-imports the last downloaded CSV instead.
-// Step 2: Import the CSV into SQLite billcom_bills_ref table.
-//
-// Runs daily at 7 AM MT. This keeps the dedup check in ap-single-forward.ts
-// (isAlreadyClaimedOrForwarded → billcom_bills_ref lookup) current within
-// ~24 hours, reducing duplicate Bill.com forwards when bills are manually
-// uploaded outside of Aria's pipeline.
-//
-// First-time setup: run `npx tsx src/cli/download-billcom-ref.ts --headed`
-// once to establish the persistent browser profile + log into bill.com.
-// Subsequent headless runs will reuse the session cookies.
+// HERMIA(2026-08-13): Import weekly CUA/manual All Bills CSVs from
+// ~/Downloads/Aria-Ingest/billcom/. Playwright download is retired — login
+// cookies die and filtered exports poisoned the ref table. CUA (or Bill)
+// drops the current All Bills page (~100 active) into that folder.
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "billcom-ref-import",
-    schedule: "0 7 * * *",  // Daily 7 AM
+    schedule: "30 7 * * 1",  // Monday 7:30 AM — after CUA drop
     onFail: "log",
-    description: "Daily 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
+    description: "Monday 7:30 AM: import multi-vendor AllBills CSVs from Aria-Ingest/billcom (no Playwright).",
     handler: async () => {
-        try {
-            // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)
-            const { main: downloadBillComRef } = await import("@/cli/download-billcom-ref");
-            await downloadBillComRef();
-        } catch (err: any) {
-            console.warn(`[billcom-ref-import] Download step warning: ${err?.message ?? err}`);
-            console.warn("[billcom-ref-import] Proceeding with import of existing CSV...");
-        }
-
-        try {
-            // Step 2: Import existing CSV into SQLite
-            const { main: importBillComRef } = await import("@/cli/import-billcom-ref");
-            await importBillComRef();
-        } catch (err: any) {
-            console.error(`[billcom-ref-import] Import step failed: ${err?.message ?? err}`);
-        }
-
-        // Step 3: Clean up old ap_activity_log entries (keep 90 days)
-        try {
-            const { createClient } = await import("@/lib/supabase");
-            const db = createClient();
-            if (db) {
-                const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-                const { data, error } = await db
-                    .from("ap_activity_log")
-                    .delete()
-                    .lt("created_at", cutoff);
-                if (error) {
-                    console.warn(`[billcom-ref-import] Log cleanup warning: ${error.message}`);
-                } else {
-                    const count = typeof data === 'number' ? data : (Array.isArray(data) ? data.length : 0);
-                    console.log(`[billcom-ref-import] Log cleanup: removed entries older than 90 days`);
-                }
-            }
-        } catch (err: any) {
-            console.warn(`[billcom-ref-import] Log cleanup skipped: ${err?.message ?? err}`);
-        }
+        const { importInbox } = await import("@/cli/import-billcom-ref");
+        await importInbox();
     },
-    budget: { durationMs: 120_000 },
+    budget: { durationMs: 60_000 },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1387,8 +1342,8 @@ defineJob({
         }
 
         console.log(
-            `[ap-forward-verification] checked=${result.checked}, verified=${result.verified}, ` +
-            `alreadyVerified=${result.alreadyVerified}, unadjudicable=${result.unadjudicable}, ` +
+            `[ap-forward-verification] checked=${result.checked}, inBillcom=${result.verified}, ` +
+            `alreadyProcessed=${result.alreadyProcessed}, unadjudicable=${result.unadjudicable}, ` +
             `unconfirmed=${result.unconfirmed.length}, refCoverageStart=${result.refCoverageStart ?? "n/a"}`
         );
 

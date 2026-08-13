@@ -5,10 +5,15 @@
  *          ever confirms Bill.com parsed the PDF into a bill (AAA Cooper
  *          freight: 5 weeks of "successfully forwarded" while ~$35K went
  *          unpaid). This module reconciles ap_local_forwards against
- *          billcom_bills_ref and surfaces forwards that never landed. It also
- *          finally activates the dead `verified` column (all 361 rows were 0
- *          on 2026-08-13 — the bounce-check code queries `verified = 0` but
- *          nothing ever set it to 1).
+ *          Bill.com and surfaces forwards that never landed.
+ *
+ *          Flag split (2026-08-13): `verified` is owned by
+ *          gmail-delivery-verify.ts — it proves Gmail SENT the forward
+ *          (all 274 rows were verified=1 after the Gmail sweep, which used
+ *          to make this sweep skip everything). This module judges
+ *          processed-status via its OWN `billcom_processed` column, so a
+ *          Gmail-verified row is still judged and the two signals never
+ *          clobber each other.
  *
  *          Staleness guard: billcom_bills_ref was frozen for 5 weeks on
  *          2026-08-13 (MAX(imported_at) = 2026-07-05). When the ref data is
@@ -52,6 +57,8 @@ export interface VerificationSweepResult {
    * exports are a filtered view, so "absent from ref" ≠ "absent from Bill.com".
    */
   unadjudicable: number;
+  /** Rows already marked billcom_processed=1 (skipped; Gmail verified is NOT this). */
+  alreadyProcessed: number;
   refStale: boolean; // billcom_bills_ref older than staleHours
   refAgeHours: number | null;
   /** Oldest invoice_date present in billcom_bills_ref — the coverage floor. */
@@ -102,6 +109,7 @@ interface ForwardRow {
   ocr_invoice_number: string | null;
   ocr_total: string | null;
   verified: number;
+  billcom_processed: number;
 }
 
 interface RefBillRow {
@@ -146,6 +154,16 @@ function parseAmount(v: unknown): number | null {
 /** Strip non-digits then leading zeros: "0064058411" → "64058411". */
 function normalizeInvoice(s: string): string {
   return s.replace(/\D/g, "").replace(/^0+/, "");
+}
+
+function invoicesLooselyEqual(a: string, b: string): boolean {
+  const da = normalizeInvoice(a);
+  const db = normalizeInvoice(b);
+  if (!da || !db) return false;
+  if (da === db) return true;
+  const [short, long] = da.length <= db.length ? [da, db] : [db, da];
+  if (short.length < 6) return false;
+  return long.startsWith(short) || long.endsWith(short);
 }
 
 /**
@@ -288,7 +306,7 @@ function matchForwardToRef(fwd: ForwardRow, refs: RefBillRow[]): MatchReason | n
 
     // Rule 2: normalized invoice# (leading zeros / padding differences)
     if (fwdVendor && refVendor && fwdVendor === refVendor && fwdInvoice && refInvoice) {
-      if (normFwd && normFwd === normalizeInvoice(refInvoice)) {
+      if (normFwd && invoicesLooselyEqual(fwdInvoice, refInvoice)) {
         return "normalized-invoice";
       }
     }
@@ -296,7 +314,7 @@ function matchForwardToRef(fwd: ForwardRow, refs: RefBillRow[]): MatchReason | n
     // Rule 3: invoice#-only, for rows with no recoverable vendor. Requires a
     // long identifier so short human invoice numbers ("1234") can't collide.
     if (!fwdVendor && normFwd.length >= 6 && refInvoice) {
-      if (normFwd === normalizeInvoice(refInvoice)) {
+      if (invoicesLooselyEqual(fwdInvoice, refInvoice)) {
         return "invoice-only";
       }
     }
@@ -358,6 +376,7 @@ export function runForwardVerificationSweep(opts?: {
     alreadyVerified: 0,
     unconfirmed: [],
     unadjudicable: 0,
+    alreadyProcessed: 0,
     refStale: false,
     refAgeHours: null,
     refCoverageStart: null,
@@ -413,7 +432,7 @@ export function runForwardVerificationSweep(opts?: {
     const rows = db
       .prepare(
         `SELECT id, email_from, email_subject, pdf_filename, forwarded_at,
-                ocr_vendor_name, ocr_invoice_number, ocr_total, verified
+                ocr_vendor_name, ocr_invoice_number, ocr_total, verified, billcom_processed
          FROM ap_local_forwards
          WHERE status IN (${TAKEN_STATUS_LIST.map(() => "?").join(",")})
            AND forwarded_at >= datetime('now', ?)
@@ -421,11 +440,11 @@ export function runForwardVerificationSweep(opts?: {
       )
       .all(...TAKEN_STATUS_LIST, `-${lookbackDays} days`) as ForwardRow[];
 
-    let alreadyVerified = 0;
+    let alreadyProcessed = 0;
     const candidates: ForwardRow[] = [];
     for (const row of rows) {
-      if (row.verified === 1) {
-        alreadyVerified += 1;
+      if (Number(row.billcom_processed) === 1) {
+        alreadyProcessed += 1;
       } else {
         candidates.push(row);
       }
@@ -434,12 +453,12 @@ export function runForwardVerificationSweep(opts?: {
     let verified = 0;
     let unadjudicable = 0;
     const unconfirmed: ForwardVerificationRow[] = [];
-    const markVerified = db.prepare("UPDATE ap_local_forwards SET verified = 1 WHERE id = ?");
+    const markProcessed = db.prepare("UPDATE ap_local_forwards SET billcom_processed = 1 WHERE id = ?");
 
     for (const row of candidates) {
       const reason = matchForwardToRef(row, refs);
       if (reason !== null) {
-        markVerified.run(row.id);
+        markProcessed.run(row.id);
         verified += 1;
         continue;
       }
@@ -515,7 +534,8 @@ export function runForwardVerificationSweep(opts?: {
     return {
       checked: candidates.length,
       verified,
-      alreadyVerified,
+      alreadyVerified: alreadyProcessed,
+      alreadyProcessed,
       unconfirmed,
       unadjudicable,
       refStale: false,

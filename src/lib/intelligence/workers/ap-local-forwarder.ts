@@ -179,6 +179,71 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     return false;
 }
 
+/**
+ * One-stop junk classifier for the local forwarder's pre-send gate.
+ *
+ * Exported so the policy is unit-testable (ap-local-forwarder-junk.test.ts)
+ * and reusable by any other AP surface. Superset of the historical
+ * isNonInvoiceSender gate: everything that helper skipped is still skipped,
+ * plus the generic junk classes measured in ap_local_forwards on 2026-08-13
+ * (37 of 106 FORWARDED rows were not invoices):
+ *
+ *   - FedEx Billing Online statement packets — "Your New FedEx Billing Online
+ *     invoice is attached" from noreply@fedex.com. Multi-invoice billing
+ *     packets, NOT a single invoice; must never reach Bill.com.
+ *   - Vendor order acknowledgments — "Acknowledgment for OrderNumber:
+ *     3259787-00 has been created." from BFG Supply (an order ack, not an
+ *     invoice; the existing 'order acknowledgement' classes miss this shape).
+ *   - Due notices — "Notice of Invoice Due ID: 16" from Uline AR (the notice,
+ *     not the invoice PDF; real "Uline Invoice <digits> ID# 16" emails are
+ *     unaffected).
+ *   - Credit memos — "Credit Memo 149505 from Evergreen Growers Supply"
+ *     (negative-value documents are not bills; SKIP new credit-memo forwards).
+ *   - Account-management correspondence — "BUISA1 - URGENT UPDATE REQUIRED"
+ *     from Berger (account mail, not an invoice).
+ *
+ * RE: threads are skipped ONLY via the per-vendor individual-invoice policy
+ * (AAA Cooper: only "Invoice Stmt ..." / bare-Pro# subjects forward). There is
+ * deliberately NO blanket "RE:" rule — an invoice-numbered reply thread
+ * ("RE: Uline Invoice 211897049 ID# 16") still forwards.
+ *
+ * @param args.from    raw Gmail From header ("Name <email@domain.com>")
+ * @param args.subject raw Gmail Subject header
+ * @returns true when the email must NOT be forwarded (skip before send)
+ */
+export function isNonInvoiceEmail(args: { from: string; subject: string }): boolean {
+    const { from, subject } = args;
+    const fromLower = (from || "").toLowerCase();
+    const subjectLower = (subject || "").toLowerCase();
+
+    // Historical gate stays intact — every class it skipped is still skipped.
+    if (isNonInvoiceSender(from, subject)) return true;
+
+    // FedEx Billing Online statement packets (noreply@fedex.com, subject
+    // "Your New FedEx Billing Online invoice is attached"). Multi-invoice
+    // billing packets — Bill.com gets individual invoices, not packets.
+    // NOTE (2026-08-13): this subject also identifies the fedex-billing-packet
+    // channel; per the measured audit those forwards are junk, so the gate
+    // stops the whole channel before send.
+    if (subjectLower.includes("fedex billing online")) return true;
+
+    // BFG Supply order acknowledgments: "Acknowledgment for OrderNumber:
+    // 3259787-00 has been created." (also covers British spelling).
+    if (/acknowledgment\s+for\s+order/i.test(subjectLower)) return true;
+
+    // Uline AR due notice (NOT the invoice PDF):
+    // "Notice of Invoice Due ID: 16 C# (9897269)".
+    if (subjectLower.includes("notice of invoice due")) return true;
+
+    // Credit memos — negative-value documents, never forwarded as bills.
+    if (subjectLower.includes("credit memo")) return true;
+
+    // Account-management correspondence: "BUISA1 - URGENT UPDATE REQUIRED".
+    if (subjectLower.includes("urgent update required")) return true;
+
+    return false;
+}
+
 /** Statement / collections attachments that must never hit Bill.com. */
 function isStatementAttachment(filename: string, from: string, subject: string): boolean {
     const f = (filename || "").toLowerCase();
@@ -1199,8 +1264,14 @@ export async function runLocalApForward(): Promise<{
             const from = headers.find((h: any) => h.name === "From")?.value || "unknown";
             const gmailMessageId = msg.id;
 
-            // Skip known non-invoice senders (tracking notifications, etc.)
-            if (isNonInvoiceSender(from, subject)) {
+            // Skip known non-invoice senders / junk classes BEFORE send and
+            // BEFORE vendor routing (tracking notifications, FedEx Billing
+            // Online packets, order acks, credit memos, due notices, ...).
+            // isNonInvoiceEmail is the superset gate: historical
+            // isNonInvoiceSender + junk classes measured 2026-08-13. The AAA
+            // Cooper individual-invoice-only policy (RE: remittance threads,
+            // Account <digits> - bundles) lives inside it — verified 2026-08-13.
+            if (isNonInvoiceEmail({ from, subject })) {
                 console.log(`   [AP-Local] Skipping non-invoice: ${subject.slice(0, 50)} (${from.slice(0, 25)})`);
                 recordSkippedForward({
                     gmailMessageId,

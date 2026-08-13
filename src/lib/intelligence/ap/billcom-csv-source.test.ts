@@ -37,7 +37,7 @@ vi.mock("@/lib/storage/local-db", () => ({
   getLocalDb: () => mem,
 }));
 
-import { resolveBillComCsv, isRefDataStale } from "./billcom-csv-source";
+import { resolveBillComCsv, isRefDataStale, listBillComInboxCsvs } from "./billcom-csv-source";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 let dataDir: string;
@@ -237,5 +237,20 @@ describe("isRefDataStale", () => {
         );
       `);
     }
+  });
+});
+
+describe("listBillComInboxCsvs", () => {
+  it("skips empty/missing dir and ranks multi-vendor first", () => {
+    expect(listBillComInboxCsvs(path.join(os.tmpdir(), "no-such-billcom-inbox"))).toEqual([]);
+
+    const header = "Invoice no.,Vendor,Invoice amount\n";
+    const multi = path.join(downloadsDir, "AllBillsPage (m).csv");
+    const single = path.join(downloadsDir, "AllBillsPage (s).csv");
+    fs.writeFileSync(multi, header + "1,Uline,10\n2,Abels,20\n");
+    fs.writeFileSync(single, header + "9,AAA Cooper Transportation,1\n");
+    const listed = listBillComInboxCsvs(downloadsDir);
+    expect(listed[0].vendorCount).toBeGreaterThan(1);
+    expect(listed.some((f) => f.vendorCount === 1)).toBe(true);
   });
 });

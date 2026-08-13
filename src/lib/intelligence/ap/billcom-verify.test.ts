@@ -33,6 +33,7 @@ mem.exec(`
     completed_at DATETIME,
     vendor_routing_action TEXT,
     verified INTEGER DEFAULT 0,
+    billcom_processed INTEGER DEFAULT 0,
     ocr_line_items TEXT,
     ocr_freight TEXT,
     ocr_tax TEXT,
@@ -98,6 +99,7 @@ function insertForward(row: {
   ocrTotal?: string | null;
   status?: string;
   verified?: number;
+  billcomProcessed?: number;
   emailFrom?: string | null;
   emailSubject?: string | null;
 }): number {
@@ -106,8 +108,8 @@ function insertForward(row: {
     .prepare(
       `INSERT INTO ap_local_forwards (
          gmail_message_id, email_from, email_subject, pdf_filename, pdf_content_hash,
-         status, forwarded_at, ocr_vendor_name, ocr_invoice_number, ocr_total, verified
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         status, forwarded_at, ocr_vendor_name, ocr_invoice_number, ocr_total, verified, billcom_processed
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       `msg-${msgCounter}`,
@@ -121,6 +123,7 @@ function insertForward(row: {
       row.invoiceNumber ?? null,
       row.ocrTotal ?? null,
       row.verified ?? 0,
+      row.billcomProcessed ?? 0,
     );
   return Number(info.lastInsertRowid);
 }
@@ -153,6 +156,13 @@ function getVerified(id: number): number {
   return row.verified;
 }
 
+function getBillcomProcessed(id: number): number {
+  const row = mem.prepare("SELECT billcom_processed FROM ap_local_forwards WHERE id = ?").get(id) as {
+    billcom_processed: number;
+  };
+  return row.billcom_processed;
+}
+
 beforeEach(() => {
   mem.prepare("DELETE FROM ap_local_forwards").run();
   mem.prepare("DELETE FROM billcom_bills_ref").run();
@@ -177,9 +187,10 @@ describe("runForwardVerificationSweep", () => {
     expect(result.refStale).toBe(false);
     expect(result.checked).toBe(1);
     expect(result.verified).toBe(1);
-    expect(result.alreadyVerified).toBe(0);
+    expect(result.alreadyProcessed).toBe(0);
     expect(result.unconfirmed).toHaveLength(0);
-    expect(getVerified(id)).toBe(1);
+    expect(getBillcomProcessed(id)).toBe(1);
+    expect(getVerified(id)).toBe(0);
   });
 
   it("2. normalized invoice# match (leading zeros stripped) → verified", () => {
@@ -196,7 +207,8 @@ describe("runForwardVerificationSweep", () => {
 
     expect(result.verified).toBe(1);
     expect(result.unconfirmed).toHaveLength(0);
-    expect(getVerified(id)).toBe(1);
+    expect(getBillcomProcessed(id)).toBe(1);
+    expect(getVerified(id)).toBe(0);
   });
 
   it("3. forwarded, absent from ref, age > graceHours → appears in unconfirmed", () => {
@@ -304,10 +316,11 @@ describe("runForwardVerificationSweep", () => {
 
     expect(result.verified).toBe(1);
     expect(result.unconfirmed).toHaveLength(0);
-    expect(getVerified(id)).toBe(1);
+    expect(getBillcomProcessed(id)).toBe(1);
+    expect(getVerified(id)).toBe(0);
   });
 
-  it("7. already-verified rows counted in alreadyVerified, not re-processed", () => {
+  it("7. billcom_processed=1 rows are skipped; verified=1 rows are still examined", () => {
     insertRef({ invoiceNumber: "999", vendorName: "FedEx", invoiceAmount: 100 });
     // Seed AAA Cooper coverage so the pending row is adjudicable.
     for (let i = 1; i <= 12; i++) {
@@ -318,12 +331,12 @@ describe("runForwardVerificationSweep", () => {
       });
     }
     insertForward({
-      pdfFilename: "already.pdf",
+      pdfFilename: "already-judged.pdf",
       forwardedAt: hoursAgo(48),
-      vendorName: "Belt Power",
-      invoiceNumber: "3198860",
-      ocrTotal: "534.85",
-      verified: 1,
+      vendorName: "AAA Cooper Transportation",
+      invoiceNumber: "64118005", // present in ref — would match if re-examined
+      ocrTotal: "205",
+      billcomProcessed: 1, // a previous Bill.com sweep already confirmed it
     });
     insertForward({
       pdfFilename: "pending.pdf",
@@ -335,11 +348,152 @@ describe("runForwardVerificationSweep", () => {
 
     const result = runForwardVerificationSweep();
 
-    expect(result.alreadyVerified).toBe(1);
-    expect(result.checked).toBe(1); // only the unverified row is examined
+    expect(result.alreadyProcessed).toBe(1);
+    expect(result.checked).toBe(1); // only the non-processed row is examined
     expect(result.verified).toBe(0);
     expect(result.unconfirmed).toHaveLength(1);
     expect(result.unconfirmed[0].pdfFilename).toBe("pending.pdf");
+  });
+
+  // ── Flag split (2026-08-13): verified vs billcom_processed ────────────────
+  // gmail-delivery-verify.ts owns `verified` — it proves Gmail SENT the
+  // forward. billcom-verify must judge processed-status independently via the
+  // NEW `billcom_processed` column, never skip on verified=1, and never clear
+  // it. Previously the Gmail sweep set verified=1 on ALL 274 forwards, so the
+  // 9 AM Bill.com sweep skipped every row and never judged processed-status.
+
+  it("verified=1 Gmail row still gets judged; match writes billcom_processed, never clears verified", () => {
+    insertRef({ invoiceNumber: "3198860", vendorName: "belt power", invoiceAmount: 534.85 });
+    const id = insertForward({
+      pdfFilename: "gmail-verified.pdf",
+      forwardedAt: hoursAgo(48),
+      vendorName: "Belt Power",
+      invoiceNumber: "3198860",
+      ocrTotal: "534.85",
+      verified: 1, // the Gmail delivery sweep already confirmed the SEND
+    });
+
+    const result = runForwardVerificationSweep();
+
+    // verified=1 must NOT skip the row — it is still judged against Bill.com.
+    expect(result.alreadyProcessed).toBe(0);
+    expect(result.checked).toBe(1);
+    expect(result.verified).toBe(1); // newly confirmed present in Bill.com
+    expect(result.unconfirmed).toHaveLength(0);
+    expect(getBillcomProcessed(id)).toBe(1); // match written to the NEW column
+    expect(getVerified(id)).toBe(1); // Gmail flag untouched (never cleared)
+  });
+
+  it("a match sets billcom_processed=1, NOT verified (verified stays owned by the Gmail sweep)", () => {
+    insertRef({ invoiceNumber: "64058411", vendorName: "ULINE", invoiceAmount: 3283.53 });
+    const id = insertForward({
+      pdfFilename: "Uline_Invoice2.pdf",
+      forwardedAt: hoursAgo(48),
+      vendorName: "Uline",
+      invoiceNumber: "0064058411",
+      ocrTotal: "3283.53",
+    });
+
+    const result = runForwardVerificationSweep();
+
+    expect(result.verified).toBe(1);
+    expect(getBillcomProcessed(id)).toBe(1);
+    expect(getVerified(id)).toBe(0); // billcom-verify must not touch verified
+  });
+
+  it("rows already billcom_processed are skipped, not re-judged", () => {
+    insertRef({ invoiceNumber: "3198860", vendorName: "belt power", invoiceAmount: 534.85 });
+    const id = insertForward({
+      pdfFilename: "judged.pdf",
+      forwardedAt: hoursAgo(48),
+      vendorName: "Belt Power",
+      invoiceNumber: "3198860",
+      ocrTotal: "534.85",
+      billcomProcessed: 1,
+      verified: 0,
+    });
+
+    const result = runForwardVerificationSweep();
+
+    expect(result.alreadyProcessed).toBe(1);
+    expect(result.checked).toBe(0); // not examined again
+    expect(result.verified).toBe(0);
+    expect(getBillcomProcessed(id)).toBe(1);
+    expect(getVerified(id)).toBe(0); // untouched
+  });
+
+  // ── Invoice# matcher regressions (2026-08-13) ─────────────────────────────
+  // Real misses: Abel's 481033 lands in Bill.com as "48 10 3 3/1" and
+  // American Extracts 4485 as "SF4485". Both must match; two distinct long
+  // Pro#s (64058414 vs 64058431) must never be conflated.
+
+  it("481033 (Aria) matches ref '48 10 3 3/1' (Bill.com) via digit containment", () => {
+    insertRef({
+      invoiceNumber: "48 10 3 3/1",
+      vendorName: "Abel's Ace Hardware",
+      invoiceAmount: 100,
+      invoiceDate: dateMMDDYYYY(new Date()),
+    });
+    const id = insertForward({
+      pdfFilename: "abels.pdf",
+      forwardedAt: hoursAgo(48),
+      vendorName: "Abel's Ace Hardware",
+      invoiceNumber: "481033",
+      ocrTotal: "100",
+    });
+
+    const result = runForwardVerificationSweep();
+
+    expect(result.verified).toBe(1);
+    expect(result.unconfirmed).toHaveLength(0);
+    expect(getBillcomProcessed(id)).toBe(1);
+  });
+
+  it("4485 (Aria) matches ref 'SF4485' (Bill.com) — letters stripped", () => {
+    insertRef({
+      invoiceNumber: "SF4485",
+      vendorName: "American Extracts",
+      invoiceAmount: 200,
+      invoiceDate: dateMMDDYYYY(new Date()),
+    });
+    const id = insertForward({
+      pdfFilename: "am-extracts.pdf",
+      forwardedAt: hoursAgo(48),
+      vendorName: "American Extracts",
+      invoiceNumber: "4485",
+      ocrTotal: "200",
+    });
+
+    const result = runForwardVerificationSweep();
+
+    expect(result.verified).toBe(1);
+    expect(result.unconfirmed).toHaveLength(0);
+    expect(getBillcomProcessed(id)).toBe(1);
+  });
+
+  it("64058414 does NOT match 64058431 (distinct long Pro#s never conflated)", () => {
+    // Seed AAA Cooper coverage so a genuine miss reaches unconfirmed.
+    for (let i = 1; i <= 12; i++) {
+      insertRef({
+        invoiceNumber: "640580" + String(i).padStart(2, "0"),
+        vendorName: "AAA Cooper Transportation",
+        invoiceAmount: 100 + i,
+      });
+    }
+    insertRef({ invoiceNumber: "64058431", vendorName: "AAA Cooper Transportation", invoiceAmount: 328.38 });
+    insertForward({
+      pdfFilename: "ACT_STMD_64058414.PDF",
+      forwardedAt: hoursAgo(72),
+      vendorName: "AAA Cooper Transportation",
+      invoiceNumber: "64058414",
+      ocrTotal: "328.38",
+    });
+
+    const result = runForwardVerificationSweep();
+
+    expect(result.verified).toBe(0);
+    expect(result.unconfirmed).toHaveLength(1);
+    expect(result.unconfirmed[0].invoiceNumber).toBe("64058414");
   });
 
   // ── Calibration regressions ───────────────────────────────────────────────

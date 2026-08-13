@@ -215,6 +215,48 @@ export function resolveBillComCsv(opts?: {
   };
 }
 
+/** Canonical drop folder so agents see weekly CUA/manual exports without chat attach. */
+export function billcomInboxDir(): string {
+  return path.join(os.homedir(), "Downloads", "Aria-Ingest", "billcom");
+}
+
+export interface InboxCsv {
+  path: string;
+  vendorCount: number | null;
+  mtimeMs: number;
+}
+
+/**
+ * List AllBillsPage*.csv in the agent inbox. Skips empty files.
+ * Multi-vendor files first (breadth), then newest.
+ */
+export function listBillComInboxCsvs(inboxDir?: string): InboxCsv[] {
+  const dir = inboxDir ?? billcomInboxDir();
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: InboxCsv[] = [];
+  for (const name of names) {
+    if (!DOWNLOADS_GLOB.test(name)) continue;
+    const filePath = path.join(dir, name);
+    const st = safeStat(filePath);
+    if (!st || !st.isFile() || st.size < 40) continue;
+    const vendorCount = countCsvVendors(filePath);
+    if (vendorCount === null || vendorCount < 1) continue;
+    out.push({ path: filePath, vendorCount, mtimeMs: st.mtimeMs });
+  }
+  out.sort((a, b) => {
+    const aBroad = (a.vendorCount ?? 0) > 1 ? 1 : 0;
+    const bBroad = (b.vendorCount ?? 0) > 1 ? 1 : 0;
+    if (aBroad !== bBroad) return bBroad - aBroad;
+    return b.mtimeMs - a.mtimeMs;
+  });
+  return out;
+}
+
 /**
  * Report how stale billcom_bills_ref has gone, by comparing the newest
  * imported_at against now. Used to make staleness loud instead of silent:

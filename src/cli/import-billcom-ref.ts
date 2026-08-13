@@ -15,11 +15,12 @@
  *
  * Usage:
  *   npx tsx src/cli/import-billcom-ref.ts
+ *   npx tsx src/cli/import-billcom-ref.ts --inbox
  *   npx tsx src/cli/import-billcom-ref.ts --csv=path/to/custom.csv
  */
 
 import { getLocalDb } from "@/lib/storage/local-db";
-import { resolveBillComCsv, isRefDataStale } from "@/lib/intelligence/ap/billcom-csv-source";
+import { resolveBillComCsv, isRefDataStale, listBillComInboxCsvs } from "@/lib/intelligence/ap/billcom-csv-source";
 import fs from "fs";
 
 // ── CSV Column Mapping ───────────────────────────────────────────────────────
@@ -297,8 +298,36 @@ function importRows(rows: ParsedRow[]): { inserted: number; updated: number; err
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+export async function importInbox(): Promise<void> {
+  const files = listBillComInboxCsvs().filter((f) => (f.vendorCount ?? 0) > 1);
+  if (files.length === 0) {
+    throw new Error("no multi-vendor CSVs in Downloads/Aria-Ingest/billcom/");
+  }
+  console.log(`[billcom-import] inbox: ${files.length} multi-vendor file(s)`);
+  for (const f of files) {
+    console.log(`[billcom-import] CSV: ${f.path} (vendors=${f.vendorCount})`);
+    const rows = parseCSV(f.path);
+    const result = importRows(rows);
+    console.log(`[billcom-import]   wrote ${result.inserted + result.updated} (err ${result.errors})`);
+  }
+  const db = getLocalDb();
+  const total = (db.prepare("SELECT COUNT(*) AS cnt FROM billcom_bills_ref").get() as { cnt: number }).cnt;
+  console.log(`[billcom-import] ✓ inbox done. Table total: ${total} rows.`);
+}
+
 export async function main(): Promise<void> {
   console.log(`[billcom-import] Importing Bill.com reference data...`);
+
+  const inboxMode = process.argv.includes("--inbox");
+  if (inboxMode) {
+    try {
+      await importInbox();
+    } catch (err: any) {
+      console.error(`[billcom-import] --inbox: ${err?.message ?? err}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
 
   // Explicit --csv= override wins over auto-resolution.
   const csvArg = process.argv.find((a) => a.startsWith("--csv="));
