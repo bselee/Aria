@@ -7,7 +7,8 @@
  * @author  Hermia
  * @created 2026-07-10
  * @updated 2026-07-10 — ERROR reclaim, hash-first claim, health-check ready
- * @deps    local-db, gmail, crypto
+ * @updated 2026-08-13 — fuzzy vendor+amount+date dedup layer (Workstream D)
+ * @deps    local-db, gmail, crypto, ./ap-dedup
  * @env     BILL_COM_FORWARD_EMAIL (default: buildasoilap@bill.com)
  *
  * INVARIANT (Bill Selee, 2026-07-10):
@@ -20,6 +21,7 @@ import { createHash, randomBytes } from "crypto";
 import { getLocalDb } from "@/lib/storage/local-db";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
+import { findFuzzyDuplicate } from "./ap-dedup";
 
 const BILL_COM_EMAIL =
   process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
@@ -48,6 +50,8 @@ export interface SingleForwardRequest {
   pdfBuffer: Buffer;
   vendorName?: string;
   invoiceNumber?: string;
+  /** Invoice total in dollars — feeds the LAST-RESORT fuzzy dedup layer. */
+  invoiceTotal?: number;
   source: SingleForwardSource;
   gmail?: any;
   ocrRawText?: string;
@@ -119,6 +123,7 @@ export function isAlreadyClaimedOrForwarded(
   pdfHash: string,
   vendorName?: string,
   invoiceNumber?: string,
+  invoiceTotal?: number,
 ): { hit: boolean; reason: string; billcomSentMessageId?: string | null } {
   const db = getLocalDb();
   expireStaleClaims(db);
@@ -163,6 +168,56 @@ export function isAlreadyClaimedOrForwarded(
     };
   }
 
+  if (invoiceNumber) {
+    const inv = invoiceNumber.trim();
+    const invNormalized = inv.replace(/\D/g, "").replace(/^0+/, "");
+    if (invNormalized.length >= 5) {
+      // Layer 4: prior forward row carrying the same OCR invoice# (vendor-agnostic
+      // for LTL Pro#-style numbers — OCR vendor name is unreliable).
+      try {
+        const byOcr = db
+          .prepare(
+            `SELECT status, billcom_sent_message_id FROM ap_local_forwards
+             WHERE status IN (${TAKEN_IN_CLAUSE})
+               AND ocr_invoice_number IS NOT NULL
+               AND (
+                 ocr_invoice_number = ?
+                 OR REPLACE(ocr_invoice_number, '-', '') = ?
+                 OR LTRIM(ocr_invoice_number, '0') = ?
+               )
+             LIMIT 1`,
+          )
+          .get(inv, invNormalized, invNormalized, ...taken) as
+          | { status: string; billcom_sent_message_id: string | null }
+          | undefined;
+        if (byOcr) {
+          return {
+            hit: true,
+            reason: `ocr invoice# (${byOcr.status})`,
+            billcomSentMessageId: byOcr.billcom_sent_message_id,
+          };
+        }
+      } catch {
+        /* column may be absent in some envs */
+      }
+
+      // Layer 5: local invoice_cache (365d AP logs)
+      try {
+        const byCache = db
+          .prepare(
+            `SELECT 1 FROM invoice_cache
+             WHERE invoice_number = ?
+               AND expire_at > datetime('now')
+             LIMIT 1`,
+          )
+          .get(inv);
+        if (byCache) return { hit: true, reason: "invoice_cache invoice#" };
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
   if (vendorName && invoiceNumber) {
     try {
       const ref = db
@@ -178,6 +233,28 @@ export function isAlreadyClaimedOrForwarded(
       }
     } catch {
       /* ref table missing */
+    }
+  }
+
+  // ── LAST-RESORT layer: fuzzy vendor + amount + date window ──────────────
+  // Runs DEAD LAST, only after hash, message+filename, invoice#, and
+  // billcom_bills_ref have all missed. Catches a vendor re-sending the same
+  // invoice as a freshly-generated PDF (different bytes, different filename,
+  // invoice# absent or OCR-garbled — e.g. AAA Cooper's ocr_invoice_number
+  // has yielded "3746570" (account number) and "==Start of OCR for page 1==").
+  // Requires BOTH vendor and a finite positive total — never guesses.
+  if (vendorName && typeof invoiceTotal === "number" && Number.isFinite(invoiceTotal) && invoiceTotal > 0) {
+    try {
+      const fuzzy = findFuzzyDuplicate({ vendorName, total: invoiceTotal });
+      if (fuzzy.hit) {
+        return {
+          hit: true,
+          reason: fuzzy.reason,
+          billcomSentMessageId: fuzzy.existingBillcomMessageId,
+        };
+      }
+    } catch {
+      /* fuzzy layer must never block a legitimate forward */
     }
   }
 
@@ -206,6 +283,7 @@ function claimForward(
     pdfHash,
     req.vendorName,
     req.invoiceNumber,
+    req.invoiceTotal,
   );
   if (existing.hit) {
     return {
@@ -245,6 +323,8 @@ function claimForward(
              pdf_content_hash = ?,
              vendor_routing_action = ?,
              ocr_raw_text = COALESCE(?, ocr_raw_text),
+             ocr_vendor_name = COALESCE(?, ocr_vendor_name),
+             ocr_invoice_number = COALESCE(?, ocr_invoice_number),
              billcom_sent_message_id = NULL,
              error_message = ?,
              forwarded_at = datetime('now')
@@ -257,6 +337,8 @@ function claimForward(
         pdfHash,
         req.vendorRoutingAction || req.source,
         req.ocrRawText || null,
+        req.vendorName || null,
+        req.invoiceNumber || null,
         `reclaim:${req.source}`,
         reclaimable.id,
       );
@@ -272,8 +354,9 @@ function claimForward(
         `INSERT INTO ap_local_forwards
            (gmail_message_id, email_from, email_subject, pdf_filename,
             pdf_content_hash, status, vendor_routing_action, ocr_raw_text,
+            ocr_vendor_name, ocr_invoice_number,
             error_message, forwarded_at)
-         VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, datetime('now'))`,
+         VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?, ?, datetime('now'))`,
       )
       .run(
         req.gmailMessageId,
@@ -283,6 +366,8 @@ function claimForward(
         pdfHash,
         req.vendorRoutingAction || req.source,
         req.ocrRawText || null,
+        req.vendorName || null,
+        req.invoiceNumber || null,
         `claim:${req.source}`,
       );
     return { claimed: true, claimId: Number(info.lastInsertRowid) };
@@ -294,6 +379,7 @@ function claimForward(
       pdfHash,
       req.vendorName,
       req.invoiceNumber,
+      req.invoiceTotal,
     );
     if (again.hit) {
       return {
