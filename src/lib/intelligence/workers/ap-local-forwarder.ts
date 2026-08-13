@@ -42,6 +42,11 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
 import {
+    deriveCanonicalVendorName,
+    extractInvoiceNumber,
+    isBundleEmail,
+} from "@/lib/intelligence/ap/vendor-invoice-patterns";
+import {
     FEDEX_CARRIER_BILL_ACTION,
     buildFedExBillComFilename,
     classifyFedExBillingAttachment,
@@ -83,6 +88,28 @@ function parseFromHeader(from: string): { email: string; name: string } {
 function checkVendorRouting(from: string, subject: string, filename: string = ""): VendorRoutingRule | null {
     const { email, name } = parseFromHeader(from);
     return matchVendorRouting(email, name, subject, filename);
+}
+
+/**
+ * Extract a candidate invoice/Pro number from an email subject.
+ * AAA Cooper sends individual invoices as "Invoice Stmt - Cust 0001159492 Pro#: 64058431"
+ * or a bare Pro# "64471555". Other vendors use "Invoice #12345" shapes.
+ * Returns the raw numeric invoice number string, or undefined.
+ * This is the RELIABLE identity for dedup — OCR invoice# is unreliable for LTL
+ * freight (pulls account number "3746570" or "==Start of OCR==", not the Pro#).
+ */
+function extractInvoiceNumberFromSubject(subject: string): string | undefined {
+    // WS-C (2026-08-13): extraction lives in the declarative per-vendor table
+    // (src/lib/intelligence/ap/vendor-invoice-patterns.ts). No sender context
+    // here, so use the generic chain — byte-identical to the historical
+    // subject-only logic (Pro# → bare digits → invoice), AAA Cooper Pro# included.
+    return extractInvoiceNumber("", subject);
+}
+
+/** Derive a normalized vendor name from a From header for DB dedup gating. */
+function deriveVendorName(from: string): string | undefined {
+    // WS-C (2026-08-13): canonical names come from the vendor pattern table.
+    return deriveCanonicalVendorName(from);
 }
 
 /**
@@ -136,6 +163,18 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
         (fromLower.includes("billtrust.com") && (fromLower.includes("toyota") || subjectLower.includes("ticf")))
     ) {
         return true;
+    }
+    // AAA Cooper Transportation (2026-08-13): forward INDIVIDUAL invoices only.
+    // Their correspondence bundles ("Account 1159492 - BUILDASOIL"), statements,
+    // and reply threads ("RE: Need remittance") bundle the SAME invoices that are
+    // also sent individually — forwarding them creates "Multiple Copies" in
+    // Bill.com. Individual invoices are the "Invoice Stmt - ... Pro#: N" emails
+    // or bare-Pro# subjects. Those stay forwarded; everything else is skipped.
+    if (fromLower.includes("aaacooper")) {
+        const isIndividualInvoice =
+            subjectLower.includes("invoice stmt") ||
+            /^\s*\d{5,10}\s*$/.test(subject.trim());
+        if (!isIndividualInvoice) return true;
     }
     return false;
 }
@@ -1319,8 +1358,15 @@ export async function runLocalApForward(): Promise<{
                     );
                 }
 
-                // Dedup: hash / message+file / vendor+inv — log, never re-send
-                if (isDuplicate(gmailMessageId, pdfFilename, pdfHash) || isAlreadyForwarded(gmailMessageId, pdfFilename, pdfHash)) {
+                // Dedup: hash / message+file / vendor+inv — log, never re-send.
+                // Extract invoice# from the SUBJECT (reliable for AAA Cooper Pro#)
+                // and derive vendor name, so the vendor+invoice# DB gate fires.
+                const subjectInvoiceNumber = extractInvoiceNumberFromSubject(subject);
+                const subjectVendorName = deriveVendorName(from);
+                if (
+                    isDuplicate(gmailMessageId, pdfFilename, pdfHash) ||
+                    isAlreadyForwarded(gmailMessageId, pdfFilename, pdfHash, subjectVendorName, subjectInvoiceNumber)
+                ) {
                     console.log(`   [AP-Local] ⏭️ Already logged/forwarded (dedup): ${pdfFilename} (msg ${gmailMessageId})`);
                     summary.skipped++;
                     continue;
@@ -1396,7 +1442,8 @@ export async function runLocalApForward(): Promise<{
                             ? "FedEx"
                             : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
                               ? "Down to Earth Worms"
-                              : undefined,
+                              : subjectVendorName,
+                        invoiceNumber: subjectInvoiceNumber,
                     });
                     if (once.status === "already_forwarded") {
                         console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);
