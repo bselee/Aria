@@ -219,13 +219,16 @@ export function isNonInvoiceEmail(args: { from: string; subject: string }): bool
     // Historical gate stays intact — every class it skipped is still skipped.
     if (isNonInvoiceSender(from, subject)) return true;
 
-    // FedEx Billing Online statement packets (noreply@fedex.com, subject
-    // "Your New FedEx Billing Online invoice is attached"). Multi-invoice
-    // billing packets — Bill.com gets individual invoices, not packets.
-    // NOTE (2026-08-13): this subject also identifies the fedex-billing-packet
-    // channel; per the measured audit those forwards are junk, so the gate
-    // stops the whole channel before send.
-    if (subjectLower.includes("fedex billing online")) return true;
+    // FedEx Billing Online past-due NOTICES — "FedEx Billing Online -
+    // Invoice(s) Past Due" from BillingOnline@fedex.com. These carry NO
+    // invoice PDF (the notice, not the bill) — skip. The invoice-attached
+    // emails ("Your New FedEx Billing Online invoice is attached" from
+    // noreply@fedex.com) MUST forward: they are the FedEx carrier bills
+    // (full packet, pay-path only via fedex-billing-packet.ts).
+    // REVERSED (2026-08-18, Bill): the 08-13 gate that skipped the whole
+    // channel was wrong — "fedex can not be skipped!". The packet channel
+    // forwards as carrier_bill; only past-due notices stay skipped.
+    if (subjectLower.includes("fedex billing online") && subjectLower.includes("past due")) return true;
 
     // BFG Supply order acknowledgments: "Acknowledgment for OrderNumber:
     // 3259787-00 has been created." (also covers British spelling).
@@ -511,8 +514,13 @@ async function enrichInvoiceForPoMatch(args: {
             `UPDATE ap_local_forwards
              SET ocr_raw_text = COALESCE(?, ocr_raw_text),
                  ocr_processed_at = datetime('now'),
-                 ocr_vendor_name = ?,
-                 ocr_invoice_number = ?,
+                 -- HERMIA(2026-08-18): subject-derived identity wins. OCR of AAA
+                 -- Cooper freight PDFs yields the CUSTOMER/account number
+                 -- ("3746570") instead of the Pro#, and an unconditional write
+                 -- here clobbered the reliable subject Pro# stored at claim
+                 -- time. Only fill vendor/invoice# when the row has none.
+                 ocr_vendor_name = CASE WHEN ocr_vendor_name IS NULL OR ocr_vendor_name = '' THEN ? ELSE ocr_vendor_name END,
+                 ocr_invoice_number = CASE WHEN ocr_invoice_number IS NULL OR ocr_invoice_number = '' THEN ? ELSE ocr_invoice_number END,
                  ocr_total = ?,
                  ocr_freight = ?,
                  ocr_tax = ?,

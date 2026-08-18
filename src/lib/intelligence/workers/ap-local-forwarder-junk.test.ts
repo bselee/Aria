@@ -41,14 +41,16 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
         ).toBe(false);
     });
 
-    // ── FedEx Billing Online statement packets (must skip) ────────────────
-    it("skips FedEx Billing Online invoice-attached email (multi-invoice statement packet)", () => {
+    // ── FedEx Billing Online (REVERSED 2026-08-18, Bill: "fedex can not be skipped!") ──
+    // Invoice-attached emails are FedEx carrier bills — they MUST forward
+    // (full packet, pay-path only via fedex-billing-packet.ts).
+    it("ALLOWS FedEx Billing Online invoice-attached email (carrier bill)", () => {
         expect(
             isNonInvoiceEmail({
                 from: "FedEx Billing Online <noreply@fedex.com>",
                 subject: "Your New FedEx Billing Online invoice is attached",
             }),
-        ).toBe(true);
+        ).toBe(false);
     });
 
     it("skips FedEx Billing Online past-due notice", () => {
