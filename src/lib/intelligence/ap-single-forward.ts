@@ -192,7 +192,7 @@ export function isAlreadyClaimedOrForwarded(
                )
              LIMIT 1`,
           )
-          .get(inv, invNormalized, invNormalized, ...taken) as
+          .get(...taken, inv, invNormalized, invNormalized) as
           | { status: string; billcom_sent_message_id: string | null }
           | undefined;
         if (byOcr) {

@@ -102,6 +102,20 @@ describe("classifyFedExBillingAttachment", () => {
         expect(meta.serviceHint).toBe("Express");
         expect(meta.mayTrimPages).toBe(false);
     });
+
+    it("derives display invoice# from filename digits when packet text is unavailable", () => {
+        // Real-world case: local forwarder's first classify runs before OCR text
+        // exists. The filename digits MUST still yield the dashed number that gets
+        // passed into forwardInvoiceOnce (ocr_invoice_number / dedup layers 4-6).
+        const meta = classifyFedExBillingAttachment({
+            from: "noreply@fedex.com",
+            subject: "Your New FedEx Billing Online invoice is attached",
+            filename: "12.99999.10033.942652443.XXXXX5250.000030.pdf",
+            pdfTextPreview: undefined,
+        });
+        expect(meta.isPacket).toBe(true);
+        expect(meta.invoiceNumberDisplay).toBe("9-426-52443");
+    });
 });
 
 describe("Bill.com filename + queue fields", () => {

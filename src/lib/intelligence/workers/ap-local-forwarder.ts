@@ -1511,7 +1511,12 @@ export async function runLocalApForward(): Promise<{
                         pdfBuffer,
                         source: "local-forwarder",
                         gmail,
-                        ocrRawText: paidCheck.rawText,
+                        // FedEx packets: rawText is the FULL multi-page packet text
+                        // (up to ~426KB for Ground) — persist only a prefix. The
+                        // invoice#, vendor and totals live in ocr_* columns, not this blob.
+                        ocrRawText: isFedExCarrierBill
+                            ? (paidCheck.rawText || "").slice(0, 60000)
+                            : paidCheck.rawText,
                         vendorRoutingAction: isFedExCarrierBill
                             ? FEDEX_CARRIER_BILL_ACTION
                             : skipReconciliation
@@ -1522,7 +1527,15 @@ export async function runLocalApForward(): Promise<{
                             : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
                               ? "Down to Earth Worms"
                               : subjectVendorName,
-                        invoiceNumber: subjectInvoiceNumber,
+                        // FedEx subjects carry NO invoice number ("Your New FedEx
+                        // Billing Online invoice is attached") — fall back to the
+                        // filename-derived packet number so ocr_invoice_number is
+                        // populated and Layers 4–6 (ocr invoice#, invoice_cache,
+                        // billcom_bills_ref) can dedupe FedEx re-sends. This was
+                        // the blind spot that let the 08-11 backlog re-forward
+                        // invoices Bill.com already had.
+                        invoiceNumber: subjectInvoiceNumber
+                            || (isFedExCarrierBill ? fedexMeta.invoiceNumberDisplay : undefined),
                     });
                     if (once.status === "already_forwarded") {
                         console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);
