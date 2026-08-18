@@ -50,6 +50,7 @@ import {
     FEDEX_CARRIER_BILL_ACTION,
     buildFedExBillComFilename,
     classifyFedExBillingAttachment,
+    extractFedExInvoiceTotal,
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
@@ -1279,7 +1280,44 @@ export async function runLocalApForward(): Promise<{
             // isNonInvoiceSender + junk classes measured 2026-08-13. The AAA
             // Cooper individual-invoice-only policy (RE: remittance threads,
             // Account <digits> - bundles) lives inside it — verified 2026-08-13.
+            // Extract PDF or invoice-image attachments BEFORE the junk gate:
+            // a gate-skipped email that still CARRIES PDFs must never be
+            // silently archived (FedEx past-due notices usually have none,
+            // but if one ever does, the invoices go to Bill's review, not
+            // the void).
+            const invoiceAttachments = extractInvoiceAttachments(msgRes.data.payload);
+
             if (isNonInvoiceEmail({ from, subject })) {
+                const fedexPastDue =
+                    subject.toLowerCase().includes("fedex billing online") &&
+                    subject.toLowerCase().includes("past due");
+                if (fedexPastDue && invoiceAttachments.length > 0) {
+                    // Past-due NOTICE WITH invoice PDFs attached — leave unread
+                    // and labeled so Bill can decide (never silently drop bills).
+                    console.warn(
+                        `   [AP-Local] ⏸️ FedEx past-due WITH ${invoiceAttachments.length} PDF(s) — left unread for review: ${subject.slice(0, 50)}`,
+                    );
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: invoiceAttachments[0]?.filename || "(pdf-attached)",
+                        reason: "fedex past-due notice WITH pdf attachments — left unread for review",
+                        vendorRoutingAction: "human_review",
+                    });
+                    try {
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId,
+                            addLabels: ["Invoice Forward"],
+                            removeLabels: [],
+                        });
+                    } catch (labelErr: any) {
+                        console.warn(`   [AP-Local] Label failed on past-due-with-pdf: ${labelErr?.message}`);
+                    }
+                    summary.skipped++;
+                    continue;
+                }
                 console.log(`   [AP-Local] Skipping non-invoice: ${subject.slice(0, 50)} (${from.slice(0, 25)})`);
                 recordSkippedForward({
                     gmailMessageId,
@@ -1293,9 +1331,6 @@ export async function runLocalApForward(): Promise<{
                 summary.skipped++;
                 continue;
             }
-
-            // Extract PDF or invoice-image attachments first (filename needed for routing)
-            const invoiceAttachments = extractInvoiceAttachments(msgRes.data.payload);
 
             // ── Vendor routing check (subject + each attachment filename) ──
             // Only three outcomes that matter for forwarding:
@@ -1536,6 +1571,13 @@ export async function runLocalApForward(): Promise<{
                         // invoices Bill.com already had.
                         invoiceNumber: subjectInvoiceNumber
                             || (isFedExCarrierBill ? fedexMeta.invoiceNumberDisplay : undefined),
+                        // FedEx packet summary carries "TOTAL THIS INVOICEUSD$X" —
+                        // capture it so the claim stores ocr_total and the weekly
+                        // sweep can amount-check (and the fuzzy dedup layer can
+                        // catch same-invoice re-sends by amount).
+                        invoiceTotal: isFedExCarrierBill
+                            ? extractFedExInvoiceTotal(paidCheck.rawText) ?? undefined
+                            : undefined,
                     });
                     if (once.status === "already_forwarded") {
                         console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);

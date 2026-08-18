@@ -102,6 +102,19 @@ export function extractFedExInvoiceNumberFromText(text: string | null | undefine
     return null;
 }
 
+/**
+ * Extract the TOTAL THIS INVOICE amount from FedEx packet summary text.
+ * Packet page 1 renders it as "TOTAL THIS INVOICEUSD$15,287.10" (no space
+ * between INVOICE and USD). Returns the bare number or null when absent.
+ */
+export function extractFedExInvoiceTotal(text: string | null | undefined): number | null {
+    const t = String(text || "");
+    const m = t.match(/TOTAL\s+THIS\s+INVOICE\s*USD\s*\$?\s*([\d,]+(?:\.\d{1,2})?)/i);
+    if (!m?.[1]) return null;
+    const n = Number(m[1].replace(/,/g, ""));
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 export function detectFedExBillingServiceHint(
     text: string | null | undefined,
     subject?: string | null,

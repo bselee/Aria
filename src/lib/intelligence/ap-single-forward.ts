@@ -330,6 +330,7 @@ function claimForward(
              ocr_raw_text = COALESCE(?, ocr_raw_text),
              ocr_vendor_name = COALESCE(?, ocr_vendor_name),
              ocr_invoice_number = COALESCE(?, ocr_invoice_number),
+             ocr_total = COALESCE(?, ocr_total),
              billcom_sent_message_id = NULL,
              error_message = ?,
              forwarded_at = datetime('now')
@@ -344,6 +345,7 @@ function claimForward(
         req.ocrRawText || null,
         req.vendorName || null,
         req.invoiceNumber || null,
+        req.invoiceTotal != null ? String(req.invoiceTotal) : null,
         `reclaim:${req.source}`,
         reclaimable.id,
       );
@@ -357,11 +359,11 @@ function claimForward(
     const info = db
       .prepare(
         `INSERT INTO ap_local_forwards
-           (gmail_message_id, email_from, email_subject, pdf_filename,
-            pdf_content_hash, status, vendor_routing_action, ocr_raw_text,
-            ocr_vendor_name, ocr_invoice_number,
-            error_message, forwarded_at)
-         VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?, ?, datetime('now'))`,
+          (gmail_message_id, email_from, email_subject, pdf_filename,
+           pdf_content_hash, status, vendor_routing_action, ocr_raw_text,
+           ocr_vendor_name, ocr_invoice_number, ocr_total,
+           error_message, forwarded_at)
+        VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?, ?, ?, datetime('now'))`,
       )
       .run(
         req.gmailMessageId,
@@ -373,6 +375,7 @@ function claimForward(
         req.ocrRawText || null,
         req.vendorName || null,
         req.invoiceNumber || null,
+        req.invoiceTotal != null ? String(req.invoiceTotal) : null,
         `claim:${req.source}`,
       );
     return { claimed: true, claimId: Number(info.lastInsertRowid) };

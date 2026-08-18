@@ -51,7 +51,25 @@ vi.mock("@/lib/gmail/auth", () => ({
     getAuthenticatedClient: async () => ({}),
 }));
 
-import { isAlreadyClaimedOrForwarded } from "./ap-single-forward";
+vi.mock("@googleapis/gmail", () => ({
+    gmail: () => ({
+        users: {
+            messages: {
+                send: async () => ({ data: { id: "sent-total-test" } }),
+                get: async () => ({
+                    data: {
+                        payload: {
+                            mimeType: "multipart/mixed",
+                            parts: [{ mimeType: "application/pdf", filename: "irrelevant.pdf" }],
+                        },
+                    },
+                }),
+            },
+        },
+    }),
+}));
+
+import { isAlreadyClaimedOrForwarded, forwardInvoiceOnce } from "./ap-single-forward";
 
 const FEDEX_FROM = "FedEx Billing Online <noreply@fedex.com>";
 const FEDEX_SUBJECT = "Your New FedEx Billing Online invoice is attached";
@@ -123,5 +141,24 @@ describe("FedEx re-send protection via invoice# layers", () => {
             "9-426-52444",
         );
         expect(miss.hit).toBe(false);
+    });
+
+    it("claim persists ocr_total from invoiceTotal (FedEx amount capture)", async () => {
+        const result = await forwardInvoiceOnce({
+            gmailMessageId: "msg-fedex-total",
+            emailFrom: "FedEx Billing Online <noreply@fedex.com>",
+            emailSubject: "Your New FedEx Billing Online invoice is attached",
+            pdfFilename: "FedEx_Ground_9-426-52442.pdf",
+            pdfBuffer: Buffer.from("fake-fedex-packet-bytes"),
+            vendorName: "FedEx",
+            invoiceNumber: "9-426-52442",
+            invoiceTotal: 15287.1,
+            source: "local-forwarder",
+        });
+        expect(result.status).toBe("forwarded");
+        const row = mem
+            .prepare("SELECT ocr_total FROM ap_local_forwards WHERE gmail_message_id = ?")
+            .get("msg-fedex-total") as any;
+        expect(row.ocr_total).toBe("15287.1");
     });
 });
