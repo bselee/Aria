@@ -28,10 +28,11 @@ const ops = () => OpsManager.singleton;
 
 defineJob({
     name: "ap-polling",
-    schedule: "0 8,12,17 * * *",
+    // 7:30 so overnight ads are gone before Bill opens Gmail; noon + 5pm stay on the hour.
+    schedule: ["30 7 * * *", "0 12,17 * * *"],
     onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
     description:
-        "Poll bill.selee@ + ap@ : ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
+        "Poll bill.selee@ + ap@ at 7:30/12/17 Denver: ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
     handler: async () => {
         // HERMIA(2026-06-18): Local-first forwarding — scans Gmail directly, forwards
         // invoice PDFs to Bill.com, tracks dedup in local SQLite. Zero Supabase
@@ -929,11 +930,15 @@ defineJob({
                 const chatId = process.env.TELEGRAM_CHAT_ID;
                 if (chatId) {
                     try {
-                        // The handler inside drafter-agent already gates the send
-                        await o.bot.telegram.sendMessage(
-                            chatId,
-                            formatDrafterTelegramSummary(result),
-                        );
+                        if (process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                            // The handler inside drafter-agent already gates the send
+                            await o.bot.telegram.sendMessage(
+                                chatId,
+                                formatDrafterTelegramSummary(result),
+                            );
+                        } else {
+                            console.log('[drafter-scan] Telegram disabled — summary skipped.');
+                        }
                     } catch (err: any) {
                         console.warn(`[drafter-scan] Telegram notification failed: ${err.message}`);
                     }
