@@ -220,6 +220,17 @@ export async function runShipStatusFollowup(opts?: {
         // (L1 receipt check from po-followup-watcher) must NOT exclude the
         // PO. The timestamp comparison lives in isShipStatusCandidate.
         .is("vendor_noncomm_at", null)
+        // Null-safe status exclusion: isShipStatusCandidate treats a NULL
+        // status as NOT received, but PostgREST's
+        // .not("status", "eq", "received") would also drop NULL-status rows
+        // (NULL <> 'received' is unknown in SQL). So exclude only explicit
+        // 'received' rows with an OR that keeps NULL status in the window.
+        // The dropship regex stays in code (DROPSHIP_PATTERN) — not here.
+        .or("status.is.null,status.neq.received")
+        // Newest acks first: the acked 7-30d pool can exceed the 25-row
+        // limit, and default (insertion) order returns stale/never-eligible
+        // rows first — silently starving eligible POs out of the window.
+        .order("vendor_acknowledged_at", { ascending: false })
         .limit(25);
 
     if (error) {
