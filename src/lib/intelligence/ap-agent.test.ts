@@ -6,12 +6,14 @@ const {
     parseInvoiceMock,
     sendMessageMock,
     getOrderDetailsMock,
+    upsertVendorInvoiceMock,
 } = vi.hoisted(() => ({
     extractPDFMock: vi.fn(),
     extractPDFWithLLMMock: vi.fn(),
     parseInvoiceMock: vi.fn(),
     sendMessageMock: vi.fn(),
     getOrderDetailsMock: vi.fn(),
+    upsertVendorInvoiceMock: vi.fn(),
 }));
 
 vi.mock("../pdf/extractor", () => ({
@@ -24,7 +26,7 @@ vi.mock("../pdf/invoice-parser", () => ({
 }));
 
 vi.mock("../storage/vendor-invoices", () => ({
-    upsertVendorInvoice: vi.fn(),
+    upsertVendorInvoice: upsertVendorInvoiceMock,
 }));
 
 vi.mock("../storage/invoice-review-corpus", () => ({
@@ -467,10 +469,15 @@ describe("APAgent processInvoiceBuffer", () => {
         expect(docInsert).toBeDefined();
         expect(docInsert.action_required).toBe(false);
 
-        // 4. Invoice insert should set status to "completed"
-        const invUpsert = inserts.invoices[0];
+        // 4. Archive upsert (vendor_invoices) should set status to "completed".
+        //    Since 2026-08-12 the legacy `invoices` table is a read-only view;
+        //    the single write path is upsertVendorInvoice (see ap-agent.ts).
+        expect(upsertVendorInvoiceMock).toHaveBeenCalledTimes(1);
+        const invUpsert = upsertVendorInvoiceMock.mock.calls[0][0];
         expect(invUpsert).toBeDefined();
         expect(invUpsert.status).toBe("completed");
+        expect(invUpsert.vendor_name).toBe("AAA Cooper");
+        expect(invUpsert.po_number).toBeNull();
 
         // 5. Telegram notification must be suppressed
         expect(sendMessageMock).not.toHaveBeenCalled();

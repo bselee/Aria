@@ -1,7 +1,7 @@
 /**
  * @file    src/lib/ops/ap-boot-catchup.ts
  * @purpose After bot restart, recover a missed sparse ap-polling window
- *          (8/12/17 America/Denver) with one idempotent runJobOnce.
+ *          (7:30/12:00/17:00 America/Denver) with one idempotent runJobOnce.
  *          Boot used to call deprecated pollAPInbox only — that path does
  *          not run the local forwarder.
  * @author  Hermia
@@ -10,8 +10,15 @@
  * @env     none
  */
 
-/** ap-polling fire hours in America/Denver (local wall clock). */
-export const AP_POLLING_HOURS_DENVER = [8, 12, 17] as const;
+/** ap-polling fire windows in America/Denver (local wall clock). */
+export const AP_POLLING_WINDOWS_DENVER = [
+    { hour: 7, minute: 30 },
+    { hour: 12, minute: 0 },
+    { hour: 17, minute: 0 },
+] as const;
+
+/** @deprecated Use AP_POLLING_WINDOWS_DENVER — hour-only alias for the old 8/12/17 schedule. */
+export const AP_POLLING_HOURS_DENVER = [7, 12, 17] as const;
 
 export interface ApWindowSkipInput {
     /** Current instant (UTC Date). */
@@ -87,9 +94,9 @@ export function denverLocalToUtc(
  */
 export function mostRecentApPollingWindow(now: Date): Date {
     const p = denverParts(now);
-    // Candidate windows: today's schedule hours ≤ now, else yesterday's 17:00.
-    const todayCandidates = AP_POLLING_HOURS_DENVER
-        .map((h) => denverLocalToUtc(p.y, p.m, p.day, h, 0))
+    // Candidate windows: today's schedule slots ≤ now, else yesterday's 17:00.
+    const todayCandidates = AP_POLLING_WINDOWS_DENVER
+        .map((slot) => denverLocalToUtc(p.y, p.m, p.day, slot.hour, slot.minute))
         .filter((w) => w.getTime() <= now.getTime());
 
     if (todayCandidates.length > 0) {

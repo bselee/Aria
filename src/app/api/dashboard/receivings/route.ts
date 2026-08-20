@@ -443,7 +443,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
             // ── Match suggestions: find unmatched invoices for received PO vendors ──
             const vendorNames = [...new Set(received.map((r: any) => r.supplier).filter(Boolean))] as string[];
-            let matchSuggestions: any[] = [];
+            const matchSuggestions: any[] = [];
 
             if (vendorNames.length > 0) {
                 let unmatchedInvoices: any[] = [];
@@ -1085,8 +1085,8 @@ export async function POST(req: NextRequest) {
             // Pure evaluation. If it blocks we 409 and skip completeOrder.
             // Phase 0 (operator-approved price/qty/freight) may already have
             // written Finale — that is intentional (invoice-as-truth on Apply).
-            let receivedQtys: Record<string, number> = {};
-            let packMultipliers: Record<string, number> = {};
+            const receivedQtys: Record<string, number> = {};
+            const packMultipliers: Record<string, number> = {};
             try {
                 // Load receipt quantities from Finale shipment details (read-only)
                 const poDetails = await finale.getOrderDetails(orderId);

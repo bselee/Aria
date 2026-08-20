@@ -45,9 +45,17 @@ describe("cron/jobs/index registration", () => {
 
     it("every job has a valid 5-field cron schedule", () => {
         for (const job of listJobs()) {
-            const fields = job.schedule.trim().split(/\s+/);
-            expect(fields, `bad schedule for ${job.name}: "${job.schedule}"`).toHaveLength(5);
+            const exprs = Array.isArray(job.schedule) ? job.schedule : [job.schedule];
+            expect(exprs.length, `${job.name} has no schedule`).toBeGreaterThan(0);
+            for (const expr of exprs) {
+                const fields = expr.trim().split(/\s+/);
+                expect(fields, `bad schedule for ${job.name}: "${expr}"`).toHaveLength(5);
+            }
         }
+    });
+
+    it("ap-polling morning window is 7:30 Denver; noon and 5pm stay on the hour", () => {
+        expect(getJob("ap-polling")?.schedule).toEqual(["30 7 * * *", "0 12,17 * * *"]);
     });
 
     it("every job uses America/Denver tz", () => {

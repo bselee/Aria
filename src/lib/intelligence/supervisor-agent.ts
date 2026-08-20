@@ -314,7 +314,7 @@ Respond strictly balancing these criteria, and leveraging past experiences if re
             await criticalAlert(
                 this.bot,
                 chatId,
-                `🚨 <b>Agent Crash Escalation</b> 🚨\n\n<b>Agent:</b> ${agentName}\n<b>Supervisor Assessment:</b> Fix required.\n<b>Error:</b> ${errorMessage}\n<pre>${stackSnippet}</pre>`,
+                `<b>Agent Crash Escalation</b>\n\n<b>Agent:</b> ${agentName}\n<b>Supervisor Assessment:</b> Fix required.\n<b>Error:</b> ${errorMessage}\n<pre>${stackSnippet}</pre>`,
                 { parse_mode: 'HTML' }
             );
             console.log(`     [Supervisor] ↗️ Escalated ${agentName} failure to Engineering.`);

@@ -381,7 +381,7 @@ All AP agent decisions are logged to `ap_activity_log`:
 | `email_subject` | Email subject |
 | `intent` | Classified intent |
 | `action_taken` | Human-readable action description |
-| `notified_slack` | Whether Slack was also notified |
+| `notified_slack` | Legacy Slack-notification flag (column kept; Slack removed 2026-08-20) |
 | `metadata` | JSONB — PO number, invoice number, verdicts, applied/error arrays |
 
 The `daily recap` (sent at 8:00 AM weekdays) summarizes all entries from the current UTC day grouped by intent. Will can spot-check classifications and flag errors.

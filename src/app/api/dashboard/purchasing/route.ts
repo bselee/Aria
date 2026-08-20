@@ -201,6 +201,7 @@ export async function GET(req: NextRequest) {
     let recentPOs: any[] = [];
     try {
         recentPOs = await client.getRecentPurchaseOrders(180, 500);
+        (globalThis as any).__aria_recent_pos = { at: Date.now(), pos: recentPOs };
     } catch (err: any) {
         console.error('[purchasing/route] Failed to fetch recent purchase orders:', err.message);
     }
@@ -386,7 +387,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
-        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp } = await req.json();
+        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp, skipPreflight } = await req.json();
 
         if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
             return NextResponse.json(
@@ -457,7 +458,12 @@ export async function POST(req: NextRequest) {
 
         let recentPOs: any[] = [];
         try {
-            recentPOs = await client.getRecentPurchaseOrders(45, 500);
+            const cached = (globalThis as any).__aria_recent_pos as { at: number; pos: any[] } | undefined;
+            if (cached && Date.now() - cached.at < 10 * 60 * 1000 && Array.isArray(cached.pos) && cached.pos.length > 0) {
+                recentPOs = cached.pos;
+            } else {
+                recentPOs = await client.getRecentPurchaseOrders(45, 500);
+            }
         } catch (err: any) {
             console.error('[purchasing/route] Failed to fetch recent purchase orders for vendor cycle:', err.message);
         }
@@ -521,10 +527,9 @@ export async function POST(req: NextRequest) {
             console.warn(`[purchasing/route] forceTopUp: ${dupGuard.summary}`);
         }
 
-        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
+        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination, { skipPreflight: !!skipPreflight });
 
-        // Invalidate caches so the next GET shows the new PO.
-        invalidatePurchasingCaches();
+        // Coverage overlay on the next GET is enough — do not bust the 12–15 min SWR scan.
 
         return NextResponse.json({
             ...result,

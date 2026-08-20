@@ -69,7 +69,6 @@ describe("buildCatalog", () => {
             "ops-manager",
             "aria-bot",
             "ap-agent",
-            "watchdog",
             "supervisor",
             "reconciliation",
             "purchasing",

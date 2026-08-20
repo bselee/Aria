@@ -109,8 +109,7 @@ export async function runOverdueFollowup(): Promise<FollowupResult[]> {
 
         try {
             // 0. Check if vendor has already invoiced — if so, goods shipped.
-            //    No need to draft a follow-up. The Slack detector already
-            //    tells staff "shipped today" when they ask about the PO.
+            //    No need to draft a follow-up.
             const hasInvoice = await invoiceExists(po.orderId);
             if (hasInvoice) {
                 results.push({

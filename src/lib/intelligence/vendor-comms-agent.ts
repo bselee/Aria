@@ -325,10 +325,12 @@ export class VendorCommsAgent {
         ];
 
         // HERMIA(2026-05-28): L3 templates for 15+ day unresponsive vendors.
-        // Firmer tone, mentions reorder risk and alternate sourcing.
+        // Firmer tone, mentions reorder risk and alternate sourcing. Close with
+        // "Thanks!" like every other touchpoint — Gmail adds Bill's signature,
+        // so no company sign-off in the body.
         const L3_TEMPLATES = [
-            `Hi,\n\nThis is our third follow-up on PO #${poNumber} sent ${sentDateStr}, now ${Math.floor((Date.now() - new Date(sentDateStr).getTime()) / 86400000)} days ago.${detailsBlock}\n\nWe have not received tracking or a ship date. This is now impacting our reorder planning.\n\nPlease confirm the order status today. If the order cannot be fulfilled, we will need to source from an alternate vendor.\n\nRegards,\nBuildASoil Purchasing`,
-            `Hi,\n\nWe've followed up twice on PO #${poNumber} from ${sentDateStr} with no response.${detailsBlock}\n\nWithout tracking or a status update, we're unable to plan our receiving schedule and may need to cancel and reorder elsewhere.\n\nCan you please respond with tracking or a ship date today?\n\nRegards,\nBuildASoil Purchasing`,
+            `Hi,\n\nThis is our third follow-up on PO #${poNumber} sent ${sentDateStr}, now ${Math.floor((Date.now() - new Date(sentDateStr).getTime()) / 86400000)} days ago.${detailsBlock}\n\nWe have not received tracking or a ship date. This is now impacting our reorder planning.\n\nPlease confirm the order status today. If the order cannot be fulfilled, we will need to source from an alternate vendor.\n\nThanks!`,
+            `Hi,\n\nWe've followed up twice on PO #${poNumber} from ${sentDateStr} with no response.${detailsBlock}\n\nWithout tracking or a status update, we're unable to plan our receiving schedule and may need to cancel and reorder elsewhere.\n\nCan you please respond with tracking or a ship date today?\n\nThanks!`,
         ];
 
         if (count >= 3) {

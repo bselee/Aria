@@ -320,6 +320,37 @@ describe('extractTrackingNumbers', () => {
         expect(extractTrackingNumbers('no tracking here')).toEqual([]);
     });
 
+    // HERMIA(2026-08-20): regression for Ferticell PO 125211 — Logan Hausherr
+    // sent carrier + PRO only as an ODFL trace URL. Before urlPro the extractor
+    // returned [] and the PO sat with zero tracking despite a perfect vendor ack.
+    it('extracts an ODFL PRO from a carrier trace URL in the email body', () => {
+        const text =
+            'We shipped PO#125211 yesterday with Old Dominion. You can track your shipment here : ' +
+            'https://www.odfl.com/us/en/tools/trace-track-ltl-freight.html?proNumbers=78088240060.';
+        const results = extractTrackingNumbers(text);
+        expect(results).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ carrier: 'urlPro', trackingNumber: '78088240060' }),
+            ]),
+        );
+    });
+
+    it('extracts tracking numbers from FedEx / UPS / USPS tracking URLs', () => {
+        expect(
+            extractTrackingNumbers('https://www.fedex.com/fedextrack/?tracknumbers=794657123456')
+                .some(r => r.trackingNumber === '794657123456'),
+        ).toBe(true);
+        expect(
+            extractTrackingNumbers('https://www.ups.com/track?tracknum=1Z22YV580360436423')
+                .some(r => r.trackingNumber === '1Z22YV580360436423'),
+        ).toBe(true);
+        expect(
+            extractTrackingNumbers(
+                'https://tools.usps.com/go/TrackConfirmAction?tLabels=9434650106151053145623',
+            ).some(r => r.trackingNumber === '9434650106151053145623'),
+        ).toBe(true);
+    });
+
     it('extracts the real UPS tracking number from a Thirsty Earth ShipStation email', () => {
         const results = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthUpsShipstation);
         expect(results).toEqual(

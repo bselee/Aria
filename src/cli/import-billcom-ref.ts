@@ -243,7 +243,7 @@ function parseCSV(filePath: string): ParsedRow[] {
 function importRows(rows: ParsedRow[]): { inserted: number; updated: number; errors: number } {
   const db = getLocalDb();
   let inserted = 0;
-  let updated = 0;
+  const updated = 0;
   let errors = 0;
 
   const upsert = db.prepare(`

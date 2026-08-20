@@ -8,7 +8,7 @@
  * For each SKU from purchases tab: queries Finale for stock, sales velocity, open POs, lead time,
  * then ranks items by genuine need (HIGH_NEED / MEDIUM / LOW / NOISE).
  *
- * For each Pending request: fuzzy-matches the details string to a Finale SKU (reuses Slack watchdog's
+ * For each Pending request: fuzzy-matches the details string to a Finale SKU (reuses the
  * Fuse.js pattern), queries Finale, and classifies the same way. Filters to status === 'Pending' only.
  *
  * Output distinguishes between: VENDOR_SUGGESTION vs TEAM_REQUEST source.

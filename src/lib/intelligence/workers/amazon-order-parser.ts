@@ -2,8 +2,8 @@
  * @file    amazon-order-parser.ts
  * @purpose Parses Amazon order confirmation and shipping notification emails.
  *          Extracts order #, items, quantities, prices, tracking, and ETA.
- *          Matches orders to pending Slack requests and sends Telegram
- *          notifications for Will's review before notifying requesters.
+ *          Records orders for spend tracking and sends Telegram
+ *          notifications for Will's review.
  * @author  Antigravity
  * @created 2026-03-19
  * @updated 2026-03-19
@@ -85,10 +85,10 @@ export class AmazonOrderParser {
             return;
         }
 
-        // Step 3: Try to match to a pending Slack request
-        const match = await this.matchToSlackRequest(db, orderData);
+        // Step 3: Try to match to a pending request
+        const match = await this.matchToPendingRequest(db, orderData);
 
-        // Step 4: Update the slack_request record
+        // Step 4: Update the request record
         if (match) {
             await db
                 .from('slack_requests')
@@ -106,13 +106,13 @@ export class AmazonOrderParser {
                 })
                 .eq('id', match.id);
 
-            console.log(`[AmazonOrderParser] Matched order #${orderData.orderId} to Slack request from ${match.requester_name}`);
+            console.log(`[AmazonOrderParser] Matched order #${orderData.orderId} to request from ${match.requester_name}`);
         } else {
-            // No Slack request match — still record the order for spend tracking
-            // Insert a new slack_request record with just the Amazon data
+            // No request match — still record the order for spend tracking
+            // Insert a new request record with just the Amazon data
             await db.from('slack_requests').insert({
                 channel_id: 'unmatched',
-                channel_name: 'Amazon (no Slack request)',
+                channel_name: 'Amazon Direct',
                 message_ts: `amazon_${orderData.orderId}`,
                 requester_user_id: 'system',
                 requester_name: 'Amazon Direct',
@@ -131,8 +131,7 @@ export class AmazonOrderParser {
         }
 
         // Step 5: Notify Will on Telegram with order summary
-        // DECISION(2026-03-19): No auto-reply to Slack. Will reviews on Telegram
-        // and can approve a Slack notification via /notify command.
+        // DECISION(2026-03-19): No auto-reply. Will reviews on Telegram.
         await this.notifyTelegram(orderData, match);
     }
 
@@ -214,15 +213,15 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
     }
 
     /**
-     * Match an Amazon order to a pending Slack request by item name similarity and timing.
+     * Match an Amazon order to a pending request by item name similarity and timing.
      */
-    private async matchToSlackRequest(
+    private async matchToPendingRequest(
         db: ReturnType<typeof createClient>,
         orderData: AmazonOrderData
     ): Promise<{ id: string; requester_name: string; channel_id: string; message_ts: string; thread_ts: string | null } | null> {
         if (!db) return null;
 
-        // Get pending Slack requests from the last 7 days
+        // Get pending requests from the last 7 days
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
@@ -309,8 +308,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
 
     /**
      * Send a Telegram notification for a new Amazon order.
-     * DECISION(2026-03-19): Will reviews on Telegram. No auto-Slack notification.
-     * If matched to a Slack request, include /notify command for manual approval.
+     * DECISION(2026-03-19): Will reviews on Telegram. No auto-notification.
      */
     private async notifyTelegram(
         order: AmazonOrderData,
@@ -333,10 +331,9 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         message += `\nItems:\n${itemList}\n`;
 
         if (match) {
-            message += `\nMatched to Slack request from ${match.requester_name}`;
-            message += `\nApprove Slack notification: /notify ${match.id}`;
+            message += `\nMatched to request from ${match.requester_name}`;
         } else {
-            message += `\nNo matching Slack request found (Amazon direct purchase)`;
+            message += `\nNo matching request found (Amazon direct purchase)`;
         }
 
         if (order.trackingNumber) {
@@ -355,7 +352,6 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
 
     /**
      * Send a Telegram notification for a shipping update.
-     * Includes /notify command for Will to approve sending to the Slack requester.
      */
     private async notifyTelegramShipping(
         order: AmazonOrderData,
@@ -374,7 +370,6 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
 
         if (request.requester_name && request.requester_name !== 'Amazon Direct') {
             message += `\nRequested by: ${request.requester_name}`;
-            message += `\nApprove Slack notification: /notify ${request.id}`;
         }
 
         try {

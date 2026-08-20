@@ -27,7 +27,7 @@
  *          Day 3 scope: scaffold the registry + register the 8 existing
  *          copilot read tools by reference (no behavior change). Migrating
  *          additional tool sources (bot inline tools, finale helpers,
- *          gmail helpers, slack helpers) lands incrementally.
+ *          gmail helpers) lands incrementally.
  *
  *          See docs on the AIOS Tool Manager:
  *          https://github.com/agiresearch/AIOS — borrowed pattern, NOT
@@ -52,7 +52,6 @@ export type ToolCategory =
     | "scraping"      // browser-driven data fetches
     | "memory"        // Pinecone / vector recall
     | "telegram"      // bot-side comms
-    | "slack"         // Slack reads / 👀 reactions
     | "gmail"         // Gmail reads / forwards
     | "build"         // calendar / build-risk
     | "tracking"      // shipment / carrier APIs

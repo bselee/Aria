@@ -35,11 +35,11 @@ bot.on(message('document'), async (ctx: Context) => {
             emailFrom: msg.from.username || msg.from.first_name,
         });
 
-        ctx.reply(`✅ Successfully grouped and extracted: ${fileName}\nStatus: ${result.document?.status}\nAction: ${result.document?.action_summary}`);
+        ctx.reply(`Successfully grouped and extracted: ${fileName}\nStatus: ${result.document?.status}\nAction: ${result.document?.action_summary}`);
 
     } catch (err) {
         console.error(err);
-        ctx.reply("❌ Error processing your document via ARIA.");
+        ctx.reply("Error processing your document via ARIA.");
     }
 });
 

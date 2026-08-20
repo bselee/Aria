@@ -431,7 +431,7 @@ async function enrichInvoiceForPoMatch(args: {
         }
     }
 
-    let vendorHint =
+    const vendorHint =
         args.vendorHint ||
         (/ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(args.emailFrom)
             ? "Down to Earth Worms"
@@ -1342,7 +1342,7 @@ export async function runLocalApForward(): Promise<{
             // Human-review flag derives from the SENDER/SUBJECT rule — set before
             // the per-file loop so a statement-PDF skip override doesn't unset it.
             // Past-due/collections/AAA Cooper: forward, leave UNREAD in inbox.
-            let leaveUnreadForReview = routingRule?.action === "human_review";
+            const leaveUnreadForReview = routingRule?.action === "human_review";
             for (const att of invoiceAttachments) {
                 const byFile = checkVendorRouting(from, subject, att.filename);
                 if (byFile?.action === "skip") {

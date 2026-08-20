@@ -29,7 +29,6 @@
  *   │
  *   ├── Domain: Communications
  *   │   └── CommsMasterAgent — "I own vendor + team messages"
- *   │       ├── SlackWatchdog — detect requests, 👀 react
  *   │       ├── EmailAcknowledger — auto-reply to vendors
  *   │       └── VendorComms — PO follow-up drafting
  *   │
@@ -129,8 +128,7 @@ const AGENT_REGISTRY: AgentRegistration[] = [
     { domain: "purchasing", name: "purchasing-followup", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "PO acknowledgment tracking + vendor nudges" },
 
     // Communications
-    { domain: "communications", name: "comms-master", role: "master", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Owns Slack + email + vendor comms" },
-    { domain: "communications", name: "slack-watchdog", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Slack monitoring + 👀 reactions" },
+    { domain: "communications", name: "comms-master", role: "master", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Owns email + vendor comms" },
     { domain: "communications", name: "email-ack", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Vendor email auto-acknowledgment" },
     { domain: "communications", name: "vendor-comms", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "PO follow-up email drafting" },
 
@@ -334,8 +332,6 @@ export class HermesOrchestrator {
             "drop-detector": ["tracking-master", "ops-master"],
             "pattern-miner": ["ops-master", "cognitive-round"],
             "proactive-brief": ["ops-master", "comms-master"],
-            "daily-slack-review": ["slack-watchdog", "comms-master"],
-            "slack-detector-heartbeat": ["slack-watchdog", "ops-master"],
             "system-heartbeat": ["ops-master"],
             "monday-briefing": ["ops-master", "comms-master"],
             "aria-bot-startup": ["ops-master", "cron-scheduler"],

@@ -205,7 +205,7 @@ export function detectAutopay(
 
     let isAutopay = false;
     let confidence: 'high' | 'medium' | 'low' = 'low';
-    let reasonParts: string[] = [];
+    const reasonParts: string[] = [];
 
     // Tier 1: Strong domain match
     if (email.includes('@')) {

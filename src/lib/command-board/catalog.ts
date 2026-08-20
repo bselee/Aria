@@ -23,7 +23,6 @@ const HIERARCHY: CommandBoardAgent[] = [
     { id: "ops-manager", label: "Ops Manager", reportsTo: "will", process: ["aria-bot"], skills: [], workflows: [] },
     { id: "aria-bot", label: "Aria Bot", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
     { id: "ap-agent", label: "AP Agent", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "watchdog", label: "Slack Watchdog", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
     { id: "supervisor", label: "Supervisor", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
     { id: "reconciliation", label: "Reconciliation", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
     { id: "purchasing", label: "Purchasing", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },

@@ -49,6 +49,14 @@ Thumbs.db
 scratch/
 tmp/
 tmp_*
+# Assessment-discovered scratch (2026-08): temp debug scripts + sticker rabbit hole
+scratch-*.ts
+scripts/_tmp_*
+scripts/_diag-*.ts
+scripts/sticker-*.py
+scripts/compare-sticker-pricing.ts
+scripts/replay-split-rows.ts
+scripts/summarize-sticker-report.py
 test-*.ts
 test_*.ts
 probe-*.ts

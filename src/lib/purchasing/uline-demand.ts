@@ -7,7 +7,7 @@
  *
  * Demand sources:
  *   - "finale"      — items from Finale POs (draft or auto-reorder)
- *   - "requests"     — items requested via Slack/Telegram (slack_requests table)
+ *   - "requests"     — items requested via Telegram (slack_requests table)
  *   - "basauto"      — items scraped from basauto.vercel.app
  */
 

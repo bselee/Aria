@@ -300,7 +300,7 @@ export async function processDefaultInboxInvoice(
         //      and jobName fields ("PU105L 124469" → 124469).
         //   4. If still no PO#, fall through to correlatePo's vendor-recent /
         //      sku-overlap fallbacks (the multi-strategy pipeline handles it).
-        let poNumber: string | null = extractPONumber(subject, bodyText);
+        const poNumber: string | null = extractPONumber(subject, bodyText);
         if (poNumber) base.poNumber = poNumber;
 
         // ── Vendor context from Pinecone ─────────────────────────────────────

@@ -4,7 +4,6 @@ import { createClient } from "../db";
 import { getLocalDb, dedupSeen, dedupMark, dedupCount } from "../storage/local-db";
 import { type ScheduledTask } from "node-cron";
 import { Telegraf } from "telegraf";
-import { WebClient } from "@slack/web-api";
 import { SYSTEM_PROMPT } from "../../config/persona";
 import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
@@ -97,8 +96,6 @@ export class OpsManager {
 
     public bot: Telegraf;
     private scheduledTasks: ScheduledTask[] = [];
-    private slack: WebClient | null;
-    private slackChannel: string;
     private apIdentifier: APIdentifierAgent;
     private emailIngestionDefault: EmailIngestionWorker;
     private emailIngestionAP: EmailIngestionWorker;
@@ -127,17 +124,6 @@ export class OpsManager {
     constructor(bot: Telegraf) {
         this.bot = bot;
         OpsManager.singleton = this;
-
-        // DECISION(2026-02-25): Initialize Slack client alongside Telegram.
-        // Slack posting is best-effort — if SLACK_BOT_TOKEN is missing, we
-        // gracefully skip Slack without blocking the Telegram message.
-        const slackToken = process.env.SLACK_BOT_TOKEN;
-        this.slack = slackToken ? new WebClient(slackToken) : null;
-        this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
-
-        if (!this.slack) {
-            console.warn("\u26a0\ufe0f OpsManager: SLACK_BOT_TOKEN not set \u2014 Slack cross-posting disabled.");
-        }
 
         // Initialize dedicated AP agents
         this.apIdentifier = new APIdentifierAgent(bot);

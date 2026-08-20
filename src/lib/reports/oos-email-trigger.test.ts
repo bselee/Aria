@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildEmailBody, buildSlackBody, type BuildBlockingInfo } from "./oos-email-trigger";
+import { buildEmailBody, type BuildBlockingInfo } from "./oos-email-trigger";
 import type { OOSReportResult, EnrichedOOSItem, EnrichedPOInfo } from "./oos-report";
 
 describe("oos email trigger wording", () => {
@@ -59,14 +59,7 @@ describe("oos email trigger wording", () => {
             new Map<string, BuildBlockingInfo>(),
             "Apr 22, 2026",
         );
-        const slack = buildSlackBody(
-            result,
-            [item],
-            [],
-            new Map<string, BuildBlockingInfo>(),
-        );
 
         expect(html).toContain("Aging POs - Vendor Outreach");
-        expect(slack).toContain("Aging POs - Vendor Outreach");
     });
 });

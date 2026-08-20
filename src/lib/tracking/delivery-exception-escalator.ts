@@ -200,23 +200,17 @@ async function draftExceptionEmail(
         const gmail = GmailApi({ version: "v1", auth });
 
         const poDigits = poNumber.replace(/^PO-?/i, "");
-        const subject = `URGENT: Delivery Exception — PO #${poDigits} (${ex.tracking_number})`;
+        const carrier = ex.carrier_name || "The carrier";
+        const status = ex.status_display || "delivery exception";
+        const subject = `Delivery exception on PO #${poDigits} (${ex.tracking_number})`;
 
         const body = [
             "Hi,",
             "",
-            `We received a delivery exception notification for PO #${poDigits}:`,
+            `${carrier} flagged a delivery exception on PO #${poDigits}, tracking ${ex.tracking_number} (${status}). Can you check on it and let me know what happened? If it's coming back to us, we'll need to re-ship or cancel.`,
             "",
-            `  Tracking: ${ex.tracking_number}`,
-            `  Carrier: ${ex.carrier_name || "N/A"}`,
-            `  Status: ${ex.status_display || "Delivery exception"}`,
-            vendorName ? `  Vendor: ${vendorName}` : "",
-            "",
-            "Can you look into this and let us know what happened? If the shipment is being returned, we need to arrange re-ship or cancel.",
-            "",
-            "Thanks,",
-            "BuildASoil Purchasing",
-        ].filter(l => l !== undefined).join("\n");
+            "Thanks!",
+        ].join("\n");
 
         // Build MIME
         const boundary = "boundary_" + Date.now();

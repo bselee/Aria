@@ -103,6 +103,9 @@ export default function InvoicePOMatcher({
     manuallyMatching,
     onManualInputChange,
 }: InvoicePOMatcherProps) {
+    // ── Expanded alternatives state ──────────────────────────────────────
+    const [expandedAlts, setExpandedAlts] = useState<Set<string>>(new Set());
+
     // ── Partition into sections ──────────────────────────────────────────
     const { ready, review, autoMatched } = useMemo(() => {
         const ready: MatchSuggestion[] = [];
@@ -159,9 +162,6 @@ export default function InvoicePOMatcher({
     const readyTotal = ready.reduce((s, r) => s + (Number(r.invoiceTotal) || 0), 0);
     const reviewTotal = review.reduce((s, r) => s + (Number(r.invoiceTotal) || 0), 0);
     const autoTotal = autoMatched.reduce((s, r) => s + (Number(r.invoiceTotal) || 0), 0);
-
-    // ── Expanded alternatives state ──────────────────────────────────────
-    const [expandedAlts, setExpandedAlts] = useState<Set<string>>(new Set());
 
     // ── Shared row renderer ───────────────────────────────────────────────
     function Row({ s, compact = false }: { s: MatchSuggestion; compact?: boolean }) {

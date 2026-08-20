@@ -1233,6 +1233,29 @@ export async function reconcileInvoiceToPO(
         );
         invoice = { ...invoice, lineItems: [] };
     }
+
+    // ————————————————— Shape normalization: DB rows stored from the AP pipeline use
+    // snake_case keys (qty, sku, unit_price, ext_price), while InvoiceData.lineItems
+    // is camelCase (qty, sku, unitPrice, total). Callers like invoice-po-matcher pass
+    // vendor_invoices.line_items straight through, so unitPrice reads undefined,
+    // balance math collapses to freight-only, and buildReconciliationSummary crashes
+    // with "Cannot read properties of undefined (reading 'toFixed')" (TeraGanix
+    // 121591 → PO 124825, 2026-08-19). Normalize ONCE here for every caller.
+    invoice = {
+        ...invoice,
+        lineItems: invoice.lineItems.map((li) => {
+            const src = li as Record<string, unknown>;
+            return {
+                ...(li as object),
+                sku: (src.sku ?? src.productId ?? null) as string | null,
+                description: (src.description ?? "") as string,
+                qty: Number(src.qty ?? src.quantity ?? 0),
+                unit: (src.unit ?? null) as string | null,
+                unitPrice: Number(src.unitPrice ?? src.unit_price ?? 0),
+                total: src.total != null ? Number(src.total) : Number(src.ext_price ?? 0),
+            };
+        }),
+    };
     // Same defense for the string fields the reconciler treats as required:
     // legacy vendor_invoices rows (null vendor_name / null raw_data) feed
     // through po-sweep.ts:122 with these fields undefined, blowing up
@@ -2395,7 +2418,7 @@ function reconcileTracking(invoice: InvoiceData): TrackingUpdate | null {
  * 
  * IMPORTANT: This should only be called after reconcileInvoiceToPO()
  * and verifying that autoApplicable is true OR after receiving
- * manual Slack approval for needs_approval items.
+ * manual approval for needs_approval items.
  */
 export async function applyReconciliation(
     result: ReconciliationResult,
@@ -3198,8 +3221,8 @@ function buildReconciliationSummary(
         const pct = Math.abs(pc.percentChange * 100).toFixed(0);
         const dollarDiff = Math.abs(pc.dollarImpact).toFixed(2);
         const item = pc.productId || pc.description?.slice(0, 30) || "item";
-        const poFmt = pc.poPrice.toFixed(2);
-        const invFmt = pc.invoicePrice.toFixed(2);
+        const poFmt = (pc.poPrice ?? 0).toFixed(2);
+        const invFmt = (pc.invoicePrice ?? 0).toFixed(2);
 
         if (pc.verdict === "rejected") {
             parts.push(`ðŸš¨ ${item}: price jumped from $${poFmt} to $${invFmt} â€” ${pct}Ã— change, likely a decimal error. NOT applied. Needs manual fix.`);

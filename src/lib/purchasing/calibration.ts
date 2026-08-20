@@ -413,6 +413,60 @@ function parseVendorPolicyRow(row: any): VendorReorderPolicy {
     };
 }
 
+/**
+ * Create or update the vendor outlook row (lead, cover, note).
+ * Partial fields: omit a key to leave it unchanged. Pass null to clear.
+ */
+export async function upsertVendorReorderPolicy(input: {
+    vendorPartyId: string;
+    vendorName?: string | null;
+    notes?: string | null;
+    leadTimeOverrideDays?: number | null;
+    targetCoverDays?: number | null;
+    standardOrderQty?: number | null;
+}): Promise<VendorReorderPolicy | null> {
+    const partyId = String(input.vendorPartyId || "").trim();
+    if (!partyId) return null;
+    const db = createClient();
+    if (!db) return null;
+
+    const existing = (await loadVendorReorderPolicies([partyId])).get(partyId);
+    const lead = input.leadTimeOverrideDays !== undefined
+        ? input.leadTimeOverrideDays
+        : existing?.leadTimeOverrideDays ?? null;
+    const cover = input.targetCoverDays !== undefined
+        ? input.targetCoverDays
+        : existing?.targetCoverDays ?? null;
+    const notes = input.notes !== undefined ? input.notes : existing?.notes ?? null;
+    const truck = input.standardOrderQty !== undefined
+        ? input.standardOrderQty
+        : existing?.standardOrderQty ?? null;
+
+    const row = {
+        vendor_party_id: partyId,
+        vendor_name: input.vendorName ?? existing?.vendorName ?? null,
+        lead_time_override_days: lead,
+        target_cover_days: cover,
+        moq_mode: existing?.moqMode ?? "enforce",
+        overbuy_review_pct: existing?.overbuyReviewPct ?? 50,
+        overbuy_review_dollars: existing?.overbuyReviewDollars ?? 1000,
+        notes,
+        standard_order_qty: truck,
+        updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await db
+        .from("vendor_reorder_policies")
+        .upsert(row, { onConflict: "vendor_party_id" })
+        .select("vendor_party_id, vendor_name, lead_time_override_days, target_cover_days, moq_mode, overbuy_review_pct, overbuy_review_dollars, notes, favorite_batches, is_bulk_vendor, typical_leg_count, typical_leg_interval_days, standard_order_qty")
+        .single();
+    if (error) {
+        console.warn(`[calibration] upsertVendorReorderPolicy failed: ${error.message}`);
+        return null;
+    }
+    return parseVendorPolicyRow(data);
+}
+
 // ──────────────────────────────────────────────────
 // SHIPMENT LEGS (bulk PO per-leg delivery schedule)
 // ──────────────────────────────────────────────────

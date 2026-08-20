@@ -337,7 +337,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                     if (routingRule.action === 'amazon_order') {
                         // DECISION(2026-03-19): Amazon emails are routed to a dedicated
-                        // parser that extracts order data and matches to Slack requests.
+                        // parser that extracts order data for spend tracking.
                         // Mark as read but do NOT archive — Will may want to reference.
                         try {
                             const { AmazonOrderParser } = await import('./workers/amazon-order-parser');
@@ -1833,7 +1833,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                                 // Both activity log and Telegram say the same plain English thing.
                                 action_taken: result.summary,
-                                notified_slack: false,
                                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                                 reconciliation_report: result.report ?? null,
                             }).eq("id", pendingLogId);
@@ -2136,7 +2135,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                 // Both activity log and Telegram say the same plain English thing.
                 action_taken: result.summary,
-                notified_slack: false,
                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                 reconciliation_report: reconciliationReport,
             });
@@ -2178,7 +2176,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     /**
-     * Send reconciliation summary to Telegram (and Slack).
+     * Send reconciliation summary to Telegram.
      *
      * DECISION(2026-05-20): Phase-aware notification.
      *   Phase 1 (Surface): real-time Telegram with [✅ Noted] [⚠️ Flag] buttons when
@@ -2256,8 +2254,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         } catch (err: any) {
             console.error("Telegram reconciliation notification failed:", err.message);
         }
-
-        // Slack cross-posting disabled: AP/reconciliation review lives in Telegram and the dashboard.
     }
 
     /**
@@ -2315,8 +2311,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         emailSubject: string,
         intent: string,
         actionTaken: string,
-        metadata?: Record<string, any>,
-        notifiedSlack: boolean = false
+        metadata?: Record<string, any>
     ) {
         if (!supabase) return;
         try {
@@ -2325,7 +2320,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 email_subject: emailSubject,
                 intent,
                 action_taken: actionTaken,
-                notified_slack: notifiedSlack,
                 metadata: metadata || null
             });
         } catch (err: any) {
@@ -2334,7 +2328,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     /**
-     * Sends a daily recap of all AP Agent actions to Telegram and Slack.
+     * Sends a daily recap of all AP Agent actions to Telegram.
      * Groups by intent category for easy scanning.
      *
      * DECISION(2026-02-26): This provides a monitoring layer so Will can

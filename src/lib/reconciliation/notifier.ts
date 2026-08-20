@@ -30,18 +30,18 @@ export async function sendReconciliationSummary(run: ReconciliationRun): Promise
     if (r.status === 'failed') {
         const lastError = r.errors[r.errors.length - 1];
         message = [
-            `❌ ${r.vendor} reconciliation FAILED`,
+            `${r.vendor} reconciliation FAILED`,
             r.summary ? `Step: ${r.summary}` : '',
             lastError ? `Error: ${lastError.message}` : '',
             r.errors.length > 1 ? `(${r.errors.length} errors total)` : '',
             `\nSee: https://supabase.com/project/_/editor/table/reconciliation_runs?id=${r.id}`,
         ].filter(Boolean).join('\n');
     } else {
-        const emoji = r.status === 'success' ? '✅' : '⚠️';
+        const label = r.status === 'success' ? 'OK' : 'WARN';
         const endedAt = r.ended_at ?? new Date();
         const freight = r.freight_added_cents > 0 ? ` · ${formatCents(r.freight_added_cents)} freight added` : '';
         message = [
-            `${emoji} ${r.vendor} reconciliation (${r.mode})`,
+            `${label} ${r.vendor} reconciliation (${r.mode})`,
             `${r.invoices_found} invoices · ${r.pos_updated} POs updated${freight}`,
             `Duration: ${duration(r.started_at, endedAt)}`,
             r.errors.length > 0 || r.warnings.length > 0

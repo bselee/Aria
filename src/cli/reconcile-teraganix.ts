@@ -232,7 +232,7 @@ async function reconcileInvoice(
     console.log(`\n================================`);
     console.log(`Reconciling PO ${poId} with Invoice #${invoice.orderNumber} (Inv Date: ${invoice.date})`);
 
-    let result = {
+    const result = {
         priceChanges: 0,
         freightAdded: 0,
         status: po.statusId,

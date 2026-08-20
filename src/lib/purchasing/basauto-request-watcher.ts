@@ -1,7 +1,7 @@
 /**
  * @file    src/lib/purchasing/basauto-request-watcher.ts
  * @purpose Surfaces basauto.vercel.app pending purchase requests via Telegram,
- *          same funnel as Slack stale-request-watcher. Reads the snapshot
+ *          same funnel as the legacy request watcher. Reads the snapshot
  *          file written by scripts/basauto_poll.py (Hermes cron at 6AM).
  * @author  Hermia
  * @created 2026-06-09
@@ -99,7 +99,7 @@ function formatRequest(req: BasautoRequest): string {
  * Check for new pending basauto purchase requests and notify Bill.
  * Called from the followup-sop cron (every 2 hours).
  *
- * Pattern: same funnel as runStaleSlackRequests — read snapshot, diff against
+ * Pattern: read snapshot, diff against
  * seen IDs, send TG for any new pending items, update seen set.
  */
 export async function runBasautoRequestWatcher(): Promise<void> {
@@ -128,7 +128,7 @@ export async function runBasautoRequestWatcher(): Promise<void> {
         return;
     }
 
-    // Format notification — same terse voice as Slack request watcher
+    // Format notification — same terse voice as the request watchers
     let msg: string;
     if (newPending.length === 1) {
         msg = `📋 BASAUTO purchase request needs action:\n${formatRequest(newPending[0])}`;

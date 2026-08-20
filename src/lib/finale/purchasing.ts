@@ -1592,7 +1592,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             isBulkDelivery?: boolean;
         }>,
         memo?: string,
-        purchaseDestination?: string
+        purchaseDestination?: string,
+        options?: { skipPreflight?: boolean },
     ): Promise<{
         orderId: string;
         finaleUrl: string;
@@ -1641,9 +1642,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             console.warn('[finale] Duplicate check failed (non-blocking):', e.message);
         }
 
+        const priceAlerts: string[] = [];
+        if (!options?.skipPreflight) {
         // ── Step 0b: Price change detection ─────────────────────────────────
         // DECISION(2026-03-04): Flag SKUs with >=10% price change vs last PO.
-        const priceAlerts: string[] = [];
         try {
             for (const item of items) {
                 if (!item.unitPrice || item.unitPrice <= 0) continue;
@@ -1658,10 +1660,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         } catch (e: any) {
             console.warn('[finale] Price check failed (non-blocking):', e.message);
         }
+        }
 
         // ── Step 0.5: Pre-validate all product SKUs exist in Finale ──────────
         // DECISION(2026-03-23): Finale silently accepts POs with invalid productUrls,
-        // creating line items with no product linked. Pre-validate to fail fast.
+        // creating line items with no product linked. Never skip this — skipPreflight
+        // is price-check only. Aria send is not used; blank SKUs are a hard fail.
         for (const item of items) {
             const exists = await this.validateProductExists(item.productId);
             if (!exists) {

@@ -165,7 +165,7 @@ async function runObservabilityHooks(
 ): Promise<void> {
     // Skip the heavy dynamic imports in test environments. Vitest sets
     // VITEST=true automatically; without this skip, importing ops-manager
-    // transitively pulls Telegraf, Slack, the full Aria graph, blowing past
+    // transitively pulls Telegraf, the full Aria graph, blowing past
     // the default 5s test timeout. The hooks fire normally in production.
     if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") {
         return;
@@ -275,13 +275,16 @@ export function startCronRunner(): void {
             console.log(`[cron-runner] ${job.name}: disabled, skipping schedule`);
             continue;
         }
+        const exprs = Array.isArray(job.schedule) ? job.schedule : [job.schedule];
         try {
-            cron.schedule(
-                job.schedule,
-                () => { void runJobOnce(job.name, "cron"); },
-                { timezone: job.tz },
-            );
-            console.log(`[cron-runner] ${job.name}: scheduled "${job.schedule}" ${job.tz}`);
+            for (const expr of exprs) {
+                cron.schedule(
+                    expr,
+                    () => { void runJobOnce(job.name, "cron"); },
+                    { timezone: job.tz },
+                );
+            }
+            console.log(`[cron-runner] ${job.name}: scheduled "${exprs.join(" | ")}" ${job.tz}`);
         } catch (err: any) {
             console.error(`[cron-runner] ${job.name}: schedule failed: ${err.message}`);
         }

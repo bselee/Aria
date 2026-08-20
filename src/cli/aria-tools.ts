@@ -168,7 +168,7 @@ export function getAriaTools(opts: {
                 try {
                     const { runBuildRiskAnalysis } = await import('../lib/builds/build-risk');
                     const report = await runBuildRiskAnalysis(30, () => { });
-                    return report.slackMessage;
+                    return report.textReport;
                 } catch (err: any) {
                     return `Build risk analysis failed: ${err.message}`;
                 }

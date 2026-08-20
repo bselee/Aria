@@ -4,7 +4,7 @@
  *          receivings (PO_RECEIVED activity), invoice-PO matches completed
  *          (RECONCILIATION_AUTO_APPLIED / RECONCILIATION resolved verdicts),
  *          and PO spend created last week (Finale orderDate). Also surfaces
- *          overdue build-risk items and pending Slack asks.
+ *          overdue build-risk items and pending asks.
  *          Sends clean, actionable text email to Bill.
  * @author  Hermia
  * @created 2026-06-15
@@ -41,14 +41,6 @@ interface PoSpendSummary {
   count: number;
   totalValue: number;
   rows: Array<{ orderId: string; supplier: string; total: number; orderDate: string }>;
-}
-
-interface SlackRequestSummary {
-  sku: string;
-  count: number;
-  statuses: string[];
-  latestDate: string;
-  requesters: string[];
 }
 
 interface UpcomingNeed {
@@ -195,51 +187,6 @@ async function getLastWeekPoSpend(db: any, weekStart: string, weekEnd: string): 
   };
 }
 
-/** Recent Slack requests (last 7d), grouped by SKU. */
-async function getSlackRequestsBySku(db: any): Promise<SlackRequestSummary[]> {
-  const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
-
-  const { data, error } = await db
-    .from("slack_requests")
-    .select("items_requested, status, created_at, requester_name")
-    .gte("created_at", cutoff)
-    .order("created_at", { ascending: false });
-
-  if (error || !data) {
-    console.warn("[monday-briefing] slack_requests query failed:", error?.message);
-    return [];
-  }
-
-  const skuMap = new Map<string, { count: number; statuses: Set<string>; dates: string[]; requesters: Set<string> }>();
-
-  for (const row of data as any[]) {
-    const skus: string[] = Array.isArray(row.items_requested) ? row.items_requested : [];
-    const status = row.status || "pending";
-    const date = row.created_at?.slice(0, 10) || "";
-    const requester = row.requester_name || "unknown";
-
-    for (const sku of skus) {
-      if (!sku) continue;
-      const entry = skuMap.get(sku) || { count: 0, statuses: new Set(), dates: [], requesters: new Set() };
-      entry.count += 1;
-      entry.statuses.add(status);
-      if (date) entry.dates.push(date);
-      entry.requesters.add(requester);
-      skuMap.set(sku, entry);
-    }
-  }
-
-  return Array.from(skuMap.entries())
-    .map(([sku, e]) => ({
-      sku,
-      count: e.count,
-      statuses: Array.from(e.statuses),
-      latestDate: e.dates.sort().reverse()[0] || "",
-      requesters: Array.from(e.requesters),
-    }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 8);
-}
 
 /**
  * Upcoming needs — pulls from latest build_risk_snapshot (high-risk items needing
@@ -306,7 +253,6 @@ function buildBriefingEmail(
   receivings: ReceivingSummary,
   matches: MatchSummary,
   poSpend: PoSpendSummary,
-  slack: SlackRequestSummary[],
   upcoming: UpcomingNeed[]
 ): string {
   const lines: string[] = [];
@@ -320,13 +266,13 @@ function buildBriefingEmail(
   // ── Action-needed block (only if there's something to act on) ──
   if (upcoming.length > 0) {
     const headline = overdueCount > 0
-      ? `⚠️  ACTION NEEDED — ${upcoming.length} builds at CRITICAL/HIGH risk (${overdueCount} past due)`
-      : `⚠️  ACTION NEEDED — ${upcoming.length} builds at CRITICAL/HIGH risk`;
+      ? `ACTION NEEDED — ${upcoming.length} builds at CRITICAL/HIGH risk (${overdueCount} past due)`
+      : `ACTION NEEDED — ${upcoming.length} builds at CRITICAL/HIGH risk`;
     lines.push(headline);
     lines.push("───────────────────────────────────────────────────────────────");
     upcoming.forEach((u) => {
       const qty = u.suggestedQty ? `qty ~${u.suggestedQty}` : "qty ?";
-      const vendor = u.vendor || "UNRESOLVED ⚠ data gap";
+      const vendor = u.vendor || "UNRESOLVED data gap";
       const dueNote = u.overdueDays != null
         ? `was due ${u.dueBy} (${u.overdueDays}d overdue)`
         : `due ${u.dueBy}`;
@@ -336,7 +282,7 @@ function buildBriefingEmail(
   }
 
   // ── Receivings ──
-  lines.push(`📦  RECEIVED LAST WEEK (${weekStart} – ${weekEnd})`);
+  lines.push(`RECEIVED LAST WEEK (${weekStart} – ${weekEnd})`);
   lines.push("───────────────────────────────────────────────────────────────");
   if (receivings.count === 0) {
     lines.push("  None received.");
@@ -349,7 +295,7 @@ function buildBriefingEmail(
   lines.push("");
 
   // ── Invoice-PO matches ──
-  lines.push("✅  INVOICE-PO MATCHING LAST WEEK");
+  lines.push("INVOICE-PO MATCHING LAST WEEK");
   lines.push("───────────────────────────────────────────────────────────────");
   const totalMatched = matches.autoApplied + matches.noChangeMatches;
   if (totalMatched === 0 && matches.errors === 0) {
@@ -366,7 +312,7 @@ function buildBriefingEmail(
   lines.push("");
 
   // ── PO spend created ──
-  lines.push(`🧾  POs CREATED LAST WEEK (${weekStart} – ${weekEnd})`);
+  lines.push(`POs CREATED LAST WEEK (${weekStart} – ${weekEnd})`);
   lines.push("───────────────────────────────────────────────────────────────");
   if (poSpend.count === 0) {
     lines.push("  No POs created (or local Finale mirror unavailable — check dashboard).");
@@ -374,19 +320,6 @@ function buildBriefingEmail(
     lines.push(`  ${poSpend.count} POs · $${poSpend.totalValue.toLocaleString()}`);
     poSpend.rows.forEach((p) => {
       lines.push(`    PO ${p.orderId.padEnd(8)} ${p.supplier.padEnd(28)} $${p.total.toFixed(0)}  (${p.orderDate})`);
-    });
-  }
-  lines.push("");
-
-  // ── Slack asks ──
-  lines.push("💬  SLACK — SKU STATUS REVIEW (last 7 days)");
-  lines.push("───────────────────────────────────────────────────────────────");
-  if (slack.length === 0) {
-    lines.push("  No new Slack purchase requests recorded.");
-  } else {
-    slack.forEach((s) => {
-      const statuses = s.statuses.join(", ");
-      lines.push(`  ${s.sku.padEnd(12)} x${s.count}  ${statuses}  latest ${s.latestDate}`);
     });
   }
   lines.push("");
@@ -426,15 +359,14 @@ export async function generateAndSendMondayBriefing(): Promise<void> {
 
   console.log(`[monday-briefing] Collecting data for ${dateStr} (prior week ${weekStart}..${weekEnd})...`);
 
-  const [receivings, matches, poSpend, slack, upcoming] = await Promise.all([
+  const [receivings, matches, poSpend, upcoming] = await Promise.all([
     getLastWeekReceivings(db, weekStart, weekEnd),
     getLastWeekMatches(db, weekStart, weekEnd),
     getLastWeekPoSpend(db, weekStart, weekEnd),
-    getSlackRequestsBySku(db),
     getUpcomingNotablePurchases(db),
   ]);
 
-  const body = buildBriefingEmail(dateStr, weekStart, weekEnd, receivings, matches, poSpend, slack, upcoming);
+  const body = buildBriefingEmail(dateStr, weekStart, weekEnd, receivings, matches, poSpend, upcoming);
 
   const subject = `Aria Briefing — ${dateStr}`;
 

@@ -893,7 +893,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                 // --- INVOICE QUEUEING (ap inbox only) ---
                 let processedAnyPDF = false;
-                let manualReviewReason: string | null = null;
+                const manualReviewReason: string | null = null;
 
                 const pdfParts: any[] = [];
                 const walkParts = (parts: any[]): void => {
@@ -1068,7 +1068,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             } else if (extractedPdf) {
                                 // Non-FedEx: optional single-page pick for Bill.com OCR.
                                 // KAIZEN(2026-07-22): Removed AAA Cooper forced-page-1 override.
-                                let pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                const pageSelection = await this.selectPrimaryInvoicePageNumber(
                                     buffer,
                                     extractedPdf.pages,
                                     extractedPdf.metadata?.pageCount,

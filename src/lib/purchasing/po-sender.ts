@@ -540,7 +540,7 @@ export async function commitAndSendPO(
         const verificationIssues: string[] = [];
         let finalStatus = 'ORDER_LOCKED';
         let committed = true;
-        let committedAt = new Date().toISOString();
+        const committedAt = new Date().toISOString();
         const MAX_COMMIT_RETRIES = 3;
         for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt++) {
             try {
@@ -745,7 +745,6 @@ export async function commitAndSendPO(
                 email_subject: subject,
                 intent,
                 action_taken: actionTaken,
-                notified_slack: false,
                 metadata: {
                     orderId,
                     vendorEmail: vendorEmail ?? null,
@@ -1014,7 +1013,6 @@ export async function retrySendEmail(
                 email_subject: subject,
                 intent: emailVia === 'gmail-fallback' ? 'PO_SEND_GMAIL' : 'PO_SEND_FINALE',
                 action_taken: `PO #${orderId} email retry succeeded via ${retryViaLabel} -> ${vendorEmail}`,
-                notified_slack: false,
                 metadata: {
                     orderId,
                     vendorEmail,

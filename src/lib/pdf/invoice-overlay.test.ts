@@ -8,22 +8,58 @@
  * @created 2026-08-18
  */
 import { describe, expect, it } from "vitest";
-import { PDFDocument, StandardFonts } from "pdf-lib";
+import { PDFDocument, StandardFonts, decodePDFRawStream, PDFRawStream } from "pdf-lib";
 import {
     buildStampedFilename,
     shouldStampInvoice,
     stampInvoicePdf,
 } from "./invoice-overlay";
-// @ts-expect-error - No types available for pdf-parse
-import pdfParse from "pdf-parse";
 
-/** Minimal one-page PDF with a line of text, so pdf-parse has content. */
+/** Minimal one-page PDF with a line of text. */
 async function makeSamplePdf(): Promise<Buffer> {
     const pdf = await PDFDocument.create();
     const font = await pdf.embedFont(StandardFonts.Helvetica);
     const page = pdf.addPage([612, 792]);
     page.drawText("AAA COOPER TRANSPORTATION", { x: 50, y: 700, size: 12, font });
     return Buffer.from(await pdf.save());
+}
+
+/**
+ * Extract readable text drawn on page 1 via pdf-lib's own stream decoder.
+ * pdf-parse (pdf.js v1.10.100) cannot parse pdf-lib ObjStm/xref streams
+ * (InvalidPDFException) — tooling limit, not a stamp bug (2026-08-19).
+ * Helvetica draws use hex Tj operands (`<2320…>`), so we decode those too.
+ */
+async function pageTextLayer(buffer: Buffer): Promise<string> {
+    const pdf = await PDFDocument.load(buffer);
+    const contents = pdf.getPage(0).node.Contents();
+    if (!contents) return "";
+    const streams: PDFRawStream[] = [];
+    if (typeof (contents as { size?: unknown }).size === "function") {
+        const arr = contents as { size: () => number; lookup: (i: number) => unknown };
+        for (let i = 0; i < arr.size(); i++) {
+            const s = arr.lookup(i);
+            if (s instanceof PDFRawStream) streams.push(s);
+        }
+    } else if (contents instanceof PDFRawStream) {
+        streams.push(contents);
+    }
+    const raw = streams
+        .map((s) => new TextDecoder("latin1").decode(decodePDFRawStream(s).decode()))
+        .join("\n");
+    const decoded: string[] = [];
+    for (const m of raw.matchAll(/<([0-9A-Fa-f]+)>/g)) {
+        const hex = m[1];
+        let s = "";
+        for (let i = 0; i + 1 < hex.length; i += 2) {
+            s += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+        }
+        decoded.push(s);
+    }
+    for (const m of raw.matchAll(/\((?:\\.|[^\\)])*\)/g)) {
+        decoded.push(m[0].slice(1, -1).replace(/\\(.)/g, "$1"));
+    }
+    return decoded.join("\n");
 }
 
 describe("shouldStampInvoice", () => {
@@ -84,8 +120,7 @@ describe("stampInvoicePdf", () => {
 
         expect(stamped.length).toBeGreaterThan(original.length);
 
-        const parsed = await pdfParse(stamped, { max: 0 });
-        const text = parsed.text || "";
+        const text = await pageTextLayer(stamped);
         // The stamp line must be extractable as REAL text — this is exactly
         // what Bill.com's OCR/extractor reads. The template prefix is just
         // "# " because the page's own "INVOICE" title carries the label.

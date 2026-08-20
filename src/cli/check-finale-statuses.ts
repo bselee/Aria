@@ -70,8 +70,8 @@ async function testFeb20() {
         console.log(`  ${skus}`);
     }
 
-    // Now simulate Slack digest
-    console.log("\n\n═══ Simulated Slack Digest ═══\n");
+    // Now simulate the digest
+    console.log("\n\n═══ Simulated Digest ═══\n");
     const { FinaleClient } = await import('../lib/finale/client');
     const client = new FinaleClient();
 

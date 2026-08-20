@@ -122,7 +122,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     } else if (process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                         await bot.telegram.sendMessage(
                             chatId,
-                            `ℹ️ *Draft PO #${draft.orderId} Detected!*\n` +
+                            `*Draft PO #${draft.orderId} Detected!*\n` +
                             `*Vendor*: ${draft.vendorName}\n` +
                             `*Status*: Already manually sent (proven via Gmail search). Auto-committed in Finale and marked sent in database.`,
                             { parse_mode: 'Markdown' }
@@ -155,7 +155,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                         await bot.telegram.sendMessage(
                             chatId,
-                            `⚠️ *Autonomy Blocked on PO #${draft.orderId}*\n` +
+                            `*Autonomy Blocked on PO #${draft.orderId}*\n` +
                             `*Vendor*: ${review.vendorName}\n` +
                             `*Reason*: No order contact email on file. Update vendor\\_profiles or vendors table.`,
                             { parse_mode: 'Markdown' }
@@ -179,18 +179,18 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                         telegramChatId: chatId,
                     });
 
-                    const msg = `📦 *Draft PO #${draft.orderId} Generated (Level 1)*\n` +
+                    const msg = `*Draft PO #${draft.orderId} Generated (Level 1)*\n` +
                                 `*Vendor*: ${review.vendorName}\n` +
                                 `*Total*: $${review.total.toFixed(2)}\n\n` +
-                                `☝️ _Aria auto-generated this draft. Tap below to review details and confirm sending:_`;
+                                `_Aria auto-generated this draft. Tap below to review details and confirm sending:_`;
 
                     if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                         await bot.telegram.sendMessage(chatId, msg, {
                             parse_mode: 'Markdown',
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: '🔍 Review & Send', callback_data: `po_review_${draft.orderId}` },
-                                    { text: '⏭️ Skip', callback_data: `po_skip_${draft.orderId}` }
+                                    { text: 'Review & Send', callback_data: `po_review_${draft.orderId}` },
+                                    { text: 'Skip', callback_data: `po_skip_${draft.orderId}` }
                                 ]]
                             }
                         });
@@ -220,11 +220,11 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                         await bot.telegram.sendMessage(
                             chatId,
-                            `✅ *PO #${draft.orderId} Auto-Reviewed (Level 2 → Manual Send)*\n` +
+                            `*PO #${draft.orderId} Auto-Reviewed (Level 2 → Manual Send)*\n` +
                             `*Vendor*: ${review.vendorName}\n` +
                             `*Total*: $${review.total.toFixed(2)}\n` +
                             `*Sent To*: ${email}\n` +
-                            `🔗 [View in Finale](${link})\n\n` +
+                            `[View in Finale](${link})\n\n` +
                             `_Auto-send disabled during trust building. Review and approve via dashboard or /sendpo ${draft.orderId}_`,
                             { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
                         );
@@ -241,7 +241,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                 if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                     await bot.telegram.sendMessage(
                         chatId,
-                        `🚨 *Autonomous PO #${draft.orderId} Failed*\n` +
+                        `*Autonomous PO #${draft.orderId} Failed*\n` +
                         `*Vendor*: ${draft.vendorName}\n` +
                         `*Error*: ${innerErr.message || innerErr}`,
                         { parse_mode: 'Markdown' }

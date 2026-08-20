@@ -419,6 +419,49 @@ describe("reconcileInvoiceToPO guardrails", () => {
         expect(result.feeChanges.find((fc) => fc.feeType === "FREIGHT")?.verdict).toBe("auto_approve");
     });
 
+    // Regression: TeraGanix 121591 → PO 124825 (2026-08-19). vendor_invoices.line_items
+    // rows from the AP pipeline are snake_case (qty/sku/unit_price/ext_price), while
+    // InvoiceData.lineItems is camelCase. Passing the DB shape straight through used to
+    // read unitPrice=undefined → balance math collapsed to freight-only AND
+    // buildReconciliationSummary crashed with "Cannot read properties of undefined
+    // (reading 'toFixed')". The reconciler must normalize the DB shape at entry.
+    it("normalizes snake_case DB line items (unit_price/ext_price) without crashing", async () => {
+        const invoice = {
+            vendorName: "TeraGanix",
+            invoiceNumber: "121591",
+            poNumber: "124825",
+            lineItems: [
+                { qty: 6, sku: "EM102", ext_price: 1336.8, unit_price: 222.8, description: "Case of TCM Consortium Microbes" },
+            ],
+            subtotal: 1336.8,
+            freight: 200,
+            tax: 0,
+            total: 1536.8,
+            amountDue: 1536.8,
+            confidence: "medium",
+        } as any;
+        const client = {
+            getOrderSummary: vi.fn().mockResolvedValue({
+                orderId: "124825",
+                supplier: "TeraGanix",
+                supplierName: "TeraGanix",
+                status: "Open",
+                orderDate: "2026-07-01",
+                total: 1536.8,
+                subtotal: 1336.8,
+                adjustments: [],
+                items: [{ productId: "EM102", quantity: 6, unitPrice: 222.8, description: "TCM Consortium Microbes" }],
+            }),
+        } as any;
+
+        const result = await reconcileInvoiceToPO(invoice, "124825", client);
+
+        // No crash, balance computes to the real subtotal (not freight-only), verdict sane.
+        expect(result.overallVerdict).not.toBe("needs_approval");
+        expect(result.warnings.some((w) => /lineItems array/.test(w))).toBe(false);
+        expect(result.summary).toBeTruthy();
+    });
+
     // 2026-05-15: new test for the disproportion guard (Guard 3b).
     it("escalates freight that exceeds 2× PO subtotal even under the $4000 cap", async () => {
         // $3500 freight on a $500 product PO — 7× ratio. Old behavior was

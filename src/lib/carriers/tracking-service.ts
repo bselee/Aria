@@ -65,6 +65,16 @@ export const TRACKING_PATTERNS = {
     // where the carrier pattern doesn't match but the number has a TRK/TRACK label.
     // Examples: TRK# 8051904063, TRACK# ABC123456789, TRK: XF1234567890
     trk: /\b(?:TRK|TRACK)\s*[#:]?\s*([0-9A-Z]{8,25})\b/i,
+    // Tracking number embedded in a carrier's own tracking URL query string.
+    // HERMIA(2026-08-20): highest-signal gap found on Ferticell PO 125211 —
+    // "track your shipment here: https://www.odfl.com/...?proNumbers=78088240060"
+    // carried carrier + PRO in one link, but no pattern above matched a bare
+    // number inside a URL, so the PO stayed at zero tracking. A number sitting
+    // in a carrier tracking param IS the tracking number — treat it as such.
+    // Covers ODFL (proNumbers), FedEx (tracknumbers), UPS (tracknum),
+    // USPS (tLabels), DHL (tracking-id), AAA Cooper (ProNum),
+    // TForce (HAWB), YRC (referenceNumber), Saia/Estes/XPO (pro).
+    urlPro: /[?&](?:proNumbers?|pro|ProNum|trackNum(?:ber)?s?|trackingNum(?:ber)?s?|tLabels?|tracking-?id|referenceNumber|HAWB)=([0-9][0-9A-Z]{6,29})/i,
 };
 
 // ──────────────────────────────────────────────────
@@ -114,8 +124,10 @@ export function detectLTLCarrier(text: string): string | null {
 // ──────────────────────────────────────────────────
 
 const LTL_DIRECT_LINKS: Record<string, string> = {
-    "Old Dominion Freight Line": "https://www.odfl.com/trace/Trace.jsp?pro={PRO}",
-    "Old Dominion": "https://www.odfl.com/trace/Trace.jsp?pro={PRO}",
+    // HERMIA(2026-08-20): odfl.com/trace/Trace.jsp 301-redirects now; use the
+    // current trace tool URL the vendor themselves link (verified 200).
+    "Old Dominion Freight Line": "https://www.odfl.com/us/en/tools/trace-track-ltl-freight.html?proNumbers={PRO}",
+    "Old Dominion": "https://www.odfl.com/us/en/tools/trace-track-ltl-freight.html?proNumbers={PRO}",
     "Saia": "https://www.saia.com/tracking?pro={PRO}",
     "Estes": "https://www.estes-express.com/tracking?pro={PRO}",
     "R&L Carriers": "https://www.rlcarriers.com/freight/shipping/shipment-tracing?pro={PRO}",
@@ -174,6 +186,9 @@ export function extractTrackingNumbers(text: string): Array<{ carrier: string; t
     const CARRIER_BASE: Record<string, number> = {
         ups: 100,
         usps: 95,
+        // A number sitting inside a carrier's own tracking URL is as explicit
+        // as it gets — the vendor handed us the carrier AND the number.
+        urlPro: 93,
         dhl: 90,
         oakharbor: 88,
         pro: 85,

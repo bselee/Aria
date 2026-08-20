@@ -32,8 +32,11 @@ export interface JobCtx {
 export interface JobDef {
     /** Unique, kebab-case. Used as the key in /run <name> and in cron_runs.task_name. */
     name: string;
-    /** Standard cron expression (5-field). Validated by node-cron at schedule time. */
-    schedule: string;
+    /**
+     * One 5-field cron expression, or several when a job cannot be expressed
+     * as a single pattern (e.g. 7:30 plus 12:00/17:00). Validated by node-cron.
+     */
+    schedule: string | string[];
     /** IANA tz. Defaults to America/Denver (Will's local). */
     tz?: string;
     /** What runs on each tick. ctx provides log + abort signal + invokedBy. */
@@ -61,8 +64,9 @@ export function defineJob(def: JobDef): void {
     if (!def.name || typeof def.name !== "string") {
         throw new Error("defineJob: name required (non-empty string)");
     }
-    if (!def.schedule || typeof def.schedule !== "string") {
-        throw new Error(`defineJob(${def.name}): schedule required (non-empty string)`);
+    const exprs = Array.isArray(def.schedule) ? def.schedule : [def.schedule];
+    if (exprs.length === 0 || exprs.some((s) => !s || typeof s !== "string")) {
+        throw new Error(`defineJob(${def.name}): schedule required (non-empty string or string[])`);
     }
     if (_registry.has(def.name)) {
         throw new Error(`defineJob: "${def.name}" already registered`);

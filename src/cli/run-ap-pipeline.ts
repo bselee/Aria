@@ -515,7 +515,6 @@ async function main() {
                         email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                         intent: "RECONCILIATION",
                         action_taken: `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`,
-                        notified_slack: false,
                         metadata: buildAuditMetadata(result, applyResult, "auto"),
                     });
                     console.log("   ✅ Reconciliation logged to Supabase");
@@ -552,7 +551,6 @@ async function main() {
                         email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                         intent: "RECONCILIATION",
                         action_taken: `Manual run applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`,
-                        notified_slack: false,
                         metadata: buildAuditMetadata(result, applyResult, "manual"),
                     });
                     console.log("   ✅ Reconciliation logged to Supabase");

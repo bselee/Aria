@@ -2,7 +2,7 @@
  * @file    src/lib/tracking/email-tracking-ingest.ts
  * @purpose Scans Gmail (both main + AP inbox) for vendor shipping confirmations,
  *          extracts tracking numbers + PO numbers, detects carrier, and upserts
- *          to the shipments table so the dashboard, carrier-poll, and Slack
+ *          to the shipments table so the dashboard and carrier-poll can
  *          detector can all surface tracking status.
  *
  *          Solves the "manual tracking insert" workflow: vendor emails a tracking
@@ -518,7 +518,7 @@ async function extractPdfAttachmentText(
 
     let pdfParse: any;
     try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
+         
         pdfParse = (await import("pdf-parse")).default || (await import("pdf-parse"));
     } catch {
         console.warn("[email-tracking-ingest] pdf-parse unavailable — skipping PDF OCR");
@@ -645,7 +645,7 @@ function htmlToPlainText(html: string): string {
 
 /**
  * Extract PO numbers from text. Reuses the same patterns as
- * po-correlator / Slack request-detector. Handles:
+ * po-correlator. Handles:
  *   "PO #124833", "PO-124833", "PO 124833", "order 124833",
  *   "71473626-1124833" (Finale vendor-ref format)
  */

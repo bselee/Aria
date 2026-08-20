@@ -261,11 +261,17 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         expect(unifiedObjectGenerationMock).not.toHaveBeenCalled();
         expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({
             email_from: "billing@fedex.com",
-            pdf_filename: "fedex-bill-1001.pdf",
+            // DECISION(2026-08-05): FedEx Billing Online PDFs are renamed to a
+            // Bill.com display name by buildFedExBillComFilename() (service hint
+            // + invoice #); the original filename is preserved on the row as
+            // extracted_json.original_pdf_filename.
+            pdf_filename: "FedEx_Invoice_unknown.pdf",
             status: "PENDING_FORWARD",
             extracted_json: expect.objectContaining({
                 source_gmail_message_id: "gmail-fedex-1",
                 completion_mode: "forward_success",
+                fedex_full_packet: true,
+                original_pdf_filename: "fedex-bill-1001.pdf",
             }),
         }));
         expect(updateMock).toHaveBeenCalledWith({ processed_by_ap: true });
@@ -355,23 +361,27 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         expect(updateMock).toHaveBeenCalledWith({ processed_by_ap: true });
     });
 
+    // DECISION(2026-08-05): FedEx Billing Online packets are forwarded in FULL —
+    // never single-page-trimmed (ap-identifier.ts:1041). The pdf-lib trim path
+    // still exists for NON-FedEx PDFs, so this test drives it with a generic
+    // vendor packet: page 1 = invoice, page 2 = packing slip → trimmed to page 1.
     it("trims mixed paperwork packets down to the primary invoice page before queueing", async () => {
         const queueRows = [
             {
-                id: "row-fedex-mixed-1",
-                subject: "Your FedEx invoice is ready",
-                from_email: "billing@fedex.com",
+                id: "row-mixed-1",
+                subject: "Invoice 1002 — mixed paperwork packet",
+                from_email: "billing@midwestpackaging.com",
                 body_snippet: "Please see attached invoice PDF.",
                 body_text: "Please see attached invoice PDF.",
-                gmail_message_id: "gmail-fedex-mixed-1",
+                gmail_message_id: "gmail-mixed-1",
                 source_inbox: "ap",
-                pdf_filenames: ["fedex-bill-1002.pdf"],
+                pdf_filenames: ["Inv_1002_mixed_packet.pdf"],
             },
         ];
 
         const modifyMock = vi.fn();
         const attachmentGetMock = vi.fn().mockResolvedValue({
-            data: { data: Buffer.from("fedex-mixed-pdf").toString("base64url") },
+            data: { data: Buffer.from("mixed-packet-pdf").toString("base64url") },
         });
         const uploadMock = vi.fn().mockResolvedValue({ error: null });
         const insertMock = vi.fn().mockResolvedValue({ error: null });
@@ -423,7 +433,7 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
                         data: {
                             payload: {
                                 parts: [
-                                    { filename: "fedex-bill-1002.pdf", body: { attachmentId: "att-fedex-mixed-1" } },
+                                    { filename: "Inv_1002_mixed_packet.pdf", body: { attachmentId: "att-mixed-1" } },
                                 ],
                             },
                         },
@@ -653,7 +663,14 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         expect(updateMock).toHaveBeenCalledWith({ processed_by_ap: true });
     });
 
-    it("leaves ambiguous multi-page FedEx packets unread instead of forwarding extra paperwork", async () => {
+    // DECISION(2026-08-05): FedEx Billing Online packets are forwarded in FULL —
+    // never single-page-trimmed and never gated on page ambiguity
+    // (ap-identifier.ts:1041). The old "ambiguous packet → leave unread" path and
+    // the extractPDFWithLLM OCR escalation that fed it are gone from the queue
+    // path: when the whole packet is the intended forward, ambiguity is moot.
+    // The test's original intent ("no extra paperwork forwarded") now means the
+    // full packet is queued as-is — nothing beyond it.
+    it("queues ambiguous multi-page FedEx packets in full — no LLM escalation, no page picking, no Gmail touch", async () => {
         const queueRows = [
             {
                 id: "row-fedex-ambiguous-1",
@@ -670,7 +687,7 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         const attachmentGetMock = vi.fn().mockResolvedValue({
             data: { data: Buffer.from("fedex-ambiguous-pdf").toString("base64url") },
         });
-        const uploadMock = vi.fn().mockResolvedValue({ error: null });
+        const modifyMock = vi.fn();
         const insertMock = vi.fn().mockResolvedValue({ error: null });
         const maybeSingleMock = vi.fn().mockResolvedValue({ data: null });
         const updateMock = vi.fn(() => ({
@@ -689,18 +706,8 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
             ocrStrategy: "pdf-parse",
             ocrDurationMs: 1,
         });
-        extractPDFWithLLMMock.mockResolvedValue({
-            rawText: "Shipment packet\nAdditional paperwork",
-            pages: [
-                { pageNumber: 1, text: "Shipment packet\nReference 1005", hasTable: false },
-                { pageNumber: 2, text: "Additional paperwork\nReference 1005", hasTable: false },
-            ],
-            tables: [],
-            metadata: { pageCount: 2, fileSize: 789 },
-            hasImages: true,
-            ocrStrategy: "google/gemini-2.5-flash",
-            ocrDurationMs: 200,
-        });
+        // Intentionally NOT seeding extractPDFWithLLM: the FedEx queue path must
+        // never call it — full-packet forwarding needs no OCR page resolution.
 
         const gmail = {
             users: {
@@ -718,7 +725,7 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
                             },
                         },
                     }),
-                    modify: vi.fn(),
+                    modify: modifyMock,
                     attachments: {
                         get: attachmentGetMock,
                     },
@@ -765,7 +772,7 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
             }),
             storage: {
                 from: vi.fn(() => ({
-                    upload: uploadMock,
+                    upload: vi.fn(),
                 })),
             },
         };
@@ -774,9 +781,29 @@ describe("APIdentifierAgent single-pipeline invoice handling", () => {
         const agent = new APIdentifierAgent();
         await agent.identifyAndQueue();
 
-        expect(extractPDFWithLLMMock).toHaveBeenCalledTimes(1);
-        expect(uploadMock).not.toHaveBeenCalled();
-        expect(insertMock).not.toHaveBeenCalled();
+        expect(extractPDFWithLLMMock).not.toHaveBeenCalled();
+        expect(pdfDocumentLoadMock).not.toHaveBeenCalled();
+        // Full packet uploaded untouched — nothing trimmed, nothing extra.
+        expect(uploadPDFMock).toHaveBeenCalledWith(
+            Buffer.from("fedex-ambiguous-pdf"),
+            expect.objectContaining({ type: "ap_invoices" }),
+        );
+        expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({
+            email_from: "billing@fedex.com",
+            pdf_filename: "FedEx_Invoice_unknown.pdf",
+            status: "PENDING_FORWARD",
+            extracted_json: expect.objectContaining({
+                source_gmail_message_id: "gmail-fedex-ambiguous-1",
+                completion_mode: "forward_success",
+                vendor_routing_action: "carrier_bill",
+                fedex_full_packet: true,
+                fedex_may_trim_pages: false,
+                skip_product_po_match: true,
+                forwarded_page_count: 2,
+                original_pdf_filename: "fedex-bill-1005.pdf",
+            }),
+        }));
+        expect(modifyMock).not.toHaveBeenCalled();
         expect(updateMock).toHaveBeenCalledWith({ processed_by_ap: true });
     });
 

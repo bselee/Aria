@@ -247,7 +247,7 @@ export function detectAtRiskPOs(input: DetectAtRiskPOsInput): AtRiskPO[] {
 // ── Activity-feed writer ───────────────────────────────────────────────────
 //
 // Per the Activity-first routing rule: detected risks land as Activity rows
-// FIRST (intent=PO_ARRIVAL_AT_RISK), not as Slack/Gmail pushes. Builds panel
+// FIRST (intent=PO_ARRIVAL_AT_RISK), not as external pushes. Builds panel
 // renders a red-alert summary from these rows; "Compose ETA draft" and other
 // next-step actions are triggered FROM the Activity row by Will/dashboard.
 
@@ -443,7 +443,6 @@ export async function writeAtRiskActivityRows(risks: AtRiskPO[]): Promise<WriteA
                         email_subject: subject,
                         intent: ACTIVITY_INTENT_PO_AT_RISK,
                         action_taken: action,
-                        notified_slack: false,
                         metadata,
                     });
                 if (error) {

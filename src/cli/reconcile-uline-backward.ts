@@ -149,7 +149,7 @@ async function main() {
 
     // 2. Load Billtrust freight bills (both CSVs), Uline only
     const csv1 = CSV1 || findCsv(/^FEDEX_\d+.*\.csv$/i, DEFAULT_DIRS);
-    let bills: UlineFreightBill[] = [];
+    const bills: UlineFreightBill[] = [];
     for (const csvPath of [CSV1, CSV2].filter(Boolean)) {
         const rows = readCsv(csvPath!);
         const seen = new Set<string>();

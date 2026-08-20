@@ -26,7 +26,7 @@ function money(value: number): string {
 function fmtDate(value: string): string {
     // Accepts "2026-06-25", "2026-06-25T...", ISO, or raw string. Never returns "undefined".
     if (!value) return "";
-    let date = new Date(value);
+    const date = new Date(value);
     if (Number.isNaN(date.getTime())) {
         // fallback parse YYYY-MM-DD prefix
         const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);

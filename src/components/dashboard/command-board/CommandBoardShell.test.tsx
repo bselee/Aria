@@ -40,14 +40,6 @@ const baseAgents = [
         skills: [],
         workflows: [],
     },
-    {
-        id: "watchdog",
-        label: "Slack Watchdog",
-        reportsTo: "ops-manager",
-        process: [],
-        skills: [],
-        workflows: [],
-    },
 ];
 
 const baseCatalog = {

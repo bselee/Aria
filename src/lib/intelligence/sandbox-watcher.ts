@@ -117,7 +117,7 @@ async function handlePDF(filePath: string, apAgent: APAgent, bot: Telegraf) {
             `Status: Submitted to AP pipeline — check Telegram for reconciliation result.\n`
         );
         console.log(`[sandbox] PDF pipeline complete for: ${filename}`);
-        await notifyTelegram(bot, `📂 <b>Sandbox</b> — processed PDF: <code>${filename}</code>`);
+        await notifyTelegram(bot, `<b>Sandbox</b> — processed PDF: <code>${filename}</code>`);
     } catch (err: any) {
         console.error(`[sandbox] PDF pipeline error for ${filename}: ${err.message}`);
         writeResponse(
@@ -126,7 +126,7 @@ async function handlePDF(filePath: string, apAgent: APAgent, bot: Telegraf) {
             `Error: ${err.message}\n` +
             `Timestamp: ${new Date().toISOString()}\n`
         );
-        await notifyTelegram(bot, `📂 <b>Sandbox</b> — ❌ PDF failed: <code>${filename}</code>\n${err.message}`);
+        await notifyTelegram(bot, `<b>Sandbox</b> — PDF failed: <code>${filename}</code>\n${err.message}`);
     }
 
     moveToProcessed(filePath);
@@ -176,7 +176,7 @@ async function handleTXT(filePath: string, bot: Telegraf) {
 
         writeResponse(`${basename}-response.txt`, responseContent);
         console.log(`[sandbox] Answered question: ${filename}`);
-        await notifyTelegram(bot, `📂 <b>Sandbox</b> — answered: <code>${filename}</code>`);
+        await notifyTelegram(bot, `<b>Sandbox</b> — answered: <code>${filename}</code>`);
     } catch (err: any) {
         console.error(`[sandbox] LLM error for ${filename}: ${err.message}`);
         writeResponse(
@@ -228,7 +228,7 @@ async function handleSpreadsheet(filePath: string, bot: Telegraf) {
             `---\n${answer}\n`
         );
         console.log(`[sandbox] Summarized spreadsheet: ${filename}`);
-        await notifyTelegram(bot, `📂 <b>Sandbox</b> — summarized: <code>${filename}</code>`);
+        await notifyTelegram(bot, `<b>Sandbox</b> — summarized: <code>${filename}</code>`);
     } catch (err: any) {
         console.error(`[sandbox] Spreadsheet error for ${filename}: ${err.message}`);
         writeResponse(
@@ -269,7 +269,7 @@ async function handleImage(filePath: string, bot: Telegraf) {
                 `Timestamp: ${new Date().toISOString()}\n`
             );
             console.log(`[sandbox] Image uploaded to local storage: ${localPath}`);
-            await notifyTelegram(bot, `📂 <b>Sandbox</b> — uploaded image: <code>${filename}</code>`);
+            await notifyTelegram(bot, `<b>Sandbox</b> — uploaded image: <code>${filename}</code>`);
         } else {
             writeResponse(
                 `${basename}-skipped.txt`,
@@ -303,7 +303,7 @@ async function handleUnknown(filePath: string, bot: Telegraf) {
         `File moved to processed/ — no automated action taken.\n`
     );
 
-    await notifyTelegram(bot, `📂 <b>Sandbox</b> — unknown file type: <code>${filename}</code> (${ext})`);
+    await notifyTelegram(bot, `<b>Sandbox</b> — unknown file type: <code>${filename}</code> (${ext})`);
     moveToProcessed(filePath);
 }
 

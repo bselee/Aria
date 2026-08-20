@@ -4,9 +4,8 @@
  *          and route them based on filename prefix:
  *
  *          CR_ / CRMIN_ / CR (CR Minerals pumice invoices):
- *            → DM Parker the PDF directly with stock-on-order info.
- *              Uses SLACK_BOT_TOKEN so the message appears from @Purchase bot,
- *              not impersonating Bill. No public channel posts.
+ *            → Email to buildasoilap@bill.com (same as AP invoice forwarding).
+ *              HERMIA(2026-08-20): was a Slack DM to Parker; Slack removed.
  *
  *          Benny_ (Benny's invoices):
  *            → Email to buildasoilap@bill.com (same as AP invoice forwarding)
@@ -20,32 +19,18 @@
  *
  * @author  Hermia
  * @created 2026-06-16
- * @updated 2026-06-19 — DM Parker with PDF; uses SLACK_BOT_TOKEN not user token.
- *          Removed public channel post (was impersonating Bill in #purchase-orders).
- * @deps    @slack/web-api, @googleapis/gmail (sendGmailPdfEmail)
- * @env     SLACK_BOT_TOKEN, SLACK_OWNER_USER_ID
- *          GMAIL tokens for "default" and "ap" slots
+ * @updated 2026-08-20 — Slack removed; CR scans now email to Bill.com.
+ * @deps    @googleapis/gmail (forwardInvoiceOnce via ap-single-forward)
+ * @env     GMAIL tokens for "default" and "ap" slots
  */
 
 import fs from "fs";
 import path from "path";
-import { WebClient } from "@slack/web-api";
-import { getAuthenticatedClient } from "./gmail/auth";
-import { gmail as GmailApi } from "@googleapis/gmail";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const SCANS_DIR = "C:\\Users\\BuildASoil\\OneDrive\\_FREIGHT\\Documents\\Scans";
 const STATE_FILE = path.join(process.cwd(), "data", "scans-watcher-state.json");
-
-/** Parker McMahon's Slack user ID — resolved at runtime, cached per run */
-let PARKER_SLACK_ID: string | null = null;
-const PARKER_NAME = "Parker McMahon";
-
-// Max age for a "most recent" CR Minerals PO query (look back 90 days)
-const CR_PO_LOOKBACK_DAYS = 90;
-const CR_SKU = "PU100";
-const CR_VENDOR = "CR Minerals";
 
 // ── State persistence ──────────────────────────────────────────────────────
 
@@ -73,7 +58,7 @@ function saveState(state: WatcherState): void {
 
 // ── File Classification ────────────────────────────────────────────────────
 
-type ScanAction = "slack_parker_cr" | "email_billcom" | "ignore" | "unknown";
+type ScanAction = "email_billcom" | "ignore" | "unknown";
 
 interface ClassifiedFile {
     basename: string;
@@ -95,7 +80,7 @@ function classifyFile(basename: string, fullPath: string): ClassifiedFile {
         upper.startsWith("CR_DELIV_") ||
         basename.match(/^CR[A-Za-z]*_\d+/i)
     ) {
-        return { basename, fullPath, action: "slack_parker_cr", label: "CR Minerals — DM Parker with PDF" };
+        return { basename, fullPath, action: "email_billcom", label: "CR Minerals invoice — email to Bill.com" };
     }
 
     // Benny patterns: Benny_, Benny
@@ -134,125 +119,7 @@ function classifyFile(basename: string, fullPath: string): ClassifiedFile {
     return { basename, fullPath, action: "unknown", label: "Unclassified scan" };
 }
 
-// ── Slack: DM Parker the CR Minerals scan + PDF ────────────────────────────
-
-/**
- * DM Parker the CR Minerals scan PDF with stock-on-order info.
- * Opens a DM channel, uploads the PDF so Parker can open it directly,
- * and includes the stock context as the message caption.
- *
- * Uses SLACK_BOT_TOKEN (bot) — posts as @Purchase bot, NOT as Bill Selee.
- * This is intentional: automated scan forwarding should not impersonate Bill.
- */
-async function notifyParkerAboutCRScan(
-    slackBotToken: string,
-    pdfPath: string,
-    className: string,
-    crPoInfo: string,
-): Promise<void> {
-    const slack = new WebClient(slackBotToken);
-
-    // Resolve Parker's Slack user ID (cached per run)
-    if (!PARKER_SLACK_ID) {
-        try {
-            const usersList = await slack.users.list({ limit: 200 });
-            const parker = usersList.members?.find(
-                (m) => m.real_name === PARKER_NAME || m.name === "parker" || m.name?.toLowerCase().includes("parker"),
-            );
-            PARKER_SLACK_ID = parker?.id ?? null;
-        } catch (err) {
-            console.warn(`[scans-watcher] Could not resolve Parker's Slack ID: ${(err as Error).message}`);
-            return;
-        }
-    }
-
-    if (!PARKER_SLACK_ID) {
-        console.warn(`[scans-watcher] Parker's Slack ID not resolvable — skipping DM`);
-        return;
-    }
-
-    // Open a DM (IM) channel with Parker
-    let dmChannelId: string;
-    try {
-        const dm = await slack.conversations.open({
-            users: PARKER_SLACK_ID,
-        });
-        dmChannelId = (dm as any).channel?.id;
-        if (!dmChannelId) {
-            console.warn(`[scans-watcher] Could not open DM with Parker`);
-            return;
-        }
-    } catch (err) {
-        console.error(`[scans-watcher] Failed to open DM: ${(err as Error).message}`);
-        return;
-    }
-
-    // Upload the PDF file to the DM. The initial_comment becomes the
-    // message caption that accompanies the file in Slack.
-    try {
-        await slack.files.upload({
-            channels: dmChannelId,
-            file: fs.createReadStream(pdfPath),
-            filename: className,
-            title: `CR Minerals — ${className}`,
-            initial_comment: crPoInfo,
-        });
-        console.log(`[scans-watcher] ✓ DM'd Parker with ${className} (${crPoInfo})`);
-    } catch (err) {
-        console.error(`[scans-watcher] Failed to upload file to Parker DM: ${(err as Error).message}`);
-
-        // Fallback: text-only message if file upload fails
-        try {
-            await slack.chat.postMessage({
-                channel: dmChannelId,
-                text: `New CR scan: ${className}\n${crPoInfo}`,
-            });
-            console.log(`[scans-watcher] ✓ Fallback DM (no file) sent for ${className}`);
-        } catch (fallbackErr) {
-            console.error(`[scans-watcher] Fallback DM also failed: ${(fallbackErr as Error).message}`);
-        }
-    }
-}
-
-/**
- * Query the most recent CR Minerals PO from Finale to reference in the Slack message.
- * Uses searchProducts for PU100 to find stock-on-order and vendor info,
- * then builds a reference message.
- * Falls back to a static message if Finale query fails.
- */
-async function findMostRecentCRPo(): Promise<string> {
-    try {
-        const { FinaleClient } = await import("./finale/client");
-        const finale = new FinaleClient();
-
-        // Search for PU100 (Pumice) to get stock-on-order and product info
-        const { results } = await finale.searchProducts(CR_SKU, 5);
-
-        if (results && results.length > 0) {
-            const pu100 = results.find(
-                (p: any) => p.productId?.toUpperCase() === CR_SKU
-            );
-
-            if (pu100) {
-                const onOrder = pu100.stockOnOrder || "0";
-                const name = pu100.name || "Pumice";
-                return `PU100 (${name}) — ${onOrder} units on order`;
-            }
-
-            // Fallback to first result
-            const first = results[0];
-            const onOrder = first.stockOnOrder || "0";
-            return `PU100 — ${onOrder} units on order`;
-        }
-
-        return `PU100 (Pumice) — no stock data found in Finale.`;
-    } catch (err) {
-        console.warn(`[scans-watcher] Finale search failed: ${(err as Error).message}`);
-        return `CR Minerals (PU100) — check Finale for latest PO.`;
-    }
-}
-
-// ── Email: Forward Benny scan to Bill.com ───────────────────────────────────
+// ── Email: Forward scan to Bill.com ────────────────────────────────────────
 
 /**
  * Vendor name detection from filename prefix.
@@ -263,11 +130,21 @@ function detectVendorFromFilename(pdfFilename: string): string | undefined {
     if (upper.startsWith("BENNY_") || upper.startsWith("BENNY")) {
         return "Benny Martinez Trucking";
     }
+    if (
+        upper.startsWith("CR_") ||
+        upper.startsWith("CRMIN_") ||
+        upper.startsWith("CRMIN") ||
+        upper.startsWith("CR_DELIVERY_") ||
+        upper.startsWith("CR_PUMICE_") ||
+        upper.startsWith("CR_DELIV_")
+    ) {
+        return "CR Minerals";
+    }
     return undefined;
 }
 
 /**
- * Email a Benny scan PDF to buildasoilap@bill.com via the single-forward gate.
+ * Email a scan PDF to buildasoilap@bill.com via the single-forward gate.
  *
  * HERMIA(2026-07-30): Replaced raw Gmail MIME send with forwardInvoiceOnce().
  * This routes through the canonical single-forward gate, which provides:
@@ -279,7 +156,7 @@ function detectVendorFromFilename(pdfFilename: string): string | undefined {
  * runs — the hash-based dedup will block re-forwarding even if the state file
  * resets.
  */
-async function emailBennyToBillCom(pdfPath: string, pdfFilename: string): Promise<void> {
+async function emailToBillCom(pdfPath: string, pdfFilename: string): Promise<void> {
     const pdfBuffer = fs.readFileSync(pdfPath);
     const vendorName = detectVendorFromFilename(pdfFilename);
 
@@ -327,7 +204,6 @@ async function emailBennyToBillCom(pdfPath: string, pdfFilename: string): Promis
 export interface ScanWatchResult {
     scanned: number;
     processed: number;
-    slackNotifications: number;
     emailForwards: number;
     errors: number;
     details: string[];
@@ -341,7 +217,6 @@ export async function runScansWatch(): Promise<ScanWatchResult> {
     const result: ScanWatchResult = {
         scanned: 0,
         processed: 0,
-        slackNotifications: 0,
         emailForwards: 0,
         errors: 0,
         details: [],
@@ -349,7 +224,6 @@ export async function runScansWatch(): Promise<ScanWatchResult> {
 
     // Load state
     const state = loadState();
-    const slackBotToken = process.env.SLACK_BOT_TOKEN;
 
     // Ensure scans directory exists
     if (!fs.existsSync(SCANS_DIR)) {
@@ -380,17 +254,6 @@ export async function runScansWatch(): Promise<ScanWatchResult> {
 
     result.scanned = newFiles.length;
 
-    // Pre-resolve CR PO info if we have any CR files
-    let crPoInfo = "";
-    const hasCRFiles = newFiles.some((f) => {
-        const upper = f.toUpperCase();
-        return upper.startsWith("CR_") || upper.startsWith("CRMIN_") || upper.startsWith("CRMIN");
-    });
-
-    if (hasCRFiles) {
-        crPoInfo = await findMostRecentCRPo();
-    }
-
     // Process each file
     for (const basename of newFiles) {
         const fullPath = path.join(SCANS_DIR, basename);
@@ -398,21 +261,8 @@ export async function runScansWatch(): Promise<ScanWatchResult> {
 
         try {
             switch (classified.action) {
-                case "slack_parker_cr": {
-                    if (slackBotToken) {
-                        await notifyParkerAboutCRScan(slackBotToken, fullPath, basename, crPoInfo);
-                        result.slackNotifications++;
-                    } else {
-                        result.details.push(`SLACK_BOT_TOKEN not set — cannot notify Parker about ${basename}`);
-                        result.errors++;
-                    }
-                    result.processed++;
-                    result.details.push(`✓ ${basename} → DM Parker (CR Minerals)`);
-                    break;
-                }
-
                 case "email_billcom": {
-                    await emailBennyToBillCom(fullPath, basename);
+                    await emailToBillCom(fullPath, basename);
                     result.emailForwards++;
                     result.processed++;
                     result.details.push(`✓ ${basename} → Emailed to Bill.com`);
@@ -452,7 +302,7 @@ if (require.main === module) {
         .then((r) => {
             console.log(`\n[scans-watcher] Complete:`);
             console.log(
-                `  Scanned: ${r.scanned} | Processed: ${r.processed} | Slack: ${r.slackNotifications} | Email: ${r.emailForwards} | Errors: ${r.errors}`,
+                `  Scanned: ${r.scanned} | Processed: ${r.processed} | Email: ${r.emailForwards} | Errors: ${r.errors}`,
             );
             for (const detail of r.details) {
                 console.log(`  ${detail}`);

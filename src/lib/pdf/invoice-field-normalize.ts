@@ -221,7 +221,7 @@ export function normalizeInvoiceForDb(
     const po = cleanInvoiceField(rawPo);
     let total = Number(parsed?.total) || 0;
     if (!total && fb.total) total = fb.total;
-    let invoiceDate = cleanInvoiceField(parsed?.invoiceDate ?? null) || fb.invoiceDate;
+    const invoiceDate = cleanInvoiceField(parsed?.invoiceDate ?? null) || fb.invoiceDate;
     let vendorName =
         cleanInvoiceField(parsed?.vendorName ?? null) ||
         opts?.vendorHint ||

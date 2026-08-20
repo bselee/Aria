@@ -281,32 +281,6 @@ async function probeBotAlive(): Promise<ProbeResult> {
     }
 }
 
-/**
- * Probe: aria-slack poller liveness via its `agent_heartbeats` row. Stamps
- * every ~1 min; row age over 5 min is unhealthy. A missing row is treated as
- * OK (Slack may be intentionally unregistered when env is unset).
- */
-async function probeSlackPollerAlive(): Promise<ProbeResult> {
-    const name = "slack-poller-alive";
-    const db = createClient();
-    if (!db) return { name, ok: false, message: "Client null — Supabase env missing" };
-    try {
-        const ts = await withTimeout(
-            latestTimestamp(db, "agent_heartbeats", "heartbeat_at", (q) => q.eq("agent_name", "aria-slack")),
-            5000,
-            name,
-        );
-        if (!ts) return { name, ok: true, message: "No aria-slack row — not registered (OK)" };
-        const age = ageMinutes(ts);
-        if (age > 5) {
-            return { name, ok: false, message: `Last heartbeat ${age}min ago (>5min)`, detail: { ts, age } };
-        }
-        return { name, ok: true, message: `OK (${age}min ago)` };
-    } catch (err) {
-        return { name, ok: false, message: errMsg(err), detail: err };
-    }
-}
-
 // ── Cron freshness probes (informational) ────────────────────────────────
 
 /**
@@ -375,7 +349,6 @@ export const HEARTBEAT_PROBES: ProbeSpec[] = [
     { name: "dashboard-http", category: "infra", critical: true, probe: probeDashboardHttp },
     // Process
     { name: "bot-alive", category: "process", critical: true, probe: probeBotAlive },
-    { name: "slack-poller-alive", category: "process", critical: false, probe: probeSlackPollerAlive },
     // Cron freshness (informational)
     { name: "ap-polling-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("ap-polling-fresh", "ap-polling", 20) },
     { name: "build-risk-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("build-risk-fresh", "build-risk", 26, { weekdaysOnly: true }) },

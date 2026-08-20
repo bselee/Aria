@@ -338,7 +338,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
     }
 
     /**
-     * Formats today's received POs as a readable Slack/Telegram digest message.
+     * Formats today's received POs as a readable Telegram digest message.
      *
      * @param   receivedPOs - Array of received PO objects from Finale
      * @returns A markdown-formatted digest string of today's receivings

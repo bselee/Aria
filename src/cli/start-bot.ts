@@ -476,7 +476,6 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         { command: 'consumption', description: 'BOM consumption for a SKU' },
         { command: 'builds', description: 'Upcoming calendar builds' },
         { command: 'buildrisk', description: 'Build risk analysis' },
-        { command: 'requests', description: 'Slack purchase-request feed' },
         { command: 'kaizen', description: 'Recent corrections / learnings' },
     ]).catch((err: any) => console.warn('setMyCommands failed:', err.message));
 
@@ -504,14 +503,8 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn('[sandbox] Watcher failed to start (non-fatal):', err.message);
     }
 
-    // ── Slack Request Detector ────────────────────────────────────────────
-        // HERMIA(2026-07-13): Disabled. Token revoked / channel discovery broken
-        // for months; boot noise only. File kept at lib/slack/request-detector.ts
-        // for possible future revive. Heartbeat cron also retired.
-        console.log('[boot] Slack Request Detector: disabled (token_revoked / non-functional)');
-
-        // restore approvals
-        try {
+    // restore approvals
+    try {
         // KAIZEN(2026-06-04): Persist-expire stale rows FIRST so they don't
         // linger as status='pending' in Supabase (a 2026-03 Uline approval sat
         // 'pending' for 2+ months because the boot loader only skipped them

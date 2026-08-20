@@ -375,7 +375,7 @@ class QueryBuilder {
     }
 
     // Clean URL — remove /rest/v1/ if present, ensure no double slashes
-    let base = pgrstUrl.replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
+    const base = pgrstUrl.replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
     const url = new URL(`${base}/${this.table}`);
 
     const headers: Record<string, string> = {

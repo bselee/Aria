@@ -182,7 +182,7 @@ export class POService {
      * Detect open POs at risk of arriving after their line-item SKUs run out,
      * and surface each as a PO_ARRIVAL_AT_RISK row in ap_activity_log. Builds
      * panel + Activity feed render these for review and next-step actions.
-     * Activity-first routing: no Slack/Gmail push from this method.
+     * Activity-first routing: no external push from this method.
      */
     public async runPOArrivalRiskCheck(): Promise<void> {
         const [{ detectAtRiskPOs, writeAtRiskActivityRows, loadInvoiceMatchedPOs }, { loadActivePurchases }, { finaleClient }] = await Promise.all([
