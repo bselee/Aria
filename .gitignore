@@ -135,6 +135,9 @@ tmp-next-dev-*.out.log
 # Local scraped data — regenerated each run (timestamped scrapedAt field)
 purchase-requests.json
 purchases-data.json
+data/basauto-recon.json
+data/basauto-recon-dismissed.json
+data/basauto-scrape.json
 
 # External MCP tool dir — intentionally not in this repo
 tools/excel-mcp-server/

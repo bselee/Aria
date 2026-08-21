@@ -27,6 +27,7 @@ import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
 import DailyOpsSummaryPanel from "@/components/dashboard/DailyOpsSummaryPanel";
 import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
 import BasautoPanel from "@/components/dashboard/BasautoPanel";
+import BasautoReconPanel from "@/components/dashboard/BasautoReconPanel";
 import DedupActivityPanel from "@/components/dashboard/DedupActivityPanel";
 import ReconciliationPanel from "@/components/dashboard/ReconciliationPanel";
 import DepositMatchPanel from "@/components/dashboard/DepositMatchPanel";
@@ -141,6 +142,12 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
             label: "BASAUTO Requests",
             short: "BASAUTO",
             render: () => <BasautoPanel />,
+        },
+        {
+            id: "basauto-recon",
+            label: "BASAUTO Recon",
+            short: "BAS Recon",
+            render: () => <BasautoReconPanel />,
         },
         {
             id: "dedup-activity",

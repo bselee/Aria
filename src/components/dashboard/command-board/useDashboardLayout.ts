@@ -35,6 +35,7 @@ export const ALL_PANEL_IDS = [
         "daily-ops-summary",
         "po-lifecycle",
         "basauto-requests",
+        "basauto-recon",
         "dedup-activity",
         "reconciliation",
         "deposit-match",
@@ -77,7 +78,7 @@ export const DEFAULT_LAYOUT: DashboardLayout = {
     // are the actionable core; status wallpaper is not auto-mounted.
     left: ["receivings"],
     midLeft: ["invoice-queue", "active-purchases"],
-    midRight: ["purchasing"],
+    midRight: ["purchasing", "basauto-recon"],
     right: ["activity", "build-risk"],
 };
 
