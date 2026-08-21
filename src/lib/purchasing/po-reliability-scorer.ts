@@ -13,12 +13,17 @@
  *          Delivered POs are EXCLUDED from stockOnOrder — their stock is
  *          already in stockOnHand and counting them again is double-counting.
  *
- *          Falls back to local po_lifecycle_cache (SQLite) when Supabase
- *          is unavailable, so received-PO detection works without cloud.
+ *          FIX(2026-08-21): delivered/received detection no longer leans on
+ *          po_lifecycle_cache. `getProductActivity()` now credits line-level
+ *          REMAINING (see ../finale/po-remaining-inbound.ts) and excludes
+ *          fully-received POs at the source, so this module never sees them.
+ *          The local-DB backfill + receiving_cache + blanket-vendor exemption
+ *          that the 2026-08-04 fix depended on covered only 40 of 73 credited
+ *          POs and was removed — line-level remaining is authoritative.
  *
  * @author  Hermia
  * @created 2026-06-11
- * @deps    @/lib/db (purchase_orders, shipments tables), @/lib/storage/local-db
+ * @deps    @/lib/db (purchase_orders, shipments tables)
  * @env     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
  */
 
@@ -169,43 +174,6 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
         poMap.set(row.po_number, row);
     }
 
-    // KAIZEN(2026-08-04): Fall back to local po_lifecycle_cache for any POs
-    // not found in Supabase. Without this, received POs with no Supabase record
-    // fall through to "no_record" instead of "delivered" → stockOnOrder includes
-    // phantom inventory already in the warehouse → false HOLD decisions.
-    const missingOrderIds = orderIds.filter(id => !poMap.has(id));
-    if (missingOrderIds.length > 0) {
-        try {
-            const { getLocalDb } = await import("@/lib/storage/local-db");
-            const localDb = getLocalDb();
-            if (localDb) {
-                const placeholders = missingOrderIds.map(() => "?").join(",");
-                const localRows = localDb.prepare(
-                    `SELECT po_number, lifecycle_state FROM po_lifecycle_cache WHERE po_number IN (${placeholders})`
-                ).all(...missingOrderIds) as Array<{ po_number: string; lifecycle_state: string }>;
-                for (const row of localRows) {
-                    if (!poMap.has(row.po_number)) {
-                        poMap.set(row.po_number, {
-                            po_number: row.po_number,
-                            lifecycle_stage: row.lifecycle_state,
-                            tracking_numbers: null,
-                            last_movement_summary: null,
-                            vendor_acknowledged_at: null,
-                            vendor_noncomm_at: null,
-                            po_sent_verified_at: null,
-                            po_sent_at: null,
-                        });
-                    }
-                }
-                if (localRows.length > 0) {
-                    console.log(`[po-reliability] Local DB backfilled ${localRows.length}/${missingOrderIds.length} missing POs`);
-                }
-            }
-        } catch (localErr: any) {
-            console.warn("[po-reliability] Local DB backfill failed:", localErr?.message ?? localErr);
-        }
-    }
-
     // Index shipment data by PO number. If shipment query failed,
     // continue with PO-only scoring — shipments are supplementary.
     const shipmentsByPO = new Map<string, ShipmentRow[]>();
@@ -243,8 +211,9 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
         );
         const lifecycle = row.lifecycle_stage ?? "";
 
-        // Already delivered — shouldn't be in openPOs but handle gracefully.
-        // Case-insensitive: Supabase may use "received", local DB uses "RECEIVED".
+        // Already delivered — shouldn't be in openPOs (getProductActivity now
+        // excludes fully-received POs via line-level remaining) but handle
+        // gracefully as a safety net if a shipment says delivered.
         if (anyDelivered || lifecycle.toLowerCase() === "received" || lifecycle.toLowerCase() === "completed") {
             return {
                 ...po,
@@ -373,59 +342,27 @@ export function deliverableStockOnOrder(pos: OpenPOReliable[]): number {
  * A delivered PO means the stock is already in stockOnHand — counting it
  * again as "on order" is double-counting that produces false HOLD decisions.
  *
- * KAIZEN(2026-08-04): Subtract delivered quantities instead of Math.max().
- * Uses receiving_cache to distinguish fully-received single-shipment POs
- * (subtract) from partially-received blanket POs (keep). Falls back to
- * blanket-vendor exemption when receiving data is unavailable.
+ * FIX(2026-08-21): `openPOs[].quantity` is now line-level REMAINING inbound —
+ * `getProductActivity()` credits `remainingInboundQty()` (Finale's
+ * `productUnitsRemainingToBePackedShippedOrReceived`) and EXCLUDES fully
+ * received POs at the source, so the sum of quantities is already the correct
+ * "how much is genuinely still on the way".
+ *
+ * The prior delivered-subtraction leaned on po_lifecycle_cache +
+ * receiving_cache + a blanket-vendor party-ID exemption. That chain held only
+ * 40 of the 73 credited POs, which is why the 2026-08-04 fix did NOT hold —
+ * 106,472 phantom units leaked through the 33 missing POs. Line-level
+ * remaining is Finale's own authoritative answer and needs no cache (a fully
+ * received line has remaining 0 and is already gone; blanket POs are handled
+ * by Finale's per-line math). Trust the number that's already correct.
  *
  * Stuck lifecycle (no ack, stale tracking) is a chase/escalation signal in
  * Purchases — not a reason to place a second PO for the same demand window.
  */
-
-/** Party IDs for blanket-PO vendors — fallback when receiving_cache has no data. */
-const BLANKET_VENDOR_PARTY_IDS = new Set(["10024", "10745"]);
-
 export function coverageStockOnOrder(
     openPOs: Array<{ quantity: number; vendorPartyId?: string | null }>,
-    enriched?: OpenPOReliable[],
 ): number {
-    // Base: all open PO quantities (conservative — assume all will arrive)
-    const finaleTotal = openPOs.reduce((sum, po) => sum + Math.max(0, po.quantity || 0), 0);
-    if (!enriched || enriched.length === 0) return finaleTotal;
-
-    // Determine which delivered POs to subtract.
-    // A PO is "delivered and fully received" when:
-    //   a) Enrichment says it's delivered (stuckReason === "delivered"), AND
-    //   b) receiving_cache confirms fully_received, OR we have no cache data
-    //      but it's NOT a blanket vendor (conservative: assume single-shipment).
-    // Partially-received blanket POs are NOT subtracted.
-    let deliveredQty = 0;
-    for (const po of enriched) {
-        if (po.stuckReason !== "delivered") continue;
-
-        // Check receiving_cache for full-receipt confirmation
-        const orderId = po.orderId;
-        let fullyReceived: boolean | null = null;
-        try {
-            const { isPOFullyReceived } = require("./receiving-cache");
-            fullyReceived = isPOFullyReceived(orderId);
-        } catch { /* receiving_cache module may not be loaded yet */ }
-
-        if (fullyReceived === true) {
-            // Confirmed fully received — subtract
-            deliveredQty += Math.max(0, po.quantity || 0);
-        } else if (fullyReceived === false) {
-            // Confirmed partially received (blanket PO) — keep on-order
-            continue;
-        } else {
-            // No receiving_cache data — fall back to blanket vendor check
-            if (!BLANKET_VENDOR_PARTY_IDS.has(po.vendorPartyId ?? "")) {
-                deliveredQty += Math.max(0, po.quantity || 0);
-            }
-        }
-    }
-
-    return Math.max(0, finaleTotal - deliveredQty);
+    return openPOs.reduce((sum, po) => sum + Math.max(0, po.quantity || 0), 0);
 }
 
 /** True when at least one open PO lacks deliverability evidence (chase needed). */

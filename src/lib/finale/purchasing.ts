@@ -2297,14 +2297,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     // HERMIA(2026-06-10): Enrich open POs with delivery reliability data.
                     // Stuck/unacknowledged/overdue POs don't count toward on-order coverage.
-                    // KAIZEN(2026-08-04): Inject vendorPartyId for blanket-PO detection.
+                    // KAIZEN(2026-08-21): coverageStockOnOrder no longer needs enriched —
+                    // openPOs[].quantity is line-level remaining (received POs excluded
+                    // upstream), so no delivered-subtraction pass is required.
                     for (const po of compActivity.openPOs) { (po as any).vendorPartyId = partyId; }
-                    const bomEnrichedPOs: OpenPOReliable[] = compActivity.openPOs.length > 0
-                        ? await enrichOpenPOs(compActivity.openPOs)
-                        : [];
                     // HERMIA(2026-07-10): Full Finale open PO credit for BOM coverage math.
                     // On-time rate still soft-discounts only for reliability, never zeros stuck POs.
-                    const rawStockOnOrder = coverageStockOnOrder(compActivity.openPOs, bomEnrichedPOs);
+                    const rawStockOnOrder = coverageStockOnOrder(compActivity.openPOs);
                     const onTimeRate = this.getVendorOnTimeRate(groupName);
                     // Floor at 50% so chronic late vendors still get partial credit; never 0 from stuck.
                     const trustedRate = Math.max(0.5, Math.min(1, onTimeRate || 1));
@@ -2891,7 +2890,6 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // HERMIA(2026-06-10): Enrich open POs with lifecycle data so
                     // we can distinguish "in transit" POs from stuck/unacknowledged ones.
                     // Only DELIVERABLE POs should remove a SKU from Ordering.
-                    // KAIZEN(2026-08-04): Inject vendorPartyId for blanket-PO detection.
                     for (const po of activity.openPOs) { (po as any).vendorPartyId = partyId; }
                     const enrichedOpenPOs: OpenPOReliable[] = activity.openPOs.length > 0
                         ? await enrichOpenPOs(activity.openPOs)
@@ -2901,7 +2899,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // HERMIA(2026-07-10): Credit Finale open PO qty fully for demand math.
                     // Stuck lifecycle is a chase signal (Purchases), not zero-supply for reorder.
                     // Prior: deliverable-only credit zeroed soo while openPOs ribbon still showed qty → false re-order.
-                    const rawStockOnOrder = coverageStockOnOrder(activity.openPOs, enrichedOpenPOs);
+                    const rawStockOnOrder = coverageStockOnOrder(activity.openPOs);
                     if (stuckPOs.length > 0) {
                         const stuckSummary = stuckPOs.map(po =>
                             `${po.orderId}(${po.stuckReason}/${po.ageDays}d)`,
