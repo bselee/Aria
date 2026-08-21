@@ -153,7 +153,10 @@ describe("isConcretePastDate / hasReceiptEvidence", () => {
         expect(hasReceiptEvidence({ receiveDate: "2026-08-04", shipments: [] })).toBe(true);
         expect(hasReceiptEvidence({ receiveDate: "2026-10-31", shipments: [] })).toBe(false);
         expect(hasReceiptEvidence({ receiveDate: null, shipments: [{ receiveDate: "2026-08-04" }] })).toBe(true);
-        expect(hasReceiptEvidence({ receiveDate: null, shipments: [{ receiveDate: "2026-08-21" }] })).toBe(false);
+        // Dynamic future date — the original hardcoded "2026-08-21" expired on 2026-08-21
+        // and started failing the day it became a past date (time-bomb fixture).
+        const futureDate = new Date(Date.now() + 9 * 86400000).toISOString().slice(0, 10);
+        expect(hasReceiptEvidence({ receiveDate: null, shipments: [{ receiveDate: futureDate }] })).toBe(false);
         expect(hasReceiptEvidence({ receiveDate: null, shipments: [] })).toBe(false);
     });
 });
