@@ -64,8 +64,12 @@ describe("cron/jobs/index registration", () => {
         }
     });
 
-    it("kaizen #4: po-sync runs every 4 hours", () => {
-        expect(getJob("po-sync")?.schedule).toBe("0 */4 * * *");
+    it("kaizen #4: po-sync runs every 4 hours (staggered off :00 — see STAGGER 2026-08-21)", () => {
+        // Asserts the INTENT (every 4h) while allowing the stagger minute. The
+        // :00 slot was vacated because 17 jobs firing together starved the
+        // node-cron event loop and silently skipped the 03:00/04:00 jobs.
+        expect(getJob("po-sync")?.schedule).toMatch(/^\d{1,2} \*\/4 \* \* \*$/);
+        expect(getJob("po-sync")?.schedule).not.toBe("0 */4 * * *");
     });
 
     it("kaizen #6: missing-reconciliation-watchdog is Mon-Fri only", () => {

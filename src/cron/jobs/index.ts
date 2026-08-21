@@ -339,7 +339,9 @@ defineJob({
 // the prior 30-min cadence burned Gmail/Supabase quota with no signal gain.
 defineJob({
     name: "po-sync",
-    schedule: "0 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *". 17 jobs fired at :00 and starved
+    // the single-threaded event loop (see po-arrival-risk-check note).
+    schedule: "6 */4 * * *",
     onFail: "log",
     description: "Sync PO conversations with Gmail threads (every 4h).",
     handler: async () => { await (await ops())?.syncPOConversations(); },
@@ -465,7 +467,9 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "po-purchase-sync",
-    schedule: "0 */2 * * *",
+    // STAGGER(2026-08-21): was "0 */2 * * *" — 17.8s run contributed to the
+    // :00 thundering herd that wedged the loop 02:24-04:32.
+    schedule: "12 */2 * * *",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Sync purchase_orders from Finale (every 2h) — foundation for invoice→PO matching.",
     handler: async () => {
@@ -570,7 +574,8 @@ defineJob({
 
 defineJob({
     name: "purchasing-calendar-sync",
-    schedule: "0 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *".
+    schedule: "18 */4 * * *",
     onFail: "log",
     description: "Sync PO lifecycle to Google Calendar (every 4h).",
     handler: async () => { await (await ops())?.runPurchasingCalendarSync(); },
@@ -632,7 +637,8 @@ defineJob({
 // granularity is plenty.
 defineJob({
     name: "po-auto-complete-watcher",
-    schedule: "0 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *".
+    schedule: "24 */4 * * *",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-complete eligible POs (every 4h; default OFF via PO_AUTO_COMPLETE_ENABLED).",
     handler: async () => { await (await ops())?.runPOAutoCompleteWatcher(); },
@@ -646,7 +652,13 @@ defineJob({
 // Every 2h: arrival ETAs and runway both change slowly, no need for tighter.
 defineJob({
     name: "po-arrival-risk-check",
-    schedule: "0 */2 * * *",
+    // STAGGER(2026-08-21): was "0 */2 * * *". This job ran 199.6s on 2026-08-21
+    // at 02:00 — OVER its 180s budget, yet still recorded 'succeeded', so the
+    // budget is advisory and does not abort. Combined with 16 other :00 jobs it
+    // starved node-cron's event loop; the scheduler logged "missed execution"
+    // warnings and did not recover until 04:32, so the 03:00/04:00 jobs never
+    // fired at all. Moved off :00 and given its own slot.
+    schedule: "36 */2 * * *",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Detect PO arrivals that will land after stockout (every 2h).",
     handler: async () => { await (await ops())?.runPOArrivalRiskCheck(); },
@@ -721,7 +733,8 @@ defineJob({
 // SQLite is the sole store — no cloud sync needed.
 defineJob({
     name: "memory-sync",
-    schedule: "0 */6 * * *",
+    // STAGGER(2026-08-21): was "0 */6 * * *".
+    schedule: "42 */6 * * *",
     onFail: "log",
     description: "Log memory vector counts from local SQLite (every 6h).",
     handler: async () => {
