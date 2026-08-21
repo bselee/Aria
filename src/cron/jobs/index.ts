@@ -884,9 +884,9 @@ defineJob({
 // cognitive rounds, and expired cache entries.
 defineJob({
     name: "sqlite-housekeeping",
-    schedule: "0 3 * * *",
+    schedule: "20 21 * * *",
     onFail: "log",
-    description: "Prune stale SQLite records and VACUUM (daily 3 AM).",
+    description: "Prune stale SQLite records and VACUUM (nightly 9:20 PM).",
     handler: async () => {
         const { pruneStaleRecords, vacuumDb, getDbFileSize } = await import("@/lib/storage/housekeeping");
         const beforeSize = getDbFileSize();
@@ -907,12 +907,12 @@ defineJob({
 });
 
 // HERMIA(2026-07-15): Daily SQLite backup.
-// Runs daily at 4AM. Keeps 7 days of backups.
+// Runs nightly at 9:25 PM. Keeps 7 days of backups.
 defineJob({
     name: "sqlite-backup",
-    schedule: "0 4 * * *",
+    schedule: "25 21 * * *",
     onFail: "log",
-    description: "Backup aria-local.db and prune old backups (daily 4 AM).",
+    description: "Backup aria-local.db and prune old backups (nightly 9:25 PM).",
     handler: async () => {
         const { createLocalBackup, pruneBackups } = await import("@/lib/storage/housekeeping");
         const backupPath = createLocalBackup();
@@ -1470,9 +1470,9 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "db-retention-prune",
-    schedule: "0 3 * * *",
+    schedule: "30 21 * * *",
     onFail: "log",
-    description: "VACUUM FULL email_inbox_queue and cron_runs, prune old runs (nightly).",
+    description: "VACUUM FULL email_inbox_queue and cron_runs, prune old runs (nightly 9:30 PM).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
         console.log("[db-retention-prune] Starting nightly retention prune ...");
