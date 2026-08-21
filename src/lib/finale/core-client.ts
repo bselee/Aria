@@ -157,6 +157,19 @@ export interface PurchasingItem {
     packSize?: { unitsPerPack: number; packUnit: string }; // null = not registered
     qtyDiverged?: boolean;
     qtyDivergencePct?: number;
+    /**
+     * Third opinion from basauto.vercel.app, joined in by the purchasing route
+     * from data/basauto-recon.json. Present only for SKUs the reconciliation
+     * flagged. Lets the row show basauto vs Finale vs Aria instead of hiding a
+     * three-way disagreement behind a two-number display.
+     */
+    basautoRecon?: {
+        basautoQty: number | null;
+        basautoUrgency: string | null;
+        verdict: string;
+        severity: "high" | "medium" | "low";
+        reason: string;
+    };
     velocityInflated?: boolean;        // true when chooseVelocitySignal capped a demand signal that exceeded 3× sales/receipts
     velocityRawRate?: number;          // the original (pre-cap) daily rate Finale reported, for context
     velocityRealityCap?: number;       // max(salesVelocity, purchaseVelocity) — what the cap pinned dailyRate to

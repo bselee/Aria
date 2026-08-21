@@ -2839,18 +2839,43 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                             <span>·</span>
                                                                                             <span>{Math.round(item.stockOnHand)} on hand</span>
                                                                                         </div>
-                                                                                        {(item.finaleReorderQty ?? 0) > 0 && (
-                                                                                            <div className="flex items-center gap-2 mt-0.5">
-                                                                                                <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
-                                                                                                    Finale: {item.finaleReorderQty}
-                                                                                                </span>
-                                                                                                <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                        {((item.finaleReorderQty ?? 0) > 0 || item.basautoRecon) && (
+                                                                                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                                                                                {item.basautoRecon && item.basautoRecon.basautoQty != null && (
+                                                                                                    <>
+                                                                                                        <span
+                                                                                                            title={`basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}`}
+                                                                                                            className="text-[11px] font-mono italic text-violet-300"
+                                                                                                        >
+                                                                                                            basauto: {item.basautoRecon.basautoQty}
+                                                                                                        </span>
+                                                                                                        <span className="text-zinc-600 text-[10px]">·</span>
+                                                                                                    </>
+                                                                                                )}
+                                                                                                {(item.finaleReorderQty ?? 0) > 0 && (
+                                                                                                    <>
+                                                                                                        <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
+                                                                                                            Finale: {item.finaleReorderQty}
+                                                                                                        </span>
+                                                                                                        <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                                    </>
+                                                                                                )}
                                                                                                 <span className={`text-[11px] font-mono font-semibold ${item.qtyDiverged ? 'text-emerald-300' : 'text-zinc-200'}`}>
                                                                                                     Aria: {item.suggestedQty}
                                                                                                 </span>
                                                                                                 {item.qtyDiverged && item.qtyDivergencePct != null && (
                                                                                                     <span className="text-[9px] font-mono text-amber-400 border border-amber-500/20 rounded px-1">
                                                                                                         ⚠ {Math.abs(item.qtyDivergencePct)}% diff
+                                                                                                    </span>
+                                                                                                )}
+                                                                                                {item.basautoRecon && (
+                                                                                                    <span
+                                                                                                        title={item.basautoRecon.reason}
+                                                                                                        className={`text-[9px] font-mono rounded px-1 border ${item.basautoRecon.severity === 'high'
+                                                                                                            ? 'text-red-300 border-red-500/30'
+                                                                                                            : 'text-violet-300 border-violet-500/25'}`}
+                                                                                                    >
+                                                                                                        {item.basautoRecon.verdict.replace(/_/g, ' ').toLowerCase()}
                                                                                                     </span>
                                                                                                 )}
                                                                                             </div>

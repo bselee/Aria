@@ -13,6 +13,7 @@ import {
     mergeOpenPOsWithRecentCoverage,
 } from '@/lib/purchasing/ordering-po-coverage';
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
+import { readReconBadges } from '@/lib/purchasing/basauto-recon-lookup';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -208,6 +209,10 @@ export async function GET(req: NextRequest) {
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+    // Third-opinion join: basauto's own reorder recommendation, read once per
+    // request from data/basauto-recon.json. Empty map when the report is
+    // missing — rows then degrade to the previous Finale→Aria display.
+    const reconBadges = readReconBadges();
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -329,6 +334,7 @@ export async function GET(req: NextRequest) {
                 commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
                 urgency: displayUrgency,
+                basautoRecon: reconBadges.get(productId.toUpperCase()),
             };
         });
 
