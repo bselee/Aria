@@ -25,7 +25,6 @@ function bas(overrides: Partial<BasautoRecord> = {}): BasautoRecord {
         description: "Diamond K Gypsum By The Pound",
         supplier: "Diamond K Gypsum",
         urgency: "OK",
-        unitsInStock: 13978,
         stockDaysLeft: 100,
         reorderQty: 0,
         reorderDate: null,
@@ -35,7 +34,6 @@ function bas(overrides: Partial<BasautoRecord> = {}): BasautoRecord {
         velocity: 100,
         lastReceived: null,
         quantity: null,
-        averageBuildConsumption: null,
         ...overrides,
     };
 }
@@ -54,9 +52,7 @@ function aria(overrides: Partial<AriaItemLite> = {}): AriaItemLite {
         runwayDays: 125.3,
         openPOs: [],
         suggestedQty: 0,
-        assessmentDecision: "hold",
         assessmentRecommendedQty: 0,
-        supplierName: "Diamond K Gypsum",
         ...overrides,
     };
 }
@@ -104,12 +100,46 @@ describe("assessBasautoItem", () => {
         expect(r?.reason).toContain("Do not re-buy");
     });
 
+    it("does NOT claim OVERBUY_RISK when enrichment zeroed stockOnOrder (phantom PO)", () => {
+        // Regression guard (2026-08-21): a fully-received PO still appears in
+        // openPOs, but enrichment subtracts it from stockOnOrder. Asserting
+        // "do not re-buy" off that phantom would cause a stockout.
+        const a = aria({
+            urgency: "ok",
+            stockOnHand: 126,
+            dailyRate: 3.91,
+            openPOs: [{ orderId: "124394", quantity: 500, orderDate: "2/20/2026" }],
+            stockOnOrder: 0,
+        });
+        const r = assessBasautoItem(bas({ urgency: "Overdue", reorderQty: 2334, onOrder: 0, stockDaysLeft: 0 }), a);
+        expect(r?.verdict).not.toBe("OVERBUY_RISK");
+    });
+
+    it("credits only the enriched on-order figure, not the raw PO sum", () => {
+        // openPOs still lists 3,800 ordered but only 800 genuinely remains.
+        const a = aria({
+            urgency: "ok",
+            stockOnHand: 10,
+            dailyRate: 2,
+            openPOs: [
+                { orderId: "124394", quantity: 3000, orderDate: "2/20/2026" },
+                { orderId: "125215", quantity: 800, orderDate: "8/19/2026" },
+            ],
+            stockOnOrder: 800,
+        });
+        const r = assessBasautoItem(bas({ urgency: "Overdue", reorderQty: 500, onOrder: 0 }), a);
+        expect(r?.verdict).toBe("OVERBUY_RISK");
+        expect(r?.reason).toContain("800 still inbound");
+        expect(r?.reason).not.toContain("3,800 still inbound");
+    });
+
     it("does NOT flag OVERBUY_RISK when basauto already sees the on-order qty", () => {
         const a = aria({
             urgency: "ok",
             stockOnHand: 10,
             dailyRate: 2,
             openPOs: [{ orderId: "125188", quantity: 3000 }],
+            stockOnOrder: 3000,
         });
         const r = assessBasautoItem(bas({ urgency: "Overdue", reorderQty: 100, onOrder: 3000 }), a);
         expect(r?.verdict).not.toBe("OVERBUY_RISK");
@@ -171,7 +201,7 @@ describe("buildReconReport", () => {
             bas({ productId: "CCC", urgency: "OK" }),
         ];
         const items = [
-            aria({ productId: "AAA", urgency: "ok", dailyRate: 1, stockOnHand: 5, openPOs: [{ orderId: "1", quantity: 500 }] }),
+            aria({ productId: "AAA", urgency: "ok", dailyRate: 1, stockOnHand: 5, stockOnOrder: 500, openPOs: [{ orderId: "1", quantity: 500 }] }),
             aria({ productId: "BBB" }),
             aria({ productId: "CCC", urgency: "ok" }),
         ];

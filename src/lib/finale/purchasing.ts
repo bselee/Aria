@@ -31,6 +31,7 @@ import {
 } from "@/lib/purchasing/calibration";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
+import { remainingInboundQty } from "./po-remaining-inbound";
 import {
     enrichOpenPOs,
     hasDeliverablePO,
@@ -1958,9 +1959,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     sort: [{ field: "orderDate", mode: "desc" }]
                 ) {
                     edges { node {
-                        orderId status orderDate dueDate
+                        orderId status statusExtended orderDate dueDate
                         itemList(first: 20) {
-                            edges { node { product { productId } quantity } }
+                            edges { node {
+                                product { productId }
+                                quantity
+                                productUnitsOrdered
+                                productUnitsReceived
+                                productUnitsRemainingToBePackedShippedOrReceived
+                            } }
                         }
                     }}
                 }
@@ -2028,9 +2035,23 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             return isNaN(parsed.getTime()) ? null
                                 : parsed.toISOString().split('T')[0];
                         };
+                        // FIX(2026-08-21): phantom on-order. Finale leaves a fully
+                        // received PO at status "Committed" FOREVER — the receipt
+                        // state lives in statusExtended and, authoritatively, on
+                        // the line. Crediting `quantity` (ordered) counted stock
+                        // already on the shelf as still inbound: 80 line-credits /
+                        // 106,472 phantom units across 19 SKUs measured live, which
+                        // held S-4122 at a fake 1,004d runway (real: 32d) and
+                        // S-3902 at 98d (real: 43d) — i.e. it SUPPRESSES real buys
+                        // and causes stockouts. Credit only what genuinely remains.
+                        // Age heuristics were rejected: PO#125169 was fully received
+                        // 15d after ordering while PO#125215 is genuinely open at a
+                        // similar age. `remaining` is the fact; date is a proxy.
+                        const remaining = remainingInboundQty(ie.node);
+                        if (remaining <= 0) break; // nothing left to receive — not supply
                         openPOs.push({
                             orderId: po.orderId,
-                            quantity: parseFinaleNumber(ie.node.quantity),
+                            quantity: remaining,
                             orderDate: po.orderDate || '',
                             dueDate: toIsoDate(po.dueDate),
                         });

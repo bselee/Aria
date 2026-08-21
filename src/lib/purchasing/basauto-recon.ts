@@ -25,7 +25,6 @@ export interface BasautoRecord {
     supplier: string | null;
     /** OK | Urgent | Overdue | Soon (or PURCHASE from the DOM-scrape fallback). */
     urgency: string;
-    unitsInStock: number | null;
     stockDaysLeft: number | null;
     reorderQty: number | null;
     reorderDate: string | null;
@@ -36,7 +35,6 @@ export interface BasautoRecord {
     lastReceived: string | null;
     /** Net 90-day stock change from Finale's transaction ledger (negative = depletion). */
     quantity: number | null;
-    averageBuildConsumption: number | null;
     /** True when synthesized from the slim `overduePurchases` section. */
     slim?: boolean;
 }
@@ -61,9 +59,7 @@ export interface AriaItemLite {
     runwayDays: number | null;
     openPOs: AriaOpenPO[];
     suggestedQty: number | null;
-    assessmentDecision: string | null;
     assessmentRecommendedQty: number | null;
-    supplierName: string | null;
 }
 
 export type Verdict =
@@ -281,11 +277,24 @@ export function assessBasautoItem(bas: BasautoRecord, aria: AriaItemLite | null)
 
     // 4. basauto flags it, Aria says calm — figure out WHY they disagree.
     // 4a. Committed PO blindness (Bill's known over-purchase risk).
+    //
+    // GUARD(2026-08-21): this verdict tells Bill "do not re-buy", so it must
+    // never rest on phantom supply. Finale keeps fully-received POs at status
+    // "Committed" forever; before the po-remaining-inbound fix, openPOs credited
+    // ORDERED quantity, so 32 of 73 credited POs were already fully received
+    // (106,472 phantom units). Suppressing a real buy causes a stockout, which
+    // is worse than the over-buy this verdict prevents. Aria's stockOnOrder is
+    // now the post-enrichment figure, so require BOTH it and the summed PO
+    // quantities to agree that supply exists — if enrichment has subtracted
+    // received POs and left nothing, fall through to a softer verdict.
+    const enrichedOnOrder = aria.stockOnOrder ?? 0;
+    const trustedOnOrder = Math.min(poQty, enrichedOnOrder > 0 ? enrichedOnOrder : poQty);
     if (
         poQty > 0 &&
+        enrichedOnOrder > 0 &&
         need30 > 0 &&
-        (bas.onOrder ?? 0) < poQty &&
-        poQty + (aria.stockOnHand ?? 0) >= need30
+        (bas.onOrder ?? 0) < trustedOnOrder &&
+        trustedOnOrder + (aria.stockOnHand ?? 0) >= need30
     ) {
         const poList = ariaSide.pos
             .map((po) => `#${po.orderId} (${po.quantity}${po.orderDate ? `, ${po.orderDate}` : ""})`)
@@ -294,7 +303,7 @@ export function assessBasautoItem(bas: BasautoRecord, aria: AriaItemLite | null)
             ...base,
             verdict: "OVERBUY_RISK",
             severity: "high",
-            reason: `basauto says ${basUrgency} (wants ${fmtQty(basQty)}) and shows on-order ${fmtQty(bas.onOrder)}, but Aria counts PO ${poList} — ${fmtQty(poQty)} on order + ${fmtQty(aria.stockOnHand)} on hand covers the 30-day need (${fmtQty(need30)}). Do not re-buy.`,
+            reason: `basauto says ${basUrgency} (wants ${fmtQty(basQty)}) and shows on-order ${fmtQty(bas.onOrder)}, but Aria counts PO ${poList} — ${fmtQty(trustedOnOrder)} still inbound + ${fmtQty(aria.stockOnHand)} on hand covers the 30-day need (${fmtQty(need30)}). Do not re-buy.`,
             basauto: basautoSide,
             aria: ariaSide,
         };

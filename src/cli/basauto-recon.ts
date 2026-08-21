@@ -106,7 +106,6 @@ function normalizeScraped(scraped: Record<string, any[]>): BasautoRecord[] {
                 description: it.description || null,
                 supplier: vendor || null,
                 urgency: it.urgency || "OK",
-                unitsInStock: null,
                 stockDaysLeft: toNumber(it.daysBuildsLeft),
                 reorderQty: toNumber(it.recommendedReorderQty),
                 reorderDate: it.purchaseAgainBy || null,
@@ -116,7 +115,6 @@ function normalizeScraped(scraped: Record<string, any[]>): BasautoRecord[] {
                 velocity: toNumber(it.dailyVelocity),
                 lastReceived: it.lastReceived || null,
                 quantity: ninety != null ? -ninety : null,
-                averageBuildConsumption: toNumber(it.avgBuildConsumption),
             });
         }
     }
@@ -136,7 +134,6 @@ function normalizeApi(payload: RawBasautoPayload): BasautoRecord[] {
                 description: p.description ?? null,
                 supplier: group.supplier ?? null,
                 urgency: p.urgency ?? "OK",
-                unitsInStock: toNumber(p.unitsInStock),
                 stockDaysLeft: toNumber(p.stockDaysLeft),
                 reorderQty: toNumber(p.reorderQty),
                 reorderDate: p.reorderDate ?? null,
@@ -146,7 +143,6 @@ function normalizeApi(payload: RawBasautoPayload): BasautoRecord[] {
                 velocity: toNumber(p.velocity),
                 lastReceived: p.lastReceived ?? null,
                 quantity: toNumber(p.quantity),
-                averageBuildConsumption: toNumber(p.averageBuildConsumption),
             });
         }
     }
@@ -161,8 +157,7 @@ function normalizeApi(payload: RawBasautoPayload): BasautoRecord[] {
                     description: p.description ?? null,
                     supplier: group.supplier ?? null,
                     urgency: "Overdue",
-                    unitsInStock: null,
-                    stockDaysLeft: toNumber(p.stockDaysLeft),
+                        stockDaysLeft: toNumber(p.stockDaysLeft),
                     reorderQty: toNumber(p.reorderQty),
                     reorderDate: null,
                     onOrder: null,
@@ -171,7 +166,6 @@ function normalizeApi(payload: RawBasautoPayload): BasautoRecord[] {
                     velocity: null,
                     lastReceived: null,
                     quantity: null,
-                    averageBuildConsumption: null,
                     slim: true,
                 });
             }
@@ -244,9 +238,7 @@ async function fetchAria(): Promise<{ items: AriaItemLite[]; cachedAt: string | 
                       }))
                     : [],
                 suggestedQty: toNumber(it.suggestedQty),
-                assessmentDecision: it.assessment?.decision ?? null,
                 assessmentRecommendedQty: toNumber(it.assessment?.recommendedQty),
-                supplierName: it.supplierName ?? it.vendorName ?? null,
             });
         }
     }
