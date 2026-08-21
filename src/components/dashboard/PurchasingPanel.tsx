@@ -20,7 +20,10 @@ import type { FinaleReorderMethod, PurchasingGroup } from "@/lib/finale/client";
 import type { ExpectedDelivery, DraftVerification, CommitVerification } from "@/lib/purchasing/po-verification";
 import { CrystalBallDetail, type CrystalBallItem } from "./CrystalBallDetail";
 import { CrystalBallSearch } from "./CrystalBallSearch";
+import { VendorOutlookBar } from "./VendorOutlookBar";
 import { FilterChip, ActionChip } from "@/components/dashboard/chips";
+import { selectForwardPoLines, applyTruckQty } from "@/lib/purchasing/forward-po-lines";
+import { decodeOutlookNotes, isHoldActive, type VendorOutlookFields } from "@/lib/purchasing/vendor-outlook";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -39,6 +42,9 @@ type PurchasingItem = {
     } | null;
     dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
+    effectiveLeadTimeDays?: number;
+    stockAvailable?: number | null;
+    forwardDemandEntry?: { requiredQty: number; earliestBuildDate: string; feedsBuilds: string[] } | null;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     urgency: UrgencyTier;
     explanation: string; suggestedQty: number;
@@ -400,6 +406,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [error, setError] = useState<string | null>(null);
 
     const [vendorTab, setVendorTab] = useState<string>("all");
+    const [outlookByVendor, setOutlookByVendor] = useState<Record<string, VendorOutlookFields>>({});
     // Vendor dropdown combobox state (replaces horizontal tab strip)
     const [vendorDropdownOpen, setVendorDropdownOpen] = useState(false);
     const [vendorSearchQuery, setVendorSearchQuery] = useState("");
@@ -653,6 +660,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         return "Selected items need PO handling";
     }
     function itemMatchesFocus(item: PurchasingItem): boolean {
+        const outlook = outlookByVendor[item.supplierPartyId];
+        const held = isHoldActive(outlook?.holdUntilDate ?? decodeOutlookNotes(item.vendorPolicy?.notes ?? null).holdUntilDate);
+        if (held && focusFilter === "order_now") return false;
         if (focusFilter === "order_now") {
             if (itemMatchesOrderingFocus(item, "order_now")) {
                 return true;
@@ -841,7 +851,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             }
         }
 
-        useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+        useEffect(() => { load();   }, []);
 
         // RCV receipt event → bust ordering cache so need drops same day
         const prevReceiptAtRef = useRef<number>(0);
@@ -900,23 +910,26 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
 
     async function createVendorPO(group: PurchasingGroup, ignoreCommitGuards?: boolean): Promise<POResult | null> {
         const pid = group.vendorPartyId;
-        // When Quick Draft or ORDER ALL: use all eligible items, not just checked ones.
-        // Only draft items the policy engine says to order (assessment.decision === 'order').
-        const selected = group.items.filter(i =>
-                    !isSnoozed(i.productId) &&
-                    canIncludeInDraftPO(i.reorderMethod) &&
-                    !itemIsCovered(i) &&
-                    !i.draftPO &&
-                    (i as any).assessment?.decision === 'order'
-                );
-        const hasChecked = selected.some(i => checked[pid]?.[i.productId]);
-        const items = (ignoreCommitGuards || !hasChecked ? selected : selected.filter(i => checked[pid]?.[i.productId]))
-            .map(i => ({ productId: i.productId, quantity: i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false, leadTimeDays: (i as any).leadTimeDays ?? null }));
+        const items = applyTruckQty(
+            selectForwardPoLines({
+                items: group.items,
+                focus: focusFilter,
+                qtyOverrides: qtys[pid],
+                isSnoozed,
+                isCovered: itemIsCovered,
+                checked: checked[pid],
+                requireChecked: false,
+            }),
+            outlookByVendor[pid]?.truckQty ?? null,
+        ).map(line => ({
+            ...line,
+            leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? line.leadTimeDays,
+        }));
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ vendorPartyId: pid, items, memo: "Purchasing Intelligence draft — review and commit in Finale", ignoreCommitGuards }),
+            body: JSON.stringify({ vendorPartyId: pid, items, memo: "Purchasing Intelligence draft — review and commit in Finale", ignoreCommitGuards, skipPreflight: true }),
         });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Failed");
@@ -924,8 +937,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     }
 
     async function handleCreateAllDrafts(groups: PurchasingGroup[]) {
-        // One-click: draft, commit, and send each vendor individually.
-        // No confirmation — hands off to Purchases panel.
+        // Draft only. Send from Finale — Aria email is not the path.
         for (const group of groups) {
             const pid = group.vendorPartyId;
             const sel = group.items.filter(i =>
@@ -939,17 +951,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             try {
                 const result = await createVendorPO(group, true);
                 if (result?.orderId) {
-                                    setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                    const res = await fetch('/api/dashboard/purchasing/commit', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                    });
-                                    // Draft (and usually commit) landed in Finale — leave Ordering now.
-                                    // Email failure must not keep the vendor on the board.
-                                    if (res.ok) setSentPOs(p => new Set(p).add(result.orderId!));
-                                    markVendorOrdered(pid, result.orderId);
-                                }
+                    setCreatedPOs(p => ({ ...p, [pid]: result }));
+                    markVendorOrdered(pid, result.orderId);
+                }
             } catch (e: any) {
                 console.error(`[order-all] ${group.vendorName}:`, e.message);
             } finally {
@@ -986,9 +990,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                 totalUnits,
                             });
                             await load(true);
-                            // DO NOT auto-transition to handleReviewAndSend — send function needs fix
                         }
-                        await load(true);
         } catch (e: any) {
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
@@ -2257,37 +2259,24 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                 <span className="text-[10px] font-mono text-emerald-400 px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10">
                                                                     ✓ PO #{createdPOs[pid].orderId}
                                                                 </span>
-                                                                <button
-                                                                    onClick={async () => {
-                                                                                                                                            const poId = createdPOs[pid].orderId;
-                                                                                                                                            if (!poId) return;
-                                                                                                                                            const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                                method: 'POST',
-                                                                                                                                                headers: { 'Content-Type': 'application/json' },
-                                                                                                                                                body: JSON.stringify({ action: 'send-direct', orderId: poId, vendorPartyId: pid }),
-                                                                                                                                            });
-                                                                                                                                            if (res.ok) {
-                                                                                                                                                setSentPOs(p => new Set(p).add(poId));
-                                                                                                                                                markVendorOrdered(pid, poId);
-                                                                                                                                            } else {
-                                                                                                                                                // Draft already exists — still leave Ordering; retry email from Purchases/Finale.
-                                                                                                                                                markVendorOrdered(pid, poId);
-                                                                                                                                                const json = await res.json().catch(() => ({}));
-                                                                                                                                                setError(`Send failed: ${(json as any).error || 'Unknown'} — PO stays in Finale`);
-                                                                                                                                            }
-                                                                                                                                        }}
-                                                                    className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-amber-500 bg-amber-600/30 hover:bg-amber-500/40 text-amber-200 transition-colors"
-                                                                >Send</button>
+                                                                <a
+                                                                    href={createdPOs[pid].finaleUrl}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                    className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-zinc-600 bg-zinc-800/40 hover:bg-zinc-700/50 text-zinc-200"
+                                                                    title="Open in Finale — send from there"
+                                                                >Finale</a>
                                                             </div>
                                                         );
                                                     }
                                                     // Order button: only when something still needs ordering (not already on open/draft PO)
-                                                                                                        const orderableItems = activeItems.filter(i =>
-                                                                                                            canIncludeInDraftPO(i.reorderMethod)
-                                                                                                            && !itemIsCovered(i)
-                                                                                                            && !i.draftPO
-                                                                                                            && (i as any).assessment?.decision === "order"
-                                                                                                        );
+                                                                                                        const orderableItems = selectForwardPoLines({
+                                                                                                            items: activeItems,
+                                                                                                            focus: focusFilter,
+                                                                                                            qtyOverrides: groupQtys,
+                                                                                                            isSnoozed,
+                                                                                                            isCovered: itemIsCovered,
+                                                                                                        });
                                                                                                         const coveredOnly = activeItems.length > 0 && orderableItems.length === 0
                                                                                                             && activeItems.some(i => itemIsCovered(i) || !!i.draftPO || (i.openPOs?.length ?? 0) > 0);
                                                                                                         if (!vSnoozed && coveredOnly) {
@@ -2304,38 +2293,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                             const wasInspected = expanded.has(pid);
                                                                                                             return (
                                                                                                                 <button
-                                                                                                                    onClick={async () => {
-                                                                                                                        if (wasInspected) {
-                                                                                                                            // You reviewed — draft only for safety
-                                                                                                                            handleCreateOne(group, true);
-                                                                                                                        } else {
-                                                                                                                            // You trust it — draft + commit + send
-                                                                                                                            try {
-                                                                                                                                                                                                                                                            const result = await createVendorPO(group, true);
-                                                                                                                                                                                                                                                            if (result?.orderId) {
-                                                                                                                                                                                                                                                                setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                                                                                                                                                                                                                                                const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                                                                                                                                                    method: 'POST',
-                                                                                                                                                                                                                                                                    headers: { 'Content-Type': 'application/json' },
-                                                                                                                                                                                                                                                                    body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                                                                                                                                                                                                                                                });
-                                                                                                                                                                                                                                                                if (res.ok) {
-                                                                                                                                                                                                                                                                    setSentPOs(p => new Set(p).add(result.orderId!));
-                                                                                                                                                                                                                                                                } else {
-                                                                                                                                                                                                                                                                    setError('Draft created — send failed. PO is in Finale; email may need manual send.');
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                // PO exists in Finale — leave Ordering regardless of email path.
-                                                                                                                                                                                                                                                                markVendorOrdered(pid, result.orderId);
-                                                                                                                                                                                                                                                                await load(true);
-                                                                                                                                                                                                                                                            } else {
-                                                                                                                                                                                                                                                                setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
-                                                                                                                                                                                                                                                            }
-                                                                                                                                                                                                                                                        } catch (e: any) { setError(e.message); }
-                                                                                                                        }
-                                                                                                                    }}
+                                                                                                                    onClick={() => handleCreateOne(group, true)}
                                                                                                                     disabled={anyCreating}
                                                                                                                     className="text-[10px] font-mono px-2 py-1 rounded border bg-emerald-900/30 hover:bg-emerald-800/40 text-emerald-300 border-emerald-800 transition-colors disabled:opacity-40 shrink-0"
-                                                                                                                    title={wasInspected ? "Draft only — you reviewed this vendor" : "Draft, commit, and send"}
+                                                                                                                    title="Draft in Finale — send from Finale"
                                                                                                                 >
                                                                                                                     Order
                                                                                                                 </button>
@@ -2348,6 +2309,23 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                     ▾
                                                 </button>
                                             </div>
+                                            {isExpanded && (
+                                                <VendorOutlookBar
+                                                    vendorPartyId={pid}
+                                                    vendorName={group.vendorName}
+                                                    initial={outlookByVendor[pid] ?? (() => {
+                                                        const decoded = decodeOutlookNotes(activeItems[0]?.vendorPolicy?.notes ?? null);
+                                                        return {
+                                                            notes: decoded.notes,
+                                                            holdUntilDate: decoded.holdUntilDate,
+                                                            leadTimeOverrideDays: activeItems[0]?.vendorPolicy?.leadTimeOverrideDays ?? null,
+                                                            targetCoverDays: activeItems[0]?.vendorPolicy?.targetCoverDays ?? null,
+                                                            truckQty: null,
+                                                        };
+                                                    })()}
+                                                    onSaved={(next) => setOutlookByVendor(p => ({ ...p, [pid]: next }))}
+                                                />
+                                            )}
 
                                             {/* ── Item rows ── */}
                                             {isExpanded && (
@@ -2861,18 +2839,43 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                             <span>·</span>
                                                                                             <span>{Math.round(item.stockOnHand)} on hand</span>
                                                                                         </div>
-                                                                                        {(item.finaleReorderQty ?? 0) > 0 && (
-                                                                                            <div className="flex items-center gap-2 mt-0.5">
-                                                                                                <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
-                                                                                                    Finale: {item.finaleReorderQty}
-                                                                                                </span>
-                                                                                                <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                        {((item.finaleReorderQty ?? 0) > 0 || item.basautoRecon) && (
+                                                                                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                                                                                {item.basautoRecon && item.basautoRecon.basautoQty != null && (
+                                                                                                    <>
+                                                                                                        <span
+                                                                                                            title={`basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}`}
+                                                                                                            className="text-[11px] font-mono italic text-violet-300"
+                                                                                                        >
+                                                                                                            basauto: {item.basautoRecon.basautoQty}
+                                                                                                        </span>
+                                                                                                        <span className="text-zinc-600 text-[10px]">·</span>
+                                                                                                    </>
+                                                                                                )}
+                                                                                                {(item.finaleReorderQty ?? 0) > 0 && (
+                                                                                                    <>
+                                                                                                        <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
+                                                                                                            Finale: {item.finaleReorderQty}
+                                                                                                        </span>
+                                                                                                        <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                                    </>
+                                                                                                )}
                                                                                                 <span className={`text-[11px] font-mono font-semibold ${item.qtyDiverged ? 'text-emerald-300' : 'text-zinc-200'}`}>
                                                                                                     Aria: {item.suggestedQty}
                                                                                                 </span>
                                                                                                 {item.qtyDiverged && item.qtyDivergencePct != null && (
                                                                                                     <span className="text-[9px] font-mono text-amber-400 border border-amber-500/20 rounded px-1">
                                                                                                         ⚠ {Math.abs(item.qtyDivergencePct)}% diff
+                                                                                                    </span>
+                                                                                                )}
+                                                                                                {item.basautoRecon && (
+                                                                                                    <span
+                                                                                                        title={item.basautoRecon.reason}
+                                                                                                        className={`text-[9px] font-mono rounded px-1 border ${item.basautoRecon.severity === 'high'
+                                                                                                            ? 'text-red-300 border-red-500/30'
+                                                                                                            : 'text-violet-300 border-violet-500/25'}`}
+                                                                                                    >
+                                                                                                        {item.basautoRecon.verdict.replace(/_/g, ' ').toLowerCase()}
                                                                                                     </span>
                                                                                                 )}
                                                                                             </div>

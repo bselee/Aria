@@ -1,4 +1,45 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
+
+const mem = new Database(":memory:");
+mem.exec(`
+  CREATE TABLE ap_local_forwards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    gmail_message_id TEXT NOT NULL,
+    email_from TEXT,
+    email_subject TEXT,
+    pdf_filename TEXT NOT NULL,
+    pdf_content_hash TEXT NOT NULL,
+    billcom_sent_message_id TEXT,
+    status TEXT NOT NULL DEFAULT 'FORWARDED',
+    reconciliation_status TEXT,
+    matched_po_number TEXT,
+    reconciliation_notes TEXT,
+    error_message TEXT,
+    forwarded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reconciled_at DATETIME,
+    completed_at DATETIME,
+    vendor_routing_action TEXT,
+    verified INTEGER DEFAULT 0,
+    billcom_processed INTEGER DEFAULT 0,
+    ocr_raw_text TEXT,
+    ocr_vendor_name TEXT,
+    ocr_invoice_number TEXT,
+    ocr_total TEXT,
+    reconciliation_verdict TEXT,
+    reconciliation_result_json TEXT,
+    UNIQUE(gmail_message_id, pdf_filename)
+  );
+  CREATE TABLE billcom_bills_ref (
+    invoice_number TEXT NOT NULL,
+    vendor_name TEXT NOT NULL,
+    UNIQUE(invoice_number, vendor_name)
+  );
+  CREATE TABLE invoice_cache (
+    invoice_number TEXT,
+    expire_at DATETIME
+  );
+`);
 
 const {
     gmailFactoryMock,
@@ -6,16 +47,26 @@ const {
     createClientMock,
     applyMessageLabelPolicyMock,
     processInvoiceBufferMock,
+    downloadPDFMock,
 } = vi.hoisted(() => ({
     gmailFactoryMock: vi.fn(),
     getAuthenticatedClientMock: vi.fn(),
     createClientMock: vi.fn(),
     applyMessageLabelPolicyMock: vi.fn(),
     processInvoiceBufferMock: vi.fn(),
+    downloadPDFMock: vi.fn(),
 }));
 
 vi.mock("@googleapis/gmail", () => ({
     gmail: gmailFactoryMock,
+}));
+
+vi.mock("../../storage/supabase-storage", () => ({
+    downloadPDF: downloadPDFMock,
+}));
+
+vi.mock("../../storage/local-db", () => ({
+    getLocalDb: () => mem,
 }));
 
 vi.mock("../../gmail/auth", () => ({
@@ -41,7 +92,13 @@ import { APForwarderAgent } from "./ap-forwarder";
 describe("APForwarderAgent", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        // The legacy forwarder path is env-gated (default off — ap-local-forwarder is the
+        // live path). These tests exercise the legacy path deliberately.
+        process.env.DEPRECATED_FORWARDER_ENABLED = "true";
+        mem.prepare("DELETE FROM ap_local_forwards").run();
+        mem.prepare("DELETE FROM billcom_bills_ref").run();
         getAuthenticatedClientMock.mockResolvedValue({});
+        downloadPDFMock.mockResolvedValue(Buffer.from("pdf-data"));
         processInvoiceBufferMock.mockResolvedValue({
             success: true,
             state: "reconciled",
@@ -150,7 +207,10 @@ describe("APForwarderAgent", () => {
         const agent = new APForwarderAgent();
         await agent.processPendingForwards();
 
-        expect(sendMock).toHaveBeenCalledTimes(2);
+        // The single-forward gate dedups the second loop iteration (the mock returns
+        // the same queue item for both the PENDING and ERROR queries), so exactly ONE
+        // send reaches Bill.com — the invariant, not a bug.
+        expect(sendMock).toHaveBeenCalledTimes(1);
         expect(processInvoiceBufferMock).toHaveBeenCalledWith(
             Buffer.from("pdf-data"),
             "fedex-bill-1001.pdf",
@@ -164,7 +224,7 @@ describe("APForwarderAgent", () => {
         expect(getMock).toHaveBeenCalledWith({
             userId: "me",
             id: "sent-msg-1",
-            format: "metadata",
+            format: "full",
         });
         expect(applyMessageLabelPolicyMock).toHaveBeenCalledWith(expect.objectContaining({
             gmailMessageId: "gmail-source-1",
@@ -273,11 +333,11 @@ describe("APForwarderAgent", () => {
         const agent = new APForwarderAgent();
         await agent.processPendingForwards();
 
-        expect(sendMock).toHaveBeenCalledTimes(2);
+        expect(sendMock).toHaveBeenCalledTimes(1);
         expect(applyMessageLabelPolicyMock).not.toHaveBeenCalled();
     });
 
-    it("keeps the source email in the inbox and marks it retryable when invoice processing fails after Bill.com send", async () => {
+    it("archives the source email once Bill.com has the invoice even if post-processing fails", async () => {
         processInvoiceBufferMock.mockResolvedValue({
             success: false,
             state: "processing_error",
@@ -386,9 +446,11 @@ describe("APForwarderAgent", () => {
         const agent = new APForwarderAgent();
         await agent.processPendingForwards();
 
-        expect(sendMock).toHaveBeenCalledTimes(2);
-                expect(processInvoiceBufferMock).toHaveBeenCalledTimes(2);
-                expect(applyMessageLabelPolicyMock).toHaveBeenCalledTimes(2);
+        expect(sendMock).toHaveBeenCalledTimes(1);
+                expect(processInvoiceBufferMock).toHaveBeenCalledTimes(1);
+                // Bill.com send verified → email marked processed and archived even
+                // though OCR/PO-match failed (retry lives in /aphealth, not the inbox).
+                expect(applyMessageLabelPolicyMock).toHaveBeenCalledTimes(1);
                 expect(emailQueueUpdateMock).toHaveBeenCalledWith({ processed_by_ap: true });
         expect(updateCalls).toContainEqual(expect.objectContaining({
                     status: "FORWARDED",

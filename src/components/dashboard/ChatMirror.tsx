@@ -7,7 +7,7 @@ import { MessageSquare, Radio, Bot, Send, Loader2, Plus, Paperclip, FolderPlus, 
 type ChatLog = {
     id: string;
     created_at: string;
-    source: "telegram" | "slack";
+    source: "telegram";
     role: "user" | "assistant";
     content: string;
     metadata: any;
@@ -310,36 +310,6 @@ export default function ChatMirror() {
                         )}
 
                         {logs.map((log) => {
-                            // Slack detection — full-width amber card
-                            if (log.source === "slack") {
-                                return (
-                                    <div key={log.id} className="w-full">
-                                        <div className="rounded-lg bg-amber-500/5 border border-amber-500/20 p-3">
-                                            <div className="flex items-center gap-2 mb-2">
-                                                <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded px-1.5 py-0.5">
-                                                    Slack #{log.metadata?.channel || "unknown"}
-                                                </span>
-                                                {log.metadata?.matchedProduct && (
-                                                    <span className="text-[10px] font-mono text-zinc-400 truncate">
-                                                        → {log.metadata.matchedProduct}
-                                                    </span>
-                                                )}
-                                                <span className="ml-auto text-[10px] font-mono text-zinc-600 shrink-0">
-                                                    {new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                                                </span>
-                                            </div>
-                                            <p className="text-xs text-zinc-300 leading-relaxed">{log.content}</p>
-                                            {log.metadata?.userName && (
-                                                <p className="text-[10px] text-zinc-600 mt-1 font-mono">
-                                                    from {log.metadata.userName}
-                                                    {log.metadata.activePO ? ` · PO: ${log.metadata.activePO}` : ""}
-                                                </p>
-                                            )}
-                                        </div>
-                                    </div>
-                                );
-                            }
-
                             // Telegram messages — chat bubble style
                             const isUser = log.role === "user";
                             const fromDash = log.metadata?.from === "dashboard";
@@ -552,10 +522,6 @@ function MirrorHeader({ isCollapsed, setIsCollapsed }: { isCollapsed: boolean, s
                 <span className="flex items-center gap-1.5">
                     <span className="text-[10px] font-mono text-blue-400 uppercase tracking-widest">TG</span>
                     <span className="flex h-1.5 w-1.5 rounded-full bg-blue-400 shadow-[0_0_6px_rgba(96,165,250,0.8)] animate-pulse" />
-                </span>
-                <span className="flex items-center gap-1.5">
-                    <span className="text-[10px] font-mono text-amber-400 uppercase tracking-widest">Slack</span>
-                    <span className="flex h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.8)] animate-pulse" />
                 </span>
                 <button
                     onClick={() => setIsCollapsed(!isCollapsed)}

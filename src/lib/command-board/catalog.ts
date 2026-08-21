@@ -1,12 +1,15 @@
 /**
  * @file    catalog.ts
- * @purpose Reads the live `.agents/**` directory tree and the hardcoded v1
- *          agent hierarchy and produces a single CommandBoardCatalog object
- *          consumed by the dashboard. No caching — the directory is small.
+ * @purpose Reads the live `.agents/**` directory tree and derives the agent
+ *          hierarchy from HermesOrchestrator's AGENT_REGISTRY (the runtime
+ *          canonical taxonomy) and produces a single CommandBoardCatalog
+ *          object consumed by the dashboard. No caching — the directory is
+ *          small.
  */
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { buildCommandBoardHierarchy } from "@/lib/intelligence/hermes-orchestrator";
 import type {
     CommandBoardAgent,
     CommandBoardCatalog,
@@ -16,22 +19,16 @@ import type {
     CommandBoardWorkflow,
 } from "./types";
 
-// ── Hierarchy v1 (hardcoded) ────────────────────────────────────────────────
+// ── Hierarchy (derived from AGENT_REGISTRY) ─────────────────────────────────
+//
+// The runtime canonical agent tree lives in HermesOrchestrator's
+// AGENT_REGISTRY (src/lib/intelligence/hermes-orchestrator.ts). The Command
+// Board derives its rendered hierarchy from it so the dashboard can never
+// drift from runtime truth — agent ids are the registry names, which is
+// exactly what agent_heartbeats.agent_name rows use, so live status joins
+// correctly.
 
-const HIERARCHY: CommandBoardAgent[] = [
-    { id: "will", label: "Will", reportsTo: null, process: [], skills: [], workflows: [] },
-    { id: "ops-manager", label: "Ops Manager", reportsTo: "will", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "aria-bot", label: "Aria Bot", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "ap-agent", label: "AP Agent", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "watchdog", label: "Slack Watchdog", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "supervisor", label: "Supervisor", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "reconciliation", label: "Reconciliation", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "purchasing", label: "Purchasing", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "tracking", label: "Tracking", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "build-risk", label: "Build Risk", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-    { id: "nightshift", label: "Nightshift", reportsTo: "ops-manager", process: ["nightshift-runner"], skills: [], workflows: [] },
-    { id: "vendor-intelligence", label: "Vendor Intelligence", reportsTo: "ops-manager", process: ["aria-bot"], skills: [], workflows: [] },
-];
+export const COMMAND_BOARD_HIERARCHY: CommandBoardAgent[] = buildCommandBoardHierarchy();
 
 // ── Markdown summary helper ─────────────────────────────────────────────────
 
@@ -196,12 +193,10 @@ export async function buildCatalog(): Promise<CommandBoardCatalog> {
     ]);
     return {
         generatedAt: new Date().toISOString(),
-        agents: HIERARCHY.map((a) => ({ ...a })),
+        agents: COMMAND_BOARD_HIERARCHY.map((a) => ({ ...a })),
         agentFiles,
         skills,
         workflows,
         references,
     };
 }
-
-export const COMMAND_BOARD_HIERARCHY = HIERARCHY;

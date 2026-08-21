@@ -3,7 +3,7 @@
 #
 # Registers a Windows Task Scheduler entry that runs `pm2 resurrect` at user
 # logon, so aria-bot comes back automatically after a reboot without
-# requiring Will to log in and manually `pm2 start ecosystem.config.cjs`.
+# requiring Will to log in and manually `pm2 start ecosystem.config.json`.
 #
 # NOTE: aria-dashboard auto-start uses `next start` (production mode, ~150MB
 # RSS idle). The 2026-04-30 first attempt used `next dev` with a 12GB heap

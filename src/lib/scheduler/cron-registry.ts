@@ -79,7 +79,7 @@ export const CRON_JOBS: CronJobDefinition[] = [
     },
     {
         name: 'DailySummary',
-        description: 'Morning operational summary to Telegram and Slack (Friday=weekly wrap, Monday=previous week review)',
+        description: 'Morning operational summary to Telegram (Friday=weekly wrap, Monday=previous week review)',
         schedule: '0 8 * * 1-5',
         scheduleHuman: '8:00 AM weekdays',
         timezone: 'America/Denver',

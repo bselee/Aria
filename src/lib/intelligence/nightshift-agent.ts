@@ -274,7 +274,7 @@ export async function runNightshiftLoop(opts: NightshiftLoopOpts = {}): Promise<
         return;
     }
 
-    let localCount = 0;
+    const localCount = 0;
     let haikuCount = 0;
     let failedCount = 0;
 

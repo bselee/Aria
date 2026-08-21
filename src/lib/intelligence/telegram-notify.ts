@@ -11,11 +11,22 @@
 import { isBusinessHours } from './alert-gate';
 
 /**
+ * Master switch for ALL Telegram outbound (2026-08-19, Bill: no more Telegram).
+ * Default OFF. Set ARIA_TELEGRAM_ENABLED=true in the environment to re-enable.
+ */
+export const isTelegramEnabled = (): boolean => process.env.ARIA_TELEGRAM_ENABLED === 'true';
+
+/**
  * Send a Markdown message to Bill's Telegram chat.
  * Gated by business hours — drops silently outside Mon-Fri 7AM-5PM.
  * Falls back to plain text if Markdown parsing fails.
  */
 export async function sendTelegramNotify(text: string): Promise<void> {
+    if (!isTelegramEnabled()) {
+        const preview = text.slice(0, 60).replace(/\n/g, ' ');
+        console.log(`[telegram-notify] Disabled (ARIA_TELEGRAM_ENABLED != true) — dropping: "${preview}..."`);
+        return;
+    }
     // Gate: only send during business hours
     if (!isBusinessHours()) {
         const preview = text.slice(0, 60).replace(/\n/g, ' ');
@@ -34,6 +45,10 @@ export async function sendTelegramNotify(text: string): Promise<void> {
  * where silence during off-hours is worse than noise.
  */
 export async function sendCriticalTelegramNotify(text: string): Promise<void> {
+    if (!isTelegramEnabled()) {
+        console.log(`[telegram-notify] Disabled — critical alert dropped: "${text.slice(0, 60).replace(/\n/g, ' ')}..."`);
+        return;
+    }
     console.log('[telegram-notify] Critical alert — bypassing business hours gate.');
     await sendTelegramMessage(text);
 }
@@ -100,6 +115,11 @@ export async function sendTelegramNotifyWithButtons(
     text: string,
     buttons: TelegramInlineButton[][],
 ): Promise<void> {
+    if (!isTelegramEnabled()) {
+        const preview = text.slice(0, 60).replace(/\n/g, ' ');
+        console.log(`[telegram-notify] Disabled (ARIA_TELEGRAM_ENABLED != true) — buttons dropped: "${preview}..."`);
+        return;
+    }
     // Gate: only send during business hours
     if (!isBusinessHours()) {
         const preview = text.slice(0, 60).replace(/\n/g, ' ');

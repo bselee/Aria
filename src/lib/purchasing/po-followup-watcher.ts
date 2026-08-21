@@ -4,13 +4,15 @@
  *          OUTSIDE the original thread, and if not, DRAFT a polite poke for
  *          Will to review and send. Never auto-sends.
  *
- * Flow per PO (sent 5-9 days ago, no ack, no tracking):
+ * Flow per PO (sent 2-9 days ago, no ack, no tracking):
  *   1. Scan bill.selee@ inbox for recent inbound mail (~14d).
  *   2. Run vendor-reply-detector with strategies: subject_po → body_po →
  *      domain_unique. If matched, write vendor_acknowledged_at + source.
  *   3. If no match, find the original PO thread, build VendorCommContext,
  *      call VendorCommsAgent.draftFollowUp() to create a Gmail DRAFT.
- *      Set tracking_requested_at so we don't re-draft.
+ *      Ladder (Bill spec 2026-08-20): L1 at 48h stamps tracking_requested_at;
+ *      L2 at 5d drafts the tracking request + stamps 'l2_escalated';
+ *      L3 at 7d drafts the firmer escalation + stamps 'l3_escalated'.
  *
  * Dropships excluded (memory note 2026-05-04). Window is forward-looking
  * only: POs sent ≥10 days ago are aged out and never poked — Will reviews
@@ -28,8 +30,9 @@ const DROPSHIP_PATTERN = /autopot|printful|grand.?master|\bhlg\b|horticulture li
 
 // Forward-looking window: only pokes POs sent 2–9 days ago. Anything older
 // stays untouched — L2/L3 escalation picks those up.
-// L1: 2 days — polite acknowledgment request
-// L2: 5 days — firmer, mentioning reorder risk
+// Bill's 2026-08-20 spec:
+// L1: 48h — polite receipt check ("making sure you received this")
+// L2: 5 days — firmer, requesting tracking / ship date
 // L3: 7+ days — escalate, consider alternate vendor
 const WINDOW_MIN_DAYS = 2;
 const WINDOW_MAX_DAYS = 9;
@@ -38,7 +41,9 @@ export interface FollowupOutcome {
     poNumber: string;
     action:
         | 'cross_thread_match'    // vendor reply found outside PO thread → acked
-        | 'l1_drafted'            // Gmail draft created for Will to review
+        | 'l1_drafted'            // L1 receipt-check draft created for Will to review
+        | 'l2_drafted'            // L2 tracking-request draft created for Will to review
+        | 'l3_drafted'            // L3 firmer escalation draft created for Will to review
         | 'skipped_dropship'
         | 'skipped_no_thread'
         | 'skipped_aged_out'
@@ -64,11 +69,66 @@ interface StalePO {
     lifecycle_stage: string | null;
 }
 
-function daysSince(iso: string | null | undefined): number | null {
+function daysSince(iso: string | null | undefined, nowMs: number = Date.now()): number | null {
     if (!iso) return null;
     const t = new Date(iso).getTime();
     if (isNaN(t)) return null;
-    return Math.floor((Date.now() - t) / 86_400_000);
+    return Math.floor((nowMs - t) / 86_400_000);
+}
+
+/** Hours since an ISO timestamp — used for the exact 48h L1 threshold. */
+function hoursSince(iso: string | null | undefined, nowMs: number = Date.now()): number | null {
+    if (!iso) return null;
+    const t = new Date(iso).getTime();
+    if (isNaN(t)) return null;
+    return Math.floor((nowMs - t) / 3_600_000);
+}
+
+/** The minimal PO fields decideFollowupLevel needs (a subset of StalePO). */
+export interface FollowupLevelPO {
+    tracking_requested_at: string | null;
+    po_sent_verified_at: string | null;
+    lifecycle_stage: string | null;
+}
+
+export interface FollowupDecision {
+    level: 'l1' | 'l2' | 'l3' | 'skip';
+    reason?: string;
+}
+
+/**
+ * Bill's 2026-08-20 escalation ladder (pure, unit-testable):
+ *   - tracking_requested_at null (L1 not yet drafted): <48h since sent →
+ *     skip 'recent'; >=48h → L1 polite receipt check.
+ *   - tracking_requested_at set (L1 drafted): lifecycle_stage containing
+ *     'l3' → skip 'already_escalated'; >=7d → L3 firmer escalation; >=5d
+ *     without an 'l2' stage → L2 tracking request; else skip
+ *     'too_early_for_l2'.
+ * Defensive: null/invalid po_sent_verified_at → skip 'invalid_sent_date'.
+ */
+export function decideFollowupLevel(po: FollowupLevelPO, nowMs: number): FollowupDecision {
+    if (!po.po_sent_verified_at) {
+        return { level: 'skip', reason: 'invalid_sent_date' };
+    }
+    if (isNaN(new Date(po.po_sent_verified_at).getTime())) {
+        return { level: 'skip', reason: 'invalid_sent_date' };
+    }
+
+    if (po.tracking_requested_at == null) {
+        const hSent = hoursSince(po.po_sent_verified_at, nowMs);
+        if (hSent == null || hSent < 48) return { level: 'skip', reason: 'recent' };
+        return { level: 'l1' };
+    }
+
+    // L1 already drafted → L2/L3 ladder.
+    const stage = (po.lifecycle_stage ?? '').toLowerCase();
+    if (stage.includes('l3')) return { level: 'skip', reason: 'already_escalated' };
+
+    const dSent = daysSince(po.po_sent_verified_at, nowMs);
+    if (dSent == null) return { level: 'skip', reason: 'invalid_sent_date' };
+    if (dSent >= 7) return { level: 'l3' };
+    if (dSent >= 5 && !stage.includes('l2')) return { level: 'l2' };
+    return { level: 'skip', reason: 'too_early_for_l2' };
 }
 
 /**
@@ -95,7 +155,11 @@ async function searchInboundForPO(gmail: any, poNumber: string): Promise<any[]> 
     return full;
 }
 
-async function findPOThread(gmail: any, poNumber: string): Promise<{
+/**
+ * Find the original outbound PO email thread for a PO number.
+ * Shared with po-ship-status-followup so both watchers reply in-thread.
+ */
+export async function findPOThread(gmail: any, poNumber: string): Promise<{
     threadId: string; messageId: string; subject: string; sentAt: Date; vendorEmail: string | null;
 } | null> {
     const digits = poNumber.replace(/^PO-?/i, '');
@@ -227,7 +291,8 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
         .lte('po_sent_verified_at', cutoffMax)
         .is('vendor_noncomm_at', null)
         .is('vendor_acknowledged_at', null)
-        .is('tracking_requested_at', null)  // not yet drafted
+        // NOTE: no tracking_requested_at filter — L1-stamped POs must re-enter
+        // the scan so the L2/L3 ladder can draft the next escalation step.
         .limit(20);
 
     if (error) {
@@ -255,8 +320,16 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
             continue;
         }
         const dSent = daysSince(po.po_sent_verified_at);
-        if (dSent == null || dSent < WINDOW_MIN_DAYS || dSent > WINDOW_MAX_DAYS) {
+        if (dSent == null || dSent > WINDOW_MAX_DAYS) {
             outcomes.push({ poNumber: po.po_number, action: 'skipped_aged_out', reason: `sent ${dSent}d ago` });
+            continue;
+        }
+        // Bill's 2026-08-20 ladder: L1 at 48h (polite receipt check), L2 at
+        // 5d (request tracking/ship date), L3 at 7d (firmer escalation).
+        // POs stamped by an earlier run re-enter here via the helper.
+        const decision = decideFollowupLevel(po, Date.now());
+        if (decision.level === 'skip') {
+            outcomes.push({ poNumber: po.po_number, action: 'skipped_recent', reason: decision.reason });
             continue;
         }
 
@@ -366,13 +439,30 @@ export async function runPOFollowupWatcher(opts?: { dryRun?: boolean }): Promise
 
         try {
             if (!dryRun) {
-                await agent.draftFollowUp(ctx, 1);
-                await db
-                    .from('purchase_orders')
-                    .update({ tracking_requested_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-                    .eq('po_number', po.po_number);
+                if (decision.level === 'l1') {
+                    await agent.draftFollowUp(ctx, 1);
+                    await db
+                        .from('purchase_orders')
+                        .update({ tracking_requested_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+                        .eq('po_number', po.po_number);
+                } else if (decision.level === 'l2') {
+                    await agent.draftFollowUp(ctx, 2);
+                    await db
+                        .from('purchase_orders')
+                        .update({ lifecycle_stage: 'l2_escalated', updated_at: new Date().toISOString() })
+                        .eq('po_number', po.po_number);
+                } else {
+                    // L3 firmer escalation. tracking_requested_at is already set
+                    // from L1 — do NOT re-stamp it here.
+                    await agent.draftFollowUp(ctx, 3);
+                    await db
+                        .from('purchase_orders')
+                        .update({ lifecycle_stage: 'l3_escalated', updated_at: new Date().toISOString() })
+                        .eq('po_number', po.po_number);
+                }
             }
-            outcomes.push({ poNumber: po.po_number, action: 'l1_drafted' });
+            const action = decision.level === 'l2' ? 'l2_drafted' : decision.level === 'l3' ? 'l3_drafted' : 'l1_drafted';
+            outcomes.push({ poNumber: po.po_number, action });
         } catch (err: any) {
             console.error(`[po-followup] ${po.po_number} draft failed:`, err?.message ?? err);
         }

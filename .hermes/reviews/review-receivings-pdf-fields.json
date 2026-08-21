@@ -1,0 +1,14 @@
+{
+  "passed": false,
+  "security_concerns": [],
+  "logic_errors": [
+    "Missing import: isReceivingsPdfVendor is used at lines 263, 562, 626, 657 but never imported in this file. The function is exported from src/config/receivings-pdf-vendors.ts but no import statement exists in route.ts. This causes a ReferenceError at runtime."
+  ],
+  "suggestions": [
+    "Add: import { isReceivingsPdfVendor } from '@/config/receivings-pdf-vendors';"
+  ],
+  "summary": "Changes add pdf_storage_path and pdfAvailable fields to API response objects, but fail to import isReceivingsPdfVendor (used 4 times) — a runtime ReferenceError.",
+  "file_reviewed": "src/app/api/dashboard/receivings/route.ts",
+  "reviewed_at": "2026-08-11",
+  "reviewer": "subagent-code-reviewer"
+}

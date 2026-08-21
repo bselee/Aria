@@ -45,9 +45,17 @@ describe("cron/jobs/index registration", () => {
 
     it("every job has a valid 5-field cron schedule", () => {
         for (const job of listJobs()) {
-            const fields = job.schedule.trim().split(/\s+/);
-            expect(fields, `bad schedule for ${job.name}: "${job.schedule}"`).toHaveLength(5);
+            const exprs = Array.isArray(job.schedule) ? job.schedule : [job.schedule];
+            expect(exprs.length, `${job.name} has no schedule`).toBeGreaterThan(0);
+            for (const expr of exprs) {
+                const fields = expr.trim().split(/\s+/);
+                expect(fields, `bad schedule for ${job.name}: "${expr}"`).toHaveLength(5);
+            }
         }
+    });
+
+    it("ap-polling morning window is 7:30 Denver; noon and 5pm stay on the hour", () => {
+        expect(getJob("ap-polling")?.schedule).toEqual(["30 7 * * *", "0 12,17 * * *"]);
     });
 
     it("every job uses America/Denver tz", () => {
@@ -56,8 +64,12 @@ describe("cron/jobs/index registration", () => {
         }
     });
 
-    it("kaizen #4: po-sync runs every 4 hours", () => {
-        expect(getJob("po-sync")?.schedule).toBe("0 */4 * * *");
+    it("kaizen #4: po-sync runs every 4 hours (staggered off :00 — see STAGGER 2026-08-21)", () => {
+        // Asserts the INTENT (every 4h) while allowing the stagger minute. The
+        // :00 slot was vacated because 17 jobs firing together starved the
+        // node-cron event loop and silently skipped the 03:00/04:00 jobs.
+        expect(getJob("po-sync")?.schedule).toMatch(/^\d{1,2} \*\/4 \* \* \*$/);
+        expect(getJob("po-sync")?.schedule).not.toBe("0 */4 * * *");
     });
 
     it("kaizen #6: missing-reconciliation-watchdog is Mon-Fri only", () => {

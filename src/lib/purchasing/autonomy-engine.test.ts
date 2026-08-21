@@ -7,7 +7,7 @@
  * @deps    vitest, autonomy-engine, po-sender
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { autoProcessAutonomyDrafts } from './autonomy-engine';
 import * as poSender from './po-sender';
 
@@ -63,6 +63,12 @@ vi.mock('../gmail/auth', () => ({
     getAuthenticatedClient: vi.fn().mockResolvedValue({}),
 }));
 
+// Master switch (2026-08-19): Telegram defaults OFF unless ARIA_TELEGRAM_ENABLED=true.
+// These tests assert Telegram alerts are sent, so opt in explicitly.
+vi.mock('../intelligence/alert-gate', () => ({
+    isBusinessHours: vi.fn(() => true), // keep tests deterministic regardless of wall clock
+}));
+
 vi.mock('./po-sender', () => ({
     storePendingPOSend: vi.fn().mockResolvedValue('session-abc'),
     commitAndSendPO: vi.fn().mockResolvedValue({ orderId: 'PO-1002', sentTo: 'test@example.com' }),
@@ -76,6 +82,9 @@ describe('autoProcessAutonomyDrafts', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         process.env.TELEGRAM_CHAT_ID = '12345';
+        // Master switch (2026-08-19) defaults Telegram OFF — opt in for tests
+        // that assert Telegram alerts are sent.
+        process.env.ARIA_TELEGRAM_ENABLED = 'true';
         mockBot = {
             telegram: {
                 sendMessage: vi.fn().mockResolvedValue({ message_id: 99 }),
@@ -108,6 +117,10 @@ describe('autoProcessAutonomyDrafts', () => {
                 },
             },
         });
+    });
+
+    afterEach(() => {
+        delete process.env.ARIA_TELEGRAM_ENABLED;
     });
 
     it('should ignore vendors at autonomy level 0', async () => {

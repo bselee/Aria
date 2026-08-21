@@ -73,8 +73,6 @@ export interface OOSReportResult {
     notInFinale: string[];
     received: string[];
     needsReview: string[];
-    /** Pre-built Slack mrkdwn body for cross-posting to #purchasing */
-    slackBody?: string;
 }
 
 // DECISION(2026-03-19): carrierUrl and detectCarrier now imported from

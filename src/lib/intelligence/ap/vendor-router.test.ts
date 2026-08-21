@@ -182,26 +182,25 @@ describe("vendor-router Toyota CF + Belt Power (2026-07-17)", () => {
         expect(r?.label).toMatch(/Toyota|TICF/i);
     });
 
-    it("beltpowerar@ statements/collections → skip", () => {
+    it("beltpowerar@ now forwards normally → no skip (2026-08-10: blocks removed)", () => {
         const r = matchVendorRouting(
             "beltpowerar@beltpower.com",
             "Belt Power AR",
             "Immediate Attention Required | BuildASoil LLC",
         );
-        expect(r?.action).toBe("skip");
-        expect(r?.label).toMatch(/Belt Power AR/i);
+        expect(r).toBeNull();
     });
 
-    it("Belt Power Invoice Reminder → skip", () => {
+    it("Belt Power Invoice Reminder now forwards → no skip (2026-08-10: blocks removed)", () => {
         const r = matchVendorRouting(
             "beltpowerar@beltpower.com",
             "Belt Power AR",
             "Invoice 3196029 Reminder from Belt Power, LLC",
         );
-        expect(r?.action).toBe("skip");
+        expect(r).toBeNull();
     });
 
-    it("Belt Power Statement PDF filename → skip", () => {
+    it("Belt Power Statement PDF filename → skip (generic statement.pdf rule)", () => {
         const r = matchVendorRouting(
             "remitto@beltpower.com",
             "Belt Power, LLC",
@@ -209,8 +208,7 @@ describe("vendor-router Toyota CF + Belt Power (2026-07-17)", () => {
             "BuildASoil_LLC_Statement.pdf",
         );
         expect(r?.action).toBe("skip");
-        // May hit collections subject rule or statement filename rule — either is correct
-        expect(r?.label).toMatch(/Belt Power|Statement/i);
+        expect(r?.label).toMatch(/Statement/i);
     });
 
     it("Belt Power remitto real invoice → forward (null rule)", () => {

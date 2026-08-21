@@ -86,19 +86,21 @@ import { coverageStockOnOrder } from "./po-reliability-scorer";
 
 describe("coverageStockOnOrder", () => {
     it("credits full Finale open PO qty even when enriched marks stuck", () => {
+        // quantity is line-level REMAINING now; stuck lifecycle is a chase signal,
+        // not a reason to zero supply credit (HERMIA 2026-07-10 + 2026-08-21).
         const open = [{ quantity: 500 }];
-        const enriched = [{
-            orderId: "125056",
-            quantity: 500,
-            orderDate: "2026-07-02",
-            isDeliverable: false,
-            stuckReason: "no_record" as const,
-            ageDays: 8,
-        }];
-        expect(coverageStockOnOrder(open, enriched)).toBe(500);
+        expect(coverageStockOnOrder(open)).toBe(500);
+    });
+
+    it("sums remaining quantities and floors negatives at zero", () => {
+        expect(coverageStockOnOrder([
+            { quantity: 100 },
+            { quantity: 0 },
+            { quantity: -5 },
+        ])).toBe(100);
     });
 
     it("returns 0 when no open POs", () => {
-        expect(coverageStockOnOrder([], [])).toBe(0);
+        expect(coverageStockOnOrder([])).toBe(0);
     });
 });

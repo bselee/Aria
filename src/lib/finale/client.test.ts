@@ -324,6 +324,26 @@ describe("FinaleClient draft PO creation guardrails", () => {
         );
         expect(global.fetch).not.toHaveBeenCalled();
     });
+
+    it("still validates SKUs when skipPreflight is true", async () => {
+        const client = new FinaleClient();
+        vi.spyOn(client, "findActiveDraftPOsForVendor").mockResolvedValue([]);
+        vi.spyOn(client as any, "checkDuplicatePOs").mockResolvedValue([]);
+        const validate = vi.spyOn(client as any, "validateProductExists").mockResolvedValue(false);
+        const price = vi.spyOn(client as any, "checkPriceChange").mockResolvedValue(null);
+
+        await expect(client.createDraftPurchaseOrder(
+            "party-zymes",
+            [{ productId: "ADZ01", quantity: 24, unitPrice: 22.63 }],
+            undefined,
+            undefined,
+            { skipPreflight: true },
+        )).rejects.toThrow(/ADZ01/);
+
+        expect(validate).toHaveBeenCalledWith("ADZ01");
+        expect(price).not.toHaveBeenCalled();
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
 });
 
 describe("FinaleClient native PO email", () => {

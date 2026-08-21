@@ -1,10 +1,10 @@
 import { createClient } from '../db';
 
 export async function logChatMessage(params: {
-  source:    'telegram' | 'slack';
+  source:    'telegram';
   role:      'user' | 'assistant';
   content:   string;
-  threadId?: string;           // chatId (telegram) or channelId (slack) — for context window
+  threadId?: string;           // chatId (telegram) — for context window
   metadata?: Record<string, any>;
 }): Promise<void> {
   try {

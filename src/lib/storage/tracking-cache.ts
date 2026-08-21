@@ -153,7 +153,43 @@ export function countActiveTrackings(): number {
  */
 export async function syncTrackingToPostgREST(record: CachedShipment): Promise<void> {
     const { enqueueSync } = await import("./sync-queue");
-    await enqueueSync("tracking_info", record.tracking_number, "upsert", record as any);
+    // KAIZEN(2026-08-12, t_1cb3c67c): the PostgREST table for tracking is
+    // `shipments` (PK tracking_key). The legacy `tracking_info` name mapped
+    // nowhere and silently dropped cache→PG PO refs. Pass a payload that
+    // includes tracking_key + po_numbers as a real array (PG text[]), so the
+    // sync queue upserts against the same shape upsertShipmentEvidence writes.
+    await enqueueSync("shipments", record.tracking_number, "upsert", {
+        tracking_number: record.tracking_number,
+        tracking_key: buildTrackingKey(record.tracking_number),
+        po_numbers: parsePoNumbers(record.po_numbers),
+        status_category: record.status_category,
+        status_display: record.status_display,
+        estimated_delivery_at: record.estimated_delivery_at,
+        delivered_at: record.delivered_at,
+        last_checked_at: record.last_checked_at,
+        updated_at: record.updated_at,
+    });
+}
+
+/** Derive the PG shipments.tracking_key from a cache tracking_number. */
+export function buildTrackingKey(trackingNumber: string): string {
+    const trimmed = String(trackingNumber || "").trim();
+    if (trimmed.includes(":::")) {
+        const [carrierName, actualNumber] = trimmed.split(":::", 2);
+        return `${carrierName.trim().toLowerCase()}:${actualNumber.trim().toLowerCase()}`;
+    }
+    return `unknown:${trimmed.toLowerCase()}`;
+}
+
+/** Parse the SQLite shipments_cache po_numbers JSON string into an array. */
+export function parsePoNumbers(raw: string | null | undefined): string[] {
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+        return [];
+    }
 }
 
 /**

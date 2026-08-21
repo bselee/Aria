@@ -4,7 +4,8 @@
  *          Shows pending + ordered requests from basauto.vercel.app.
  *          Highlights items needing attention (pending >48h, unusual items).
  *
- *          Data sourced from local cache written by scripts/basauto_poll.py.
+ *          Data sourced from local cache written by src/cli/basauto-recon.ts
+ *          (Hermes cron `basauto-recon`, 07:00 MT daily).
  *          Refreshes every 60s during view.
  *
  * @author  Hermia

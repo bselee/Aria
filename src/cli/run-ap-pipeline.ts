@@ -31,6 +31,10 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
 async function tg(msg: string, retries = 3) {
+    if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') {
+        console.log(`[ap-pipeline] Telegram disabled — skipped: "${msg.slice(0, 60).replace(/\n/g, ' ')}..."`);
+        return;
+    }
     for (let i = 0; i < retries; i++) {
         try {
             await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown" });
@@ -372,13 +376,12 @@ async function main() {
                 console.error("   ❌ Document insert failed:", docError.message);
             }
 
-            const { error: invError } = await db.from("invoices").upsert({
+            const { error: invError } = await db.from("vendor_invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber || null,
                 invoice_date: invoiceData.invoiceDate,
                 due_date: invoiceData.dueDate || invoiceData.invoiceDate,
-                payment_terms: invoiceData.paymentTerms,
                 subtotal: invoiceData.subtotal,
                 freight: invoiceData.freight || 0,
                 tax: invoiceData.tax || 0,
@@ -386,11 +389,11 @@ async function main() {
                 labor: invoiceData.labor || 0,
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
-                amount_due: invoiceData.amountDue,
                 status: matched ? "matched_review" : "unmatched",
-                document_id: documentId,
+                source: "email_attachment",
+                source_ref: String(documentId ?? ""),
                 raw_data: invoiceData,
-            }, { onConflict: "invoice_number" }).select("id").single();
+            }, { onConflict: "vendor_name,invoice_number" }).select("id").single();
 
             if (invError) {
                 console.error("   ❌ Invoice upsert failed:", invError.message);
@@ -512,7 +515,6 @@ async function main() {
                         email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                         intent: "RECONCILIATION",
                         action_taken: `Auto-applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`,
-                        notified_slack: false,
                         metadata: buildAuditMetadata(result, applyResult, "auto"),
                     });
                     console.log("   ✅ Reconciliation logged to Supabase");
@@ -549,7 +551,6 @@ async function main() {
                         email_subject: `Invoice ${result.invoiceNumber} → PO ${result.orderId}`,
                         intent: "RECONCILIATION",
                         action_taken: `Manual run applied: ${applyResult.applied.length} changes, ${applyResult.skipped.length} skipped`,
-                        notified_slack: false,
                         metadata: buildAuditMetadata(result, applyResult, "manual"),
                     });
                     console.log("   ✅ Reconciliation logged to Supabase");

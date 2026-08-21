@@ -31,6 +31,7 @@ import {
 } from "@/lib/purchasing/calibration";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
+import { remainingInboundQty } from "./po-remaining-inbound";
 import {
     enrichOpenPOs,
     hasDeliverablePO,
@@ -1592,7 +1593,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             isBulkDelivery?: boolean;
         }>,
         memo?: string,
-        purchaseDestination?: string
+        purchaseDestination?: string,
+        options?: { skipPreflight?: boolean },
     ): Promise<{
         orderId: string;
         finaleUrl: string;
@@ -1641,9 +1643,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             console.warn('[finale] Duplicate check failed (non-blocking):', e.message);
         }
 
+        const priceAlerts: string[] = [];
+        if (!options?.skipPreflight) {
         // ── Step 0b: Price change detection ─────────────────────────────────
         // DECISION(2026-03-04): Flag SKUs with >=10% price change vs last PO.
-        const priceAlerts: string[] = [];
         try {
             for (const item of items) {
                 if (!item.unitPrice || item.unitPrice <= 0) continue;
@@ -1658,10 +1661,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         } catch (e: any) {
             console.warn('[finale] Price check failed (non-blocking):', e.message);
         }
+        }
 
         // ── Step 0.5: Pre-validate all product SKUs exist in Finale ──────────
         // DECISION(2026-03-23): Finale silently accepts POs with invalid productUrls,
-        // creating line items with no product linked. Pre-validate to fail fast.
+        // creating line items with no product linked. Never skip this — skipPreflight
+        // is price-check only. Aria send is not used; blank SKUs are a hard fail.
         for (const item of items) {
             const exists = await this.validateProductExists(item.productId);
             if (!exists) {
@@ -1954,9 +1959,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     sort: [{ field: "orderDate", mode: "desc" }]
                 ) {
                     edges { node {
-                        orderId status orderDate dueDate
+                        orderId status statusExtended orderDate dueDate
                         itemList(first: 20) {
-                            edges { node { product { productId } quantity } }
+                            edges { node {
+                                product { productId }
+                                quantity
+                                productUnitsOrdered
+                                productUnitsReceived
+                                productUnitsRemainingToBePackedShippedOrReceived
+                            } }
                         }
                     }}
                 }
@@ -2024,9 +2035,23 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             return isNaN(parsed.getTime()) ? null
                                 : parsed.toISOString().split('T')[0];
                         };
+                        // FIX(2026-08-21): phantom on-order. Finale leaves a fully
+                        // received PO at status "Committed" FOREVER — the receipt
+                        // state lives in statusExtended and, authoritatively, on
+                        // the line. Crediting `quantity` (ordered) counted stock
+                        // already on the shelf as still inbound: 80 line-credits /
+                        // 106,472 phantom units across 19 SKUs measured live, which
+                        // held S-4122 at a fake 1,004d runway (real: 32d) and
+                        // S-3902 at 98d (real: 43d) — i.e. it SUPPRESSES real buys
+                        // and causes stockouts. Credit only what genuinely remains.
+                        // Age heuristics were rejected: PO#125169 was fully received
+                        // 15d after ordering while PO#125215 is genuinely open at a
+                        // similar age. `remaining` is the fact; date is a proxy.
+                        const remaining = remainingInboundQty(ie.node);
+                        if (remaining <= 0) break; // nothing left to receive — not supply
                         openPOs.push({
                             orderId: po.orderId,
-                            quantity: parseFinaleNumber(ie.node.quantity),
+                            quantity: remaining,
                             orderDate: po.orderDate || '',
                             dueDate: toIsoDate(po.dueDate),
                         });
@@ -2272,14 +2297,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     // HERMIA(2026-06-10): Enrich open POs with delivery reliability data.
                     // Stuck/unacknowledged/overdue POs don't count toward on-order coverage.
-                    // KAIZEN(2026-08-04): Inject vendorPartyId for blanket-PO detection.
+                    // KAIZEN(2026-08-21): coverageStockOnOrder no longer needs enriched —
+                    // openPOs[].quantity is line-level remaining (received POs excluded
+                    // upstream), so no delivered-subtraction pass is required.
                     for (const po of compActivity.openPOs) { (po as any).vendorPartyId = partyId; }
-                    const bomEnrichedPOs: OpenPOReliable[] = compActivity.openPOs.length > 0
-                        ? await enrichOpenPOs(compActivity.openPOs)
-                        : [];
                     // HERMIA(2026-07-10): Full Finale open PO credit for BOM coverage math.
                     // On-time rate still soft-discounts only for reliability, never zeros stuck POs.
-                    const rawStockOnOrder = coverageStockOnOrder(compActivity.openPOs, bomEnrichedPOs);
+                    const rawStockOnOrder = coverageStockOnOrder(compActivity.openPOs);
                     const onTimeRate = this.getVendorOnTimeRate(groupName);
                     // Floor at 50% so chronic late vendors still get partial credit; never 0 from stuck.
                     const trustedRate = Math.max(0.5, Math.min(1, onTimeRate || 1));
@@ -2866,7 +2890,6 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // HERMIA(2026-06-10): Enrich open POs with lifecycle data so
                     // we can distinguish "in transit" POs from stuck/unacknowledged ones.
                     // Only DELIVERABLE POs should remove a SKU from Ordering.
-                    // KAIZEN(2026-08-04): Inject vendorPartyId for blanket-PO detection.
                     for (const po of activity.openPOs) { (po as any).vendorPartyId = partyId; }
                     const enrichedOpenPOs: OpenPOReliable[] = activity.openPOs.length > 0
                         ? await enrichOpenPOs(activity.openPOs)
@@ -2876,7 +2899,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // HERMIA(2026-07-10): Credit Finale open PO qty fully for demand math.
                     // Stuck lifecycle is a chase signal (Purchases), not zero-supply for reorder.
                     // Prior: deliverable-only credit zeroed soo while openPOs ribbon still showed qty → false re-order.
-                    const rawStockOnOrder = coverageStockOnOrder(activity.openPOs, enrichedOpenPOs);
+                    const rawStockOnOrder = coverageStockOnOrder(activity.openPOs);
                     if (stuckPOs.length > 0) {
                         const stuckSummary = stuckPOs.map(po =>
                             `${po.orderId}(${po.stuckReason}/${po.ageDays}d)`,

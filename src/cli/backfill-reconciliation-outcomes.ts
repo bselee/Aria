@@ -21,7 +21,7 @@ import { createClient } from "../lib/db";
 // ─── CLI flags ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
 const DRY_RUN = !args.includes("--live");
-let DAYS_BACK = (() => {
+const DAYS_BACK = (() => {
   const idx = args.indexOf("--days");
   if (idx !== -1 && args[idx + 1]) return parseInt(args[idx + 1], 10);
   return 90;

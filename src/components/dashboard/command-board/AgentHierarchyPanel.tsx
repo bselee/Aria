@@ -41,9 +41,12 @@ function buildTree(agents: CommandBoardAgent[]): TreeNode[] {
 
 function staleness(
     heartbeats: CommandBoardHeartbeat[],
-    agentName: string,
+    agentId: string,
 ): "fresh" | "stale" | "degraded" | "unknown" {
-    const hb = heartbeats.find(h => h.agent_name === agentName);
+    // Join key is the agent id, which equals the registry name used in
+    // agent_heartbeats.agent_name (e.g. "ap-master", "purchasing-scanner") —
+    // the hierarchy is derived from AGENT_REGISTRY so they always line up.
+    const hb = heartbeats.find(h => h.agent_name === agentId);
     if (!hb) return "unknown";
     return hb.staleness ?? "unknown";
 }
@@ -62,10 +65,11 @@ function dotClass(state: ReturnType<typeof staleness>): string {
 }
 
 function activeCountFor(
-    agentLabel: string,
+    agentId: string,
     tasks: CommandBoardTaskCard[],
 ): number {
-    return tasks.filter(t => t.owner === agentLabel).length;
+    // Same join convention as heartbeats: task owner keyed by agent id.
+    return tasks.filter(t => t.owner === agentId).length;
 }
 
 /**
@@ -97,8 +101,8 @@ function TreeRow({
     selectedAgentId: string | null;
     onSelectAgent: (id: string | null) => void;
 }) {
-    const state = staleness(heartbeats, node.agent.label);
-    const active = activeCountFor(node.agent.label, tasks);
+    const state = staleness(heartbeats, node.agent.id);
+    const active = activeCountFor(node.agent.id, tasks);
     const handling = handlingFor(node.agent);
     const selected = selectedAgentId === node.agent.id;
     return (

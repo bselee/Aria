@@ -18,6 +18,8 @@
 //   'dropship'      → forward to Bill.com, skip PO matching (no Finale PO exists)
 //   'skip'          → mark read, do NOT forward (internal, self-notifications, non-invoice)
 //   'amazon_order'  → route to Amazon order parser (separate pipeline)
+//   'human_review'  → forward to Bill.com, but leave source email UNREAD in inbox
+//                     (Bill verifies these landed in Bill.com before archiving)
 //
 // DESIGN DECISION (2026-06-18, Bill Selee):
 //   ALL PDF invoices are forwarded to Bill.com identically.
@@ -40,7 +42,7 @@ export interface VendorRoutingRule {
         /** Optional attachment filename fragment (checked by local-forwarder, not Gmail headers). */
         filenameContains?: string;
     };
-    action: 'forward' | 'dropship' | 'skip' | 'amazon_order';
+    action: 'forward' | 'dropship' | 'skip' | 'amazon_order' | 'human_review';
     label: string;
 }
 
@@ -73,6 +75,19 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // Invoice PDFs come from noreply@fedex.com and flow through normally.
     { match: { fromExact: 'billingonline@fedex.com' }, action: 'skip', label: 'FedEx Past Due (No Invoice)' },
 
+    // ── Human review: forward, leave unread in inbox ────────────────────
+    // Past-due / collections / overdue notices tell Bill BAS is late — he
+    // wants them visible (unread) so he can act, then archives manually.
+    // Forwarded to Bill.com like any invoice (2026-08-12, Bill).
+    // Order matters: placed BEFORE generic statement/shipment skips so a
+    // past-due statement still surfaces unread; FedEx skip above wins for
+    // billingonline@fedex.com (no invoice PDF, handled separately).
+    { match: { subjectContains: 'past due' }, action: 'human_review', label: 'Past Due Notice (Human Review)' },
+    { match: { subjectContains: 'past-due' }, action: 'human_review', label: 'Past Due Notice (Human Review)' },
+    { match: { subjectContains: 'overdue' }, action: 'human_review', label: 'Overdue Notice (Human Review)' },
+    { match: { subjectContains: 'collections' }, action: 'human_review', label: 'Collections Notice (Human Review)' },
+    { match: { senderContains: 'berger.ca' }, action: 'human_review', label: 'Berger Collections (Human Review)' },
+
     // ── Skip: BuildASoil own statements ────────────────────────────────
     { match: { subjectContains: 'build a soil statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },
     { match: { senderContains: 'buildasoil.com', subjectContains: 'statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },
@@ -92,17 +107,7 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { subjectContains: 'your statement' }, action: 'skip', label: 'Your Statement (Not Invoice)' },
     { match: { subjectContains: 'reminder on overdue' }, action: 'skip', label: 'Overdue Reminder (Not Invoice)' },
     { match: { subjectContains: 'packing list' }, action: 'skip', label: 'Packing List (Not Invoice)' },
-    // Belt Power: invoices only from remitto@. AR mailbox + reminders/statements are noise.
-    { match: { fromExact: 'no-reply@beltpower.com' }, action: 'skip', label: 'Belt Power No-Reply (Ship Notices)' },
-    { match: { fromExact: 'beltpowerar@beltpower.com' }, action: 'skip', label: 'Belt Power AR (Statements/Collections)' },
-    { match: { senderContains: 'beltpowerar' }, action: 'skip', label: 'Belt Power AR (Statements/Collections)' },
-    { match: { senderContains: 'beltpower', subjectContains: 'statement' }, action: 'skip', label: 'Belt Power Statement' },
-    { match: { senderContains: 'beltpower', subjectContains: 'overdue' }, action: 'skip', label: 'Belt Power Overdue Reminder' },
-    { match: { senderContains: 'beltpower', subjectContains: 'shipment' }, action: 'skip', label: 'Belt Power Shipment' },
-    { match: { senderContains: 'beltpower', subjectContains: 'reminder' }, action: 'skip', label: 'Belt Power Invoice Reminder' },
-    { match: { senderContains: 'beltpower', subjectContains: 'immediate attention' }, action: 'skip', label: 'Belt Power Collections Notice' },
-    // Filename-aware rules (local-forwarder passes attachment name into matchVendorRouting)
-    { match: { senderContains: 'beltpower', filenameContains: 'statement' }, action: 'skip', label: 'Belt Power Statement PDF' },
+    // Belt Power: ALL emails forwarded (remitto@ invoices + AR/ship notices).
     { match: { filenameContains: '_statement' }, action: 'skip', label: 'Statement Attachment (Not Invoice)' },
     { match: { filenameContains: 'statement.pdf' }, action: 'skip', label: 'Statement PDF (Not Invoice)' },
 
@@ -120,6 +125,13 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
     { match: { domain: 'evergreengrowers.com' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
     { match: { senderContains: 'ferticell' }, action: 'dropship', label: 'Ferticell (Dropship)' },
+
+    // ── Human review: forward, leave unread in inbox ────────────────────
+    // Bill verifies these landed in Bill.com, then archives manually.
+    // (2026-08-12): AAA Cooper freight statements were getting marked read +
+    // archived and Bill couldn't tell they needed his eyeball. 8/10 session
+    // preference: forwarded but LEFT unread in inbox so they can't be missed.
+    { match: { senderContains: 'aaacooper' }, action: 'human_review', label: 'AAA Cooper (Human Review — leave unread)' },
 
     // QuickBooks variants
     { match: { senderContains: 'quickbooks', subjectContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship via QuickBooks)' },

@@ -431,8 +431,12 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
             console.warn(`[boot] PostgREST readiness wait failed (non-fatal): ${e.message}`);
         }
 
-        bot.launch({ dropPendingUpdates: true })
-            .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+        if (process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+            bot.launch({ dropPendingUpdates: true })
+                .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+        } else {
+            console.log('⏹️ Telegram bot NOT launched (ARIA_TELEGRAM_ENABLED != true) — Telegram disabled per Bill 2026-08-19.');
+        }
 
     console.log('✅ ARIA IS LIVE AND LISTENING');
 
@@ -472,7 +476,6 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         { command: 'consumption', description: 'BOM consumption for a SKU' },
         { command: 'builds', description: 'Upcoming calendar builds' },
         { command: 'buildrisk', description: 'Build risk analysis' },
-        { command: 'requests', description: 'Slack purchase-request feed' },
         { command: 'kaizen', description: 'Recent corrections / learnings' },
     ]).catch((err: any) => console.warn('setMyCommands failed:', err.message));
 
@@ -500,14 +503,8 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn('[sandbox] Watcher failed to start (non-fatal):', err.message);
     }
 
-    // ── Slack Request Detector ────────────────────────────────────────────
-        // HERMIA(2026-07-13): Disabled. Token revoked / channel discovery broken
-        // for months; boot noise only. File kept at lib/slack/request-detector.ts
-        // for possible future revive. Heartbeat cron also retired.
-        console.log('[boot] Slack Request Detector: disabled (token_revoked / non-functional)');
-
-        // restore approvals
-        try {
+    // restore approvals
+    try {
         // KAIZEN(2026-06-04): Persist-expire stale rows FIRST so they don't
         // linger as status='pending' in Supabase (a 2026-03 Uline approval sat
         // 'pending' for 2+ months because the boot loader only skipped them
@@ -594,7 +591,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     startBotControlPlane(ops);
 
     // ── AP sparse-window catch-up (deferred, non-blocking) ──────────────
-    // ap-polling fires only at 8/12/17 Denver. A restart spanning :00 (or a
+    // ap-polling fires only at 7:30/12/17 Denver. A restart spanning :00 (or a
     // slow boot) loses the window entirely — next chance is 4-5h later. Run
     // ONE idempotent runJobOnce("ap-polling") when the current window has no
     // cron_runs row.
@@ -657,7 +654,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         if (heapUsed > HEAP_THRESHOLD && Date.now() - lastMemAlertSent > COOLDOWN) {
             const mb = Math.round(heapUsed / 1024 / 1024);
             const chatId = process.env.TELEGRAM_CHAT_ID;
-            if (chatId && isBusinessHours()) {
+            if (chatId && isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                 await bot.telegram.sendMessage(
                     chatId,
                     `⚠️ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) — consider restarting if this persists.`
@@ -669,7 +666,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
     // ── GATED: Cron health watchdog only during business hours ──
     // Boot grace: skip stale_cron panics for the first 15 minutes after start.
-    // ap-polling is sparse (8/12/17 Denver) — threshold must cover multi-hour gaps.
+    // ap-polling is sparse (7:30/12/17 Denver) — threshold must cover multi-hour gaps.
     const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000;
     const CRON_WATCHDOG_BOOT_GRACE_MS = 15 * 60 * 1000;
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
@@ -712,7 +709,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
             if (stale.length > 0 && Date.now() - lastCronWatchdogAlert > 60 * 60 * 1000) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId && isBusinessHours()) {
+                if (chatId && isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
                     const names = stale.map(s => `${s.name} (>${s.maxStaleMin}m)`).join(', ');
                     await bot.telegram.sendMessage(
                         chatId,

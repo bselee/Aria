@@ -33,6 +33,20 @@ type TrackingApiResponse = {
         primaryLine: string;
         metaLine: string;
     } | null;
+    coverage?: {
+        totalOpen: number;
+        withTrackingIntel: number;
+        withoutTracking: Array<{
+            poNumber: string;
+            vendorName: string | null;
+            status: string | null;
+            daysSinceSent: number | null;
+            trackingRequested: boolean;
+            noTrackFlagged: boolean;
+        }>;
+        coveragePct: number;
+        asOf: string;
+    };
     error?: string;
 };
 
@@ -247,6 +261,36 @@ export default function TrackingBoardPanel({ initialQuery = "" }: { initialQuery
                                     <div className="border border-blue-500/30 rounded bg-blue-500/10 px-3 py-2">
                                         <div className="text-xs font-semibold text-blue-200">{payload.answer.primaryLine}</div>
                                         <div className="text-[11px] font-mono text-blue-300/80 mt-1">{payload.answer.metaLine}</div>
+                                    </div>
+                                )}
+
+                                {payload.coverage && payload.coverage.withoutTracking.length > 0 && (
+                                    <div className="border border-amber-500/30 rounded bg-amber-500/5 px-3 py-2 space-y-1.5">
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-[10px] font-mono uppercase tracking-[0.22em] text-amber-400">
+                                                Open POs Without Tracking
+                                            </span>
+                                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-amber-700/60 text-amber-300">
+                                                {payload.coverage.coveragePct}% covered
+                                            </span>
+                                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-400">
+                                                {payload.coverage.withoutTracking.length} gaps
+                                            </span>
+                                        </div>
+                                        {payload.coverage.withoutTracking.slice(0, 8).map((gap) => (
+                                            <div key={gap.poNumber} className="flex items-center gap-2 text-[11px]">
+                                                <span className="font-mono text-zinc-200">{gap.poNumber}</span>
+                                                <span className="text-zinc-400 truncate">{gap.vendorName || "Unknown vendor"}</span>
+                                                <span className="ml-auto shrink-0 font-mono text-zinc-500">
+                                                    {gap.noTrackFlagged ? "no-track" : gap.trackingRequested ? "requested" : gap.daysSinceSent != null ? `${gap.daysSinceSent}d` : ""}
+                                                </span>
+                                            </div>
+                                        ))}
+                                        {payload.coverage.withoutTracking.length > 8 && (
+                                            <div className="text-[10px] font-mono text-zinc-500">
+                                                +{payload.coverage.withoutTracking.length - 8} more
+                                            </div>
+                                        )}
                                     </div>
                                 )}
 

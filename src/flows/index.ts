@@ -55,7 +55,7 @@ defineFlow({
         // ── Step 1 ────────────────────────────────────────────────────
         // Was this thread already auto-replied?
         //   no  → next: send_first_ack (Friday-cycle reply)
-        //   yes → next: notify_internal_ap (Slack ping to AP team)
+        //   yes → next: notify_internal_ap (second-contact audit log)
         //
         // Note: we only dedupe against Aria's own auto-replies
         // (PAYMENT_INQUIRY_AUTOREPLY). If Will replied manually, Aria may
@@ -169,34 +169,19 @@ defineFlow({
 
         // ── Step 2b (second contact) ──────────────────────────────────
         // Vendor pinged again on the same thread after our Friday-cycle
-        // reply. Aria can't read Bill.com schedules, so we ping internal
-        // AP via Slack with vendor + invoice # + Gmail thread link. The
-        // AP team replies with a real status. No agent_task — this lives
-        // in Slack so Will isn't pulled in unless AP can't resolve.
+        // reply. Aria can't read Bill.com schedules, so we write an audit
+        // row for manual AP review — no external ping channel remains.
         notify_internal_ap: {
             maxAttempts: 3,
             run: async (ctx) => {
-                const reply = await import("@/lib/intelligence/payment-inquiry-reply");
                 const from = String(ctx.inputs["from"] ?? "");
                 const subject = String(ctx.inputs["subject"] ?? "(no subject)");
                 const threadId = String(ctx.inputs["gmail_thread_id"] ?? "");
-                const snippet = typeof ctx.inputs["snippet"] === "string"
-                    ? (ctx.inputs["snippet"] as string)
-                    : undefined;
                 if (!threadId) {
                     return {
                         kind: "escalate",
                         reason: "second-contact ping has no thread id — manual review",
                     };
-                }
-                const slacked = await reply.notifyInternalAPSlack({
-                    from,
-                    subject,
-                    gmailThreadId: threadId,
-                    snippet,
-                });
-                if (!slacked.ok) {
-                    return { kind: "retry", reason: `slack post failed: ${slacked.error}` };
                 }
 
                 // Audit row so the second-contact path is queryable later.
@@ -206,11 +191,10 @@ defineFlow({
                         email_from: from,
                         email_subject: subject,
                         intent: "PAYMENT_INQUIRY_AP_PING",
-                        action_taken: `Vendor pinged again — Slack message posted to AP channel`,
+                        action_taken: `Vendor pinged again — manual AP review required`,
                         metadata: {
                             gmailThreadId: threadId,
                             gmailMessageId: ctx.inputs["gmail_message_id"],
-                            slackTs: slacked.slackTs,
                             reasonCode: "second_contact_ap_ping",
                             sourceInbox: "ap",
                         },
@@ -220,7 +204,6 @@ defineFlow({
                 return {
                     kind: "succeeded",
                     stateUpdate: {
-                        slack_ts: slacked.slackTs,
                         outcome: "second_contact_ap_ping",
                     },
                 };

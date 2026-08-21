@@ -347,6 +347,7 @@ describe("dashboard purchasing route", () => {
             [{ productId: "LABEL-200", quantity: 100, unitPrice: 0.08 }],
             undefined,
             undefined,
+            { skipPreflight: false },
         );
     });
 });

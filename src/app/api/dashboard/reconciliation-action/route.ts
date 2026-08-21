@@ -524,20 +524,8 @@ export async function POST(req: Request) {
                         action_required: true,
                     })
                     .in("id", invoiceIds);
-
-                // Step 4: Also update the invoices table so the queue filter catches them
-                if (invoiceNumbers.length > 0) {
-                    await db
-                        .from("invoices")
-                        .update({
-                            no_po_required: true,
-                            no_po_reason: reason,
-                            no_po_marked_by: markedBy,
-                            no_po_marked_at: now,
-                            action_required: true,
-                        })
-                        .in("invoice_number", invoiceNumbers);
-                }
+                // (Legacy `invoices` is now a read-only view over vendor_invoices —
+                // the Step 3 write is what the queue sees; no separate legacy update.)
             }
 
             // Step 5: Optionally mark vendor profile as requires_po=false
@@ -797,18 +785,8 @@ export async function POST(req: Request) {
                     updated_at: now,
                 })
                 .eq("id", body.invoiceId);
-
-            // Also update the invoices table so the queue picks up the change
-            if (invoice.invoice_number) {
-                await db
-                    .from("invoices")
-                    .update({
-                        po_number: poNumber,
-                        updated_at: now,
-                    })
-                    .eq("invoice_number", invoice.invoice_number)
-                    .eq("vendor_name", invoice.vendor_name);
-            }
+            // (Legacy `invoices` is now a read-only view over vendor_invoices — the
+            // vendor_invoices write above is what the queue sees.)
 
             // Insert an ap_activity_log stub so the queue re-classifies this
             // invoice as matched_unreconciled (no review yet — user will confirm

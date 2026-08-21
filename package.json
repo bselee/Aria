@@ -35,8 +35,6 @@
     "@octokit/rest": "^21.0.0",
     "@openrouter/ai-sdk-provider": "^2.2.5",
     "@ricky0123/vad-react": "^0.0.19",
-    "@slack/bolt": "^4.6.0",
-    "@slack/web-api": "^7.14.1",
     "@supabase/supabase-js": "^2.97.0",
     "@types/node-cron": "^3.0.11",
     "@types/pdfkit": "^0.17.5",

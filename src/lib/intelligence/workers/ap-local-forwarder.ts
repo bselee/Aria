@@ -42,9 +42,15 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
 import {
+    deriveCanonicalVendorName,
+    extractInvoiceNumber,
+    isBundleEmail,
+} from "@/lib/intelligence/ap/vendor-invoice-patterns";
+import {
     FEDEX_CARRIER_BILL_ACTION,
     buildFedExBillComFilename,
     classifyFedExBillingAttachment,
+    extractFedExInvoiceTotal,
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
@@ -86,6 +92,28 @@ function checkVendorRouting(from: string, subject: string, filename: string = ""
 }
 
 /**
+ * Extract a candidate invoice/Pro number from an email subject.
+ * AAA Cooper sends individual invoices as "Invoice Stmt - Cust 0001159492 Pro#: 64058431"
+ * or a bare Pro# "64471555". Other vendors use "Invoice #12345" shapes.
+ * Returns the raw numeric invoice number string, or undefined.
+ * This is the RELIABLE identity for dedup — OCR invoice# is unreliable for LTL
+ * freight (pulls account number "3746570" or "==Start of OCR==", not the Pro#).
+ */
+function extractInvoiceNumberFromSubject(subject: string): string | undefined {
+    // WS-C (2026-08-13): extraction lives in the declarative per-vendor table
+    // (src/lib/intelligence/ap/vendor-invoice-patterns.ts). No sender context
+    // here, so use the generic chain — byte-identical to the historical
+    // subject-only logic (Pro# → bare digits → invoice), AAA Cooper Pro# included.
+    return extractInvoiceNumber("", subject);
+}
+
+/** Derive a normalized vendor name from a From header for DB dedup gating. */
+function deriveVendorName(from: string): string | undefined {
+    // WS-C (2026-08-13): canonical names come from the vendor pattern table.
+    return deriveCanonicalVendorName(from);
+}
+
+/**
  * Check if an email is likely from a non-invoice sender (tracking, marketing).
  * Also catches UPS tracking notifications that slip through vendor-router.
  * HERMIA(2026-07-10): Expanded after Belt Power shipment notices + statements
@@ -96,6 +124,19 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     const subjectLower = subject.toLowerCase();
     // UPS tracking notifications (not UPS Freight invoices)
     if (fromLower.includes("mcinfo@ups.com") && !subjectLower.includes("invoice")) {
+        return true;
+    }
+    // Payment REMINDERS / past-due notices ≠ invoices. A reminder references an
+    // invoice already in Bill.com — it is NOT a new bill to forward.
+    // Pattern: "Invoice - Reminder: Your payment to X is 11 days due"
+    //          "Invoice reminder: ..." / "Payment reminder: ..."
+    // FIX(2026-08-12, t_3d2c50e0): previously these were parsed as INVOICE with
+    // invoice_number="Reminder" (garbage) and archived with total=0. Now they are
+    // classified non-invoice and never queued/archived as real invoices.
+    if (
+        /\breminder\b/i.test(subjectLower) &&
+        (/\b(?:payment|invoice|pay|due|overdue|past\s*due|outstanding)\b/i.test(subjectLower))
+    ) {
         return true;
     }
     // Non-invoice subject classes (belt-and-suspenders with vendor-router skip rules)
@@ -116,13 +157,6 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     if (nonInvoiceSubjects.some((s) => subjectLower.includes(s))) {
         return true;
     }
-    // Belt Power no-reply / AR = ship notices + statements/collections (invoices = remitto@)
-    if (fromLower.includes("no-reply@beltpower.com")) {
-        return true;
-    }
-    if (fromLower.includes("beltpowerar@")) {
-        return true;
-    }
     // Toyota Industries Commercial Finance — paid online
     if (
         fromLower.includes("toyota commercial finance") ||
@@ -131,11 +165,86 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     ) {
         return true;
     }
-    // AAA Cooper Transportation — individual Pro# invoices left for manual review
-    // Subject pattern: "Invoice Stmt - Cust 0001159492 Pro#: 64471684"
-    if (subjectLower.includes("invoice stmt - cust 0001159492 pro#")) {
-        return true;
+    // AAA Cooper Transportation (2026-08-13): forward INDIVIDUAL invoices only.
+    // Their correspondence bundles ("Account 1159492 - BUILDASOIL"), statements,
+    // and reply threads ("RE: Need remittance") bundle the SAME invoices that are
+    // also sent individually — forwarding them creates "Multiple Copies" in
+    // Bill.com. Individual invoices are the "Invoice Stmt - ... Pro#: N" emails
+    // or bare-Pro# subjects. Those stay forwarded; everything else is skipped.
+    if (fromLower.includes("aaacooper")) {
+        const isIndividualInvoice =
+            subjectLower.includes("invoice stmt") ||
+            /^\s*\d{5,10}\s*$/.test(subject.trim());
+        if (!isIndividualInvoice) return true;
     }
+    return false;
+}
+
+/**
+ * One-stop junk classifier for the local forwarder's pre-send gate.
+ *
+ * Exported so the policy is unit-testable (ap-local-forwarder-junk.test.ts)
+ * and reusable by any other AP surface. Superset of the historical
+ * isNonInvoiceSender gate: everything that helper skipped is still skipped,
+ * plus the generic junk classes measured in ap_local_forwards on 2026-08-13
+ * (37 of 106 FORWARDED rows were not invoices):
+ *
+ *   - FedEx Billing Online statement packets — "Your New FedEx Billing Online
+ *     invoice is attached" from noreply@fedex.com. Multi-invoice billing
+ *     packets, NOT a single invoice; must never reach Bill.com.
+ *   - Vendor order acknowledgments — "Acknowledgment for OrderNumber:
+ *     3259787-00 has been created." from BFG Supply (an order ack, not an
+ *     invoice; the existing 'order acknowledgement' classes miss this shape).
+ *   - Due notices — "Notice of Invoice Due ID: 16" from Uline AR (the notice,
+ *     not the invoice PDF; real "Uline Invoice <digits> ID# 16" emails are
+ *     unaffected).
+ *   - Credit memos — "Credit Memo 149505 from Evergreen Growers Supply"
+ *     (negative-value documents are not bills; SKIP new credit-memo forwards).
+ *   - Account-management correspondence — "BUISA1 - URGENT UPDATE REQUIRED"
+ *     from Berger (account mail, not an invoice).
+ *
+ * RE: threads are skipped ONLY via the per-vendor individual-invoice policy
+ * (AAA Cooper: only "Invoice Stmt ..." / bare-Pro# subjects forward). There is
+ * deliberately NO blanket "RE:" rule — an invoice-numbered reply thread
+ * ("RE: Uline Invoice 211897049 ID# 16") still forwards.
+ *
+ * @param args.from    raw Gmail From header ("Name <email@domain.com>")
+ * @param args.subject raw Gmail Subject header
+ * @returns true when the email must NOT be forwarded (skip before send)
+ */
+export function isNonInvoiceEmail(args: { from: string; subject: string }): boolean {
+    const { from, subject } = args;
+    const fromLower = (from || "").toLowerCase();
+    const subjectLower = (subject || "").toLowerCase();
+
+    // Historical gate stays intact — every class it skipped is still skipped.
+    if (isNonInvoiceSender(from, subject)) return true;
+
+    // FedEx Billing Online past-due NOTICES — "FedEx Billing Online -
+    // Invoice(s) Past Due" from BillingOnline@fedex.com. These carry NO
+    // invoice PDF (the notice, not the bill) — skip. The invoice-attached
+    // emails ("Your New FedEx Billing Online invoice is attached" from
+    // noreply@fedex.com) MUST forward: they are the FedEx carrier bills
+    // (full packet, pay-path only via fedex-billing-packet.ts).
+    // REVERSED (2026-08-18, Bill): the 08-13 gate that skipped the whole
+    // channel was wrong — "fedex can not be skipped!". The packet channel
+    // forwards as carrier_bill; only past-due notices stay skipped.
+    if (subjectLower.includes("fedex billing online") && subjectLower.includes("past due")) return true;
+
+    // BFG Supply order acknowledgments: "Acknowledgment for OrderNumber:
+    // 3259787-00 has been created." (also covers British spelling).
+    if (/acknowledgment\s+for\s+order/i.test(subjectLower)) return true;
+
+    // Uline AR due notice (NOT the invoice PDF):
+    // "Notice of Invoice Due ID: 16 C# (9897269)".
+    if (subjectLower.includes("notice of invoice due")) return true;
+
+    // Credit memos — negative-value documents, never forwarded as bills.
+    if (subjectLower.includes("credit memo")) return true;
+
+    // Account-management correspondence: "BUISA1 - URGENT UPDATE REQUIRED".
+    if (subjectLower.includes("urgent update required")) return true;
+
     return false;
 }
 
@@ -322,7 +431,7 @@ async function enrichInvoiceForPoMatch(args: {
         }
     }
 
-    let vendorHint =
+    const vendorHint =
         args.vendorHint ||
         (/ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(args.emailFrom)
             ? "Down to Earth Worms"
@@ -342,6 +451,42 @@ async function enrichInvoiceForPoMatch(args: {
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
         if (m) norm.poNumber = m[1].padStart(5, "0");
+    }
+
+    // ── Finale cross-ref fallback (2026-08-12, t_3d2c50e0 Phase 1.2) ──────
+    // When the PDF body and email subject yield no PO, cross-reference Finale
+    // POs by supplier + date window + amount proximity (same strategy as the
+    // legacy paid-invoice handler). Target: <25% null po_number on new
+    // invoices. Only accept a confident match (Committed/Open, ±10% amount).
+    // Best-effort — never blocks the Bill.com forward path.
+    if (!norm.poNumber && norm.total > 0 && norm.vendorName && norm.vendorName !== "Unknown Vendor") {
+        try {
+            const { FinaleClient } = await import("@/lib/finale/client");
+            const finaleClient = new FinaleClient();
+            const candidates = await finaleClient.findPOByVendorAndDate(
+                norm.vendorName,
+                norm.invoiceDate || new Date().toISOString().split("T")[0],
+                45,
+            );
+            const plausible = candidates.filter((c: any) =>
+                (c.status === "Committed" || c.status === "Open") &&
+                norm.total > 0 &&
+                Math.abs(c.total - norm.total) / norm.total < 0.10,
+            );
+            if (plausible.length > 0) {
+                plausible.sort((a: any, b: any) =>
+                    Math.abs(a.total - norm.total) - Math.abs(b.total - norm.total),
+                );
+                const best = plausible[0];
+                norm.poNumber = best.orderId;
+                console.log(
+                    `   [AP-Local] Finale cross-ref matched PO ${best.orderId} ` +
+                    `(${best.supplier}, $${best.total}) for ${norm.vendorName} invoice $${norm.total}`,
+                );
+            }
+        } catch (finaleErr: any) {
+            console.warn(`   [AP-Local] Finale PO cross-ref failed: ${finaleErr?.message || finaleErr}`);
+        }
     }
 
     // ── WS2 (2026-08-05): bridge invoice tracking → shipments ──
@@ -370,8 +515,13 @@ async function enrichInvoiceForPoMatch(args: {
             `UPDATE ap_local_forwards
              SET ocr_raw_text = COALESCE(?, ocr_raw_text),
                  ocr_processed_at = datetime('now'),
-                 ocr_vendor_name = ?,
-                 ocr_invoice_number = ?,
+                 -- HERMIA(2026-08-18): subject-derived identity wins. OCR of AAA
+                 -- Cooper freight PDFs yields the CUSTOMER/account number
+                 -- ("3746570") instead of the Pro#, and an unconditional write
+                 -- here clobbered the reliable subject Pro# stored at claim
+                 -- time. Only fill vendor/invoice# when the row has none.
+                 ocr_vendor_name = CASE WHEN ocr_vendor_name IS NULL OR ocr_vendor_name = '' THEN ? ELSE ocr_vendor_name END,
+                 ocr_invoice_number = CASE WHEN ocr_invoice_number IS NULL OR ocr_invoice_number = '' THEN ? ELSE ocr_invoice_number END,
                  ocr_total = ?,
                  ocr_freight = ?,
                  ocr_tax = ?,
@@ -1035,10 +1185,14 @@ export async function runReconciliationHandoff(): Promise<{
 /**
  * Mark a Gmail message as processed (remove UNREAD + INBOX, add label).
  * Called after all PDFs in an email have been forwarded to Bill.com.
+ *
+ * NOTE (2026-08-12): removeLabels MUST include "INBOX". Commit eca39c2
+ * dropped it per the 8/10 session preference ("leave forwarded emails in
+ * inbox"), but Bill clarified on 8/12 that only human-review emails (AAA
+ * Cooper routing action) stay in the inbox — normal invoices flow out.
+ * human_review emails bypass this function entirely (label only).
  */
 async function markEmailProcessed(gmail: any, messageId: string): Promise<void> {
-    // Resolve "Invoice Forward" label by name → real Gmail label id.
-    // Passing the human name as labelId throws: Invalid label: Invoice Forward
     try {
         await applyMessageLabelPolicy({
             gmail,
@@ -1119,8 +1273,51 @@ export async function runLocalApForward(): Promise<{
             const from = headers.find((h: any) => h.name === "From")?.value || "unknown";
             const gmailMessageId = msg.id;
 
-            // Skip known non-invoice senders (tracking notifications, etc.)
-            if (isNonInvoiceSender(from, subject)) {
+            // Skip known non-invoice senders / junk classes BEFORE send and
+            // BEFORE vendor routing (tracking notifications, FedEx Billing
+            // Online packets, order acks, credit memos, due notices, ...).
+            // isNonInvoiceEmail is the superset gate: historical
+            // isNonInvoiceSender + junk classes measured 2026-08-13. The AAA
+            // Cooper individual-invoice-only policy (RE: remittance threads,
+            // Account <digits> - bundles) lives inside it — verified 2026-08-13.
+            // Extract PDF or invoice-image attachments BEFORE the junk gate:
+            // a gate-skipped email that still CARRIES PDFs must never be
+            // silently archived (FedEx past-due notices usually have none,
+            // but if one ever does, the invoices go to Bill's review, not
+            // the void).
+            const invoiceAttachments = extractInvoiceAttachments(msgRes.data.payload);
+
+            if (isNonInvoiceEmail({ from, subject })) {
+                const fedexPastDue =
+                    subject.toLowerCase().includes("fedex billing online") &&
+                    subject.toLowerCase().includes("past due");
+                if (fedexPastDue && invoiceAttachments.length > 0) {
+                    // Past-due NOTICE WITH invoice PDFs attached — leave unread
+                    // and labeled so Bill can decide (never silently drop bills).
+                    console.warn(
+                        `   [AP-Local] ⏸️ FedEx past-due WITH ${invoiceAttachments.length} PDF(s) — left unread for review: ${subject.slice(0, 50)}`,
+                    );
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: invoiceAttachments[0]?.filename || "(pdf-attached)",
+                        reason: "fedex past-due notice WITH pdf attachments — left unread for review",
+                        vendorRoutingAction: "human_review",
+                    });
+                    try {
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId,
+                            addLabels: ["Invoice Forward"],
+                            removeLabels: [],
+                        });
+                    } catch (labelErr: any) {
+                        console.warn(`   [AP-Local] Label failed on past-due-with-pdf: ${labelErr?.message}`);
+                    }
+                    summary.skipped++;
+                    continue;
+                }
                 console.log(`   [AP-Local] Skipping non-invoice: ${subject.slice(0, 50)} (${from.slice(0, 25)})`);
                 recordSkippedForward({
                     gmailMessageId,
@@ -1135,9 +1332,6 @@ export async function runLocalApForward(): Promise<{
                 continue;
             }
 
-            // Extract PDF or invoice-image attachments first (filename needed for routing)
-            const invoiceAttachments = extractInvoiceAttachments(msgRes.data.payload);
-
             // ── Vendor routing check (subject + each attachment filename) ──
             // Only three outcomes that matter for forwarding:
             //   'skip'         → mark read, archive (not an invoice)
@@ -1145,6 +1339,10 @@ export async function runLocalApForward(): Promise<{
             //   'dropship'     → forward, but skip PO reconciliation later
             //   null (no rule) → forward + PO matching (default)
             let routingRule = checkVendorRouting(from, subject);
+            // Human-review flag derives from the SENDER/SUBJECT rule — set before
+            // the per-file loop so a statement-PDF skip override doesn't unset it.
+            // Past-due/collections/AAA Cooper: forward, leave UNREAD in inbox.
+            const leaveUnreadForReview = routingRule?.action === "human_review";
             for (const att of invoiceAttachments) {
                 const byFile = checkVendorRouting(from, subject, att.filename);
                 if (byFile?.action === "skip") {
@@ -1166,7 +1364,11 @@ export async function runLocalApForward(): Promise<{
                         reason: routingRule.label,
                         vendorRoutingAction: routingRule.action,
                     });
-                    await markEmailProcessed(gmail, gmailMessageId);
+                    // Human-review email whose ATTACHMENT is a statement/skip class —
+                    // still leave the email unread so Bill sees the past-due notice.
+                    if (!leaveUnreadForReview) {
+                        await markEmailProcessed(gmail, gmailMessageId);
+                    }
                     summary.skipped++;
                     continue;
                 }
@@ -1174,10 +1376,16 @@ export async function runLocalApForward(): Promise<{
                     skipReconciliation = true;
                     console.log(`   [AP-Local] Dropship vendor: ${routingRule.label} — will skip PO matching`);
                 }
+                if (routingRule.action === "human_review") {
+                    console.log(
+                        `   [AP-Local] Human-review vendor: ${routingRule.label} — will forward but leave unread in inbox`,
+                    );
+                }
             }
 
             if (invoiceAttachments.length === 0) {
-                // No invoice attachment — not an invoice. Mark read, archive, skip.
+                // No PDF/image invoice — not an invoice. Mark read, archive, skip.
+                // Human-review (past-due/collections): leave unread so Bill sees it.
                 console.log(`   [AP-Local] No PDF/image invoice — skipping: ${subject.slice(0, 50)}`);
                 recordSkippedForward({
                     gmailMessageId,
@@ -1186,7 +1394,9 @@ export async function runLocalApForward(): Promise<{
                     pdfFilename: "(no-attachment)",
                     reason: "no PDF/image invoice attachment",
                 });
-                await markEmailProcessed(gmail, gmailMessageId);
+                if (!leaveUnreadForReview) {
+                    await markEmailProcessed(gmail, gmailMessageId);
+                }
                 summary.skipped++;
                 continue;
             }
@@ -1262,8 +1472,15 @@ export async function runLocalApForward(): Promise<{
                     );
                 }
 
-                // Dedup: hash / message+file / vendor+inv — log, never re-send
-                if (isDuplicate(gmailMessageId, pdfFilename, pdfHash) || isAlreadyForwarded(gmailMessageId, pdfFilename, pdfHash)) {
+                // Dedup: hash / message+file / vendor+inv — log, never re-send.
+                // Extract invoice# from the SUBJECT (reliable for AAA Cooper Pro#)
+                // and derive vendor name, so the vendor+invoice# DB gate fires.
+                const subjectInvoiceNumber = extractInvoiceNumberFromSubject(subject);
+                const subjectVendorName = deriveVendorName(from);
+                if (
+                    isDuplicate(gmailMessageId, pdfFilename, pdfHash) ||
+                    isAlreadyForwarded(gmailMessageId, pdfFilename, pdfHash, subjectVendorName, subjectInvoiceNumber)
+                ) {
                     console.log(`   [AP-Local] ⏭️ Already logged/forwarded (dedup): ${pdfFilename} (msg ${gmailMessageId})`);
                     summary.skipped++;
                     continue;
@@ -1329,7 +1546,12 @@ export async function runLocalApForward(): Promise<{
                         pdfBuffer,
                         source: "local-forwarder",
                         gmail,
-                        ocrRawText: paidCheck.rawText,
+                        // FedEx packets: rawText is the FULL multi-page packet text
+                        // (up to ~426KB for Ground) — persist only a prefix. The
+                        // invoice#, vendor and totals live in ocr_* columns, not this blob.
+                        ocrRawText: isFedExCarrierBill
+                            ? (paidCheck.rawText || "").slice(0, 60000)
+                            : paidCheck.rawText,
                         vendorRoutingAction: isFedExCarrierBill
                             ? FEDEX_CARRIER_BILL_ACTION
                             : skipReconciliation
@@ -1339,7 +1561,23 @@ export async function runLocalApForward(): Promise<{
                             ? "FedEx"
                             : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
                               ? "Down to Earth Worms"
-                              : undefined,
+                              : subjectVendorName,
+                        // FedEx subjects carry NO invoice number ("Your New FedEx
+                        // Billing Online invoice is attached") — fall back to the
+                        // filename-derived packet number so ocr_invoice_number is
+                        // populated and Layers 4–6 (ocr invoice#, invoice_cache,
+                        // billcom_bills_ref) can dedupe FedEx re-sends. This was
+                        // the blind spot that let the 08-11 backlog re-forward
+                        // invoices Bill.com already had.
+                        invoiceNumber: subjectInvoiceNumber
+                            || (isFedExCarrierBill ? fedexMeta.invoiceNumberDisplay : undefined),
+                        // FedEx packet summary carries "TOTAL THIS INVOICEUSD$X" —
+                        // capture it so the claim stores ocr_total and the weekly
+                        // sweep can amount-check (and the fuzzy dedup layer can
+                        // catch same-invoice re-sends by amount).
+                        invoiceTotal: isFedExCarrierBill
+                            ? extractFedExInvoiceTotal(paidCheck.rawText) ?? undefined
+                            : undefined,
                     });
                     if (once.status === "already_forwarded") {
                         console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);
@@ -1395,9 +1633,27 @@ export async function runLocalApForward(): Promise<{
                 }
             }
 
-            // Mark email as processed only if all PDFs were forwarded
+            // Mark email as processed only if all PDFs were forwarded.
+            // human_review vendors: leave UNREAD + INBOX so Bill verifies the
+            // forward landed in Bill.com before he archives (2026-08-12).
             if (allPdfsForwarded) {
-                await markEmailProcessed(gmail, gmailMessageId);
+                if (leaveUnreadForReview) {
+                    try {
+                        await applyMessageLabelPolicy({
+                            gmail,
+                            gmailMessageId,
+                            addLabels: ["Invoice Forward"],
+                            removeLabels: [],
+                        });
+                        console.log(`   [AP-Local] 🧍 Left unread in inbox for review: ${subject.slice(0, 50)}`);
+                    } catch (labelErr: any) {
+                        console.warn(
+                            `   [AP-Local] Failed to label human-review email ${gmailMessageId}: ${labelErr.message}`,
+                        );
+                    }
+                } else {
+                    await markEmailProcessed(gmail, gmailMessageId);
+                }
             }
         } catch (e: any) {
             console.error(`   [AP-Local] Error processing email ${msg.id}:`, e.message);

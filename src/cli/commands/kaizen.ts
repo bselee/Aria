@@ -93,7 +93,7 @@ const voiceCommand: BotCommand = {
             // Get the system prompt for voice content generation
             const SYSTEM_PROMPT = `You're the operations assistant for BuildASoil.`;
 
-            let textToSpeak = await unifiedTextGeneration({
+            const textToSpeak = await unifiedTextGeneration({
                 system: SYSTEM_PROMPT + "\n\nLimit your response to a single, clever sentence under 25 words for a voice greeting.",
                 prompt: "Say something witty and operational to Will to start the day."
             });

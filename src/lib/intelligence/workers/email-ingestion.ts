@@ -1,6 +1,7 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../db";
+import { getLocalDb } from "../../storage/local-db";
 import { isObviousPromotionalEmail } from "../promotional-email";
 
 /**
@@ -76,6 +77,26 @@ export class EmailIngestionWorker {
 
             const existingIds = new Set(existing?.map(e => e.gmail_message_id) || []);
             const newMessages = messages.filter(m => !existingIds.has(m.id!));
+
+            // Guard (2026-08-12): skip anything the LOCAL forwarder already handled.
+            // The local forwarder (ap-local-forwarder.ts) forwards invoices and may
+            // deliberately leave them UNREAD in the inbox (AAA Cooper human-review
+            // path). If this ingestion worker re-queues those, the old identifier
+            // pipeline archives them (INBOX+UNREAD removal) — silently undoing the
+            // "leave unread for Bill to verify" behavior. ap_local_forwards is the
+            // canonical log of what the local forwarder touched.
+            try {
+                const ldb = getLocalDb();
+                const handled = new Set(
+                    (ldb.prepare(
+                        `SELECT DISTINCT gmail_message_id FROM ap_local_forwards
+                         WHERE gmail_message_id IS NOT NULL AND status IN ('FORWARDED','SKIPPED')`
+                    ).all() as Array<{ gmail_message_id: string }>).map(r => r.gmail_message_id),
+                );
+                newMessages.splice(0, newMessages.length, ...newMessages.filter(m => !handled.has(m.id!)));
+            } catch (e: any) {
+                console.warn(`   [EmailIngestionWorker] ap_local_forwards guard unavailable: ${e.message}`);
+            }
 
             if (newMessages.length === 0) return;
 

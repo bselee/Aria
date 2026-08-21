@@ -377,7 +377,7 @@ function formatTelegramReport(result: LeadTimeTrackerResult): string | null {
     const lines: string[] = [];
 
     if (result.autoUpdates.length > 0) {
-        lines.push('🔄 Lead Time Auto-Updates');
+        lines.push('Lead Time Auto-Updates');
         for (const u of result.autoUpdates) {
             lines.push(`  ${u.vendorName}: ${u.oldOverride}d → ${u.newOverride}d (observed P90: ${u.observedP90}d, ${u.reason})`);
         }
@@ -385,7 +385,7 @@ function formatTelegramReport(result: LeadTimeTrackerResult): string | null {
 
     if (result.driftAlerts.length > 0) {
         lines.push(result.autoUpdates.length > 0 ? '' : '');
-        lines.push('⚠️ Lead Time Drift Alerts');
+        lines.push('Lead Time Drift Alerts');
         for (const d of result.driftAlerts) {
             const direction = d.observedP90 > (d.currentOverride ?? 0) ? '↑ slower' : '↓ faster';
             lines.push(`  ${d.vendorName}: override=${d.currentOverride}d, observed P90=${d.observedP90}d (${d.driftPct}% ${direction}, n=${d.sampleCount})`);
@@ -394,7 +394,7 @@ function formatTelegramReport(result: LeadTimeTrackerResult): string | null {
 
     if (result.basCrossValidations.length > 0) {
         lines.push('');
-        lines.push('📊 BAS vs Finale Lead Time Mismatches');
+        lines.push('BAS vs Finale Lead Time Mismatches');
         for (const v of result.basCrossValidations) {
             lines.push(`  ${v.vendorName}: BAS declares ${v.basDeclaredDays}d, Finale observed P50=${v.finaleObservedP50}d/P90=${v.finaleObservedP90}d (${v.driftPct}% drift, n=${v.sampleCount})`);
         }

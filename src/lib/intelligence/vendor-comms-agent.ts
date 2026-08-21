@@ -20,7 +20,7 @@ export interface VendorCommContext {
     sentAt: Date;
     hasTracking: boolean;
     trackingQuality: 'clear' | 'unclear' | 'none';
-    responseType: 'thank_you' | 'clarify' | 'follow_up_l1' | 'follow_up_l2' | 'escalate' | 'none';
+    responseType: 'thank_you' | 'clarify' | 'follow_up_l1' | 'follow_up_l2' | 'escalate' | 'ship_status' | 'none';
     // HERMIA(2026-05-28): PO context for enriched follow-up drafts
     poTotalAmount?: number;
     itemCount?: number;
@@ -151,6 +151,34 @@ export class VendorCommsAgent {
     }
 
     /**
+     * Draft a ship-status request for an ACKNOWLEDGED PO that has gone quiet:
+     * vendor confirmed the order but no tracking has arrived. Mirrors the
+     * manual email Bill sent for PO 125172 (2026-08-20): has this shipped?
+     * carrier + tracking please. DRAFT ONLY — never auto-sends.
+     */
+    async draftShipStatusRequest(context: VendorCommContext): Promise<{ draftId: string | null }> {
+        const body = this.getShipStatusBody(context);
+        const rawEmail = buildFollowUpEmail({
+            to: context.vendorEmail,
+            subject: `Re: ${context.subject}`,
+            inReplyTo: context.messageId,
+            references: context.messageId,
+            body,
+        });
+        const res = await this.gmail.users.drafts.create({
+            userId: 'me',
+            requestBody: {
+                message: {
+                    raw: Buffer.from(rawEmail).toString('base64url'),
+                    threadId: context.threadId,
+                },
+            },
+        });
+        console.log(`[vendor-comms] Drafted ship-status request to ${context.vendorEmail} for PO #${context.poNumber} — draftId: ${res.data.id}`);
+        return { draftId: res.data.id ?? null };
+    }
+
+    /**
      * Send a follow-up email (L1 or L2 based on count).
      */
     async sendFollowUp(context: VendorCommContext, followUpCount: number): Promise<void> {
@@ -231,6 +259,21 @@ export class VendorCommsAgent {
     }
 
     /**
+     * Ship-status request bodies for acknowledged-but-silent POs. Voice:
+     * Bill's own 2026-08-20 message to Novelty — short, no branding, no
+     * footer, ≤45 words, asks only for shipped/carrier/tracking.
+     */
+    private getShipStatusBody(context: VendorCommContext): string {
+        const { poNumber, vendorName } = context;
+        const templates = [
+            `Hi ${vendorName},\n\nCould you please let me know if this order (PO #${poNumber}) has shipped? If it has, please provide the carrier and tracking information.\n\nThanks!`,
+            `Hi ${vendorName},\n\nChecking on PO #${poNumber}: has it shipped yet? If so, could you send the carrier and tracking number?\n\nThanks!`,
+            `Hi ${vendorName},\n\nQuick check on PO #${poNumber}: has it shipped? Please share carrier and tracking when available.\n\nThanks!`,
+        ];
+        return templates[Math.floor(Math.random() * templates.length)];
+    }
+
+    /**
      * Build an enriched follow-up body including PO context when available.
      * HERMIA(2026-05-28): Previously templates contained only PO # + date.
      * Now includes total amount, item count, expected date, and line items
@@ -264,22 +307,30 @@ export class VendorCommsAgent {
             detailsBlock = '\n\nPO Details:\n' + lines.join('\n');
         }
 
+        // L1 is a bare, casual receipt check per Bill's 2026-08-20 spec
+        // ("Hey, making sure you received this"). No PO details block here —
+        // it reads like a spec sheet, not Bill, and blows the <=45-word budget.
         const L1_TEMPLATES = [
-            `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}.${detailsBlock}\n\nDo you have an expected ship date or tracking number?\n\nThanks!`,
-            `Hi,\n\nChecking in on PO #${poNumber} from ${sentDateStr}.${detailsBlock}\n\nAny update on tracking or an ETA?\n\nThanks!`,
-            `Hi,\n\nJust following up on PO #${poNumber} sent ${sentDateStr}.${detailsBlock}\n\nCould you share tracking or a ship date?\n\nThanks!`,
+            `Hi,\n\nJust making sure you received PO #${poNumber} sent ${sentDateStr}.\n\nCould you confirm receipt when you get a chance?\n\nThanks!`,
+            `Hi,\n\nQuick check: did PO #${poNumber} from ${sentDateStr} come through OK?\n\nThanks!`,
+            `Hi,\n\nMaking sure PO #${poNumber} made it to you.\n\nCan you confirm receipt?\n\nThanks!`,
         ];
 
+        // L2 is the "request tracking" stage from Bill's spec — same voice as
+        // the ship-status templates (modeled on his real 125172 email): ask
+        // has it shipped / carrier + tracking, bare, no details block.
         const L2_TEMPLATES = [
-            `Hi,\n\nFollowing up again on PO #${poNumber} sent ${sentDateStr}.${detailsBlock}\n\nWe need tracking or a ship date to plan receiving. Any update?\n\nThanks!`,
-            `Hi,\n\nHaven't heard back on PO #${poNumber} from ${sentDateStr}.${detailsBlock}\n\nCan you confirm the status?\n\nThanks!`,
+            `Hi,\n\nFollowing up on PO #${poNumber} sent ${sentDateStr}. Has it shipped? Please send the carrier and tracking.\n\nThanks!`,
+            `Hi,\n\nHaven't heard back on PO #${poNumber} from ${sentDateStr}. Has it shipped? If so, send the carrier and tracking number.\n\nThanks!`,
         ];
 
         // HERMIA(2026-05-28): L3 templates for 15+ day unresponsive vendors.
-        // Firmer tone, mentions reorder risk and alternate sourcing.
+        // Firmer tone, mentions reorder risk and alternate sourcing. Close with
+        // "Thanks!" like every other touchpoint — Gmail adds Bill's signature,
+        // so no company sign-off in the body.
         const L3_TEMPLATES = [
-            `Hi,\n\nThis is our third follow-up on PO #${poNumber} sent ${sentDateStr} — now ${Math.floor((Date.now() - new Date(sentDateStr).getTime()) / 86400000)} days ago.${detailsBlock}\n\nWe have not received tracking or a ship date. This is now impacting our reorder planning.\n\nPlease confirm the order status today. If the order cannot be fulfilled, we will need to source from an alternate vendor.\n\nRegards,\nBuildASoil Purchasing`,
-            `Hi,\n\nWe've followed up twice on PO #${poNumber} from ${sentDateStr} with no response.${detailsBlock}\n\nWithout tracking or a status update, we're unable to plan our receiving schedule and may need to cancel and reorder elsewhere.\n\nCan you please respond with tracking or a ship date today?\n\nRegards,\nBuildASoil Purchasing`,
+            `Hi,\n\nThis is our third follow-up on PO #${poNumber} sent ${sentDateStr}, now ${Math.floor((Date.now() - new Date(sentDateStr).getTime()) / 86400000)} days ago.${detailsBlock}\n\nWe have not received tracking or a ship date. This is now impacting our reorder planning.\n\nPlease confirm the order status today. If the order cannot be fulfilled, we will need to source from an alternate vendor.\n\nThanks!`,
+            `Hi,\n\nWe've followed up twice on PO #${poNumber} from ${sentDateStr} with no response.${detailsBlock}\n\nWithout tracking or a status update, we're unable to plan our receiving schedule and may need to cancel and reorder elsewhere.\n\nCan you please respond with tracking or a ship date today?\n\nThanks!`,
         ];
 
         if (count >= 3) {

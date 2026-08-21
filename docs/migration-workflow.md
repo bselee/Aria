@@ -10,8 +10,8 @@
 | `build_completions` | Completed MFG builds tracked from Finale → Calendar sync |
 | `build_risk_snapshots` | Daily BOM risk analysis snapshots per build |
 | `invoices` | Parsed invoice data from AP inbox (PDF extraction results) |
-| `outside_thread_alerts` | Slack thread alerts for @mentions outside monitored channels |
-| `proactive_alerts` | Proactive Telegram/Slack alerts triggered by agent intelligence |
+| `outside_thread_alerts` | Thread alerts for @mentions outside monitored channels (legacy) |
+| `proactive_alerts` | Proactive Telegram alerts triggered by agent intelligence |
 | `purchase_orders` | Synced PO data from Finale for dashboard/reconciliation |
 | `purchasing_calendar_events` | PO → Google Calendar event mapping for sync dedup |
 | `sys_chat_logs` | Dashboard chat conversation history |

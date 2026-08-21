@@ -61,9 +61,9 @@ export class BoxAgent {
     }
 
     /**
-     * Analyzes a Slack message to extract physical count claims and compares them to Finale.
+     * Analyzes a message to extract physical count claims and compares them to Finale.
      */
-    async analyzeSlackMessage(text: string): Promise<string | null> {
+    async analyzeMessage(text: string): Promise<string | null> {
         const analysis = await unifiedObjectGeneration({
             system: `You are the Box Agent. Your job is to extract inventory physical counts of shipping/corrugated boxes from text messages. 
 Identify the size requested and the physical count claimed by the user on the floor.`,

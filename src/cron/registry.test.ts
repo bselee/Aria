@@ -36,6 +36,16 @@ describe("cron registry", () => {
         expect(names).toEqual(["a", "b"]);
     });
 
+    it("accepts multiple cron expressions on one job", () => {
+        defineJob({
+            name: "multi",
+            schedule: ["30 7 * * *", "0 12,17 * * *"],
+            handler: async () => {},
+        });
+        const job = getJob("multi")!;
+        expect(job.schedule).toEqual(["30 7 * * *", "0 12,17 * * *"]);
+    });
+
     it("defaults concurrency to 1, enabled to true, tz to America/Denver", () => {
         defineJob({ name: "defaults", schedule: "* * * * *", handler: async () => {} });
         const job = getJob("defaults")!;

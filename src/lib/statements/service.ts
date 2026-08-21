@@ -433,7 +433,7 @@ export async function fetchArchivedInvoices(intake: StatementIntakeRecord): Prom
         return d.toISOString().split("T")[0];
     })();
 
-    let query = supabase
+    const query = supabase
         .from("vendor_invoices")
         .select("id, vendor_name, invoice_number, invoice_date, po_number, total")
         .ilike("vendor_name", `%${canonical}%`)

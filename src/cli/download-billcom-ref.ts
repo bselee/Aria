@@ -259,7 +259,7 @@ export async function main(): Promise<void> {
   console.log(`[billcom-dl] Starting Bill.com CSV download${headed ? " (headed mode)" : ""}...`);
 
   let context: BrowserContext;
-  let needsCleanup = false;
+  const needsCleanup = false;
 
   // Strategy 1: Persistent profile (survives MFA/SSO across runs)
   if (fs.existsSync(PROFILE_DIR)) {

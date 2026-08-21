@@ -223,11 +223,15 @@ async function main() {
         if (newRequests.length > 20) message += `...and ${newRequests.length - 20} more\n`;
     }
 
-    try {
-        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'HTML', disable_web_page_preview: true });
-        console.log('  ✅ Telegram sent');
-    } catch (err: any) {
-        console.error('  ❌ Telegram failed:', err.message);
+    if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') {
+        console.log('  ⏹️ Telegram disabled — assessment summary not sent.');
+    } else {
+        try {
+            await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'HTML', disable_web_page_preview: true });
+            console.log('  ✅ Telegram sent');
+        } catch (err: any) {
+            console.error('  ❌ Telegram failed:', err.message);
+        }
     }
 
     console.log('✅ Pipeline complete');

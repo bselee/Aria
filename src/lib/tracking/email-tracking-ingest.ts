@@ -2,7 +2,7 @@
  * @file    src/lib/tracking/email-tracking-ingest.ts
  * @purpose Scans Gmail (both main + AP inbox) for vendor shipping confirmations,
  *          extracts tracking numbers + PO numbers, detects carrier, and upserts
- *          to the shipments table so the dashboard, carrier-poll, and Slack
+ *          to the shipments table so the dashboard and carrier-poll can
  *          detector can all surface tracking status.
  *
  *          Solves the "manual tracking insert" workflow: vendor emails a tracking
@@ -373,6 +373,27 @@ async function processMessage(
                 );
 
                 if (inferredPO) {
+                    // Per-PO cap: don't let a single PO accumulate a magnet
+                    // of inferred-only shipments. After 10 inferred links,
+                    // store tracking numbers unlinked so they don't poison
+                    // the PO's shipment count. (P0 fix: PO 125178 / 567 rows)
+                    const { data: capData } = await db
+                        .from("shipments")
+                        .select("id")
+                        .overlap("po_numbers", [inferredPO])
+                        .eq("last_source", "email_ingest_inferred");
+                    const inferredCount = (capData || []).length;
+
+                    if (inferredCount >= 10) {
+                        console.log(
+                            `[email-tracking-ingest] Skipping inferred PO #${inferredPO} — ` +
+                            `already has ${inferredCount} inferred shipments (cap=10)`,
+                        );
+                        inferredPO = null;
+                    }
+                }
+
+                if (inferredPO) {
                     console.log(
                         `[email-tracking-ingest] Inferred PO #${inferredPO} for tracking ` +
                         `(no explicit PO in email/PDF text)`,
@@ -497,7 +518,7 @@ async function extractPdfAttachmentText(
 
     let pdfParse: any;
     try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
+         
         pdfParse = (await import("pdf-parse")).default || (await import("pdf-parse"));
     } catch {
         console.warn("[email-tracking-ingest] pdf-parse unavailable — skipping PDF OCR");
@@ -624,7 +645,7 @@ function htmlToPlainText(html: string): string {
 
 /**
  * Extract PO numbers from text. Reuses the same patterns as
- * po-correlator / Slack request-detector. Handles:
+ * po-correlator. Handles:
  *   "PO #124833", "PO-124833", "PO 124833", "order 124833",
  *   "71473626-1124833" (Finale vendor-ref format)
  */
@@ -713,7 +734,8 @@ function extractNumericHints(text: string): string[] {
  * 1. Direct numeric-hint match against po_number (returns immediately if
  *    exactly one candidate matches).
  * 2. Vendor-name token overlap: full vendor name substring match scores +10,
- *    individual token matches score +1 each.
+ *    individual token matches score +1 each. Minimum score floor is 2
+ *    (a single weak 3-char token match is not evidence).
  * 3. Tie-breaking: excludes dropship POs when there is ambiguity.
  *
  * @exportedForTesting — exported so unit tests can exercise the pure
@@ -751,7 +773,7 @@ export function inferPONumberFromRecentPOs(
             const tokenMatches = tokens.filter((token) => normalizedCombined.includes(token)).length;
             return { po, score: (fullMatch ? 10 : 0) + tokenMatches };
         })
-        .filter((entry) => entry.score > 0)
+        .filter((entry) => entry.score >= 2)  // floor: full vendor (>= 10) or 2+ tokens
         .sort((a, b) => b.score - a.score);
 
     if (!scored.length) return null;

@@ -29,7 +29,6 @@
  *   │
  *   ├── Domain: Communications
  *   │   └── CommsMasterAgent — "I own vendor + team messages"
- *   │       ├── SlackWatchdog — detect requests, 👀 react
  *   │       ├── EmailAcknowledger — auto-reply to vendors
  *   │       └── VendorComms — PO follow-up drafting
  *   │
@@ -129,8 +128,7 @@ const AGENT_REGISTRY: AgentRegistration[] = [
     { domain: "purchasing", name: "purchasing-followup", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "PO acknowledgment tracking + vendor nudges" },
 
     // Communications
-    { domain: "communications", name: "comms-master", role: "master", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Owns Slack + email + vendor comms" },
-    { domain: "communications", name: "slack-watchdog", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Slack monitoring + 👀 reactions" },
+    { domain: "communications", name: "comms-master", role: "master", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Owns email + vendor comms" },
     { domain: "communications", name: "email-ack", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Vendor email auto-acknowledgment" },
     { domain: "communications", name: "vendor-comms", role: "worker", status: "starting", lastHeartbeat: "", pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "PO follow-up email drafting" },
 
@@ -146,6 +144,71 @@ const AGENT_REGISTRY: AgentRegistration[] = [
     { domain: "operations", name: "supervisor", role: "worker", status: "healthy", lastHeartbeat: new Date().toISOString(), pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Error triage + escalation (deterministic)" },
     { domain: "operations", name: "budget-tracker", role: "worker", status: "healthy", lastHeartbeat: new Date().toISOString(), pendingTasks: 0, errorCount: 0, registeredAt: new Date().toISOString(), notes: "Per-agent LLM spend tracking" },
 ];
+
+// ── Command Board Hierarchy (derived) ──────────────────────────────────────
+//
+// The dashboard Command Board derives its rendered agent tree from
+// AGENT_REGISTRY so the runtime truth and the UI can never drift apart.
+// The return type is declared locally (structurally a subset of the
+// command-board CommandBoardAgent shape) rather than imported, keeping this
+// runtime module free of a dashboard dependency.
+
+export interface CommandBoardHierarchyNode {
+    id: string;
+    label: string;
+    reportsTo: string | null;
+    process: string[];
+    skills: string[];
+    workflows: string[];
+}
+
+const MASTER_LABELS: Record<string, string> = {
+    "ap-master": "AP Master",
+    "purchasing-master": "Purchasing Master",
+    "comms-master": "Comms Master",
+    "tracking-master": "Tracking Master",
+    "ops-master": "Ops Master",
+};
+
+/** "ap-ingestor" → "AP Ingestor", "carrier-poller" → "Carrier Poller". */
+function humanizeAgentName(name: string): string {
+    return name
+        .split("-")
+        .map(part => (part === "ap" ? "AP" : part.charAt(0).toUpperCase() + part.slice(1)))
+        .join(" ");
+}
+
+/**
+ * Map AGENT_REGISTRY to the Command Board hierarchy:
+ *   will (root) → hermia → {5 domain masters} → workers.
+ * Every aria agent runs in the "aria-bot" process host. Pure function —
+ * no I/O, no side effects.
+ */
+export function buildCommandBoardHierarchy(): CommandBoardHierarchyNode[] {
+    const masterByDomain = new Map<AgentDomain, string>();
+    for (const agent of AGENT_REGISTRY) {
+        if (agent.role === "master") masterByDomain.set(agent.domain, agent.name);
+    }
+
+    const nodes: CommandBoardHierarchyNode[] = [
+        { id: "will", label: "Will", reportsTo: null, process: [], skills: [], workflows: [] },
+        { id: "hermia", label: "Hermia", reportsTo: "will", process: ["aria-bot"], skills: [], workflows: [] },
+    ];
+
+    for (const agent of AGENT_REGISTRY) {
+        const isMaster = agent.role === "master";
+        nodes.push({
+            id: agent.name,
+            label: isMaster ? MASTER_LABELS[agent.name] ?? humanizeAgentName(agent.name) : humanizeAgentName(agent.name),
+            reportsTo: isMaster ? "hermia" : masterByDomain.get(agent.domain) ?? "hermia",
+            process: ["aria-bot"],
+            skills: [],
+            workflows: [],
+        });
+    }
+
+    return nodes;
+}
 
 // ── Orchestrator ────────────────────────────────────────────────────────────
 
@@ -334,8 +397,6 @@ export class HermesOrchestrator {
             "drop-detector": ["tracking-master", "ops-master"],
             "pattern-miner": ["ops-master", "cognitive-round"],
             "proactive-brief": ["ops-master", "comms-master"],
-            "daily-slack-review": ["slack-watchdog", "comms-master"],
-            "slack-detector-heartbeat": ["slack-watchdog", "ops-master"],
             "system-heartbeat": ["ops-master"],
             "monday-briefing": ["ops-master", "comms-master"],
             "aria-bot-startup": ["ops-master", "cron-scheduler"],

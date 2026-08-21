@@ -248,3 +248,85 @@ describe("3-way match — defaults", () => {
         expect(DEFAULT_TOLERANCES.qtyAbsUnits).toBe(1);
     });
 });
+
+describe("3-way match — acceptance: real receipt quantities catch the faked-data bug", () => {
+    it("BLOCKS when invoice bills 100 but only 60 arrived (real receivedQty=60)", () => {
+        // This is the scenario the old code NEVER caught because it set
+        // receivedQty = poQty when hasReceipt was true.
+        const r = evaluateThreeWayMatch(input([cleanLine({ receivedQty: 60 })]));
+        expect(r.verdict).toBe("exception");
+        expect(r.canApprove).toBe(false);
+        const d = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(d?.blocking).toBe(true);
+        expect(d?.dollarImpact).toBe(400); // 40 units x $10
+    });
+
+    it("flags short shipment as non-blocking variance when invoice bills only what arrived", () => {
+        // 60 of 100 arrived, vendor correctly billed only 60.
+        // Payment for received goods should proceed; shortfall is informational.
+        const r = evaluateThreeWayMatch(
+            input([cleanLine({ receivedQty: 60, invoiceQty: 60 })]),
+        );
+        expect(r.verdict).toBe("variance");
+        expect(r.canApprove).toBe(false); // surfaced for review, not auto-approved
+        const short = r.discrepancies.find((x) => x.kind === "qty_short_received");
+        expect(short?.blocking).toBe(false);
+        expect(short?.message).toContain("short 40");
+    });
+
+    it("treats null receivedQty as zero received (over-bill detected)", () => {
+        // When receipt data is unavailable (receivedQty = null), the module
+        // treats it as zero. Invoice of 100 against zero received = over-bill.
+        const r = evaluateThreeWayMatch(input([cleanLine({ receivedQty: null })]));
+        expect(r.verdict).toBe("exception");
+        expect(r.canApprove).toBe(false);
+        const d = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(d?.blocking).toBe(true);
+    });
+
+    it("BLOCKS over-billing through case-normalized quantity (pack multiplier)", () => {
+        // PO: 120 EA @ $10.00. Received: 60 EA.
+        // Invoice: 10 cases @ $120/case, 12 per case = 120 EA.
+        // 120 billed vs 60 received = 60-unit overbill. $10/EA × 60 = $600.
+        const r = evaluateThreeWayMatch(
+            input([
+                cleanLine({
+                    poQty: 120,
+                    receivedQty: 60,
+                    invoiceQty: 10,
+                    invoiceUnitPrice: 120.0,
+                    packMultiplier: 12,
+                }),
+            ]),
+        );
+        expect(r.verdict).toBe("exception");
+        expect(r.canApprove).toBe(false);
+        const d = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(d?.blocking).toBe(true);
+        expect(d?.dollarImpact).toBe(600); // 60 EA × $10
+    });
+
+    it("flags short shipment as non-blocking when invoice and receipt match in base units (pack multiplier)", () => {
+        // PO: 120 EA @ $10.00. Received: 60 EA.
+        // Invoice: 5 cases @ $120/case, 12 per case = 60 EA (correctly billed).
+        // No over-bill; shortfall of 60 EA surfaced as informational variance.
+        const r = evaluateThreeWayMatch(
+            input([
+                cleanLine({
+                    poQty: 120,
+                    receivedQty: 60,
+                    invoiceQty: 5,
+                    invoiceUnitPrice: 120.0,
+                    packMultiplier: 12,
+                }),
+            ]),
+        );
+        expect(r.verdict).toBe("variance");
+        expect(r.canApprove).toBe(false);
+        const overBill = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(overBill).toBeUndefined(); // invoice matches receipt in base units
+        const short = r.discrepancies.find((x) => x.kind === "qty_short_received");
+        expect(short?.blocking).toBe(false);
+        expect(short?.message).toContain("short 60");
+    });
+});

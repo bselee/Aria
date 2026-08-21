@@ -77,7 +77,7 @@ export interface BuildRiskReport {
     okCount: number;
     totalComponents: number;
     daysOut: number;
-    slackMessage: string;
+    textReport: string;
     telegramMessage: string;
 }
 
@@ -460,7 +460,7 @@ export async function runBuildRiskAnalysis(
     // FG-traceback fallback when stockoutDays is null.
     //
     // Coverage info is also stored on the component (coverageDays) so the
-    // Telegram/Slack reports and the cron handler can display human-readable
+    // report formatters and the cron handler can display human-readable
     // context without redoing the math.
     const JIT_BUFFER_DAYS = 14;
     let jitTriggers = 0;
@@ -518,7 +518,7 @@ export async function runBuildRiskAnalysis(
     }
     log(`🔔 JIT order-trigger dates computed: ${jitTriggers}/${demandEntries.length} components.`);
 
-    const slackMessage = formatSlackReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
+    const textReport = formatTextReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
     const telegramMessage = formatTelegramReport(builds, componentDemandTracker, unrecognizedSkus, daysOut, fgVelocity);
 
     return {
@@ -532,7 +532,7 @@ export async function runBuildRiskAnalysis(
         okCount,
         totalComponents: demandEntries.length,
         daysOut,
-        slackMessage,
+        textReport,
         telegramMessage,
     };
 }
@@ -541,7 +541,7 @@ export async function runBuildRiskAnalysis(
 // FORMATTERS
 // ──────────────────────────────────────────────────
 
-function formatSlackReport(
+function formatTextReport(
     builds: ParsedBuild[],
     components: Map<string, ComponentDemand>,
     unrecognizedSkus: UnrecognizedSku[],
@@ -767,7 +767,7 @@ function emptyReport(daysOut: number): BuildRiskReport {
         okCount: 0,
         totalComponents: 0,
         daysOut,
-        slackMessage: '✅ No builds scheduled.',
+        textReport: '✅ No builds scheduled.',
         telegramMessage: '✅ No builds scheduled.',
     };
 }

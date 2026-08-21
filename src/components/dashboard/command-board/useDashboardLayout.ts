@@ -35,6 +35,7 @@ export const ALL_PANEL_IDS = [
         "daily-ops-summary",
         "po-lifecycle",
         "basauto-requests",
+        "basauto-recon",
         "dedup-activity",
         "reconciliation",
         "deposit-match",
@@ -75,6 +76,11 @@ export const DEFAULT_LAYOUT: DashboardLayout = {
     // HERMIA(2026-07-28): Lean default for legacy 4-col wall rollback only.
     // Command board home is Lifecycle (Order/Active/Receivings). These panels
     // are the actionable core; status wallpaper is not auto-mounted.
+    // HERMIA(2026-08-21): basauto-recon deliberately NOT added here. This
+    // DEFAULT_LAYOUT only drives the legacy 4-col wall (rollback path); the live
+    // surface is CommandBoardShell's Lifecycle tab, whose panes are hardcoded.
+    // Adding it here looked like it shipped but rendered nowhere. The recon
+    // numbers surface on the Ordering row instead (basauto-recon-lookup.ts).
     left: ["receivings"],
     midLeft: ["invoice-queue", "active-purchases"],
     midRight: ["purchasing"],

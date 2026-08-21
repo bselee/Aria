@@ -51,7 +51,7 @@ function parseArgs() {
 async function sendExpiryAlert() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (botToken && chatId) {
+  if (botToken && chatId && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
     try {
       const { Telegraf } = await import('telegraf');
       const bot = new Telegraf(botToken);

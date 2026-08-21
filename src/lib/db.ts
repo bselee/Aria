@@ -368,6 +368,29 @@ class QueryBuilder {
     }
   }
 
+  /** Promise-compatible catch() — routes rejection through then(). */
+  catch<T = any>(
+    onrejected?: (reason: any) => any
+  ): Promise<{ data: T | null; error: any }> {
+    return this.then<T>(undefined, onrejected);
+  }
+
+  /** Promise-compatible finally() — runs regardless of settlement. */
+  finally<T = any>(
+    onfinally?: () => void
+  ): Promise<{ data: T | null; error: any }> {
+    return this.then<T>(
+      (v) => {
+        onfinally?.();
+        return v;
+      },
+      (e) => {
+        onfinally?.();
+        throw e;
+      }
+    );
+  }
+
   private async execute<T>(): Promise<{ data: T | null; error: any }> {
     const pgrstUrl = getPgrstUrl();
     if (!pgrstUrl) {
@@ -375,7 +398,7 @@ class QueryBuilder {
     }
 
     // Clean URL — remove /rest/v1/ if present, ensure no double slashes
-    let base = pgrstUrl.replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
+    const base = pgrstUrl.replace(/\/rest\/v1\/?$/, "").replace(/\/+$/, "");
     const url = new URL(`${base}/${this.table}`);
 
     const headers: Record<string, string> = {
@@ -577,6 +600,29 @@ class RpcBuilder {
       if (reject) return reject(err);
       throw err;
     }
+  }
+
+  /** Promise-compatible catch() — routes rejection through then(). */
+  catch<T = any>(
+    onrejected?: (reason: any) => any
+  ): Promise<{ data: T | null; error: any }> {
+    return this.then<T>(undefined, onrejected);
+  }
+
+  /** Promise-compatible finally() — runs regardless of settlement. */
+  finally<T = any>(
+    onfinally?: () => void
+  ): Promise<{ data: T | null; error: any }> {
+    return this.then<T>(
+      (v) => {
+        onfinally?.();
+        return v;
+      },
+      (e) => {
+        onfinally?.();
+        throw e;
+      }
+    );
   }
 
   private async execute<T>(): Promise<{ data: T | null; error: any }> {

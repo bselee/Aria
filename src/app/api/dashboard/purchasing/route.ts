@@ -13,6 +13,7 @@ import {
     mergeOpenPOsWithRecentCoverage,
 } from '@/lib/purchasing/ordering-po-coverage';
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
+import { readReconBadges } from '@/lib/purchasing/basauto-recon-lookup';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -201,12 +202,17 @@ export async function GET(req: NextRequest) {
     let recentPOs: any[] = [];
     try {
         recentPOs = await client.getRecentPurchaseOrders(180, 500);
+        (globalThis as any).__aria_recent_pos = { at: Date.now(), pos: recentPOs };
     } catch (err: any) {
         console.error('[purchasing/route] Failed to fetch recent purchase orders:', err.message);
     }
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+    // Third-opinion join: basauto's own reorder recommendation, read once per
+    // request from data/basauto-recon.json. Empty map when the report is
+    // missing — rows then degrade to the previous Finale→Aria display.
+    const reconBadges = readReconBadges();
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -328,6 +334,7 @@ export async function GET(req: NextRequest) {
                 commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
                 urgency: displayUrgency,
+                basautoRecon: reconBadges.get(productId.toUpperCase()),
             };
         });
 
@@ -386,7 +393,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
-        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp } = await req.json();
+        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp, skipPreflight } = await req.json();
 
         if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
             return NextResponse.json(
@@ -457,7 +464,12 @@ export async function POST(req: NextRequest) {
 
         let recentPOs: any[] = [];
         try {
-            recentPOs = await client.getRecentPurchaseOrders(45, 500);
+            const cached = (globalThis as any).__aria_recent_pos as { at: number; pos: any[] } | undefined;
+            if (cached && Date.now() - cached.at < 10 * 60 * 1000 && Array.isArray(cached.pos) && cached.pos.length > 0) {
+                recentPOs = cached.pos;
+            } else {
+                recentPOs = await client.getRecentPurchaseOrders(45, 500);
+            }
         } catch (err: any) {
             console.error('[purchasing/route] Failed to fetch recent purchase orders for vendor cycle:', err.message);
         }
@@ -521,10 +533,9 @@ export async function POST(req: NextRequest) {
             console.warn(`[purchasing/route] forceTopUp: ${dupGuard.summary}`);
         }
 
-        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
+        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination, { skipPreflight: !!skipPreflight });
 
-        // Invalidate caches so the next GET shows the new PO.
-        invalidatePurchasingCaches();
+        // Coverage overlay on the next GET is enough — do not bust the 12–15 min SWR scan.
 
         return NextResponse.json({
             ...result,

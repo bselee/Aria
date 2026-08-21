@@ -64,7 +64,14 @@ export interface ReceivedPO {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
+    /**
+     * Goods-only subtotal from Finale GraphQL. `total - subtotal` = applied PO
+     * adjustments (freight, written by the reconcilers under productpromo/10007).
+     * Finale's GraphQL order type exposes no adjustment fields, so this delta is
+     * the only zero-extra-request way to see freight already on the PO.
+     */
+    subtotal?: number;
+    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number; unitPrice?: number }>;
     receiptHistory?: Array<{
         shipmentId: string;
         receiveDate: string;
@@ -150,6 +157,19 @@ export interface PurchasingItem {
     packSize?: { unitsPerPack: number; packUnit: string }; // null = not registered
     qtyDiverged?: boolean;
     qtyDivergencePct?: number;
+    /**
+     * Third opinion from basauto.vercel.app, joined in by the purchasing route
+     * from data/basauto-recon.json. Present only for SKUs the reconciliation
+     * flagged. Lets the row show basauto vs Finale vs Aria instead of hiding a
+     * three-way disagreement behind a two-number display.
+     */
+    basautoRecon?: {
+        basautoQty: number | null;
+        basautoUrgency: string | null;
+        verdict: string;
+        severity: "high" | "medium" | "low";
+        reason: string;
+    };
     velocityInflated?: boolean;        // true when chooseVelocitySignal capped a demand signal that exceeded 3× sales/receipts
     velocityRawRate?: number;          // the original (pre-cap) daily rate Finale reported, for context
     velocityRealityCap?: number;       // max(salesVelocity, purchaseVelocity) — what the cap pinned dailyRate to
@@ -682,7 +702,18 @@ export function deriveReceivedPurchaseOrders(
                     productId: ie.node.product?.productId || "?",
                     quantity: parseFinaleNumber(ie.node.quantity),
                     orderedQuantity: parseFinaleNumber(ie.node.quantity),
+                    unitPrice: parseFinaleNumber(ie.node.unitPrice),
                 })),
+                // HERMIA(2026-08-11): Finale's GraphQL `order` type exposes no
+                // adjustment fields (probed: orderAdjustmentList / adjustments /
+                // freight / shippingTotal / adjustmentTotal all rejected; only
+                // `subtotal` resolves). total - subtotal therefore IS the PO's
+                // applied adjustments — which for BAS POs is freight written by
+                // the reconcilers under productpromo/10007. Carrying subtotal
+                // here lets the receivings card see freight already on the PO
+                // without a per-PO REST call. Verified PO 125051: subtotal
+                // 6523.20, total 7242.85, REST adjustment 719.65 = the delta.
+                subtotal: parseFinaleNumber(po.subtotal),
                 finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
             } satisfies ReceivedPO;
         })

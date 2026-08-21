@@ -66,6 +66,10 @@ const OUTCOME_EMOJI: Record<ReconciliationOutcome, string> = {
     rejected_10x:       "🛑",
     rejected_invariant: "🛑",
     expired:            "⏰",
+    three_way_matched:     "✅",
+    three_way_variance:    "⚠️",
+    three_way_exception:   "🛑",
+    three_way_incomplete:  "⏳",
 };
 
 // ── Query ─────────────────────────────────────────────────────────────────────

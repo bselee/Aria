@@ -18,13 +18,64 @@ const eslintConfig = [
   ...compat.extends("next/core-web-vitals", "next/typescript"),
   {
     ignores: [
+      // generated / build output
       "node_modules/**",
       ".next/**",
       "out/**",
       "build/**",
-      "next-env.d.ts",
       "coverage/**",
+      "next-env.d.ts",
+      "*.d.ts",
+      // git internals (must never be linted — these are full source copies)
+      ".git/**",
+      ".worktrees/**",
+      ".git-rewrite/**",
+      // scratch / operational / non-app dirs
+      "tmp/**",
+      "scratch/**",
+      ".tmp-ltl/**",
+      ".agents/**",
+      ".hermes/**",
+      "backup/**",
+      "backups/**",
+      "logs/**",
+      "reports/**",
+      "data/**",
+      "db/**",
+      "local/**",
+      "chrome-profile/**",
+      "__pycache__/**",
+      "bin/**",
+      "tools/**",
+      "references/**",
+      "skills/**",
+      "SOPs/**",
+      "docs/**",
+      "e2e/**",
+      "migrations/**",
+      "public/**",
+      // one-off CLIs + compiled CJS utilities (not shipped app surface)
+      "scripts/**",
+      "supabase/**",
     ],
+  },
+  {
+    // Type-safety posture: the app build path is `strict: false` (finding #9).
+    // Enforcing `no-explicit-any` as error contradicts that posture; keep these as
+    // visible warnings until strict typing is staged in via tsconfig.check.json.
+    files: ["**/*.{ts,tsx,js,jsx,mjs,cjs}"],
+    rules: {
+      "@typescript-eslint/no-explicit-any": "warn",
+      "@typescript-eslint/no-unused-vars": "warn",
+      // `Function` type is the same posture as `any` — subsumed by #9.
+      "@typescript-eslint/no-unsafe-function-type": "warn",
+      // CJS interop is intentional here (CJS-only deps, tsx CLIs, serverExternalPackages).
+      "@typescript-eslint/no-require-imports": "off",
+      // React 17+ escapes text entities correctly; this rule is pedantic noise.
+      "react/no-unescaped-entities": "off",
+      // `cond && fn()` side-effect idiom is used intentionally across the codebase.
+      "@typescript-eslint/no-unused-expressions": "warn",
+    },
   },
 ];
 

@@ -1,0 +1,11 @@
+{
+  "passed": false,
+  "security_concerns": [],
+  "logic_errors": [
+    "Operation ordering bug in complete_po handler (route.ts:742-805): finale.completeOrder() is called BEFORE the 3-way match gate check (transitionLifecycleState at line 794). completeOrder() POSTs statusId='ORDER_COMPLETED' to Finale's API (receivings.ts:648-651), actually finalizing the order. If the 3-way gate then blocks, the handler returns 409 with { completed: false }, but the order is already ORDER_COMPLETED in Finale — creating an inconsistent state. The 3-way match gate check should happen first, and completeOrder() should only be called if the gate passes."
+  ],
+  "suggestions": [
+    "Swap the order: run transitionLifecycleState() (which runs the 3-way gate) FIRST, and only call finale.completeOrder() when transitionResult.ok === true."
+  ],
+  "summary": "1 logic error: completeOrder() is called before the 3-way match gate check, so a blocked gate leaves Finale in inconsistent ORDER_COMPLETED state even though the API returns completed: false."
+}

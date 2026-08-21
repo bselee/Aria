@@ -2,7 +2,7 @@
  * @file    memory.ts
  * @purpose General-purpose memory system using local SQLite (memory-store.ts).
  *          Stores and retrieves operational context: vendor patterns, follow-ups,
- *          Slack requests, conversation details, preferences, action items.
+ *          conversation details, preferences, action items.
  * @author  Will / Antigravity / Hermia
  * @created 2026-02-24
  * @updated 2026-05-28
@@ -39,7 +39,6 @@ export type MemoryCategory =
     | 'contact'             // Vendor contacts, reps, account managers
     | 'process'             // How a business process works at BuildASoil
     | 'decision'            // Key decisions made and why
-    | 'slack_request'       // Things requested via Slack
     | 'conversation'        // Key facts from conversations
     | 'general';            // Catch-all
 
@@ -48,7 +47,7 @@ export interface Memory {
     category: MemoryCategory;
     content: string;            // The actual memory text
     tags?: string[];            // Searchable tags
-    source?: string;            // Where this came from: "telegram", "slack", "email", "manual"
+    source?: string;            // Where this came from: "telegram", "email", "manual"
     relatedTo?: string;         // Vendor name, product SKU, person name, etc.
     priority?: 'low' | 'normal' | 'high' | 'critical';
     expiresAt?: string;         // ISO date if this memory should expire

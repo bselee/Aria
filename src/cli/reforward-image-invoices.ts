@@ -110,7 +110,7 @@ async function main() {
                     messageId: id,
                     id: img.attachmentId,
                 });
-                let buf = Buffer.from(attRes.data.data || "", "base64url");
+                const buf = Buffer.from(attRes.data.data || "", "base64url");
                 if (!buf.length) {
                     console.warn(`  empty attachment ${img.filename}`);
                     errors++;

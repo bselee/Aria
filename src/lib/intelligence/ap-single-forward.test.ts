@@ -25,6 +25,9 @@ mem.exec(`
     reconciliation_notes TEXT,
     vendor_routing_action TEXT,
     ocr_raw_text TEXT,
+    ocr_vendor_name TEXT,
+    ocr_invoice_number TEXT,
+    ocr_total TEXT,
     UNIQUE(gmail_message_id, pdf_filename)
   );
   CREATE TABLE billcom_bills_ref (
