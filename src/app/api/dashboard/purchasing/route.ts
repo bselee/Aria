@@ -210,9 +210,10 @@ export async function GET(req: NextRequest) {
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
     // Third-opinion join: basauto's own reorder recommendation, read once per
-    // request from data/basauto-recon.json. Empty map when the report is
-    // missing — rows then degrade to the previous Finale→Aria display.
-    const reconBadges = readReconBadges();
+    // request from data/basauto-recon.json (mtime-cached). Empty map when the
+    // report is missing — rows then degrade to the previous Finale→Aria display.
+    const recon = readReconBadges();
+    const reconBadges = recon.badges;
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -385,6 +386,11 @@ export async function GET(req: NextRequest) {
             vendorSummaries: assessment.vendorSummaries,
             mode,
             refreshing,
+            // Freshness of the basauto third-opinion join (written by the
+            // 07:00 recon cron) — lets the panel flag a stale comparison
+            // instead of silently pairing live numbers with old verdicts.
+            basautoReconAt: recon.crawledAt,
+            basautoReconStale: recon.stale,
             upcomingBuilds,
         },
         { headers: { 'Cache-Control': 'no-store' } }

@@ -9,6 +9,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { buildReconBadgeMap, readReconBadges } from "./basauto-recon-lookup";
 
 describe("buildReconBadgeMap", () => {
@@ -83,10 +86,62 @@ describe("buildReconBadgeMap", () => {
         expect(map.get("A")?.basautoQty).toBeNull();
         expect(map.get("B")?.basautoQty).toBeNull();
     });
+
+    it("carries the crawl timestamp onto each badge so rows can show snapshot age", () => {
+        const map = buildReconBadgeMap(report);
+        expect(map.get("GLP117")?.crawledAt).toBe("2026-08-21T15:15:37.670Z");
+        expect(map.get("ALK101")?.crawledAt).toBe("2026-08-21T15:15:37.670Z");
+    });
+
+    it("leaves crawledAt null when the report lacks one", () => {
+        expect(buildReconBadgeMap({ items: [{ sku: "X1" }] }).get("X1")?.crawledAt).toBeNull();
+    });
 });
 
 describe("readReconBadges", () => {
-    it("returns an empty map when the report file is absent", () => {
-        expect(readReconBadges("C:/definitely/not/a/real/aria/dir").size).toBe(0);
+    it("returns an empty badge map when the report file is absent", () => {
+        const res = readReconBadges("C:/definitely/not/a/real/aria/dir");
+        expect(res.badges.size).toBe(0);
+        expect(res.stale).toBe(true);
+        expect(res.crawledAt).toBeNull();
+    });
+
+    it("reads a report from data/basauto-recon.json and reports freshness", () => {
+        const dir = mkdtempSync(join(tmpdir(), "recon-lookup-"));
+        try {
+            const dataDir = join(dir, "data");
+            mkdirSync(dataDir);
+            writeFileSync(
+                join(dataDir, "basauto-recon.json"),
+                JSON.stringify({
+                    crawledAt: new Date().toISOString(),
+                    items: [{ sku: "A1", verdict: "AGREE", basauto: { reorderQty: 4 } }],
+                }),
+            );
+            const res = readReconBadges(dir);
+            expect(res.badges.get("A1")?.basautoQty).toBe(4);
+            expect(res.stale).toBe(false);
+            expect(res.crawledAt).toBeTruthy();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("flags an old report as stale", () => {
+        const dir = mkdtempSync(join(tmpdir(), "recon-lookup-"));
+        try {
+            const dataDir = join(dir, "data");
+            mkdirSync(dataDir);
+            writeFileSync(
+                join(dataDir, "basauto-recon.json"),
+                JSON.stringify({
+                    crawledAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+                    items: [],
+                }),
+            );
+            expect(readReconBadges(dir).stale).toBe(true);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 });

@@ -140,6 +140,10 @@ type AssessmentData = {
     refreshing?: boolean;
     error?: string;
     upcomingBuilds?: Array<{ sku: string; earliestDate: string; componentCount: number }>;
+    /** Crawl time of the basauto third-opinion report joined onto rows. */
+    basautoReconAt?: string | null;
+    /** True when the basauto report is older than the 30h TTL (cron failure). */
+    basautoReconStale?: boolean;
 };
 type POResult = {
     orderId: string;
@@ -1742,6 +1746,17 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 <span className="text-xs font-mono font-semibold text-zinc-200 uppercase tracking-widest">Ordering</span>
                 <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
+                {/* basauto third-opinion freshness — amber when the 07:00 recon cron failed and the comparison is stale */}
+                {data && !scanning && (
+                    <span
+                        title={`basauto comparison crawled ${data.basautoReconAt ? new Date(data.basautoReconAt).toLocaleString([], { timeZone: "America/Denver" }) : "?"}${data.basautoReconStale ? " — STALE (recon cron overdue)" : ""}`}
+                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${data.basautoReconStale
+                            ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
+                            : "text-violet-300 border-violet-500/25 bg-violet-500/5"}`}
+                    >
+                        BAS {data.basautoReconStale ? "stale" : "ok"}
+                    </span>
+                )}
                 {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
                 {isLoading && data && (
                     <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
@@ -2844,7 +2859,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                 {item.basautoRecon && item.basautoRecon.basautoQty != null && (
                                                                                                     <>
                                                                                                         <span
-                                                                                                            title={`basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}`}
+                                                                                                            title={`basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
                                                                                                             className="text-[11px] font-mono italic text-violet-300"
                                                                                                         >
                                                                                                             basauto: {item.basautoRecon.basautoQty}
@@ -2870,7 +2885,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                 )}
                                                                                                 {item.basautoRecon && (
                                                                                                     <span
-                                                                                                        title={item.basautoRecon.reason}
+                                                                                                        title={`${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
                                                                                                         className={`text-[9px] font-mono rounded px-1 border ${item.basautoRecon.severity === 'high'
                                                                                                             ? 'text-red-300 border-red-500/30'
                                                                                                             : 'text-violet-300 border-violet-500/25'}`}
