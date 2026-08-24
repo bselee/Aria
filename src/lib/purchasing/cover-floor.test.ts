@@ -162,3 +162,24 @@ describe("applyCoverFloor", () => {
         expect(TARGET_COVER_DAYS).toBe(45);
     });
 });
+
+describe("single-entry history guard", () => {
+    it("caps a lone 10,000-unit promo record at 90 days of supply", () => {
+        const r = applyCoverFloor({
+            sku: "PROMO101", rawNeedQty: 5, dailyRate: 5, stockOnHand: 0, stockOnOrder: 0,
+            skuPurchaseHistory: [10000],
+        });
+        expect(r.qty).toBe(450);
+        expect(r.flags).toContain("single_entry_history_capped");
+        expect(r.reason).toContain("capped");
+    });
+
+    it("keeps trusting a lone entry inside the cap (THC101 canonical)", () => {
+        const r = applyCoverFloor({
+            sku: "THC101", rawNeedQty: 5, dailyRate: 0.69, stockOnHand: 29, stockOnOrder: 0,
+            skuPurchaseHistory: [50], minimumOrderEaches: 9, unitPrice: 45,
+        });
+        expect(r.qty).toBe(50);
+        expect(r.flags).not.toContain("single_entry_history_capped");
+    });
+});

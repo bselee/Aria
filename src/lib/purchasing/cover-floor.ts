@@ -25,6 +25,10 @@ export const TARGET_COVER_DAYS = 45;
 /** Above this many days of post-receipt cover, floor-induced overbuy is flagged. */
 export const SMALL_MAX_COVER_DAYS = 60;
 
+/** Single-entry histories are trusted but capped at this many days of supply —
+ *  a one-off promo order must not become a permanent floor for a slow SKU. */
+export const SINGLE_ENTRY_HISTORY_MAX_COVER_DAYS = 90;
+
 export interface CoverFloorInput {
     sku: string;
     rawNeedQty: number;
@@ -191,6 +195,9 @@ function buildReason(args: ReasonArgs): string {
     if (flags.includes("moq_forced_overbuy")) {
         bits.push(`MOQ pushes cover past ${SMALL_MAX_COVER_DAYS}d`);
     }
+    if (flags.includes("single_entry_history_capped")) {
+        bits.push(`lone history entry capped at ${SINGLE_ENTRY_HISTORY_MAX_COVER_DAYS}d of supply`);
+    }
     return bits.join("; ");
 }
 
@@ -245,12 +252,23 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
     // Rule 4 — history floor: sanity-cap first, then mode of the consistent set.
     let historyFloor: number | null = null;
     let lastOrder: number | null = null;
+    let flagsSingleEntryCapped = false;
     if (skuPurchaseHistory != null && skuPurchaseHistory.length > 0) {
         const cleaned = sanitizeHistory(skuPurchaseHistory);
         if (cleaned.length > 0) {
             const mode = modeOf(cleaned);
             if (historyIsConsistent(cleaned, mode)) {
                 historyFloor = mode;
+                // Single-entry guard: a lone record (e.g. a one-off 10,000-unit
+                // promo) must not become a permanent floor. Cap at 90 days of
+                // supply; still generous (Bill: "even 60 days is usually OK").
+                if (cleaned.length === 1) {
+                    const capQty = Math.max(1, Math.ceil(SINGLE_ENTRY_HISTORY_MAX_COVER_DAYS * dailyRate));
+                    if (historyFloor > capQty) {
+                        historyFloor = capQty;
+                        flagsSingleEntryCapped = true;
+                    }
+                }
             }
             lastOrder = cleaned[cleaned.length - 1];
         }
@@ -275,6 +293,9 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
         } else if (moq > 0 && !overWithoutMoq) {
             flags.push("moq_forced_overbuy");
         }
+    }
+    if (flagsSingleEntryCapped) {
+        flags.push("single_entry_history_capped");
     }
 
     // Rule 7 — prose reason citing the numbers.
