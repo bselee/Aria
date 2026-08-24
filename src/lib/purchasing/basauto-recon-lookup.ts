@@ -19,6 +19,13 @@
  *          caches the parsed report keyed on file mtime so the 70KB JSON is not
  *          re-parsed on every Ordering GET.
  *
+ *          Cohesion (2026-08-24): most recon items are MISSING_IN_ARIA — SKUs
+ *          basauto flags that have no Ordering row at all, so a per-row join
+ *          can never show them. Each badge now also carries the basauto-side
+ *          snapshot (so basauto-recon-live.ts can re-verdict against live row
+ *          numbers), and readReconBadges() exposes the missing-SKU flags as a
+ *          separate list the panel renders as its own compact strip.
+ *
  * @author  Hermia
  * @created 2026-08-21
  * @deps    fs, path (reads data/basauto-recon.json — same file the panel uses)
@@ -44,11 +51,39 @@ export interface ReconBadge {
     reason: string;
     /** When the recon crawl ran — surfaces the snapshot's age on the row. */
     crawledAt: string | null;
+    /** True when the verdict was re-assessed against live Aria row state. */
+    live?: boolean;
+    /** basauto-side snapshot fields, so the verdict can be re-derived live. */
+    basauto: {
+        urgency: string | null;
+        stockDaysLeft: number | null;
+        reorderQty: number | null;
+        reorderDate: string | null;
+        velocity: number | null;
+        onOrder: number | null;
+    } | null;
 }
 
-/** Result of one report read: the per-SKU map plus its freshness. */
+/** A basauto-flagged SKU that has no Aria row — rendered in its own strip. */
+export interface MissingFlag {
+    sku: string;
+    vendor: string | null;
+    description: string | null;
+    severity: "high" | "medium" | "low";
+    reason: string;
+    basauto: {
+        urgency: string | null;
+        stockDaysLeft: number | null;
+        reorderQty: number | null;
+        reorderDate: string | null;
+    };
+    crawledAt: string | null;
+}
+
+/** Result of one report read: the per-SKU map plus freshness and missing SKUs. */
 export interface ReconLookupResult {
     badges: Map<string, ReconBadge>;
+    missing: MissingFlag[];
     crawledAt: string | null;
     stale: boolean;
 }
@@ -58,10 +93,19 @@ interface ReconReportShape {
     crawledAt?: string;
     items?: Array<{
         sku?: string;
+        vendor?: string | null;
+        description?: string | null;
         verdict?: string;
         severity?: string;
         reason?: string;
-        basauto?: { reorderQty?: number | null; urgency?: string | null } | null;
+        basauto?: {
+            reorderQty?: number | null;
+            urgency?: string | null;
+            stockDaysLeft?: number | null;
+            reorderDate?: string | null;
+            velocity?: number | null;
+            onOrder?: number | null;
+        } | null;
     }>;
 }
 
@@ -84,22 +128,72 @@ export function buildReconBadgeMap(report: ReconReportShape | null | undefined):
         if (!sku) continue;
 
         const severity = item.severity === "high" || item.severity === "low" ? item.severity : "medium";
+        const bas = item.basauto;
 
         map.set(sku, {
-            basautoQty: typeof item.basauto?.reorderQty === "number" ? item.basauto.reorderQty : null,
-            basautoUrgency: item.basauto?.urgency ?? null,
+            basautoQty: typeof bas?.reorderQty === "number" ? bas.reorderQty : null,
+            basautoUrgency: bas?.urgency ?? null,
             verdict: item.verdict ?? "UNKNOWN",
             severity,
             reason: item.reason ?? "",
             crawledAt,
+            basauto: {
+                urgency: bas?.urgency ?? null,
+                stockDaysLeft: typeof bas?.stockDaysLeft === "number" ? bas.stockDaysLeft : null,
+                reorderQty: typeof bas?.reorderQty === "number" ? bas.reorderQty : null,
+                reorderDate: bas?.reorderDate ?? null,
+                velocity: typeof bas?.velocity === "number" ? bas.velocity : null,
+                onOrder: typeof bas?.onOrder === "number" ? bas.onOrder : null,
+            },
         });
     }
     return map;
 }
 
 /**
- * Read the recon report from disk and return the SKU→badge lookup plus its
- * freshness (crawl timestamp + stale flag).
+ * Extract MISSING_IN_ARIA flags — basauto-flagged SKUs with no Aria row —
+ * sorted high-severity first. These can never join onto an Ordering row, so
+ * the panel renders them as a separate strip.
+ *
+ * @param report Parsed contents of data/basauto-recon.json.
+ * @returns Missing-SKU flags, high severity first.
+ */
+export function extractMissingFlags(report: ReconReportShape | null | undefined): MissingFlag[] {
+    if (!report?.items?.length) return [];
+
+    const crawledAt = typeof report.crawledAt === "string" ? report.crawledAt : null;
+    const out: MissingFlag[] = [];
+
+    for (const item of report.items) {
+        if (item?.verdict !== "MISSING_IN_ARIA") continue;
+        const sku = (item?.sku ?? "").trim().toUpperCase();
+        if (!sku) continue;
+
+        const severity = item.severity === "high" || item.severity === "low" ? item.severity : "medium";
+        out.push({
+            sku,
+            vendor: item.vendor ?? null,
+            description: item.description ?? null,
+            severity,
+            reason: item.reason ?? "",
+            basauto: {
+                urgency: item.basauto?.urgency ?? null,
+                stockDaysLeft: typeof item.basauto?.stockDaysLeft === "number" ? item.basauto.stockDaysLeft : null,
+                reorderQty: typeof item.basauto?.reorderQty === "number" ? item.basauto.reorderQty : null,
+                reorderDate: item.basauto?.reorderDate ?? null,
+            },
+            crawledAt,
+        });
+    }
+
+    const order: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    out.sort((a, b) => (order[a.severity] - order[b.severity]) || a.sku.localeCompare(b.sku));
+    return out;
+}
+
+/**
+ * Read the recon report from disk and return the SKU→badge lookup, the
+ * missing-SKU flags, and freshness (crawl timestamp + stale flag).
  *
  * Never throws: a missing, stale, or malformed report yields an empty badge
  * map (with `stale: true`) so the Ordering panel degrades to its previous
@@ -127,6 +221,7 @@ export function readReconBadges(cwd: string = process.cwd()): ReconLookupResult 
                 mtimeMs,
                 result: {
                     badges: buildReconBadgeMap(report),
+                    missing: extractMissingFlags(report),
                     crawledAt,
                     stale: !Number.isFinite(ageMs) || ageMs > STALE_AFTER_MS,
                 },
@@ -138,6 +233,6 @@ export function readReconBadges(cwd: string = process.cwd()): ReconLookupResult 
     }
 }
 
-const EMPTY_RESULT: ReconLookupResult = { badges: new Map(), crawledAt: null, stale: true };
+const EMPTY_RESULT: ReconLookupResult = { badges: new Map(), missing: [], crawledAt: null, stale: true };
 
 let _cache: { mtimeMs: number; result: ReconLookupResult } | null = null;

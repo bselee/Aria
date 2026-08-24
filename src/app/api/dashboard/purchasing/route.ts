@@ -14,6 +14,7 @@ import {
 } from '@/lib/purchasing/ordering-po-coverage';
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
 import { readReconBadges } from '@/lib/purchasing/basauto-recon-lookup';
+import { recomputeBasautoBadge, type LiveRowAria } from '@/lib/purchasing/basauto-recon-live';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -181,6 +182,13 @@ export async function GET(req: NextRequest) {
         groups = groups.filter(g => allowed.includes(g.urgency));
     }
 
+    // Third-opinion report read (mtime-cached): read once so both the
+    // empty-groups response and the full response can carry the missing-SKU
+    // flags. Empty map when the report is missing — rows then degrade to the
+    // previous Finale→Aria display.
+    const recon = readReconBadges();
+    const reconBadges = recon.badges;
+
     if (groups.length === 0) {
         return NextResponse.json(
             {
@@ -190,6 +198,9 @@ export async function GET(req: NextRequest) {
                 mode,
                 refreshing,
                 upcomingBuilds: [],
+                basautoReconAt: recon.crawledAt,
+                basautoReconStale: recon.stale,
+                basautoOnlyFlags: recon.missing.slice(0, 12),
             },
             { headers: { 'Cache-Control': 'no-store' } }
         );
@@ -209,11 +220,6 @@ export async function GET(req: NextRequest) {
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
-    // Third-opinion join: basauto's own reorder recommendation, read once per
-    // request from data/basauto-recon.json (mtime-cached). Empty map when the
-    // report is missing — rows then degrade to the previous Finale→Aria display.
-    const recon = readReconBadges();
-    const reconBadges = recon.badges;
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -335,7 +341,33 @@ export async function GET(req: NextRequest) {
                 commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
                 urgency: displayUrgency,
-                basautoRecon: reconBadges.get(productId.toUpperCase()),
+                // Third-opinion join, re-verdict against LIVE row state: the
+                // 07:00 crawl verdict goes stale the moment a PO is drafted or
+                // received, so rerun the same pure assessor with the basauto
+                // side from the crawl and the Aria side from this row.
+                basautoRecon: (() => {
+                    const snap = reconBadges.get(productId.toUpperCase());
+                    if (!snap) return undefined;
+                    const liveAria: LiveRowAria = {
+                        productId,
+                        urgency: displayUrgency,
+                        stockOnHand: line.item.stockOnHand ?? null,
+                        stockOnOrder: displayOnOrder,
+                        dailyRate: (line.item as any).dailyRate ?? null,
+                        dailyRateSource: (line.item as any).dailyRateSource ?? null,
+                        leadTimeDays: (line.item as any).leadTimeDays ?? null,
+                        effectiveLeadTimeDays: (line.item as any).effectiveLeadTimeDays ?? null,
+                        adjustedRunwayDays: (line.item as any).adjustedRunwayDays ?? null,
+                        runwayDays: (line.item as any).runwayDays ?? null,
+                        openPOs: mergedOpenPOs.map((po: any) => ({
+                            orderId: String(po.orderId ?? ""),
+                            quantity: Number(po.quantity) || 0,
+                            orderDate: po.orderDate ?? po.expectedDate ?? null,
+                        })),
+                        suggestedQty: displaySuggested,
+                    };
+                    return recomputeBasautoBadge(snap, liveAria, recon.crawledAt) ?? undefined;
+                })(),
             };
         });
 
@@ -391,6 +423,9 @@ export async function GET(req: NextRequest) {
             // instead of silently pairing live numbers with old verdicts.
             basautoReconAt: recon.crawledAt,
             basautoReconStale: recon.stale,
+            // basauto-flagged SKUs with no Aria row (candidate gate / job
+            // supplies) — rendered as their own strip, high severity first.
+            basautoOnlyFlags: recon.missing.slice(0, 12),
             upcomingBuilds,
         },
         { headers: { 'Cache-Control': 'no-store' } }

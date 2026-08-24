@@ -12,7 +12,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { buildReconBadgeMap, readReconBadges } from "./basauto-recon-lookup";
+import { buildReconBadgeMap, extractMissingFlags, readReconBadges } from "./basauto-recon-lookup";
 
 describe("buildReconBadgeMap", () => {
     const report = {
@@ -95,6 +95,44 @@ describe("buildReconBadgeMap", () => {
 
     it("leaves crawledAt null when the report lacks one", () => {
         expect(buildReconBadgeMap({ items: [{ sku: "X1" }] }).get("X1")?.crawledAt).toBeNull();
+    });
+
+    it("carries the basauto-side snapshot so verdicts can be re-derived live", () => {
+        const map = buildReconBadgeMap({
+            items: [{
+                sku: "GLP117",
+                verdict: "QTY_MISMATCH",
+                basauto: { reorderQty: 191, urgency: "Overdue", stockDaysLeft: 3, reorderDate: "2026-08-25", velocity: 4.2, onOrder: 0 },
+            }],
+        });
+        const b = map.get("GLP117");
+        expect(b?.basauto?.reorderQty).toBe(191);
+        expect(b?.basauto?.velocity).toBe(4.2);
+        expect(b?.basauto?.onOrder).toBe(0);
+        expect(b?.basauto?.stockDaysLeft).toBe(3);
+    });
+});
+
+describe("extractMissingFlags", () => {
+    it("collects MISSING_IN_ARIA items only, high severity first", () => {
+        const flags = extractMissingFlags({
+            crawledAt: "2026-08-24T13:00:00.000Z",
+            items: [
+                { sku: "MID", verdict: "MISSING_IN_ARIA", severity: "medium", vendor: "V1", reason: "r-mid", basauto: { urgency: "Soon", reorderQty: 5, stockDaysLeft: 20 } },
+                { sku: "ROWED", verdict: "AGREE", severity: "low" },
+                { sku: "HIGH", verdict: "MISSING_IN_ARIA", severity: "high", vendor: "V2", reason: "r-high", basauto: { urgency: "Overdue", reorderQty: 181, stockDaysLeft: 0 } },
+                { sku: "LOW", verdict: "MISSING_IN_ARIA", severity: "low", reason: "r-low", basauto: { urgency: "OK" } },
+            ],
+        });
+        expect(flags.map(f => f.sku)).toEqual(["HIGH", "MID", "LOW"]);
+        expect(flags[0].reason).toBe("r-high");
+        expect(flags[0].vendor).toBe("V2");
+        expect(flags[0].crawledAt).toBe("2026-08-24T13:00:00.000Z");
+    });
+
+    it("returns an empty list for null or item-less reports", () => {
+        expect(extractMissingFlags(null)).toEqual([]);
+        expect(extractMissingFlags({ items: [] })).toEqual([]);
     });
 });
 

@@ -144,6 +144,18 @@ type AssessmentData = {
     basautoReconAt?: string | null;
     /** True when the basauto report is older than the 30h TTL (cron failure). */
     basautoReconStale?: boolean;
+    /** basauto-flagged SKUs with no Aria row — the BAS-only strip. */
+    basautoOnlyFlags?: BasautoOnlyFlag[];
+};
+
+/** A basauto flag for a SKU that has no Ordering row at all. */
+type BasautoOnlyFlag = {
+    sku: string;
+    vendor: string | null;
+    description: string | null;
+    severity: "high" | "medium" | "low";
+    reason: string;
+    basauto: { urgency: string | null; stockDaysLeft: number | null; reorderQty: number | null; reorderDate: string | null };
 };
 type POResult = {
     orderId: string;
@@ -408,6 +420,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [loadingTiers, setLoadingTiers] = useState<Set<UrgencyTier>>(new Set());
     const [scanning, setScanning] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [showBasOnly, setShowBasOnly] = useState(false);
 
     const [vendorTab, setVendorTab] = useState<string>("all");
     const [outlookByVendor, setOutlookByVendor] = useState<Record<string, VendorOutlookFields>>({});
@@ -1849,6 +1862,53 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 )}
             </div>
 
+            {/* BAS-only strip: basauto flags SKUs Ordering has no row for (candidate
+                gate / job supplies). Collapsed one-liner by default; expand for the
+                high-severity list. Reason text on hover. */}
+            {!effectivelyCollapsed && data && (data.basautoOnlyFlags?.length ?? 0) > 0 && (() => {
+                const flags = data.basautoOnlyFlags!;
+                const highCount = flags.filter(f => f.severity === "high").length;
+                return (
+                    <div className="border-b border-zinc-800/50 bg-zinc-950/60">
+                        <button
+                            onClick={() => setShowBasOnly(s => !s)}
+                            className="w-full px-3 py-1 flex items-center gap-2 text-[10px] font-mono hover:bg-zinc-900/40 transition-colors"
+                            title={showBasOnly ? "Collapse" : "SKUs basauto flags that have no row in Ordering"}
+                        >
+                            <span className="text-zinc-500 uppercase tracking-wider shrink-0">BAS only</span>
+                            <span className={highCount > 0 ? "text-rose-300" : "text-violet-300"}>{flags.length} flagged</span>
+                            {highCount > 0 && <span className="text-rose-300/90">{highCount} high</span>}
+                            <span className="text-zinc-600 truncate">no Ordering row</span>
+                            <ChevronDown className={`w-3 h-3 ml-auto shrink-0 transition-transform ${showBasOnly ? "" : "-rotate-90"}`} />
+                        </button>
+                        {showBasOnly && (
+                            <div className="px-3 pb-2 space-y-1 max-h-56 overflow-y-auto">
+                                {flags.map(f => (
+                                    <div
+                                        key={f.sku}
+                                        title={f.reason}
+                                        className={`flex items-center gap-2 pl-2 border-l-2 ${f.severity === "high" ? "border-rose-500/60" : "border-violet-500/40"}`}
+                                    >
+                                        <span className="font-semibold text-zinc-200">{f.sku}</span>
+                                        <span className="text-zinc-500 truncate">{f.vendor ?? "no vendor"}</span>
+                                        <span className={String(f.basauto.urgency ?? "").toUpperCase() === "OVERDUE" ? "text-rose-300" : "text-amber-300"}>
+                                            {f.basauto.urgency ?? "?"}
+                                        </span>
+                                        {f.basauto.reorderQty != null && f.basauto.reorderQty > 0 && (
+                                            <span className="text-zinc-400">reorder {f.basauto.reorderQty.toLocaleString()}</span>
+                                        )}
+                                        {f.basauto.stockDaysLeft != null && (
+                                            <span className="text-zinc-600">{f.basauto.stockDaysLeft}d left</span>
+                                        )}
+                                        {f.description && <span className="text-zinc-600 truncate">{f.description}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                );
+            })()}
+
             {/* Accounting status — Ordering (separate from Active / Receivings) */}
             {!effectivelyCollapsed && data && (
                 <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
@@ -2859,7 +2919,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                 {item.basautoRecon && item.basautoRecon.basautoQty != null && (
                                                                                                     <>
                                                                                                         <span
-                                                                                                            title={`basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
+                                                                                                            title={`${item.basautoRecon.live ? "live verdict · " : ""}basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
                                                                                                             className="text-[11px] font-mono italic text-violet-300"
                                                                                                         >
                                                                                                             basauto: {item.basautoRecon.basautoQty}
@@ -2885,7 +2945,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                 )}
                                                                                                 {item.basautoRecon && (
                                                                                                     <span
-                                                                                                        title={`${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
+                                                                                                        title={`${item.basautoRecon.live ? "live verdict · " : ""}${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
                                                                                                         className={`text-[9px] font-mono rounded px-1 border ${item.basautoRecon.severity === 'high'
                                                                                                             ? 'text-red-300 border-red-500/30'
                                                                                                             : 'text-violet-300 border-violet-500/25'}`}
