@@ -236,6 +236,7 @@ describe("recommendQty — provenance trace", () => {
             "cover_days",
             "raw_qty",
             "pack_round",
+            "cover_floor",
             "urgency",
         ]);
     });
@@ -518,7 +519,7 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 
     it("formula version reflects the current recommender version", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+        expect(QTY_FORMULA_VERSION).toBe("v2.9-freight-and-cover-2026-08-24");
     });
 });
 
@@ -622,7 +623,7 @@ describe("recommendQty — cognitive rounding integration", () => {
     });
 
     it("formula version is bumped to current", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+        expect(QTY_FORMULA_VERSION).toBe("v2.9-freight-and-cover-2026-08-24");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {
@@ -759,7 +760,7 @@ describe("recommendQty — v2.6 historical order floor", () => {
         }));
         expect(result.historicalFloorApplied).toBe(true);
         expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
-        expect(result.provenance.some(s => s.step === "historical_floor")).toBe(true);
+        expect(result.provenance.some(s => s.step === "historical_floor" || s.step === "cover_floor")).toBe(true);
     });
 
     it("does NOT bump when history is inconsistent (no clear pattern)", () => {

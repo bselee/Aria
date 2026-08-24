@@ -220,6 +220,20 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
     } = input;
     const moq = minimumOrderEaches ?? 0;
 
+    // Rule 0 — a floor must never CREATE an order. Held lines (rawNeedQty <= 0)
+    // pass through as zero: MOQ/history floors must not force a purchase the
+    // core math said is unnecessary.
+    if (!(rawNeedQty > 0)) {
+        return {
+            qty: 0,
+            floorQty: 0,
+            targetQty: 0,
+            historyFloor: null,
+            flags: [],
+            reason: "no need - floor skipped",
+        };
+    }
+
     // Rule 1 — MTO/powder exclusions are the caller's job via the override.
     if (targetCoverDaysOverride != null) {
         return {

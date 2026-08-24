@@ -61,16 +61,16 @@ describe("applyCoverFloor", () => {
         expect(r.flags).toEqual([]);
     });
 
-    it("40d existing cover: gap floor is ~0 (R1), target is 5, qty stays 0", () => {
+    it("40d existing cover: gap floor is ~0 (R1), target is 5, qty is the raw need", () => {
         const r = applyCoverFloor({
             sku: "COVER40",
-            rawNeedQty: 0,
+            rawNeedQty: 2,
             dailyRate: 1,
             stockOnHand: 40,
             stockOnOrder: 0,
             skuPurchaseHistory: null,
         });
-        expect(r.qty).toBe(0);
+        expect(r.qty).toBe(2);
         expect(r.floorQty).toBe(0);
         expect(r.targetQty).toBe(TARGET_COVER_DAYS - 40);
     });
@@ -181,5 +181,16 @@ describe("single-entry history guard", () => {
         });
         expect(r.qty).toBe(50);
         expect(r.flags).not.toContain("single_entry_history_capped");
+    });
+});
+
+describe("rule 0: floor never creates an order", () => {
+    it("held line (rawNeed 0) with MOQ and history stays 0", () => {
+        const r = applyCoverFloor({
+            sku: "HELD101", rawNeedQty: 0, dailyRate: 1, stockOnHand: 100, stockOnOrder: 0,
+            skuPurchaseHistory: [50], minimumOrderEaches: 100,
+        });
+        expect(r.qty).toBe(0);
+        expect(r.reason).toContain("no need");
     });
 });
