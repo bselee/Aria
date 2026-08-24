@@ -25,7 +25,9 @@ import { spawnSync } from "child_process";
 import {
     type BasautoRecord,
     type AriaItemLite,
+    type ReconItem,
     type ReconReport,
+    BASAUTO_NON_OK,
     buildReconReport,
     normalizeSku,
     toNumber,
@@ -281,6 +283,96 @@ function loadDismissedSkus(): Set<string> {
     }
 }
 
+// ── Build-ledger enrichment ──────────────────────────────────────────────────
+
+/** Minimal shape of FinaleClient needed by the ledger enrichment. */
+interface LedgerClient {
+    graphql(query: { query: string }, label: string): Promise<{
+        stockHistoryViewConnection?: {
+            edges?: Array<{
+                node?: {
+                    recordDate?: string;
+                    transactionUpdateType?: string;
+                    quantity?: string | number;
+                };
+            }>;
+        };
+    }>;
+}
+
+/**
+ * For VELOCITY_MISMATCH items where basauto flags urgency, read Finale's own
+ * stock-history ledger and annotate the real 90-day build-consumption rate.
+ *
+ * Depletion velocity vs demand velocity is genuinely ambiguous (packed-FG
+ * transfers vs off-channel sales). The ledger resolves it: "Build consume
+ * completed" rows are the raw's true production burn. RAWGYPSUM lesson
+ * (2026-08-24): depletion said 366.8/d, demand said 110.3/d — the ledger
+ * showed 333.5/d and near-empty FG shelves, so basauto was the one that was
+ * right. Without this check the morning report would keep telling Bill to
+ * hold on a SKU that runs out in ~6 weeks.
+ *
+ * Bounded to the first 8 mismatches; fails soft so the report never dies on it.
+ */
+async function enrichBuildLedger(items: ReconItem[]): Promise<void> {
+    const targets = items
+        .filter(
+            (it) =>
+                it.verdict === "VELOCITY_MISMATCH" &&
+                BASAUTO_NON_OK.has((it.basauto.urgency ?? "").trim().toUpperCase()),
+        )
+        .slice(0, 8);
+    if (targets.length === 0) return;
+
+    let FinaleClient: new () => LedgerClient;
+    try {
+        const mod = (await import("../lib/finale/client")) as unknown as {
+            FinaleClient: new () => LedgerClient;
+        };
+        FinaleClient = mod.FinaleClient;
+    } catch (err) {
+        console.warn("[basauto-recon] build-ledger enrichment unavailable:", err instanceof Error ? err.message : err);
+        return;
+    }
+    const client = new FinaleClient();
+    const accountPath = process.env.FINALE_ACCOUNT_PATH;
+
+    for (const it of targets) {
+        try {
+            const productUrl = `/${accountPath}/api/product/${it.sku}`;
+            const q = {
+                query: `{
+                    stockHistoryViewConnection(
+                        first: 1000
+                        productUrl: "${productUrl}"
+                        sort: [{ field: "recordDate", mode: "desc" }]
+                    ) {
+                        edges { node { recordDate transactionUpdateType quantity } }
+                    }
+                }`,
+            };
+            const d = await client.graphql(q, `ledger ${it.sku}`);
+            const edges = d?.stockHistoryViewConnection?.edges ?? [];
+            const cutoff = Date.now() - 90 * 86_400_000;
+            let consumed = 0;
+            for (const e of edges) {
+                const n = e.node;
+                if (!n || n.transactionUpdateType !== "Build consume completed") continue;
+                const rawDate = n.recordDate ?? "";
+                const dt = new Date(rawDate + (rawDate.length === 10 ? "T00:00:00-06:00" : ""));
+                if (isNaN(dt.getTime()) || dt.getTime() < cutoff) continue;
+                consumed += parseFloat(String(n.quantity ?? "")) || 0;
+            }
+            if (consumed < 0) {
+                const rate = Math.abs(consumed) / 90;
+                it.reason += ` Build ledger: ${Math.abs(consumed).toFixed(0)} in 90d = ${rate.toFixed(1)}/d (real production burn).`;
+            }
+        } catch {
+            // fail soft — the unannotated verdict still prints
+        }
+    }
+}
+
 // ── Morning report (stdout → cron delivery) ─────────────────────────────────
 
 const VERDICT_LABEL: Record<string, string> = {
@@ -392,6 +484,7 @@ async function main() {
     // 3. Assess + persist + report.
     const dismissedSkus = loadDismissedSkus();
     const report = buildReconReport(basRecords, ariaItems, { source, ariaCachedAt, errors }, { dismissedSkus });
+    await enrichBuildLedger(report.items);
     mkdirSync(join(REPO_ROOT, "data"), { recursive: true });
     writeFileSync(REPORT_FILE, JSON.stringify(report, null, 2), "utf-8");
     printMorningReport(report);

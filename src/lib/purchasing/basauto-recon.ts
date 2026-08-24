@@ -310,6 +310,13 @@ export function assessBasautoItem(bas: BasautoRecord, aria: AriaItemLite | null)
     }
 
     // 4b. Velocity source mismatch (depletion vs demand) — the root cause for most false urgencies.
+    //
+    // CORRECTION(2026-08-24, RAWGYPSUM): the original text asserted "including
+    // what became packed FG" as the explanation for every gap. That was wrong:
+    // gypsum's 3.3× gap was REAL off-channel consumption (build ledger showed
+    // 333.5 lb/d, FG shelves near zero), not packed inventory. The two signals
+    // measure different things and either can be right — the tiebreaker is the
+    // Finale build ledger + FG shelf levels, which the CLI enriches in below.
     const basVel = bas.velocity ?? 0;
     const ariaRate = aria.dailyRate ?? 0;
     if (basVel > 0 && ariaRate > 0) {
@@ -319,7 +326,7 @@ export function assessBasautoItem(bas: BasautoRecord, aria: AriaItemLite | null)
                 ...base,
                 verdict: "VELOCITY_MISMATCH",
                 severity: "medium",
-                reason: `basauto velocity ${fmtRate(basVel)} vs Aria ${fmtRate(ariaRate)} (${ratio.toFixed(1)}×). basauto uses net 90-day stock depletion (${fmtQty(bas.quantity != null ? Math.abs(bas.quantity) : null)} lb out) including what became packed FG; Aria uses Finale demand/90 (${aria.dailyRateSource ?? "demand"}), gated by FG sell-through.`,
+                reason: `basauto velocity ${fmtRate(basVel)} vs Aria ${fmtRate(ariaRate)} (${ratio.toFixed(1)}×). basauto = net 90-day stock depletion (${fmtQty(bas.quantity != null ? Math.abs(bas.quantity) : null)} out); Aria = Finale demand/90 (${aria.dailyRateSource ?? "demand"}) gated by FG sell-through. Depletion counts packed-FG transfers (still ours) OR off-channel sales Finale never records — verify the Finale build ledger and FG shelf levels before acting on either.`,
                 basauto: basautoSide,
                 aria: ariaSide,
             };
