@@ -1,14 +1,16 @@
 /**
  * @file    src/lib/purchasing/cover-floor.ts
- * @purpose Pure 30/45d cover floor for small SKUs. Raises tiny recommender
- *          quantities to a sensible days-of-supply floor and consults purchase
- *          history (with corruption sanity caps) so a small reorder matches what
- *          the vendor actually ships. MTO/powder exclusions are the CALLER's job
- *          via targetCoverDaysOverride — this module never imports policy.
+ * @purpose Pure 30/45d cover floor for small (non-freight) SKUs. Raises tiny
+ *          recommender quantities to a sensible days-of-supply floor and
+ *          consults purchase history (with corruption sanity caps) so a small
+ *          reorder matches what the vendor actually ships.
  *
- *          Gap semantics (R1): the floor raises POST-RECEIPT cover to the
- *          minimum. It never adds a flat 30d on top of existing stock, so a
- *          line with 40d of existing cover gets ~0 from the floor.
+ *          Bill's rule (2026-08-24): "must at least purchase 30-45 days
+ *          otherwise too much shipping and waste of vendor time." The ORDER
+ *          itself must cover >= 30 days of supply (target 45, 60 is usually
+ *          OK), and when the order is small, history decides. This module is
+ *          the single enforcement point for non-freight SKUs. MTO/powder
+ *          exclusions are the CALLER's job via targetCoverDaysOverride.
  *
  * @author  Hermia
  * @created 2026-08-24
@@ -16,18 +18,20 @@
  * @env     none
  */
 
-/** Minimum days of supply the floor guarantees post-receipt. */
+/** Minimum days of supply every small-SKU order must cover. */
 export const MIN_COVER_DAYS = 30;
 
-/** Days of supply the recommender should aim for (targetQty reporting only). */
+/** Days of supply the recommender should aim for (advisory, reported). */
 export const TARGET_COVER_DAYS = 45;
 
-/** Above this many days of post-receipt cover, floor-induced overbuy is flagged. */
+/** Above this many days of supply, floor-induced overbuy is flagged. */
 export const SMALL_MAX_COVER_DAYS = 60;
 
-/** Single-entry histories are trusted but capped at this many days of supply —
- *  a one-off promo order must not become a permanent floor for a slow SKU. */
-export const SINGLE_ENTRY_HISTORY_MAX_COVER_DAYS = 90;
+/** Corruption guard: a history/last-order floor more than this multiple of the
+ *  raw need is treated as corrupt and rejected (e.g. a one-off 4,501,447-unit
+ *  line, or a 10,000-unit promo). A real print run of 250 vs a 20-unit raw
+ *  need (12.5x) passes; the corrupt 4.5M vs ~400 raw need (~11,000x) does not. */
+export const MAX_HISTORY_FLOOR_RATIO = 1000;
 
 export interface CoverFloorInput {
     sku: string;
@@ -36,6 +40,7 @@ export interface CoverFloorInput {
     stockOnHand: number;
     stockOnOrder: number;
     skuPurchaseHistory?: number[] | null;
+    lastPurchaseQty?: number | null;
     minimumOrderEaches?: number | null;
     unitPrice?: number | null;
     targetCoverDaysOverride?: number | null;
@@ -46,6 +51,7 @@ export interface CoverFloorResult {
     floorQty: number;
     targetQty: number;
     historyFloor: number | null;
+    lastOrderFloor: number | null;
     flags: string[];
     reason: string;
 }
@@ -77,8 +83,8 @@ function sanitizeHistory(history: number[]): number[] {
 }
 
 /**
- * Most frequent value. Ties break to the value closest to the history median
- * ("most recent median"), then to the one most recently ordered.
+ * Most frequent value. Ties break to the value closest to the history median,
+ * then to the one most recently ordered.
  */
 function modeOf(values: number[]): number {
     const counts = new Map<number, number>();
@@ -126,66 +132,61 @@ function historyIsConsistent(cleaned: number[], mode: number): boolean {
     return modeCount >= 3 || (max <= mode * 1.2 && min >= mode * 0.8);
 }
 
+/** A floor candidate is corrupt when it exceeds this multiple of the raw need. */
+function isCorruptFloor(value: number, rawNeedQty: number): boolean {
+    return rawNeedQty > 0 && value > MAX_HISTORY_FLOOR_RATIO * rawNeedQty;
+}
+
 interface ReasonArgs {
     rawNeedQty: number;
     qty: number;
     dailyRate: number;
-    existingCoverDays: number;
     floorQty: number;
     historyFloor: number | null;
-    lastOrder: number | null;
+    lastOrderFloor: number | null;
     moq: number;
     flags: string[];
 }
 
 /**
- * Prose reason citing the numbers: what was raised, what drove it (history
- * mode / MOQ / gap floor), and the resulting days of supply, e.g.
- * "raised 5 to 50: purchase history consistently 50 (last order 50); 50 = 72.5d
- * of supply at 0.69/day".
+ * Prose reason citing the numbers: what was raised and what drove it (history
+ * mode / last order / supply floor / MOQ), plus the resulting days of supply.
  */
 function buildReason(args: ReasonArgs): string {
-    const { rawNeedQty, qty, dailyRate, existingCoverDays, floorQty, historyFloor, lastOrder, moq, flags } = args;
+    const { rawNeedQty, qty, dailyRate, floorQty, historyFloor, lastOrderFloor, moq, flags } = args;
     const rate = Math.round(dailyRate * 100) / 100;
     const supplyDays = Math.round((qty / dailyRate) * 10) / 10;
-    const existingDays = Math.round(existingCoverDays * 10) / 10;
 
     const rawRounded = Math.ceil(rawNeedQty);
     const floorRounded = Math.ceil(floorQty);
     const histRounded = historyFloor == null ? null : Math.ceil(historyFloor);
+    const lastRounded = lastOrderFloor == null ? null : Math.ceil(lastOrderFloor);
     const moqRounded = Math.ceil(moq);
 
-    const driver: "raw" | "floor" | "history" | "moq" =
-        histRounded != null &&
-        qty === histRounded &&
-        histRounded >= rawRounded &&
-        histRounded >= floorRounded &&
-        histRounded >= moqRounded
-            ? "history"
-            : qty === moqRounded &&
-                moqRounded > 0 &&
-                moqRounded >= rawRounded &&
-                moqRounded >= floorRounded &&
-                moqRounded >= (histRounded ?? 0)
-              ? "moq"
-              : qty === floorRounded &&
-                  floorRounded > rawRounded &&
-                  floorRounded >= moqRounded &&
-                  floorRounded >= (histRounded ?? 0)
-                ? "floor"
-                : "raw";
+    const driver: "raw" | "floor" | "history" | "last_order" | "moq" =
+        qty === lastRounded && lastRounded != null && lastRounded >= Math.max(rawRounded, floorRounded, histRounded ?? 0, moqRounded)
+            ? "last_order"
+            : histRounded != null && qty === histRounded && histRounded >= Math.max(rawRounded, floorRounded, moqRounded)
+              ? "history"
+              : qty === moqRounded && moqRounded > 0 && moqRounded >= Math.max(rawRounded, floorRounded, histRounded ?? 0)
+                ? "moq"
+                : qty === floorRounded && floorRounded > rawRounded
+                  ? "floor"
+                  : "raw";
 
     const bits: string[] = [];
     if (driver === "raw") {
-        bits.push(`need ${rawNeedQty} kept (${existingDays}d existing cover)`);
+        bits.push(`need ${rawNeedQty} kept`);
     } else {
         bits.push(`raised ${rawNeedQty} to ${qty}`);
-        if (driver === "history") {
-            bits.push(`purchase history consistently ${historyFloor} (last order ${lastOrder ?? historyFloor})`);
+        if (driver === "last_order") {
+            bits.push(`last order was ${lastOrderFloor} units (${Math.round(((lastOrderFloor! - rawNeedQty) / lastOrderFloor!) * 100)}% below)`);
+        } else if (driver === "history") {
+            bits.push(`purchase history consistently ${historyFloor}`);
         } else if (driver === "moq") {
             bits.push(`minimum order ${moq} units`);
         } else {
-            bits.push(`30d cover gap floor (existing ${existingDays}d)`);
+            bits.push(`30d order-supply floor`);
         }
     }
     bits.push(`${qty} = ${supplyDays}d of supply at ${rate}/day`);
@@ -195,8 +196,8 @@ function buildReason(args: ReasonArgs): string {
     if (flags.includes("moq_forced_overbuy")) {
         bits.push(`MOQ pushes cover past ${SMALL_MAX_COVER_DAYS}d`);
     }
-    if (flags.includes("single_entry_history_capped")) {
-        bits.push(`lone history entry capped at ${SINGLE_ENTRY_HISTORY_MAX_COVER_DAYS}d of supply`);
+    if (flags.includes("history_floor_rejected")) {
+        bits.push(`history floor rejected as corrupt (>${MAX_HISTORY_FLOOR_RATIO}x need)`);
     }
     return bits.join("; ");
 }
@@ -206,7 +207,7 @@ function buildReason(args: ReasonArgs): string {
  *
  * @param input Line inputs: raw need, velocity, stock, purchase history, MOQ.
  * @returns The floored quantity plus diagnostics (floorQty, targetQty,
- *          historyFloor, flags, prose reason).
+ *          historyFloor, lastOrderFloor, flags, prose reason).
  */
 export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
     const {
@@ -215,20 +216,22 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
         stockOnHand,
         stockOnOrder,
         skuPurchaseHistory,
+        lastPurchaseQty,
         minimumOrderEaches,
         targetCoverDaysOverride,
     } = input;
     const moq = minimumOrderEaches ?? 0;
 
     // Rule 0 — a floor must never CREATE an order. Held lines (rawNeedQty <= 0)
-    // pass through as zero: MOQ/history floors must not force a purchase the
-    // core math said is unnecessary.
+    // pass through as zero: floors must not force a purchase the core math
+    // said is unnecessary.
     if (!(rawNeedQty > 0)) {
         return {
             qty: 0,
             floorQty: 0,
             targetQty: 0,
             historyFloor: null,
+            lastOrderFloor: null,
             flags: [],
             reason: "no need - floor skipped",
         };
@@ -241,6 +244,7 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
             floorQty: 0,
             targetQty: 0,
             historyFloor: null,
+            lastOrderFloor: null,
             flags: [],
             reason: "vendor target cover override present - floor skipped",
         };
@@ -253,63 +257,73 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
             floorQty: 0,
             targetQty: 0,
             historyFloor: null,
+            lastOrderFloor: null,
             flags: [],
             reason: "no usable daily rate - floor skipped",
         };
     }
 
-    // Rule 3 — gap semantics (R1): raise POST-RECEIPT cover to the minimum.
-    const existingCoverDays = (stockOnHand + stockOnOrder) / dailyRate;
-    const floorQty = Math.max(0, MIN_COVER_DAYS - existingCoverDays) * dailyRate;
-    const targetQty = Math.max(0, TARGET_COVER_DAYS - existingCoverDays) * dailyRate;
+    // Rule 3 — the ORDER must cover >= MIN_COVER_DAYS of supply. Bill: "must at
+    // least purchase 30-45 days otherwise too much shipping and waste of
+    // vendor time." This is a floor on the order size, independent of existing
+    // runway (a SKU inside the order window still buys a meaningful amount).
+    const floorQty = Math.ceil(MIN_COVER_DAYS * dailyRate);
+    const targetQty = Math.ceil(TARGET_COVER_DAYS * dailyRate);
 
     // Rule 4 — history floor: sanity-cap first, then mode of the consistent set.
     let historyFloor: number | null = null;
-    let lastOrder: number | null = null;
-    let flagsSingleEntryCapped = false;
+    let flagsHistoryRejected = false;
     if (skuPurchaseHistory != null && skuPurchaseHistory.length > 0) {
         const cleaned = sanitizeHistory(skuPurchaseHistory);
         if (cleaned.length > 0) {
             const mode = modeOf(cleaned);
             if (historyIsConsistent(cleaned, mode)) {
-                historyFloor = mode;
-                // Single-entry guard: a lone record (e.g. a one-off 10,000-unit
-                // promo) must not become a permanent floor. Cap at 90 days of
-                // supply; still generous (Bill: "even 60 days is usually OK").
-                if (cleaned.length === 1) {
-                    const capQty = Math.max(1, Math.ceil(SINGLE_ENTRY_HISTORY_MAX_COVER_DAYS * dailyRate));
-                    if (historyFloor > capQty) {
-                        historyFloor = capQty;
-                        flagsSingleEntryCapped = true;
-                    }
+                if (isCorruptFloor(mode, rawNeedQty)) {
+                    flagsHistoryRejected = true;
+                } else {
+                    historyFloor = mode;
                 }
             }
-            lastOrder = cleaned[cleaned.length - 1];
         }
     }
 
-    // Rule 5 — final qty: max of raw need, gap floor, history floor, MOQ; round up.
-    const qty = Math.ceil(Math.max(rawNeedQty, floorQty, historyFloor ?? 0, moq));
+    // Rule 4b — last-order floor. When the recommended order is >= 50% below
+    // the most recent actual purchase (Bill: "when a small order, look at
+    // history and decide"), floor to that last order. Catches the inconsistent
+    // multi-entry case (THC101 [50,30,20,25,45,30] -> mode is noisy but the
+    // last order was a clean 50) that the mode path intentionally rejects.
+    let lastOrderFloor: number | null = null;
+    if (lastPurchaseQty != null && lastPurchaseQty > 0 && !isCorruptFloor(lastPurchaseQty, rawNeedQty)) {
+        const base = Math.max(rawNeedQty, floorQty, historyFloor ?? 0, moq);
+        if (lastPurchaseQty > base && (lastPurchaseQty - base) / lastPurchaseQty >= 0.5) {
+            lastOrderFloor = lastPurchaseQty;
+        }
+    }
 
-    // Rule 6 — over-60d cover is only flagged when a FLOOR caused the overage
-    // (a raw need that already exceeds 60d is the recommender's business).
+    // Rule 5 — final qty: max of raw need, supply floor, history floor,
+    // last-order floor, MOQ; round up.
+    const qty = Math.ceil(Math.max(rawNeedQty, floorQty, historyFloor ?? 0, lastOrderFloor ?? 0, moq));
+
+    // Rule 6 — over-60d cover is flagged when a FLOOR caused the overage.
     const flags: string[] = [];
     const postReceiptCoverDays = (stockOnHand + stockOnOrder + qty) / dailyRate;
     if (postReceiptCoverDays > SMALL_MAX_COVER_DAYS) {
+        const drivenByHistory =
+            (historyFloor != null && historyFloor === qty) || (lastOrderFloor != null && lastOrderFloor === qty);
         const qtyWithoutHistory = Math.ceil(Math.max(rawNeedQty, floorQty, moq));
         const overWithoutHistory =
             (stockOnHand + stockOnOrder + qtyWithoutHistory) / dailyRate > SMALL_MAX_COVER_DAYS;
-        const qtyWithoutMoq = Math.ceil(Math.max(rawNeedQty, floorQty, historyFloor ?? 0));
+        const qtyWithoutMoq = Math.ceil(Math.max(rawNeedQty, floorQty, historyFloor ?? 0, lastOrderFloor ?? 0));
         const overWithoutMoq =
             (stockOnHand + stockOnOrder + qtyWithoutMoq) / dailyRate > SMALL_MAX_COVER_DAYS;
-        if (historyFloor != null && !overWithoutHistory) {
+        if (drivenByHistory && !overWithoutHistory) {
             flags.push("history_over_60d");
         } else if (moq > 0 && !overWithoutMoq) {
             flags.push("moq_forced_overbuy");
         }
     }
-    if (flagsSingleEntryCapped) {
-        flags.push("single_entry_history_capped");
+    if (flagsHistoryRejected) {
+        flags.push("history_floor_rejected");
     }
 
     // Rule 7 — prose reason citing the numbers.
@@ -317,13 +331,12 @@ export function applyCoverFloor(input: CoverFloorInput): CoverFloorResult {
         rawNeedQty,
         qty,
         dailyRate,
-        existingCoverDays,
         floorQty,
         historyFloor,
-        lastOrder,
+        lastOrderFloor,
         moq,
         flags,
     });
 
-    return { qty, floorQty, targetQty, historyFloor, flags, reason };
+    return { qty, floorQty, targetQty, historyFloor, lastOrderFloor, flags, reason };
 }

@@ -1,10 +1,12 @@
 /**
  * @file    src/lib/purchasing/cover-floor.test.ts
- * @purpose Contract tests for the 30/45d cover floor: gap semantics (R1 —
- *          the floor raises POST-RECEIPT cover, it never adds a flat 30d on
- *          top of existing stock), history mode floor with the 100x-median
- *          sanity cap (kills corrupt values like 4501447), MOQ interaction,
- *          override/zero-rate passthrough, and the 60d overbuy flags.
+ * @purpose Contract tests for the 30/45d cover floor. Bill's rule
+ *          (2026-08-24): the ORDER must cover >= 30 days of supply (target 45,
+ *          60 usually OK) and, when the order is small, history decides. Tests
+ *          the 30d order-supply floor, the history mode floor with the
+ *          100x-median sanity cap, the last-order floor for inconsistent
+ *          history, MOQ interaction, override/zero-rate passthrough, and the
+ *          over-60d flags.
  *
  * @author  Hermia
  * @created 2026-08-24
@@ -16,39 +18,39 @@ import { describe, it, expect } from "vitest";
 import { applyCoverFloor, MIN_COVER_DAYS, TARGET_COVER_DAYS } from "./cover-floor";
 
 describe("applyCoverFloor", () => {
-    it("THC101 canonical (2026-08-24 screenshot): history floor 50 beats the 5-unit gap fill", () => {
+    it("THC101 canonical (real data): last-order 50 beats a noisy history + tiny gap", () => {
         const r = applyCoverFloor({
             sku: "THC101",
             rawNeedQty: 5,
             dailyRate: 0.69,
             stockOnHand: 29,
             stockOnOrder: 0,
-            skuPurchaseHistory: [50],
-            minimumOrderEaches: 9,
+            skuPurchaseHistory: [50, 30, 20, 25, 45, 30],
+            lastPurchaseQty: 50,
             unitPrice: 45,
         });
         expect(r.qty).toBe(50);
-        expect(r.reason).toContain("50");
+        expect(r.reason).toContain("last order was 50");
         expect(r.flags).not.toContain("moq_forced_overbuy");
     });
 
-    it("GLP102: consistent [30, 30] history floors to 30 and cites history", () => {
+    it("GLP102 (real data): 30d order-supply floor = 18 when history is inconsistent", () => {
         const r = applyCoverFloor({
             sku: "GLP102",
             rawNeedQty: 5,
             dailyRate: 0.59,
             stockOnHand: 28,
             stockOnOrder: 0,
-            skuPurchaseHistory: [30, 30],
+            skuPurchaseHistory: [20, 30],
+            lastPurchaseQty: 20,
         });
-        // 30d flat floor would be ~18 at 0.59/day — qty must clear that either way.
-        expect(r.qty).toBeGreaterThanOrEqual(18);
-        // The consistent history [30, 30] is the binding floor.
-        expect(r.qty).toBe(30);
-        expect(r.reason).toMatch(/history/i);
+        // 30d floor = ceil(30 x 0.59) = 18. History [20,30] is inconsistent,
+        // last order 20 is only 10% above 18, so no last-order floor.
+        expect(r.qty).toBe(18);
+        expect(r.floorQty).toBe(18);
     });
 
-    it("BASLPE103: mode 80 (3 of 7 orders) beats the 30d gap floor; no flags", () => {
+    it("BASLPE103: consistent mode 80 beats the 30d floor; no flags", () => {
         const r = applyCoverFloor({
             sku: "BASLPE103",
             rawNeedQty: 32,
@@ -61,7 +63,7 @@ describe("applyCoverFloor", () => {
         expect(r.flags).toEqual([]);
     });
 
-    it("40d existing cover: gap floor is ~0 (R1), target is 5, qty is the raw need", () => {
+    it("30d order-supply floor applies even with healthy runway (flat, not gap)", () => {
         const r = applyCoverFloor({
             sku: "COVER40",
             rawNeedQty: 2,
@@ -70,9 +72,9 @@ describe("applyCoverFloor", () => {
             stockOnOrder: 0,
             skuPurchaseHistory: null,
         });
-        expect(r.qty).toBe(2);
-        expect(r.floorQty).toBe(0);
-        expect(r.targetQty).toBe(TARGET_COVER_DAYS - 40);
+        expect(r.floorQty).toBe(MIN_COVER_DAYS); // 30 x 1
+        expect(r.targetQty).toBe(TARGET_COVER_DAYS); // 45 x 1
+        expect(r.qty).toBe(30);
     });
 
     it("S-4122: need 500 already above target — unchanged", () => {
@@ -163,24 +165,55 @@ describe("applyCoverFloor", () => {
     });
 });
 
-describe("single-entry history guard", () => {
-    it("caps a lone 10,000-unit promo record at 90 days of supply", () => {
+describe("last-order floor", () => {
+    it("floors to the last order when the suggestion is >= 50% below it", () => {
+        const r = applyCoverFloor({
+            sku: "LAST1", rawNeedQty: 2, dailyRate: 1, stockOnHand: 0, stockOnOrder: 0,
+            skuPurchaseHistory: [30, 20], lastPurchaseQty: 60,
+        });
+        // 30d floor = 30; last order 60 is 50% above it → floor to 60.
+        expect(r.qty).toBe(60);
+        expect(r.reason).toContain("last order was 60");
+    });
+
+    it("does NOT floor when last order is close to the suggestion", () => {
+        const r = applyCoverFloor({
+            sku: "LAST2", rawNeedQty: 18, dailyRate: 1, stockOnHand: 0, stockOnOrder: 0,
+            skuPurchaseHistory: [20, 30], lastPurchaseQty: 20,
+        });
+        // base = max(18, 30d floor 30) = 30; last 20 < 30 -> no floor.
+        expect(r.qty).toBe(30);
+        expect(r.reason).not.toContain("last order was");
+    });
+
+    it("rejects a last order > 1000x raw need as corrupt (no floor)", () => {
+        const r = applyCoverFloor({
+            sku: "LAST3", rawNeedQty: 5, dailyRate: 5, stockOnHand: 0, stockOnOrder: 0,
+            skuPurchaseHistory: null, lastPurchaseQty: 10000,
+        });
+        // 10000 > 1000 x 5 -> rejected; falls back to the 30d supply floor = 150.
+        expect(r.qty).toBe(150);
+        expect(r.lastOrderFloor).toBeNull();
+    });
+
+    it("keeps a real print-run last order (label: 250 vs 20 raw need)", () => {
+        const r = applyCoverFloor({
+            sku: "OAG109LABELBACK", rawNeedQty: 20, dailyRate: 0.54, stockOnHand: 29, stockOnOrder: 0,
+            skuPurchaseHistory: null, lastPurchaseQty: 250,
+        });
+        // 250 is 12.5x raw need — a legitimate print run, not corrupt.
+        expect(r.qty).toBe(250);
+        expect(r.reason).toContain("last order was 250");
+    });
+
+    it("rejects a lone corrupt history entry (10,000-unit promo) and falls back to the supply floor", () => {
         const r = applyCoverFloor({
             sku: "PROMO101", rawNeedQty: 5, dailyRate: 5, stockOnHand: 0, stockOnOrder: 0,
             skuPurchaseHistory: [10000],
         });
-        expect(r.qty).toBe(450);
-        expect(r.flags).toContain("single_entry_history_capped");
-        expect(r.reason).toContain("capped");
-    });
-
-    it("keeps trusting a lone entry inside the cap (THC101 canonical)", () => {
-        const r = applyCoverFloor({
-            sku: "THC101", rawNeedQty: 5, dailyRate: 0.69, stockOnHand: 29, stockOnOrder: 0,
-            skuPurchaseHistory: [50], minimumOrderEaches: 9, unitPrice: 45,
-        });
-        expect(r.qty).toBe(50);
-        expect(r.flags).not.toContain("single_entry_history_capped");
+        expect(r.qty).toBe(150);
+        expect(r.flags).toContain("history_floor_rejected");
+        expect(r.reason).toContain("rejected as corrupt");
     });
 });
 

@@ -104,7 +104,7 @@ describe("recommendQty — v2.9 regression oracle (byte-identical vs v2.8)", () 
         expect(result.rawNeededEaches).toBeCloseTo(22.8, 5);
     });
 
-    it("ORS101 control: case-pack 12 path — unchanged (oracle 12)", () => {
+    it("ORS101: case-pack line now floors to full 30d supply (12 → 30) — the one intentional v2.9 change", () => {
         const result = recommendQty(makeInput({
             sku: "ORS101",
             dailyRate: 1.0,
@@ -114,8 +114,10 @@ describe("recommendQty — v2.9 regression oracle (byte-identical vs v2.8)", () 
             orderIncrementQty: 12,
             unitPrice: 10,
         }));
-        expect(result.suggestedQty).toBe(12);
+        // v2.8: 12 (one case). v2.9: 30d order-supply floor = ceil(30 x 1.0) = 30.
+        expect(result.suggestedQty).toBe(30);
         expect(result.rawNeededEaches).toBe(4);
+        expect(result.provenance.some(s => s.step === "cover_floor")).toBe(true);
     });
 
     it("BOX-101 control: no order needed, 100d cover — unchanged (oracle 0)", () => {
@@ -133,11 +135,10 @@ describe("recommendQty — v2.9 regression oracle (byte-identical vs v2.8)", () 
 });
 
 describe("recommendQty — v2.9 cover floor (Bill 2026-08-24)", () => {
-    it("THC101: history floor wins over tiny formula need — raises 5→50 with 'raised' provenance", () => {
-        // dailyRate 0.69, stock 29 → 29/0.69 = 42d existing cover, so the gap
-        // floor is 0; raw need is only ~1 → cognitive snaps to 5. Purchase
-        // history consistently says 50 → cover floor must raise to 50
-        // (Bill: "THC101 suggested 5 but history says 50, unacceptable").
+    it("THC101: last-order 50 beats noisy history + tiny formula need (real data)", () => {
+        // dailyRate 0.69, stock 29 → raw need ~1 → cognitive snaps to 5.
+        // Real history [50,30,20,25,45,30] is inconsistent (mode 30), but the
+        // most recent order was 50 → last-order floor raises 5 → 50.
         const result = recommendQty(makeInput({
             sku: "THC101",
             dailyRate: 0.69,
@@ -145,14 +146,14 @@ describe("recommendQty — v2.9 cover floor (Bill 2026-08-24)", () => {
             stockOnOrder: 0,
             leadTimeDays: 13,
             leadTimeProvenance: "13d (vendor median)",
-            skuPurchaseHistory: [50],
-            minimumOrderEaches: 9,
+            skuPurchaseHistory: [50, 30, 20, 25, 45, 30],
+            lastPurchaseQty: 50,
             unitPrice: 45,
         }));
         expect(result.suggestedQty).toBe(50);
         const coverStep = result.provenance.find(p => p.step === "cover_floor");
         expect(coverStep).toBeDefined();
-        expect(coverStep?.detail).toContain("raised");
+        expect(coverStep?.detail).toContain("last order was 50");
         expect(coverStep?.value).toBe(50);
     });
 

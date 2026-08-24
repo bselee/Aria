@@ -572,6 +572,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
                 stockOnHand: effectiveStock,
                 stockOnOrder,
                 skuPurchaseHistory: input.skuPurchaseHistory ?? null,
+                lastPurchaseQty: input.lastPurchaseQty ?? null,
                 // Step 8 owns MOQ tri-state semantics (enforce/warn/ignore,
                 // pack snap, dollar MOQ) — do not double-enforce here.
                 minimumOrderEaches: null,
@@ -581,7 +582,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
             if (cf.qty !== suggestedQty) {
                 suggestedQty = cf.qty;
             }
-            if (cf.historyFloor != null && cf.qty === cf.historyFloor && cf.qty > preFloor) {
+            if (cf.qty > preFloor && (cf.historyFloor != null || cf.lastOrderFloor != null)) {
                 historicalFloorApplied = true;
             }
             trace.push({
@@ -732,6 +733,10 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     }
 
     // v2.6c: lastPurchaseQty single-point floor (fallback when no multi-PO history)
+    // NOTE (v2.9): superseded by cover-floor Rule 4b, which applies the same
+    // >=50% deviation threshold against the floored base and adds a 90d cap.
+    // Left in place for byte-compatibility; cover-floor raises qty first so
+    // this block is effectively a no-op for every reachable state.
     if (!historicalFloorApplied && suggestedQty > 0) {
         const lastQty = input.lastPurchaseQty ?? null;
         const history = input.skuPurchaseHistory ?? [];
