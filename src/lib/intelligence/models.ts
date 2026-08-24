@@ -47,12 +47,17 @@ export const OPENROUTER_MODELS = {
     claudeHaiku: 'anthropic/claude-haiku-4.5',
     geminiFlash: 'google/gemini-2.5-flash',  // Uses OpenRouter's quota, not ours
     gpt4oMini: 'openai/gpt-4o-mini',
-    gpt4: 'openai/gpt-4',              // Best accuracy + speed (0.62s avg)
-    gpt35Turbo: 'openai/gpt-3.5-turbo', // Best value for high-volume (0.74s avg)
     // HERMIA(2026-06-04): DeepSeek V4 Flash — current default model for Aria.
-    // Extremely cheap ($0.14/M input), fast, and proven reliable for structured
-    // JSON and classification. Added to every chain as the cost-optimised first try.
+    // Extremely cheap, fast, and proven reliable for structured JSON and
+    // classification. First try in every chain.
     deepseekV4: 'deepseek/deepseek-v4-flash',
+    // HERMIA(2026-08-24): GPT-4 and GPT-3.5 stripped from every chain.
+    // Live-verified traps: gpt-4 = $30/$60 per M, gpt-3.5-turbo = $0.50/$1.50.
+    // Any DeepSeek fallback would have burned 500x on GPT-4. Replaced with
+    // live-verified Qwen slugs (old 'qwen3.5-flash' slug has rotated away).
+    qwen37Flash: 'qwen/qwen3.7-flash',               // $0.030/$0.130, 1M ctx — cheapest Qwen
+    qwen35Flash: 'qwen/qwen3.5-flash-02-23',         // $0.065/$0.260, 1M ctx
+    qwen30bA3b: 'qwen/qwen3-30b-a3b-instruct-2507',  // $0.048/$0.193 — MoE, 3B active, fastest chat
 } as const;
 
 // ── Fallback Chains ─────────────────────────────────────────────────────────
@@ -64,11 +69,12 @@ export const OPENROUTER_MODELS = {
  * Every model is proven for Zod schema generation and tool calling.
  */
 export const OPENROUTER_STRUCTURED_CHAIN = [
-    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },  // $0.14/M — cheapest proven, try first
-    { name: 'OpenRouter GPT-4', slug: OPENROUTER_MODELS.gpt4 },        // Best accuracy + speed (0.62s)
-    { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
-    { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },  // $0.056/M — proven, try first
+    { name: 'OpenRouter Qwen 3.7 Flash', slug: OPENROUTER_MODELS.qwen37Flash },    // $0.030/M — cheapest fallback
+    { name: 'OpenRouter Qwen 3.5 Flash', slug: OPENROUTER_MODELS.qwen35Flash },    // $0.065/M
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
+    { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
+    { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },  // best structured JSON
 ] as const;
 
 /**
@@ -76,12 +82,11 @@ export const OPENROUTER_STRUCTURED_CHAIN = [
  * Same models — chat quality is equally important.
  */
 export const OPENROUTER_CHAT_CHAIN = [
-    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 }, // $0.14/M — cheapest, fast, try first
-    { name: 'OpenRouter GPT-3.5 Turbo', slug: OPENROUTER_MODELS.gpt35Turbo }, // Fastest chat (0.74s), cheapest
-    { name: 'OpenRouter GPT-4', slug: OPENROUTER_MODELS.gpt4 },               // When accuracy matters
-    { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
-    { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 }, // $0.056/M — proven, try first
+    { name: 'OpenRouter Qwen 3 30B A3B', slug: OPENROUTER_MODELS.qwen30bA3b },    // $0.048/M — MoE 3B active, fastest paid chat
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
+    { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
+    { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
 ] as const;
 
 /**
@@ -115,8 +120,9 @@ export const OPENROUTER_FREE_CHAIN = [
  */
 export const OPENROUTER_VISION_MODELS_ARRAY = [
     OPENROUTER_MODELS.geminiFlash,  // ✅ Supports PDF base64 directly — try first
-    OPENROUTER_MODELS.deepseekV4,   // ✅ Supports PDF base64 — cheap $0.14/M
-    OPENROUTER_MODELS.gpt4,         // ✅ Supports PDF base64, best accuracy (0.62s)
+    OPENROUTER_MODELS.deepseekV4,   // ✅ Supports PDF base64 — cheap $0.056/M
+    // HERMIA(2026-08-24): GPT-4 removed — $30/M on base64 PDF inputs was a
+    // 500x trap for every extractor fallback.
     OPENROUTER_MODELS.claudeHaiku,  // ❌ PDF base64 → 400 error
     OPENROUTER_MODELS.gpt4oMini,    // Unlikely to support PDF base64
 ] as const;
