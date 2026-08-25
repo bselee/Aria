@@ -35,6 +35,10 @@ import {
 import { getVendorAutonomyLevel } from './po-sender';
 import { transitionLifecycleState } from './po-lifecycle';
 import { invalidatePurchasingCaches } from './cache';
+import { autoDraftQtyOk, isNeverAutonomous } from './ordering-row-copy';
+import { classifyLine, mayAutonomyDraft } from './input-class';
+
+const AUTO_DRAFT_CAP_USD = Number(process.env.PO_AUTO_DRAFT_CAP) || 2500;
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -172,6 +176,11 @@ async function processVendorGroup(
         reason: '',
     };
 
+    if (isNeverAutonomous(vendorName)) {
+        baseDetail.reason = 'never_autonomous';
+        return baseDetail;
+    }
+
     // ── GATE 1: Policy assessment — at least one line must be "order" ──
     const draftPolicy = buildDraftPOItemsFromAssessment(items);
     if (draftPolicy.items.length === 0) {
@@ -179,22 +188,32 @@ async function processVendorGroup(
         return baseDetail;
     }
 
-    // ── GATE 2: Commit guard — every orderable line must be "commit" ──
-    // Quinton's spec: reorder = lead time coverage + 90 days post-receipt supply
+    // ── GATE 2: 30-day supply on the order itself (no 1- and 5-each drafts) ──
     const guardBatch = assessPOCommitGuardsForLines(
         items.filter((line: any) =>
             line.assessment.decision === 'order' || line.assessment.decision === 'reduce'
         ),
-        { minimumPostLeadCoverageDays: 90 },
+        { minimumPostLeadCoverageDays: 30 },
     );
 
     const commitReadyProductIds = new Set(
         guardBatch.commitReadyLines.map((entry: any) => entry.line.item.productId),
     );
 
-    const commitReadyItems = draftPolicy.items.filter(item =>
-        commitReadyProductIds.has(item.productId),
-    );
+    const commitReadyItems = draftPolicy.items.filter(item => {
+        if (!commitReadyProductIds.has(item.productId)) return false;
+        const line = items.find((l: any) => l.item.productId === item.productId);
+        const dailyRate = line?.item?.dailyRate ?? line?.candidate?.directDemand ?? 0;
+        if (!autoDraftQtyOk(item.quantity, dailyRate)) return false;
+        const dollars = item.quantity * (item.unitPrice || 0);
+        const cls = classifyLine({
+            sku: item.productId,
+            lineDollars: dollars,
+            suggestedQty: item.quantity,
+            dailyRate: Number(dailyRate) || 0,
+        });
+        return mayAutonomyDraft(cls.class);
+    });
 
     if (commitReadyItems.length === 0) {
         baseDetail.reason = 'no_commit_ready_lines';
@@ -261,6 +280,11 @@ async function processVendorGroup(
     );
     baseDetail.totalValue = totalValue;
     baseDetail.skuCount = commitReadyItems.length;
+
+    if (totalValue > AUTO_DRAFT_CAP_USD) {
+        baseDetail.reason = `over_cap_$${Math.round(totalValue)}_limit_$${AUTO_DRAFT_CAP_USD}`;
+        return baseDetail;
+    }
 
     try {
         const memo = `Auto-drafted by Aria drafter-agent at ${new Date().toISOString()}. ` +

@@ -117,11 +117,29 @@ export function isDateTodayDenver(iso: string | null | undefined, now: Date = ne
     return iso.slice(0, 10) === denverYmd(now);
 }
 
+export function isOpenAutoDraft(draftPO: DraftPoRef | null | undefined): boolean {
+    return Boolean(draftPO?.autoDrafted && draftPO.orderId);
+}
+
+/** @deprecated use isOpenAutoDraft — drafts stay until Finale commit */
 export function isAutoDraftToday(
     draftPO: DraftPoRef | null | undefined,
-    now: Date = new Date(),
+    _now?: Date,
 ): boolean {
-    return Boolean(draftPO?.autoDrafted && draftPO.orderId && isDateTodayDenver(draftPO.orderDate, now));
+    return isOpenAutoDraft(draftPO);
+}
+
+/**
+ * Auto-draft qty must cover >= 30 days of use. Blocks 1- and 5-each noise.
+ * Missing daily rate: require qty >= 30 eaches.
+ */
+export function autoDraftQtyOk(qty: number, dailyRate: number | null | undefined): boolean {
+    if (!Number.isFinite(qty) || qty <= 0) return false;
+    const rate = Number(dailyRate);
+    if (Number.isFinite(rate) && rate > 0) {
+        return qty / rate >= 30;
+    }
+    return qty >= 30;
 }
 
 export interface OrderingListItem {
@@ -132,11 +150,11 @@ export interface OrderingListItem {
 }
 
 /**
- * Ordering lists need-to-order lines, plus auto-drafts created today.
- * Already on order (committed, old drafts, topping) is hidden.
+ * Ordering lists need-to-order lines, plus auto-drafts still in Finale draft.
+ * Hidden once committed / already on order.
  */
 export function shouldListOnOrdering(item: OrderingListItem, now: Date = new Date()): boolean {
-    if (isAutoDraftToday(item.draftPO, now)) return true;
+    if (isOpenAutoDraft(item.draftPO)) return true;
     const reasons = item.assessment?.reasonCodes ?? [];
     if (reasons.includes("on_order_already_covers_need") || reasons.includes("recent_draft_exists")) {
         return false;

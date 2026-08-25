@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { formatPoDraftLabel, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "./ordering-row-copy";
+import { autoDraftQtyOk, formatPoDraftLabel, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "./ordering-row-copy";
 
 describe("formatPoDraftLabel", () => {
     it("renders PO{n} Draft without a hash", () => {
@@ -98,15 +98,25 @@ describe("shouldListOnOrdering", () => {
         }, now)).toBe(false);
     });
 
-    it("lists only auto-drafts created today", () => {
+    it("lists auto-drafts until Finale commit, not only today", () => {
         expect(shouldListOnOrdering({
             assessment: { decision: "hold", reasonCodes: ["recent_draft_exists"] },
-            draftPO: { orderId: "125300", orderDate: "2026-08-25", autoDrafted: true },
+            draftPO: { orderId: "125300", orderDate: "2026-08-20", autoDrafted: true },
         }, now)).toBe(true);
         expect(shouldListOnOrdering({
             assessment: { decision: "hold", reasonCodes: ["recent_draft_exists"] },
             draftPO: { orderId: "125300", orderDate: "2026-08-25", autoDrafted: false },
         }, now)).toBe(false);
+    });
+});
+
+describe("autoDraftQtyOk", () => {
+    it("requires 30 days of supply", () => {
+        expect(autoDraftQtyOk(5, 1)).toBe(false);
+        expect(autoDraftQtyOk(1, 0.5)).toBe(false);
+        expect(autoDraftQtyOk(50, 0.69)).toBe(true);
+        expect(autoDraftQtyOk(30, 0)).toBe(true);
+        expect(autoDraftQtyOk(5, 0)).toBe(false);
     });
 });
 

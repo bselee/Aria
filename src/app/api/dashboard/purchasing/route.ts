@@ -15,7 +15,6 @@ import {
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
 import { readReconBadges } from '@/lib/purchasing/basauto-recon-lookup';
 import { recomputeBasautoBadge, type LiveRowAria } from '@/lib/purchasing/basauto-recon-live';
-import { denverYmd } from '@/lib/purchasing/ordering-row-copy';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -227,12 +226,12 @@ export async function GET(req: NextRequest) {
     try {
         const db = createClient();
         if (db) {
-            const today = denverYmd();
+            const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
             const { data: autoRows } = await db
                 .from("ap_activity_log")
                 .select("metadata, created_at")
                 .eq("intent", "PO_AUTO_DRAFT")
-                .gte("created_at", `${today}T00:00:00`);
+                .gte("created_at", since);
             for (const row of autoRows ?? []) {
                 const id = (row as any)?.metadata?.orderId;
                 if (id) autoDraftIds.add(String(id));
