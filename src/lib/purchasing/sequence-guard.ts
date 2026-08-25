@@ -6,10 +6,15 @@
  *          corrected in the same run that finds it, so the next INSERT does
  *          not hit a silent 23505 duplicate-key error.
  *
- *          Past incident (2026-08-24): qty_recommendations (49,689 vs 14,986),
- *          invoices_legacy, qty_reservations, po_sends, paid_invoices_legacy.
- *          The identification query below is generic — it scans every serial
- *          column in the public schema, not a hardcoded table list.
+ *          NOTE: this is a per-table loop, NOT a single SQL statement. The
+ *          classic one-statement detection query (last_value via
+ *          `FROM pg_get_serial_sequence(...)` and `MAX(t.id)` over a pg_class
+ *          join) does NOT work: pg_get_serial_sequence returns text (not a
+ *          relation you can SELECT last_value FROM) and pg_class has no id
+ *          column. Verified against live PG16 2026-08-25.
+ *
+ *          Past incident (2026-08-24): qty_recommendations, invoices_legacy,
+ *          qty_reservations, po_sends, paid_invoices_legacy.
  *
  * @author  Hermia
  * @created 2026-08-25
@@ -28,70 +33,107 @@ export interface SequenceHeal {
 }
 
 export interface SequenceCheckResult {
-    /** Desynced sequences found by the scan (rows returned by the HAVING query). */
+    /** Serial columns scanned this run. */
     checked: number;
     /** Sequences actually corrected via setval this run. */
     healed: Array<SequenceHeal>;
 }
 
 /**
- * Identification query: every serial column in the public schema whose
- * sequence last_value has fallen behind MAX(id). Zero rows = healthy.
+ * Every serial/bigserial column in the public schema, with its sequence.
+ * Only the column/table/sequence names — MAX(id) and last_value are fetched
+ * per table afterwards because MAX(id) needs dynamic SQL against the real
+ * table (not the catalog).
  */
-const IDENTIFY_DESYNC_SQL = `
-SELECT c.relname AS table_name, a.attname AS column_name, pg_get_serial_sequence(c.relname, a.attname) AS seq_name, (SELECT last_value FROM pg_get_serial_sequence(c.relname, a.attname)) AS seq_last, COALESCE(MAX(t.id), 0) AS max_id
+const SERIAL_COLUMNS_SQL = `
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name,
+       a.attname AS column_name,
+       pg_get_serial_sequence(n.nspname || '.' || c.relname, a.attname) AS seq_name
 FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-JOIN pg_class t ON t.oid = c.oid
-WHERE c.relkind = 'r' AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') AND pg_get_serial_sequence(c.relname, a.attname) IS NOT NULL
-GROUP BY c.relname, a.attname, pg_get_serial_sequence(c.relname, a.attname)
-HAVING COALESCE(MAX(t.id), 0) > (SELECT last_value FROM pg_get_serial_sequence(c.relname, a.attname));
+WHERE c.relkind = 'r'
+  AND n.nspname = 'public'
+  AND pg_get_serial_sequence(n.nspname || '.' || c.relname, a.attname) IS NOT NULL
 `;
+
+/**
+ * Quote a catalog identifier defensively. Names come from pg_catalog (trusted,
+ * no double-quotes), but the guard is belt-and-suspenders.
+ */
+function qid(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`;
+}
 
 /**
  * Scan the public schema for desynced serial sequences and heal any found.
  *
- * For every row where the sequence's last_value has fallen behind max(id),
- * immediately runs `SELECT setval($1, $2, true)` with (seq_name, max_id) so
- * the next nextval() returns max_id + 1. Each heal is logged loudly with
- * console.warn (table, seq, old last_value, new max). A failed setval on one
- * row is logged and skipped so the remaining sequences still get healed.
+ * For each serial column: read the sequence's last_value from pg_sequences,
+ * read MAX(column) from the actual table, and if the table's max has outpaced
+ * the sequence, run `SELECT setval($1, $2, true)` so the next nextval() is
+ * max_id + 1. Each heal is logged loudly. A failed setval on one row is logged
+ * and skipped so remaining sequences still get healed.
  *
  * Never throws: connection/query failures log and return
  * { checked: 0, healed: [] } so the cron tick survives a DB outage.
- *
- * @returns checked = desynced sequences found; healed = those corrected.
  */
 export async function checkSequences(): Promise<SequenceCheckResult> {
     const client = new Client({ connectionString: process.env.DATABASE_URL });
     const healed: Array<SequenceHeal> = [];
     try {
         await client.connect();
-        const res = await client.query(IDENTIFY_DESYNC_SQL);
-        for (const row of res.rows) {
-            const { table_name, column_name, seq_name, seq_last, max_id } = row;
+
+        const serials = await client.query(SERIAL_COLUMNS_SQL);
+        let scanned = 0;
+        for (const row of serials.rows) {
+            scanned++;
+            const schemaName: string = row.schema_name;
+            const tableName: string = row.table_name;
+            const columnName: string = row.column_name;
+            const seqName: string = row.seq_name;
             try {
-                await client.query("SELECT setval($1, $2, true)", [seq_name, max_id]);
+                const lvRes = await client.query(
+                    "SELECT last_value FROM pg_sequences WHERE schemaname || '.' || sequencename = $1",
+                    [seqName],
+                );
+                const lastValue: number | null = lvRes.rows[0]?.last_value ?? null;
+
+                const maxRes = await client.query(
+                    `SELECT COALESCE(MAX(${qid(columnName)}), 0)::bigint AS max_id FROM ${qid(schemaName)}.${qid(tableName)}`,
+                );
+                const maxId = Number(maxRes.rows[0]?.max_id ?? 0);
+
+                if (maxId <= 0) continue;
+                if (lastValue != null && maxId <= Number(lastValue)) continue;
+
+                try {
+                    await client.query("SELECT setval($1, $2, true)", [seqName, maxId]);
+                } catch (err: any) {
+                    console.error(
+                        `[sequence-guard] setval FAILED for ${tableName}.${columnName} ` +
+                            `seq=${seqName}: ${err?.message ?? err}`,
+                    );
+                    continue;
+                }
+                healed.push({
+                    table: tableName,
+                    column: columnName,
+                    seq: seqName,
+                    oldLast: lastValue ?? 0,
+                    maxId,
+                });
+                console.warn(
+                    `[sequence-guard] HEALED desynced sequence: ${tableName}.${columnName} ` +
+                        `seq=${seqName} last_value=${lastValue} -> max(id)=${maxId}`,
+                );
             } catch (err: any) {
                 console.error(
-                    `[sequence-guard] setval FAILED for ${table_name}.${column_name} ` +
-                        `seq=${seq_name}: ${err?.message ?? err}`
+                    `[sequence-guard] check failed for ${tableName}.${columnName}: ${err?.message ?? err}`,
                 );
-                continue;
             }
-            healed.push({
-                table: table_name,
-                column: column_name,
-                seq: seq_name,
-                oldLast: Number(seq_last),
-                maxId: Number(max_id),
-            });
-            console.warn(
-                `[sequence-guard] HEALED desynced sequence: ${table_name}.${column_name} ` +
-                    `seq=${seq_name} last_value=${seq_last} -> max(id)=${max_id}`
-            );
         }
-        return { checked: healed.length, healed };
+        return { checked: scanned, healed };
     } catch (err: any) {
         console.error(`[sequence-guard] scan failed: ${err?.message ?? err}`);
         return { checked: 0, healed: [] };
