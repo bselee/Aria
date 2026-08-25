@@ -166,6 +166,7 @@ type POResult = {
     finaleUrl: string;
     expectedDelivery?: ExpectedDelivery;
     verification?: DraftVerification;
+    preemptCount?: number;
 };
 type CommitReview = {
     sendId: string;
@@ -447,6 +448,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
+    const [preemptByVendor, setPreemptByVendor] = useState<Record<string, number>>({});
     const [autonomyOverride, setAutonomyOverride] = useState<Record<string, number>>({});
     // Vendors that have been drafted/committed — disappear from Ordering immediately.
         // Seeded from sessionStorage so a hard refresh within 6h doesn't resurrect them
@@ -949,6 +951,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             ...line,
             leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? line.leadTimeDays ?? null,
         }));
+        const preemptCount = items.filter((l: any) => l.preempt).length;
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
             method: "POST",
@@ -957,7 +960,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Failed");
-        return json as POResult;
+        return { ...(json as POResult), preemptCount };
     }
 
     async function handleCreateAllDrafts(groups: PurchasingGroup[]) {
@@ -976,6 +979,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 const result = await createVendorPO(group, true);
                 if (result?.orderId) {
                     setCreatedPOs(p => ({ ...p, [pid]: result }));
+                    setPreemptByVendor(p => ({ ...p, [pid]: result.preemptCount ?? 0 }));
                     markVendorOrdered(pid, result.orderId);
                 }
             } catch (e: any) {
@@ -1003,6 +1007,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             if (result) {
                             // Draft created in Finale — leave Ordering immediately (Active POs owns it).
                             setCreatedPOs(p => ({ ...p, [pid]: result }));
+                            setPreemptByVendor(p => ({ ...p, [pid]: result.preemptCount ?? 0 }));
                             setCreatedPODetails(p => ({ ...p, [pid]: result }));
                             markVendorOrdered(pid, result.orderId);
                             const selItems = selectedItems;
@@ -2383,6 +2388,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                     className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-zinc-600 bg-zinc-800/40 hover:bg-zinc-700/50 text-zinc-200"
                                                                     title="Open in Finale — send from there"
                                                                 >Finale</a>
+                                                                {preemptByVendor[pid] > 0 && (
+                                                                    <span className="text-[10px] font-mono text-zinc-500 shrink-0">+{preemptByVendor[pid]} preempt</span>
+                                                                )}
                                                             </div>
                                                         );
                                                     }

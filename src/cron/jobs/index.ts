@@ -209,6 +209,60 @@ defineJob({
     },
 });
 
+// KAIZEN (2026-08-25): DB reliability guards — (1) auto-heal desynced serial
+// sequences via setval (heal-first, not alert-only; past incident left
+// qty_recommendations 34k inserts short), (2) flag zero qty_recommendations
+// writes in 24h (calibration engine starved). Direct pg, no PostgREST.
+defineJob({
+    name: "db-integrity-guard",
+    schedule: "45 7 * * 1-5",
+    onFail: "log",  // guards must never page anyone on their own failure
+    description: "Mon-Fri 7:45 AM: auto-heals desynced serial sequences (setval) and flags zero qty_recommendations writes in 24h.",
+    handler: async () => {
+        // Dynamic imports — keeps module load light and mirrors ap-health-report.
+        const { checkSequences } = await import("@/lib/purchasing/sequence-guard");
+        const { checkSnapshotPersistence } = await import("@/lib/purchasing/snapshot-observer");
+        const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
+
+        // Guard 1: heal-first sequence desync. Only notify when something was healed.
+        const seqResult = await checkSequences();
+        if (seqResult.healed.length > 0) {
+            console.warn(
+                `[db-integrity-guard] Healed ${seqResult.healed.length} desynced sequence(s): ` +
+                    JSON.stringify(seqResult.healed)
+            );
+            await notifyViaTask({
+                sourceId: `db-integrity:${new Date().toISOString().slice(0, 10)}`,
+                type: "cron_alert",
+                goal: `DB integrity: ${JSON.stringify(seqResult)}`,
+                inputs: { result: seqResult },
+                summaryLabel: "DB Integrity",
+            });
+        }
+
+        // Guard 2: snapshot persistence. Only notify when unhealthy.
+        const snapResult = await checkSnapshotPersistence();
+        if (!snapResult.healthy) {
+            console.warn(
+                `[db-integrity-guard] Snapshot persistence UNHEALTHY — ${snapResult.count24h} ` +
+                    `qty_recommendations rows in last 24h.`
+            );
+            await notifyViaTask({
+                sourceId: `db-integrity:${new Date().toISOString().slice(0, 10)}`,
+                type: "cron_alert",
+                goal: `DB integrity: ${JSON.stringify(snapResult)}`,
+                inputs: { result: snapResult },
+                summaryLabel: "DB Integrity",
+            });
+        }
+
+        console.log(
+            `[db-integrity-guard] Done: sequences healed=${seqResult.healed.length}, ` +
+                `snapshots24h=${snapResult.count24h} healthy=${snapResult.healthy}`
+        );
+    },
+});
+
 // HERMIA(2026-06-10): Post-run follow-up — quick pipeline check at noon and 4 PM.
 // Only sends if there's actual activity or unresolved issues. Keeps Bill in the
 // loop without burning tokens on empty reports.

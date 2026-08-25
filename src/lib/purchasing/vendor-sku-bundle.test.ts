@@ -89,6 +89,7 @@ describe("bundleVendorDraftLines", () => {
         expect(ids).not.toContain("GLP115");
         expect(ids).not.toContain("GLP116");
         expect(out.find((l) => l.productId === "GLP113")?.preempt).toBe(true);
+        expect(out.find((l) => l.productId === "GLP102")?.preempt).toBe(false);
         expect(out.find((l) => l.productId === "GLP113")?.quantity).toBeGreaterThanOrEqual(30);
     });
 

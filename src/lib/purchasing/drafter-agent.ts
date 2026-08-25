@@ -72,6 +72,29 @@ interface DrafterContext {
     recentPOs?: any[];
 }
 
+/**
+ * Build a vendorPartyId → cycle-result map for a set of vendor groups from
+ * recent Finale POs. Pure — no network. Feeds Gate 4 (cycle lock) when the
+ * caller did not supply context.vendorCycles (cron drafter-scan and
+ * stockout-driver call runDrafterAgent() with no context, which previously
+ * left the gate dead).
+ */
+export function buildVendorCycleMap(
+    groups: Array<{ vendorPartyId: string; vendorName: string }>,
+    recentPOs: any[],
+): Record<string, any> {
+    const cyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+    const vendorCycles: Record<string, any> = {};
+    for (const group of groups) {
+        vendorCycles[group.vendorPartyId] = classifyVendorOrderCycle({
+            vendorPartyId: group.vendorPartyId,
+            vendorName: group.vendorName,
+            recentPOs: cyclePOs,
+        });
+    }
+    return vendorCycles;
+}
+
 // ──────────────────────────────────────────────────
 // MAIN ENTRY POINT
 // ──────────────────────────────────────────────────
@@ -118,6 +141,16 @@ export async function runDrafterAgent(context: DrafterContext = {}): Promise<Dra
         console.error('[drafter] Failed to fetch purchasing groups:', err.message);
         result.errors++;
         return result;
+    }
+
+    // ── GATE 4 FEED: vendor cycle lock needs context.vendorCycles. The cron
+    // drafter-scan and stockout-driver call runDrafterAgent() with no context,
+    // so build the map from recent Finale POs here. Caller-supplied entries win.
+    if (!context.vendorCycles || Object.keys(context.vendorCycles).length === 0) {
+        const recentPOs = await client.getRecentPurchaseOrders(45, 500).catch(() => []);
+        const vendorCycles = buildVendorCycleMap(groups, recentPOs);
+        context.vendorCycles = { ...vendorCycles, ...(context.vendorCycles ?? {}) };
+        console.log(`[drafter] Built vendor cycle map for ${Object.keys(vendorCycles).length} groups`);
     }
 
     // Assess all groups through the standard pipeline
@@ -201,6 +234,17 @@ async function processVendorGroup(
         guardBatch.commitReadyLines.map((entry: any) => entry.line.item.productId),
     );
 
+    // Lead time by productId — carried onto draft lines so
+    // createDraftPurchaseOrder computes dueDate from real vendor lead times
+    // instead of the 14-day fallback (src/lib/finale/purchasing.ts ~1745).
+    const leadTimeByProduct = new Map<string, number | null>();
+    for (const line of items) {
+        leadTimeByProduct.set(
+            line.item.productId,
+            line.item.leadTimeDays ?? line.item.effectiveLeadTimeDays ?? null,
+        );
+    }
+
     const triggerItems = draftPolicy.items.filter(item => {
         if (!commitReadyProductIds.has(item.productId)) return false;
         const line = items.find((l: any) => l.item.productId === item.productId);
@@ -238,6 +282,7 @@ async function processVendorGroup(
                 unitPrice: item.unitPrice,
                 orderIncrementQty: item.orderIncrementQty,
                 isBulkDelivery: item.isBulkDelivery,
+                leadTimeDays: leadTimeByProduct.get(item.productId) ?? null,
             })),
         }),
         AUTO_DRAFT_CAP_USD,
@@ -247,6 +292,7 @@ async function processVendorGroup(
         unitPrice: line.unitPrice,
         orderIncrementQty: line.orderIncrementQty,
         isBulkDelivery: line.isBulkDelivery,
+        leadTimeDays: line.leadTimeDays ?? null,
     }));
 
     if (commitReadyItems.length === 0) {
