@@ -49,6 +49,7 @@ export interface VendorBundleLine {
     unitPrice: number;
     orderIncrementQty: number | null;
     isBulkDelivery: boolean;
+    leadTimeDays?: number | null;
     preempt?: boolean;
 }
 
@@ -130,6 +131,7 @@ export function bundleVendorDraftLines(args: {
             unitPrice: item.unitPrice ?? 0,
             orderIncrementQty: item.orderIncrementQty ?? null,
             isBulkDelivery: item.isBulkDelivery ?? false,
+            leadTimeDays: item.leadTimeDays ?? null,
             preempt: true,
         });
     }

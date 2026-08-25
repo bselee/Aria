@@ -23,7 +23,7 @@ import { CrystalBallSearch } from "./CrystalBallSearch";
 import { VendorOutlookBar } from "./VendorOutlookBar";
 import { FilterChip, ActionChip } from "@/components/dashboard/chips";
 import { selectForwardPoLines, applyTruckQty } from "@/lib/purchasing/forward-po-lines";
-import { bundleVendorDraftLines } from "@/lib/purchasing/vendor-sku-bundle";
+import { bundleVendorDraftLines, isAmazonVendor } from "@/lib/purchasing/vendor-sku-bundle";
 import { decodeOutlookNotes, isHoldActive, type VendorOutlookFields } from "@/lib/purchasing/vendor-outlook";
 import { formatPoDraftLabel, isAutoDraftToday, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "@/lib/purchasing/ordering-row-copy";
 
@@ -947,7 +947,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             allowPreempt: !anyChecked,
         }).map(line => ({
             ...line,
-            leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? null,
+            leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? line.leadTimeDays ?? null,
         }));
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
@@ -2337,7 +2337,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                 <span className={`text-sm font-mono font-semibold ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
                                                     {group.vendorName}
                                                 </span>
-                                                {!vSnoozed && !isNeverAutonomous(group.vendorName) && (
+                                                {!vSnoozed && !isNeverAutonomous(group.vendorName) && !isAmazonVendor(group.vendorName) && (
                                                     <label
                                                         className="flex items-center gap-1 text-[10px] font-mono text-zinc-500 shrink-0"
                                                         title="Overnight auto-draft. Drafts only, never sends."
