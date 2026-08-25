@@ -37,6 +37,7 @@ import { transitionLifecycleState } from './po-lifecycle';
 import { invalidatePurchasingCaches } from './cache';
 import { autoDraftQtyOk, isNeverAutonomous } from './ordering-row-copy';
 import { classifyLine, mayAutonomyDraft } from './input-class';
+import { bundleVendorDraftLines, capBundledLines, isAmazonVendor } from './vendor-sku-bundle';
 
 const AUTO_DRAFT_CAP_USD = Number(process.env.PO_AUTO_DRAFT_CAP) || 2500;
 
@@ -176,8 +177,8 @@ async function processVendorGroup(
         reason: '',
     };
 
-    if (isNeverAutonomous(vendorName)) {
-        baseDetail.reason = 'never_autonomous';
+    if (isNeverAutonomous(vendorName) || isAmazonVendor(vendorName)) {
+        baseDetail.reason = isAmazonVendor(vendorName) ? 'amazon_excluded' : 'never_autonomous';
         return baseDetail;
     }
 
@@ -200,7 +201,7 @@ async function processVendorGroup(
         guardBatch.commitReadyLines.map((entry: any) => entry.line.item.productId),
     );
 
-    const commitReadyItems = draftPolicy.items.filter(item => {
+    const triggerItems = draftPolicy.items.filter(item => {
         if (!commitReadyProductIds.has(item.productId)) return false;
         const line = items.find((l: any) => l.item.productId === item.productId);
         const dailyRate = line?.item?.dailyRate ?? line?.candidate?.directDemand ?? 0;
@@ -214,6 +215,39 @@ async function processVendorGroup(
         });
         return mayAutonomyDraft(cls.class);
     });
+
+    const commitReadyItems = capBundledLines(
+        bundleVendorDraftLines({
+            vendorName,
+            allItems: items.map((line: any) => ({
+                productId: line.item.productId,
+                unitPrice: line.item.unitPrice,
+                suggestedQty: line.assessment?.recommendedQty,
+                orderIncrementQty: line.item.orderIncrementQty,
+                isBulkDelivery: line.item.isBulkDelivery,
+                dailyRate: line.item.dailyRate ?? line.candidate?.directDemand,
+                runwayDays: line.item.runwayDays,
+                adjustedRunwayDays: line.item.adjustedRunwayDays,
+                leadTimeDays: line.item.leadTimeDays,
+                stockOnOrder: line.item.stockOnOrder,
+                assessment: line.assessment,
+            })),
+            selected: triggerItems.map((item) => ({
+                productId: item.productId,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                orderIncrementQty: item.orderIncrementQty,
+                isBulkDelivery: item.isBulkDelivery,
+            })),
+        }),
+        AUTO_DRAFT_CAP_USD,
+    ).map((line) => ({
+        productId: line.productId,
+        quantity: line.quantity,
+        unitPrice: line.unitPrice,
+        orderIncrementQty: line.orderIncrementQty,
+        isBulkDelivery: line.isBulkDelivery,
+    }));
 
     if (commitReadyItems.length === 0) {
         baseDetail.reason = 'no_commit_ready_lines';

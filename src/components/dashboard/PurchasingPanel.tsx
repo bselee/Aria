@@ -23,6 +23,7 @@ import { CrystalBallSearch } from "./CrystalBallSearch";
 import { VendorOutlookBar } from "./VendorOutlookBar";
 import { FilterChip, ActionChip } from "@/components/dashboard/chips";
 import { selectForwardPoLines, applyTruckQty } from "@/lib/purchasing/forward-po-lines";
+import { bundleVendorDraftLines } from "@/lib/purchasing/vendor-sku-bundle";
 import { decodeOutlookNotes, isHoldActive, type VendorOutlookFields } from "@/lib/purchasing/vendor-outlook";
 import { formatPoDraftLabel, isAutoDraftToday, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "@/lib/purchasing/ordering-row-copy";
 
@@ -927,20 +928,26 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
 
     async function createVendorPO(group: PurchasingGroup, ignoreCommitGuards?: boolean): Promise<POResult | null> {
         const pid = group.vendorPartyId;
-        const items = applyTruckQty(
-            selectForwardPoLines({
-                items: group.items,
-                focus: focusFilter,
-                qtyOverrides: qtys[pid],
-                isSnoozed,
-                isCovered: itemIsCovered,
-                checked: checked[pid],
-                requireChecked: false,
-            }),
-            outlookByVendor[pid]?.truckQty ?? null,
-        ).map(line => ({
+        const anyChecked = Object.values(checked[pid] ?? {}).some(Boolean);
+        const items = bundleVendorDraftLines({
+            vendorName: group.vendorName,
+            allItems: group.items,
+            selected: applyTruckQty(
+                selectForwardPoLines({
+                    items: group.items,
+                    focus: focusFilter,
+                    qtyOverrides: qtys[pid],
+                    isSnoozed,
+                    isCovered: itemIsCovered,
+                    checked: checked[pid],
+                    requireChecked: false,
+                }),
+                outlookByVendor[pid]?.truckQty ?? null,
+            ),
+            allowPreempt: !anyChecked,
+        }).map(line => ({
             ...line,
-            leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? line.leadTimeDays,
+            leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? null,
         }));
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
