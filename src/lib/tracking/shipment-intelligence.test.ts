@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
     buildTodayShipmentSummary,
     buildBestTrackingAnswer,
+    canonicalizeTrackingNumbers,
     classifyShipmentEvidence,
     getShipmentBoardBuckets,
     getShipmentsDueForRefresh,
@@ -63,6 +64,44 @@ describe("normalizeTrackingIdentity", () => {
             carrierName: "Old Dominion",
             trackingKind: "ltl_pro",
         });
+    });
+
+    it("classifies parcel carriers tagged via Carrier:::Number as parcel, not ltl_pro", () => {
+        expect(normalizeTrackingIdentity("FedEx:::383269682926")).toMatchObject({
+            trackingKind: "parcel",
+            carrierKey: "fedex",
+        });
+    });
+
+    it("keeps LTL freight (FedEx Freight) tagged as ltl_pro", () => {
+        expect(normalizeTrackingIdentity("FedEx Freight:::300050638069")).toMatchObject({
+            trackingKind: "ltl_pro",
+        });
+    });
+});
+
+describe("canonicalizeTrackingNumbers", () => {
+    it("collapses bare + carrier-prefixed duplicates, preferring the prefixed form", () => {
+        expect(
+            canonicalizeTrackingNumbers(["FedEx:::383269682926", "383269682926"]),
+        ).toEqual(["FedEx:::383269682926"]);
+    });
+
+    it("keeps distinct tracking numbers", () => {
+        expect(
+            canonicalizeTrackingNumbers(["FedEx:::111111111111", "UPS:::1Z9999999999999999"]),
+        ).toEqual(["FedEx:::111111111111", "UPS:::1Z9999999999999999"]);
+    });
+
+    it("preserves LTL carrier casing (no title-case munging)", () => {
+        expect(
+            canonicalizeTrackingNumbers(["AAA Cooper:::723259594"]),
+        ).toEqual(["AAA Cooper:::723259594"]);
+    });
+
+    it("returns empty for empty/blank input", () => {
+        expect(canonicalizeTrackingNumbers([])).toEqual([]);
+        expect(canonicalizeTrackingNumbers(["", "  "])).toEqual([]);
     });
 });
 

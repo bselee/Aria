@@ -199,6 +199,14 @@ function parseDisplayDates(display: string): { estimatedDeliveryAt?: string | nu
     return {};
 }
 
+/**
+ * Parcel carrier keys (from detectCarrier) that are NOT LTL freight. When a
+ * number arrives as "FedEx:::…" / "UPS:::…" the carrier tag is parcel, so
+ * tracking_kind must be "parcel", not "ltl_pro". "fedex freight" (LTL) is
+ * intentionally absent — it stays ltl_pro.
+ */
+const PARCEL_CARRIER_KEYS = new Set(["ups", "usps", "dhl", "fedex"]);
+
 export function normalizeTrackingIdentity(trackingNumber: string): {
     trackingNumber: string;
     normalizedTrackingNumber: string;
@@ -217,7 +225,10 @@ export function normalizeTrackingIdentity(trackingNumber: string): {
         const [carrierNameRaw, actualNumberRaw] = trimmed.split(":::", 2);
         const carrierName = titleCaseCarrierName(carrierNameRaw.trim()) || "Freight";
         const actualNumber = actualNumberRaw.trim();
-        const kind: ShipmentTrackingKind = "ltl_pro";
+        // Parcel carriers tagged via "Carrier:::Number" are parcel, not LTL.
+        const kind: ShipmentTrackingKind = PARCEL_CARRIER_KEYS.has(carrierName.toLowerCase())
+            ? "parcel"
+            : "ltl_pro";
         return {
             trackingNumber: `${carrierName}:::${actualNumber}`,
             normalizedTrackingNumber: actualNumber,
@@ -635,18 +646,75 @@ export function getShipmentsDueForRefresh(
         .slice(0, limit);
 }
 
-async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
+/**
+ * Sources that INFER the PO link instead of reading it explicitly from the
+ * email/document. These are the magnet-poisoning class — PO 125178 accrued 567
+ * inferred FedEx numbers because nothing filtered them — and must never be
+ * stamped onto a real Finale PO.
+ */
+const INFERRED_PO_SOURCES = new Set([
+    "email_ingest_inferred",
+    "email_tracking_inferred_po",
+    "email_tracking_llm_po",
+]);
+
+/**
+ * Collapse bare + carrier-prefixed duplicates of the same tracking number
+ * (e.g. "383269682926" + "FedEx:::383269682926") into one entry, preferring
+ * the carrier-prefixed form so the Finale tracking link resolves to the
+ * carrier's own page instead of a parcelsapp fallback. Preserves the original
+ * string (never lets titleCaseCarrierName munge "AAA Cooper" → "Aaa Cooper").
+ *
+ * @param trackingNumbers - raw tracking strings from the shipments table
+ * @returns deduped, canonical-ordered tracking strings
+ */
+export function canonicalizeTrackingNumbers(trackingNumbers: string[]): string[] {
+    const best = new Map<string, string>(); // normalized suffix → best original string
+    const order: string[] = [];
+
+    for (const raw of trackingNumbers) {
+        const tn = String(raw || "").trim();
+        if (!tn) continue;
+
+        let suffix: string;
+        try {
+            suffix = normalizeTrackingIdentity(tn).normalizedTrackingNumber.toLowerCase();
+        } catch {
+            suffix = tn.toLowerCase();
+        }
+
+        const existing = best.get(suffix);
+        const preferThis = !existing || (tn.includes(":::") && !existing.includes(":::"));
+        if (preferThis) {
+            if (!existing) order.push(suffix);
+            best.set(suffix, tn);
+        }
+    }
+
+    return order.map((key) => best.get(key)).filter((v): v is string => Boolean(v));
+}
+
+export async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
     const db = createClient();
     if (!db || !poNumber) return;
 
     const { data: shipments } = await db
         .from("shipments")
-        .select("tracking_number, public_tracking_url")
+        .select("tracking_number, public_tracking_url, last_source")
         .contains("po_numbers", [poNumber])
         .eq("active", true);
 
-    const trackingNumbers = uniqueStrings((shipments || []).map((s: any) => s.tracking_number));
-    const publicUrls = uniqueStrings((shipments || []).map((s: any) => s.public_tracking_url));
+    // Exclude inferred-PO evidence: a guessed PO link must not be pushed onto a
+    // real Finale PO. Explicit/document sources (email_ingest, email_ingest_pdf,
+    // ap_invoice, po_thread_sync, carrier_api, …) all pass.
+    const explicit = (shipments || []).filter(
+        (s: any) => !INFERRED_PO_SOURCES.has(s.last_source),
+    );
+
+    const trackingNumbers = canonicalizeTrackingNumbers(
+        explicit.map((s: any) => s.tracking_number),
+    );
+    const publicUrls = uniqueStrings(explicit.map((s: any) => s.public_tracking_url));
 
     // 1. Sync to local Supabase cache
     await db
