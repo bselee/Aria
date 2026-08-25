@@ -8,6 +8,7 @@ import POFlowStepper from "./POFlowStepper";
 import type { POFlowStep } from "./POFlowStepper";
 import { POStepper } from "./POStepper";
 import { FilterChip, StatusBadge } from "@/components/dashboard/chips";
+import { formatPoDraftLabel } from "@/lib/purchasing/ordering-row-copy";
 
 type AtRiskInfo = { severity: "at_risk" | "soon_at_risk"; worstDaysShort: number };
 
@@ -1040,9 +1041,12 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                                                     statusLabel = "Received ✓";
                                                                     statusColor = "text-emerald-400 bg-emerald-500/10 border-emerald-500/30";
                                                                 } else if (isCancelled) {
-                                                                    statusLabel = "Cancelled";
-                                                                    statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
-                                                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
+                                                                                                    statusLabel = "Cancelled";
+                                                                                                    statusColor = "text-rose-400 bg-rose-500/10 border-rose-500/30";
+                                                                                                } else if (/^(created|open|draft)$/i.test(po.status || "") || po.status === "ORDER_CREATED") {
+                                                                                                    statusLabel = formatPoDraftLabel(po.orderId);
+                                                                                                    statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
+                                                                                                } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("out for delivery"))) {
                                                                     statusLabel = "Out Today";
                                                                     statusColor = "text-amber-300 bg-amber-500/10 border-amber-500/30";
                                                                 } else if (confirmedShipments.some((shipment) => shipment.status_display?.toLowerCase().includes("delivered"))) {

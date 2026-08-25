@@ -24,6 +24,7 @@ import { VendorOutlookBar } from "./VendorOutlookBar";
 import { FilterChip, ActionChip } from "@/components/dashboard/chips";
 import { selectForwardPoLines, applyTruckQty } from "@/lib/purchasing/forward-po-lines";
 import { decodeOutlookNotes, isHoldActive, type VendorOutlookFields } from "@/lib/purchasing/vendor-outlook";
+import { formatPoDraftLabel, orderDraftJustification } from "@/lib/purchasing/ordering-row-copy";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -2331,8 +2332,8 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                     if (createdPOs[pid] && !completedVendors.has(pid)) {
                                                         return (
                                                             <div className="flex items-center gap-1 shrink-0">
-                                                                <span className="text-[10px] font-mono text-emerald-400 px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10">
-                                                                    ✓ PO #{createdPOs[pid].orderId}
+                                                                <span className="text-[10px] font-mono text-amber-300 px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10">
+                                                                    {formatPoDraftLabel(createdPOs[pid].orderId)}
                                                                 </span>
                                                                 <a
                                                                     href={createdPOs[pid].finaleUrl}
@@ -2355,12 +2356,14 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                         const coveredOnly = activeItems.length > 0 && orderableItems.length === 0
                                                                                                             && activeItems.some(i => itemIsCovered(i) || !!i.draftPO || (i.openPOs?.length ?? 0) > 0);
                                                                                                         if (!vSnoozed && coveredOnly) {
+                                                                                                            const draftId = activeItems.find(i => i.draftPO?.orderId)?.draftPO?.orderId
+                                                                                                                ?? createdPOs[pid]?.orderId;
                                                                                                             return (
                                                                                                                 <span
-                                                                                                                    className="text-[10px] font-mono px-2 py-1 rounded border border-cyan-700/40 bg-cyan-950/30 text-cyan-300 shrink-0"
-                                                                                                                    title="Open or draft POs already cover this vendor. Manage them in Purchases."
+                                                                                                                    className="text-[10px] font-mono px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-300 shrink-0"
+                                                                                                                    title="Draft already exists. Review in Purchases, then send from Finale."
                                                                                                                 >
-                                                                                                                    On PO
+                                                                                                                    {draftId ? formatPoDraftLabel(draftId) : "On PO"}
                                                                                                                 </span>
                                                                                                             );
                                                                                                         }
@@ -2548,16 +2551,26 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                         Review
                                                                                     </span>
                                                                                 )}
-                                                                                {!itemSnoozed && (hasOpenPo || coveredByOpenPo || item.draftPO) && (
-                                                                                                                                                                    <span
-                                                                                                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
-                                                                                                                                                                        title={item.draftPO
-                                                                                                                                                                            ? `Draft PO #${item.draftPO.orderId} already submitted — review/commit that PO, do not re-order`
-                                                                                                                                                                            : `Already ordered on open PO${item.openPOs.length > 1 ? "s" : ""}: ${item.openPOs.map(p => `#${p.orderId} qty ${p.quantity}`).join(", ")}. Order is disabled unless coverage slips.`}
-                                                                                                                                                                    >
-                                                                                                                                                                        {item.draftPO ? "Draft submitted" : "Already on PO"}
-                                                                                                                                                                    </span>
-                                                                                                                                                                )}
+                                                                                {!itemSnoozed && item.draftPO && (
+                                                                                    <a
+                                                                                        href={item.draftPO.finaleUrl}
+                                                                                        target="_blank"
+                                                                                        rel="noreferrer"
+                                                                                        onClick={(e) => e.stopPropagation()}
+                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-300 border-amber-500/40 bg-amber-500/10 hover:border-amber-400"
+                                                                                        title="Open draft in Finale"
+                                                                                    >
+                                                                                        {formatPoDraftLabel(item.draftPO.orderId)}
+                                                                                    </a>
+                                                                                )}
+                                                                                {!itemSnoozed && !item.draftPO && (hasOpenPo || coveredByOpenPo) && (
+                                                                                    <span
+                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
+                                                                                        title={`Already ordered on open PO${item.openPOs.length > 1 ? "s" : ""}: ${item.openPOs.map(p => `#${p.orderId} qty ${p.quantity}`).join(", ")}`}
+                                                                                    >
+                                                                                        On PO
+                                                                                    </span>
+                                                                                )}
                                                                                                                                                                 {!itemSnoozed && item.commitGuard && !hasOpenPo && !item.draftPO && (
                                                                                                                                                                     <span
                                                                                                                                                                         className={`text-[10px] font-mono border rounded px-1 shrink-0 ${
@@ -3029,25 +3042,37 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                 </div>
                                                                             )}
 
-                                                                            {/* Row 4: Explanation + Why drawer */}
+                                                                            {/* Row 4: one-line draft justification + Why drawer */}
                                                                             {!itemSnoozed && (
                                                                                 <div className="mt-2 space-y-1">
                                                                                     <div className="flex items-start justify-between gap-2">
-                                                                                        <div className="text-[11px] font-mono text-zinc-400 italic flex-1">
-                                                                                            {item.assessment?.explanation ?? item.explanation}
-                                                                                            {item.projectedNextOrderDate && (
-                                                                                                <span className="ml-2 text-cyan-300 not-italic">
-                                                                                                    · 🔮 Next order ~{item.projectedNextOrderDate}
-                                                                                                </span>
-                                                                                            )}
+                                                                                        <div className="text-[11px] font-mono text-zinc-400 flex-1">
+                                                                                            {orderDraftJustification({
+                                                                                                suggestedQty: item.suggestedQty,
+                                                                                                lastPurchaseQty: item.lastPurchaseQty,
+                                                                                                runwayDays: item.runwayDays,
+                                                                                                leadTimeDays: item.effectiveLeadTimeDays ?? item.leadTimeDays,
+                                                                                                dailyRate: item.dailyRate,
+                                                                                                draftPO: item.draftPO ?? null,
+                                                                                                recommendation: item.recommendation ?? null,
+                                                                                            })}
                                                                                         </div>
                                                                                         {item.recommendation && (
                                                                                             <button
                                                                                                 onClick={(e) => { e.stopPropagation(); toggleWhy(`${pid}:${item.productId}`); }}
-                                                                                                className="text-[10px] font-mono text-cyan-400 hover:text-cyan-200 underline-offset-2 hover:underline shrink-0"
+                                                                                                className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300 shrink-0"
                                                                                                 title="Show full reorder math trace"
                                                                                             >
-                                                                                                {whyOpen.has(`${pid}:${item.productId}`) ? "Hide why" : `Why ${item.suggestedQty}?`}
+                                                                                                {whyOpen.has(`${pid}:${item.productId}`) ? "Hide" : "Why"}
+                                                                                            </button>
+                                                                                        )}
+                                                                                        {item.draftPO && (
+                                                                                            <button
+                                                                                                onClick={(e) => { e.stopPropagation(); handleCancelDraft(item.draftPO!.orderId); }}
+                                                                                                className="text-[10px] font-mono text-zinc-600 hover:text-rose-300 shrink-0"
+                                                                                                title="Cancel this draft in Finale"
+                                                                                            >
+                                                                                                Cancel
                                                                                             </button>
                                                                                         )}
                                                                                     </div>
@@ -3075,31 +3100,6 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                     Finale says {item.finaleReorderQty} (ignored — Aria's trace above is the source of truth)
                                                                                                 </div>
                                                                                             )}
-                                                                                        </div>
-                                                                                    )}
-                                                                                    {!itemSnoozed && item.draftPO && (
-                                                                                        <div className="mt-2.5 bg-amber-500/10 border border-amber-500/30 text-amber-300 rounded p-2.5 font-mono text-[11px] space-y-1.5 animate-fadeIn">
-                                                                                            <div className="flex items-start gap-1.5">
-                                                                                                <span className="font-bold text-amber-400 block text-xs">⚠️ Draft PO Detected</span>
-                                                                                            </div>
-                                                                                            <p className="leading-normal text-zinc-300">
-                                                                                                Draft PO #{item.draftPO.orderId} created on {item.draftPO.orderDate} by {item.draftPO.supplierName} contains {item.draftPO.quantity} units of this item. Please review and commit this PO instead of creating a duplicate.
-                                                                                            </p>
-                                                                                            <div className="flex items-center gap-2 pt-1">
-                                                                                                <button
-                                                                                                    onClick={(e) => { e.stopPropagation(); handleReviewAndSend(item.draftPO!.orderId); }}
-                                                                                                    className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-all font-semibold text-[10px]"
-                                                                                                >
-                                                                                                    Commit & Send PO
-                                                                                                </button>
-                                                                                                <button
-                                                                                                    onClick={(e) => { e.stopPropagation(); handleCancelDraft(item.draftPO!.orderId); }}
-                                                                                                    className="px-2 py-1 rounded border border-rose-500/40 hover:bg-rose-500/20 hover:text-rose-200 text-rose-300 transition-all font-semibold text-[10px]"
-                                                                                                    title="Cancel this draft PO in Finale"
-                                                                                                >
-                                                                                                    🗑 Cancel Draft
-                                                                                                </button>
-                                                                                            </div>
                                                                                         </div>
                                                                                     )}
                                                                                 </div>

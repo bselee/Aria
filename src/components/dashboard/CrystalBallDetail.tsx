@@ -23,6 +23,7 @@ import {
     ChevronUp,
     ExternalLink
 } from "lucide-react";
+import { formatPoDraftLabel } from "@/lib/purchasing/ordering-row-copy";
 
 export interface CrystalBallItem {
     productId: string;
@@ -424,37 +425,27 @@ export function CrystalBallDetail({ item, onClose, onCommitPO }: CrystalBallDeta
                 )}
             </div>
             
-            {/* Draft PO Warning Banner */}
             {item.draftPO && (
-                <div className="bg-amber-500/10 border border-amber-500/30 text-amber-300 rounded-lg p-4 font-mono text-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-                    <div className="flex items-start gap-2.5">
-                        <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-                        <div className="space-y-1">
-                            <span className="font-bold text-amber-400 block text-[13px]">Draft PO Detected</span>
-                            <p className="leading-relaxed">
-                                Draft PO #{item.draftPO.orderId} created on {item.draftPO.orderDate} by {item.draftPO.supplierName} contains {item.draftPO.quantity} units of this item. Please review and commit this PO instead of creating a duplicate.
-                            </p>
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
-                        <a 
-                            href={item.draftPO.finaleUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="px-2.5 py-1.5 rounded border border-amber-500/40 hover:bg-amber-500/20 hover:text-amber-200 transition-all flex items-center gap-1.5 text-[11px] font-semibold"
+                <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-400">
+                    <a
+                        href={item.draftPO.finaleUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-amber-300 border border-amber-500/40 bg-amber-500/10 rounded px-1.5 py-0.5 hover:border-amber-400"
+                    >
+                        {formatPoDraftLabel(item.draftPO.orderId)}
+                    </a>
+                    {item.draftPO.quantity != null && (
+                        <span>{Math.round(item.draftPO.quantity).toLocaleString()}</span>
+                    )}
+                    {onCommitPO && (
+                        <button
+                            onClick={() => onCommitPO(item.draftPO!.orderId)}
+                            className="ml-auto text-[10px] font-mono text-zinc-500 hover:text-zinc-200"
                         >
-                            <span>View Draft</span>
-                            <ExternalLink className="w-3.5 h-3.5" />
-                        </a>
-                        {onCommitPO && (
-                            <button
-                                onClick={() => onCommitPO(item.draftPO!.orderId)}
-                                className="px-3 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-all font-semibold text-[11px]"
-                            >
-                                Commit & Send PO
-                            </button>
-                        )}
-                    </div>
+                            Commit
+                        </button>
+                    )}
                 </div>
             )}
             
