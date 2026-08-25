@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { formatPoDraftLabel, orderDraftJustification } from "./ordering-row-copy";
+import { formatPoDraftLabel, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "./ordering-row-copy";
 
 describe("formatPoDraftLabel", () => {
     it("renders PO{n} Draft without a hash", () => {
@@ -64,3 +64,49 @@ describe("orderDraftJustification", () => {
         })).toContain("last-order floor");
     });
 });
+
+describe("isNeverAutonomous", () => {
+    it("locks Organics Alive, Colorful, CYC as a word", () => {
+        expect(isNeverAutonomous("Organics Alive")).toBe(true);
+        expect(isNeverAutonomous("Colorful Packaging Ltd")).toBe(true);
+        expect(isNeverAutonomous("FPF CYC finished")).toBe(true);
+        expect(isNeverAutonomous("bicycle shop")).toBe(false);
+        expect(isNeverAutonomous("Thrive Probiotics")).toBe(false);
+    });
+});
+
+describe("shouldListOnOrdering", () => {
+    const now = new Date("2026-08-25T15:00:00-06:00");
+
+    it("lists a need line with no open PO", () => {
+        expect(shouldListOnOrdering({
+            assessment: { decision: "order", reasonCodes: [] },
+            openPOs: [],
+            stockOnOrder: 0,
+        }, now)).toBe(true);
+    });
+
+    it("hides already-on-order and old drafts", () => {
+        expect(shouldListOnOrdering({
+            assessment: { decision: "hold", reasonCodes: ["on_order_already_covers_need"] },
+            openPOs: [{ orderId: "125100" }],
+            stockOnOrder: 50,
+        }, now)).toBe(false);
+        expect(shouldListOnOrdering({
+            assessment: { decision: "order", reasonCodes: [] },
+            draftPO: { orderId: "125192", orderDate: "2026-08-14", autoDrafted: false },
+        }, now)).toBe(false);
+    });
+
+    it("lists only auto-drafts created today", () => {
+        expect(shouldListOnOrdering({
+            assessment: { decision: "hold", reasonCodes: ["recent_draft_exists"] },
+            draftPO: { orderId: "125300", orderDate: "2026-08-25", autoDrafted: true },
+        }, now)).toBe(true);
+        expect(shouldListOnOrdering({
+            assessment: { decision: "hold", reasonCodes: ["recent_draft_exists"] },
+            draftPO: { orderId: "125300", orderDate: "2026-08-25", autoDrafted: false },
+        }, now)).toBe(false);
+    });
+});
+

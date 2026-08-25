@@ -24,7 +24,7 @@ import { VendorOutlookBar } from "./VendorOutlookBar";
 import { FilterChip, ActionChip } from "@/components/dashboard/chips";
 import { selectForwardPoLines, applyTruckQty } from "@/lib/purchasing/forward-po-lines";
 import { decodeOutlookNotes, isHoldActive, type VendorOutlookFields } from "@/lib/purchasing/vendor-outlook";
-import { formatPoDraftLabel, orderDraftJustification } from "@/lib/purchasing/ordering-row-copy";
+import { formatPoDraftLabel, isAutoDraftToday, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "@/lib/purchasing/ordering-row-copy";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -40,6 +40,7 @@ type PurchasingItem = {
         quantity: number;
         supplierName: string;
         finaleUrl: string;
+        autoDrafted?: boolean;
     } | null;
     dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
@@ -129,6 +130,7 @@ type VendorCycle = {
 };
 type PurchasingDisplayGroup = PurchasingGroup & {
     vendorCycle?: VendorCycle;
+    autonomyLevel?: number;
 };
 type AssessmentData = {
     groups: PurchasingDisplayGroup[];
@@ -444,6 +446,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
+    const [autonomyOverride, setAutonomyOverride] = useState<Record<string, number>>({});
     // Vendors that have been drafted/committed — disappear from Ordering immediately.
         // Seeded from sessionStorage so a hard refresh within 6h doesn't resurrect them
         // before the fresh recent-PO coverage overlay lands on GET.
@@ -702,11 +705,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         return item.itemType !== "bom-component";
     }
     function itemMatchesLifecycle(item: PurchasingItem): boolean {
-        // HERMIA(2026-07-28): No STATUS UI. Silently keep only actionable buckets:
-        // need = nothing on order; topping = open PO but still short. On-order /
-        // other-holds are noise on Ordering (tracked in Active POs).
-        const bucket = lifecycleBucket(item);
-        return bucket === "need" || bucket === "topping";
+        return shouldListOnOrdering(item);
     }
     // Vendor is effectively hidden if vendor-level snoozed OR every item is individually snoozed
     function vendorSnoozed(g: PurchasingGroup): boolean {
@@ -1013,6 +1012,31 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
             setCreatingPO(p => { const n = new Set(p); n.delete(pid); return n; });
+        }
+    }
+
+    async function toggleVendorAutoDraft(vendorName: string, enabled: boolean) {
+        if (isNeverAutonomous(vendorName)) return;
+        const prev = autonomyOverride[vendorName];
+        setAutonomyOverride(p => ({ ...p, [vendorName]: enabled ? 1 : 0 }));
+        try {
+            const res = await fetch("/api/dashboard/vendor-autonomy", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ vendorName, enabled }),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || res.statusText);
+            }
+        } catch (e: any) {
+            setAutonomyOverride(p => {
+                const next = { ...p };
+                if (prev === undefined) delete next[vendorName];
+                else next[vendorName] = prev;
+                return next;
+            });
+            setError(`Auto-draft for ${vendorName}: ${e.message}`);
         }
     }
 
@@ -1866,7 +1890,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             {/* BAS-only strip: basauto flags SKUs Ordering has no row for (candidate
                 gate / job supplies). Collapsed one-liner by default; expand for the
                 high-severity list. Reason text on hover. */}
-            {!effectivelyCollapsed && data && (data.basautoOnlyFlags?.length ?? 0) > 0 && (() => {
+            {false && !effectivelyCollapsed && data && (data.basautoOnlyFlags?.length ?? 0) > 0 && (() => {
                 const flags = data.basautoOnlyFlags!;
                 const highCount = flags.filter(f => f.severity === "high").length;
                 return (
@@ -2306,10 +2330,20 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                 <span className={`text-sm font-mono font-semibold ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
                                                     {group.vendorName}
                                                 </span>
-                                                {!vSnoozed && cfg.label && (
-                                                    <span className={`text-[10px] font-mono shrink-0 px-1.5 py-0.5 rounded border ${cfg.badge}`} title={cfg.label}>
-                                                        {cfg.label}
-                                                    </span>
+                                                {!vSnoozed && !isNeverAutonomous(group.vendorName) && (
+                                                    <label
+                                                        className="flex items-center gap-1 text-[10px] font-mono text-zinc-500 shrink-0"
+                                                        title="Overnight auto-draft. Drafts only, never sends."
+                                                        onClick={(e) => e.stopPropagation()}
+                                                    >
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={(autonomyOverride[group.vendorName] ?? group.autonomyLevel ?? 0) >= 1}
+                                                            onChange={(e) => toggleVendorAutoDraft(group.vendorName, e.target.checked)}
+                                                            className="w-3 h-3 rounded accent-emerald-500"
+                                                        />
+                                                        auto
+                                                    </label>
                                                 )}
                                                 <span className="text-[10px] font-mono text-zinc-500">
                                                     {activeItems.slice(0, 4).map((i, idx) => (
@@ -2356,14 +2390,14 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                         const coveredOnly = activeItems.length > 0 && orderableItems.length === 0
                                                                                                             && activeItems.some(i => itemIsCovered(i) || !!i.draftPO || (i.openPOs?.length ?? 0) > 0);
                                                                                                         if (!vSnoozed && coveredOnly) {
-                                                                                                            const draftId = activeItems.find(i => i.draftPO?.orderId)?.draftPO?.orderId
-                                                                                                                ?? createdPOs[pid]?.orderId;
+                                                                                                            const todayDraft = activeItems.find(i => isAutoDraftToday(i.draftPO))?.draftPO;
+                                                                                                            if (!todayDraft) return null;
                                                                                                             return (
                                                                                                                 <span
                                                                                                                     className="text-[10px] font-mono px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-300 shrink-0"
-                                                                                                                    title="Draft already exists. Review in Purchases, then send from Finale."
+                                                                                                                    title="Auto-drafted today. Send from Finale."
                                                                                                                 >
-                                                                                                                    {draftId ? formatPoDraftLabel(draftId) : "On PO"}
+                                                                                                                    {formatPoDraftLabel(todayDraft.orderId)}
                                                                                                                 </span>
                                                                                                             );
                                                                                                         }
@@ -2387,7 +2421,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                     ▾
                                                 </button>
                                             </div>
-                                            {isExpanded && (
+                                            {false && isExpanded && (
                                                 <VendorOutlookBar
                                                     vendorPartyId={pid}
                                                     vendorName={group.vendorName}
@@ -2504,156 +2538,28 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                         {snoozeLabel(iKey)}
                                                                                     </span>
                                                                                 )}
-                                                                                {isBundle && (
-                                                                                    <span className="text-[9px] font-mono text-blue-500/70 border border-blue-500/20 rounded px-1 shrink-0">
-                                                                                        bundle?
-                                                                                    </span>
-                                                                                )}
-                                                                                {methodBadge && !itemSnoozed && (
-                                                                                    <span className={`text-[9px] font-mono border rounded px-1 shrink-0 ${reorderMethodTone(item.reorderMethod)}`}>
-                                                                                        {methodBadge}
-                                                                                    </span>
-                                                                                )}
-                                                                                {item.packSize && !itemSnoozed && (
-                                                                                    <span className="text-[10px] font-mono text-zinc-400 shrink-0" title={`${item.packSize.unitsPerPack} ${item.packSize.packUnit} = 1 orderable pack`}>
-                                                                                        {item.packSize.unitsPerPack}/{item.packSize.packUnit}
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.vendorPolicy?.targetCoverDays != null && item.vendorPolicy.targetCoverDays > 0 && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-emerald-300 border border-emerald-500/30 bg-emerald-500/5 rounded px-1 shrink-0"
-                                                                                        title={item.vendorPolicy.notes ?? "Vendor policy target cover window"}
-                                                                                    >
-                                                                                        {item.vendorPolicy.targetCoverDays}d cover
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.vendorPolicy?.leadTimeOverrideDays != null && item.vendorPolicy.leadTimeOverrideDays > 0 && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-zinc-300 border border-zinc-600/50 bg-zinc-800/40 rounded px-1 shrink-0"
-                                                                                        title="Vendor policy lead-time override"
-                                                                                    >
-                                                                                        {item.vendorPolicy.leadTimeOverrideDays}d lead
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.moqWarning && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-amber-300 border border-amber-500/40 bg-amber-500/10 rounded px-1 shrink-0"
-                                                                                        title="Vendor MOQ not met (warn-only — qty not bumped)"
-                                                                                    >
-                                                                                        MOQ warn
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.reviewRequired && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-red-300 border border-red-500/40 bg-red-500/10 rounded px-1 shrink-0"
-                                                                                        title="Recommendation flagged for review — see reasons below"
-                                                                                    >
-                                                                                        Review
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.draftPO && (
+                                                                                {!itemSnoozed && isAutoDraftToday(item.draftPO) && item.draftPO && (
                                                                                     <a
                                                                                         href={item.draftPO.finaleUrl}
                                                                                         target="_blank"
                                                                                         rel="noreferrer"
                                                                                         onClick={(e) => e.stopPropagation()}
                                                                                         className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-300 border-amber-500/40 bg-amber-500/10 hover:border-amber-400"
-                                                                                        title="Open draft in Finale"
+                                                                                        title="Auto-drafted today"
                                                                                     >
                                                                                         {formatPoDraftLabel(item.draftPO.orderId)}
                                                                                     </a>
                                                                                 )}
-                                                                                {!itemSnoozed && !item.draftPO && (hasOpenPo || coveredByOpenPo) && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
-                                                                                        title={`Already ordered on open PO${item.openPOs.length > 1 ? "s" : ""}: ${item.openPOs.map(p => `#${p.orderId} qty ${p.quantity}`).join(", ")}`}
-                                                                                    >
-                                                                                        On PO
-                                                                                    </span>
-                                                                                )}
-                                                                                                                                                                {!itemSnoozed && item.commitGuard && !hasOpenPo && !item.draftPO && (
-                                                                                                                                                                    <span
-                                                                                                                                                                        className={`text-[10px] font-mono border rounded px-1 shrink-0 ${
-                                                                                                                                                                            item.commitGuard.decision === "commit"
-                                                                                                                                                                                ? "text-emerald-300 border-emerald-500/35 bg-emerald-500/10"
-                                                                                                                                                                                : item.commitGuard.decision === "draft_only"
-                                                                                                                                                                                    ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
-                                                                                                                                                                                    : "text-red-300 border-red-500/40 bg-red-500/10"
-                                                                                                                                                                        }`}
-                                                                                                                                                                        title={`${item.commitGuard.summary} Target: ${item.commitGuard.targetCoverDays}d total (${item.commitGuard.leadTimeDays}d lead + ${item.commitGuard.minimumPostLeadCoverageDays}d supply).`}
-                                                                                                                                                                    >
-                                                                                                                                                                        {item.commitGuard.decision === "commit"
-                                                                                                                                                                            ? "Commit ready"
-                                                                                                                                                                            : item.commitGuard.decision === "draft_only"
-                                                                                                                                                                                ? "Draft only"
-                                                                                                                                                                                : "Blocked"}
-                                                                                                                                                                    </span>
-                                                                                                                                                                )}
-                                                                                                                                                                {!itemSnoozed && item.commitGuard && hasOpenPo && item.assessment?.decision === "order" && (
-                                                                                                                                                                    <span
-                                                                                                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-200 border-amber-500/40 bg-amber-500/10"
-                                                                                                                                                                        title="Open PO exists but supply still falls short of need. This is a reorder of the shortfall — confirm before ordering again."
-                                                                                                                                                                    >
-                                                                                                                                                                        Reorder?
-                                                                                                                                                                    </span>
-                                                                                                                                                                )}
 
                                                                                 <div className="flex-1" />
-
                                                                                 {!itemSnoozed && (() => {
-                                                                                    // v2: shortage label uses effective shortage, not raw runway.
-                                                                                    // Refinement A: when the lifecycle ribbon below will render
-                                                                                    // (item has open POs), drop the "→Xd adjusted" tail since the
-                                                                                    // ribbon shows the same coverage in more detail.
                                                                                     const effective = getEffectiveShortageDays(item);
-                                                                                    const ribbonBelow = (item.openPOs?.length ?? 0) > 0;
-                                                                                    const rawIsZero = item.runwayDays === 0 && item.adjustedRunwayDays > 0;
-                                                                                    if (rawIsZero && !ribbonBelow) {
-                                                                                        return (
-                                                                                            <span className={`text-xs font-mono shrink-0 ${rc}`}>
-                                                                                                on hand out · covered <span className="text-zinc-300">{Math.round(item.adjustedRunwayDays)}d</span>
-                                                                                            </span>
-                                                                                        );
-                                                                                    }
                                                                                     return (
-                                                                                        <span className={`text-xs font-mono shrink-0 ${rc}`} title="Effective shortage: finaleStockoutDays > adjustedRunwayDays > runwayDays">
-                                                                                            shortage {Number.isFinite(effective) ? `${Math.round(effective)}d` : "—"}
-                                                                                            {!ribbonBelow && item.stockOnOrder > 0 && (
-                                                                                                <span className="text-zinc-400 font-normal text-[10px]">
-                                                                                                    {" "}(raw {Math.round(item.runwayDays)}d)
-                                                                                                </span>
-                                                                                            )}
+                                                                                        <span className={`text-xs font-mono shrink-0 ${rc}`}>
+                                                                                            {Number.isFinite(effective) ? `${Math.round(effective)}d` : "—"}
                                                                                         </span>
                                                                                     );
                                                                                 })()}
-
-                                                                                {/* Per-row trigger reason badge */}
-                                                                                {!itemSnoozed && item.triggerReason && (
-                                                                                    <span
-                                                                                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${
-                                                                                            item.triggerReason === 'build-driven' ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
-                                                                                            : item.triggerReason === 'stockout-padded' ? 'bg-rose-500/15 text-rose-300 border-rose-500/40'
-                                                                                            : item.triggerReason === 'runway-short' ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
-                                                                                            : 'bg-zinc-700/40 text-zinc-400 border-zinc-700'
-                                                                                        }`}
-                                                                                        title={item.triggerDetail ?? ''}
-                                                                                    >
-                                                                                        {item.triggerReason === 'build-driven' ? '📅 build' :
-                                                                                         item.triggerReason === 'stockout-padded' ? '🔁 stockout' :
-                                                                                         item.triggerReason === 'runway-short' ? '⏱ runway' :
-                                                                                         '🗓 cadence'}
-                                                                                    </span>
-                                                                                )}
-
-                                                                                {/* 🚛 BULK badge — shown when vendor is flagged as a bulk multi-leg shipper */}
-                                                                                {!itemSnoozed && item.isBulkVendor && (
-                                                                                    <span
-                                                                                        className="text-[9px] font-mono px-1 py-0.5 rounded border border-violet-500/40 bg-violet-500/10 text-violet-300 shrink-0"
-                                                                                        title="Bulk vendor — shipments arrive in multiple legs over time"
-                                                                                    >
-                                                                                        🚛 BULK
-                                                                                    </span>
-                                                                                )}
 
                                                                                 <div className="relative shrink-0 ml-1">
                                                                                     <button

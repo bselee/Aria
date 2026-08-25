@@ -239,29 +239,17 @@ describe("PurchasingPanel - vendor policy badges", () => {
                 await waitFor(() => expect(screen.getByText(/Colorful replenishment watch SKU/i)).toBeTruthy());
             });
 
-    it("renders cover/lead/MOQ-warn/Review badges and review reasons block", async () => {
+    it("keeps Ordering lean: no cover/MOQ/Review badges", async () => {
             stubLocalStorage();
             stubFetch();
 
             render(<PurchasingPanel />);
 
             await waitFor(() => expect(fetch).toHaveBeenCalled());
-
-            // Vendor groups render collapsed by default — click ▾ to expand items.
-            // NOTE(2026-07-28): commit 5f1de32 replaced tab strip with dropdown;
-            // vendor name no longer toggles expansion.
-            fireEvent.click(await screen.findByText("▾"));
-
-            await waitFor(() => expect(screen.getByText("180d cover")).toBeTruthy());
-
-            expect(screen.getByText("180d cover")).toBeTruthy();
-            expect(screen.getByText("45d lead")).toBeTruthy();
-            expect(screen.getByText("MOQ warn")).toBeTruthy();
-            expect(screen.getByText("Review")).toBeTruthy();
-            expect(screen.getByText("Draft only")).toBeTruthy();
-            expect(
-                screen.getByText(/Large overbuy from ordering constraints: \+100 eaches/i),
-            ).toBeTruthy();
+            await waitFor(() => expect(screen.getByText(/Colorful Packaging/i)).toBeTruthy());
+            expect(screen.queryByText("180d cover")).toBeNull();
+            expect(screen.queryByText("MOQ warn")).toBeNull();
+            expect(screen.queryByText("Draft only")).toBeNull();
         });
 
         // NOTE(2026-07-28): vendorCycleBadge is still computed (PurchasingPanel.tsx:2120)

@@ -12,6 +12,7 @@ export interface DraftPoRef {
     orderId: string;
     orderDate?: string | null;
     quantity?: number | null;
+    autoDrafted?: boolean;
 }
 
 export interface OrderDraftJustificationInput {
@@ -85,3 +86,65 @@ export function orderDraftJustification(input: OrderDraftJustificationInput): st
     if (tag) bits.push(tag);
     return bits.join(" · ");
 }
+
+/** Vendors that must never receive autonomy_level >= 1. */
+export const NEVER_AUTONOMOUS_VENDORS = [
+    "organics alive",
+    "asle",
+    "colorful",
+    "pacific bioproducts",
+    "surepack",
+    "alaska sea",
+] as const;
+
+/**
+ * True when the vendor is on the hard exclusion list (prepay / foreign /
+ * long-lead / co-pack). CYC is matched as a word so "bicycle" does not lock.
+ */
+export function isNeverAutonomous(vendorName: string | null | undefined): boolean {
+    const n = (vendorName ?? "").toLowerCase();
+    if (!n.trim()) return false;
+    if (/(^|[^a-z])cyc([^a-z]|$)/.test(n)) return true;
+    return NEVER_AUTONOMOUS_VENDORS.some((needle) => n.includes(needle));
+}
+
+export function denverYmd(now: Date = new Date()): string {
+    return now.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+}
+
+export function isDateTodayDenver(iso: string | null | undefined, now: Date = new Date()): boolean {
+    if (!iso) return false;
+    return iso.slice(0, 10) === denverYmd(now);
+}
+
+export function isAutoDraftToday(
+    draftPO: DraftPoRef | null | undefined,
+    now: Date = new Date(),
+): boolean {
+    return Boolean(draftPO?.autoDrafted && draftPO.orderId && isDateTodayDenver(draftPO.orderDate, now));
+}
+
+export interface OrderingListItem {
+    draftPO?: DraftPoRef | null;
+    openPOs?: Array<unknown> | null;
+    stockOnOrder?: number | null;
+    assessment?: { decision?: string; reasonCodes?: string[] } | null;
+}
+
+/**
+ * Ordering lists need-to-order lines, plus auto-drafts created today.
+ * Already on order (committed, old drafts, topping) is hidden.
+ */
+export function shouldListOnOrdering(item: OrderingListItem, now: Date = new Date()): boolean {
+    if (isAutoDraftToday(item.draftPO, now)) return true;
+    const reasons = item.assessment?.reasonCodes ?? [];
+    if (reasons.includes("on_order_already_covers_need") || reasons.includes("recent_draft_exists")) {
+        return false;
+    }
+    if (item.draftPO) return false;
+    if ((item.openPOs?.length ?? 0) > 0) return false;
+    if ((item.stockOnOrder ?? 0) > 0) return false;
+    const decision = item.assessment?.decision;
+    return decision === "order" || decision === "reduce";
+}
+

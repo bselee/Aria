@@ -15,6 +15,7 @@ import {
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
 import { readReconBadges } from '@/lib/purchasing/basauto-recon-lookup';
 import { recomputeBasautoBadge, type LiveRowAria } from '@/lib/purchasing/basauto-recon-live';
+import { denverYmd } from '@/lib/purchasing/ordering-row-copy';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -220,6 +221,32 @@ export async function GET(req: NextRequest) {
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+
+    const autoDraftIds = new Set<string>();
+    const autonomyByName = new Map<string, number>();
+    try {
+        const db = createClient();
+        if (db) {
+            const today = denverYmd();
+            const { data: autoRows } = await db
+                .from("ap_activity_log")
+                .select("metadata, created_at")
+                .eq("intent", "PO_AUTO_DRAFT")
+                .gte("created_at", `${today}T00:00:00`);
+            for (const row of autoRows ?? []) {
+                const id = (row as any)?.metadata?.orderId;
+                if (id) autoDraftIds.add(String(id));
+            }
+            const { data: profiles } = await db
+                .from("vendor_profiles")
+                .select("vendor_name, autonomy_level");
+            for (const p of profiles ?? []) {
+                if (p?.vendor_name) autonomyByName.set(String(p.vendor_name).toLowerCase(), Number(p.autonomy_level) || 0);
+            }
+        }
+    } catch (err: any) {
+        console.warn("[purchasing/route] autonomy/auto-draft lookup failed:", err?.message || err);
+    }
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -238,6 +265,7 @@ export async function GET(req: NextRequest) {
                     quantity: draftHit.quantity,
                     supplierName: draftHit.vendorName || group.vendorName,
                     finaleUrl: draftHit.finaleUrl,
+                    autoDrafted: autoDraftIds.has(String(draftHit.orderId)),
                 }
                 : null;
 
@@ -387,6 +415,7 @@ export async function GET(req: NextRequest) {
             vendorPartyId: group.vendorPartyId,
             urgency: worstUrgency(),
             vendorCycle,
+            autonomyLevel: autonomyByName.get(group.vendorName.toLowerCase()) ?? 0,
             items: modifiedItems,
         };
     });
