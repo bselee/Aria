@@ -1793,7 +1793,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             )}
 
             {/* ── Header ── cube icon + label + search + filters, outlined in thin white */}
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/40">
                 <Package className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-200 uppercase tracking-widest">Ordering</span>
                 <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
@@ -2117,8 +2117,11 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                             <span className="text-[10px] font-mono text-zinc-600">{focusGroups.length}</span>
                                         </button>
 
-                                        {/* Vendor rows */}
-                                        {vendorDropdownItems.map(g => {
+                                        {/* Vendor rows — skip snoozed */}
+                                        {vendorDropdownItems.filter(g => {
+                                            const hasPO = !!createdPOs[g.vendorPartyId];
+                                            return hasPO || !vendorSnoozed(g);
+                                        }).map(g => {
                                             const cfg = URGENCY[g.urgency];
                                             const isActive = vendorTab === g.vendorPartyId;
                                             const hasPO = !!createdPOs[g.vendorPartyId];

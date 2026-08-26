@@ -777,7 +777,7 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
             }
             ref={containerRef}
         >
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/40">
                 <ListChecks className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Active Purchases</span>
                 {cachedAt && !refreshing && <span className="text-[10px] text-[var(--dash-ts)] font-mono">{timeAgo(cachedAt)}</span>}

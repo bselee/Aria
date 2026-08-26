@@ -58,7 +58,7 @@ function PurchasingLifecyclePanel() {
                     data-testid="purchasing-lifecycle-panel"
                 >
                     <section
-                        className="min-w-0 min-h-0 overflow-hidden border border-zinc-300/40 rounded-md bg-zinc-950/50 flex flex-col"
+                        className="min-w-0 min-h-0 overflow-hidden bg-zinc-950/50 flex flex-col"
                         data-testid="lifecycle-pane-ordering"
                     >
                         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
@@ -68,7 +68,7 @@ function PurchasingLifecyclePanel() {
                         </div>
                     </section>
                     <section
-                        className="min-w-0 min-h-0 overflow-hidden border border-zinc-300/40 rounded-md bg-zinc-950/50 flex flex-col"
+                        className="min-w-0 min-h-0 overflow-hidden bg-zinc-950/50 flex flex-col"
                         data-testid="lifecycle-pane-purchases"
                     >
                         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
@@ -78,7 +78,7 @@ function PurchasingLifecyclePanel() {
                         </div>
                     </section>
                     <section
-                        className="min-w-0 min-h-0 overflow-hidden border border-zinc-300/40 rounded-md bg-zinc-950/50 flex flex-col"
+                        className="min-w-0 min-h-0 overflow-hidden bg-zinc-950/50 flex flex-col"
                         data-testid="lifecycle-pane-rcv"
                     >
                         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
