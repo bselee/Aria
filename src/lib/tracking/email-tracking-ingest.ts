@@ -382,13 +382,54 @@ async function processMessage(
                     .gte("created_at", recentCutoff)
                     .limit(200);
 
-                // Fallback 1: exact numeric PO hint (highest precision).
-                inferredPO = inferPONumberFromRecentPOs(
-                    { subject, bodySnippet: body, fromEmail },
-                    (recentPOs || []) as RecentPurchaseOrder[],
-                );
+                // Fallback 1: tracking number already in vendor_invoices or purchase_orders.
+                // This is the strongest signal — if an invoice/PO already has this tracking
+                // number, it belongs to that PO. Checks the normalized number (strips carrier prefix).
+                for (const hit of extracted) {
+                    if (inferredPO) break;
+                    const rawNum = hit.trackingNumber;
+                    const normalized = rawNum.includes(":::") ? rawNum.split(":::")[1].trim() : rawNum;
+                    if (!normalized || normalized.length < 8) continue;
 
-                // Fallback 2: vendor + carrier + open-PO matching. Carrier-aware
+                    // Check vendor_invoices
+                    try {
+                        const { data: invMatch } = await db
+                            .from("vendor_invoices")
+                            .select("po_number")
+                            .not("po_number", "is", null)
+                            .or(`tracking_numbers.cs.{${normalized}},tracking_numbers.cs.{"${normalized}"}`)
+                            .limit(1);
+                        if (invMatch && invMatch.length > 0 && invMatch[0].po_number) {
+                            inferredPO = invMatch[0].po_number;
+                            console.log(`[email-tracking-ingest] Matched tracking ${normalized} → PO ${inferredPO} via vendor_invoices`);
+                            break;
+                        }
+                    } catch { /* non-fatal */ }
+
+                    // Check purchase_orders
+                    try {
+                        const { data: poMatch } = await db
+                            .from("purchase_orders")
+                            .select("po_number")
+                            .or(`tracking_numbers.cs.{${normalized}},tracking_numbers.cs.{"${normalized}"}`)
+                            .limit(1);
+                        if (poMatch && poMatch.length > 0 && poMatch[0].po_number) {
+                            inferredPO = poMatch[0].po_number;
+                            console.log(`[email-tracking-ingest] Matched tracking ${normalized} → PO ${inferredPO} via purchase_orders`);
+                            break;
+                        }
+                    } catch { /* non-fatal */ }
+                }
+
+                // Fallback 2: exact numeric PO hint (highest precision).
+                if (!inferredPO) {
+                    inferredPO = inferPONumberFromRecentPOs(
+                        { subject, bodySnippet: body, fromEmail },
+                        (recentPOs || []) as RecentPurchaseOrder[],
+                    );
+                }
+
+                // Fallback 3: vendor + carrier + open-PO matching. Carrier-aware
                 // (Rootwise ships FedEx ⇒ Oak Harbor can't be Rootwise), open-only,
                 // and date-window disambiguated by vendor lead time — replaces the
                 // old vendor-token guessing that piled 567 shipments onto PO 125178.
