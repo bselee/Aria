@@ -486,9 +486,9 @@ defineJob({
 // and writes to shipments table so carrier-poll picks it up for status refresh.
 defineJob({
     name: "email-tracking-ingest",
-        schedule: "*/30 * * * *",
+        schedule: "15 */2 * * *",  // HERMIA(2026-08-26): every 2h (was 30m — too aggressive for Gmail API quota)
         onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments + write PO tracking_numbers/legs (every 30m).",
+    description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments + write PO tracking_numbers/legs (every 2h).",
     handler: async () => {
         const { runEmailTrackingIngest } = await import("@/lib/tracking/email-tracking-ingest");
         await runEmailTrackingIngest();
