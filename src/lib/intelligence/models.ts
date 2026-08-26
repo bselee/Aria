@@ -114,7 +114,7 @@ export const OPENROUTER_CHAT_CHAIN = [
  * before falling through to DeepSeek. During the 2026-07-23 heavy-use day
  * the free tier's own daily quota was exhausted, so nearly every call paid
  * for two round-trips (failed free attempt + DeepSeek) instead of one.
- * DeepSeek V4 Flash ($0.14/M) alone is cheaper than that failure tax and
+ * DeepSeek V4 Flash ($0.081/M live) alone is cheaper than that failure tax and
  * has proven reliable — lead with it directly.
  */
 export const OPENROUTER_FREE_CHAIN = [
