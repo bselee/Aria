@@ -1809,15 +1809,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                         BAS {data.basautoReconStale ? "stale" : "ok"}
                     </span>
                 )}
-                {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
-                {isLoading && data && (
-                    <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        {scanning ? "Refreshing…" : loadingTiers.size > 0
-                            ? `Loading ${Array.from(loadingTiers).join(", ")}…`
-                            : "Scanning…"}
-                    </span>
-                )}
+                {/* Compact indicator removed — loading state is obvious from content */}
                 <div className="flex-1" />
 
                 {/* v2 ordering filter — Order Now / 30 / 60 / 90 / All. Cumulative. Item-counted. */}
@@ -2226,30 +2218,8 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                     )}
 
                     {isLoading && !data && (
-                        <div className="px-4 py-10 flex items-center justify-center">
-                            <div className="flex flex-col items-center gap-3 px-6 py-6 rounded-lg border border-emerald-500/30 bg-emerald-500/5 shadow-lg max-w-md w-full">
-                                <div className="relative">
-                                    <Loader2 className="w-9 h-9 text-emerald-400 animate-spin" />
-                                    <Package className="w-4 h-4 text-emerald-300 absolute inset-0 m-auto" />
-                                </div>
-                                <div className="text-sm font-mono font-semibold text-emerald-200 tracking-wide">
-                                    {scanning ? "Re-scanning Finale…" : "Loading purchasing data…"}
-                                </div>
-                                <div className="text-[11px] font-mono text-zinc-400 text-center min-h-[14px]">
-                                    {loadingTiers.size > 0
-                                        ? `Loading ${Array.from(loadingTiers).join(", ")} items…`
-                                        : "Cold-path scans take 3–6 minutes. Hang tight."}
-                                </div>
-                                {/* Subtle skeleton hint underneath */}
-                                <div className="w-full space-y-1.5 pt-2">
-                                    {[1, 2, 3].map(i => (
-                                        <div key={i} className="flex items-center gap-2">
-                                            <div className="w-1.5 h-1.5 rounded-full skeleton-shimmer shrink-0" />
-                                            <div className="skeleton-shimmer h-2.5 rounded" style={{ width: `${45 + i * 14}%` }} />
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
+                        <div className="px-4 py-3 text-[10px] font-mono text-zinc-600">
+                            Loading…
                         </div>
                     )}
                     {error && (
