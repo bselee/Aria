@@ -1037,7 +1037,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
-                <span className="text-[10px] text-[var(--dash-ts)] font-mono">30d</span>
                 {actionRows.length > 0 && (
                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
                         {actionRows.length} action

@@ -1791,7 +1791,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             )}
 
             {/* ── Header ── cube icon + label + search + filters, outlined in thin white */}
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border border-zinc-800/70 rounded-md">
                 <Package className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-200 uppercase tracking-widest">Ordering</span>
                 <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
@@ -2010,15 +2010,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                     {vendorTab === "all" ? (
                                         <>
                                             <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 shrink-0" />
-                                            <span>
-                                                {({
-                                                    order_now: "Order Now",
-                                                    "30": "Next 30d",
-                                                    "60": "Next 60d",
-                                                    "90": "Next 90d",
-                                                    all: "All Vendors",
-                                                } as Record<FocusFilter, string>)[focusFilter]}
-                                            </span>
+                                            <span>All Vendors</span>
                                             <span className="text-zinc-500">{focusGroups.length}</span>
                                         </>
                                     ) : (
