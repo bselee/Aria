@@ -35,6 +35,30 @@ import {
     OPENROUTER_STRUCTURED_CHAIN,
 } from './models';
 
+/**
+ * HERMIA(2026-08-26): DeepSeek-direct emergency bridge — activated ONLY when every
+ * OpenRouter model in the active chain has circuit-broken (all dead simultaneously).
+ * Never a normal-path candidate: DeepSeek's own API is $0.22/M off-peak / $0.30/M peak
+ * vs OpenRouter's $0.081/M resale — 2.7-3.7x premium, so calling it when OR works
+ * is a pure loss. It exists so the AP/reconciler/text pipelines survive an
+ * OpenRouter-wide outage on the $20 deposit already held at api.deepseek.com.
+ *
+ * Requires DEEPSEEK_API_KEY in .env.local. Chain placement is dynamic: appended
+ * AFTER the OR chain has built so the OR order never changes.
+ */
+function getDeepSeekDirectProvider(): ProviderEntry | null {
+    if (!process.env.DEEPSEEK_API_KEY) return null;
+    const deepseekClient = createOpenAI({
+        baseURL: 'https://api.deepseek.com/v1',
+        apiKey: process.env.DEEPSEEK_API_KEY,
+    });
+    return {
+        name: 'DeepSeek Direct V4-Flash (emergency)',
+        model: () => deepseekClient.chat('deepseek-chat'),
+        available: true,
+    };
+}
+
 export type LLMTier = 'free' | 'paid' | 'free_only';
 
 export type LLMOptions = {
@@ -149,6 +173,7 @@ function getProviderChain(tier: LLMTier = 'paid'): ProviderEntry[] {
                 model: () => openai.chat('gpt-4o-mini'),
                 available: !!process.env.OPENAI_API_KEY,
             },
+            ...(getDeepSeekDirectProvider() ? [getDeepSeekDirectProvider()!] : []),  // HERMIA(2026-08-26): emergency-only
         );
         return chain.filter(p => p.available);
     }
@@ -171,7 +196,8 @@ function getProviderChain(tier: LLMTier = 'paid'): ProviderEntry[] {
             name: 'Anthropic Claude Sonnet 4.6',
             model: () => anthropic(DIRECT_MODELS.claudeSonnet),
             available: !!process.env.ANTHROPIC_API_KEY,
-        }
+        },
+        ...(getDeepSeekDirectProvider() ? [getDeepSeekDirectProvider()!] : []),  // HERMIA(2026-08-26): emergency-only
     );
 
     return chain.filter(p => p.available);
