@@ -449,6 +449,13 @@ export async function loadActivePurchases(
             continue;
         }
 
+        // Delivered by carrier but not yet received in Finale → move to Receivings.
+        // This PO has completed its transit journey and is waiting for warehouse receipt.
+        const isDeliveredByCarrier = confirmedShipments.length > 0 && confirmedShipments.every((shipment) => shipment.status_category === "delivered");
+        if (isDeliveredByCarrier && !isReceived) {
+            continue;
+        }
+
         const poLifecycle = poLifecycleRow;
         const vendorPromisedEta =
             plannedReceive ||

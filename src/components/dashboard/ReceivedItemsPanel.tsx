@@ -441,6 +441,44 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     }, []);
     useEffect(() => { localStorage.setItem("aria-dash-recv-collapsed", String(isCollapsed)); }, [isCollapsed]);
 
+    // ── Delivered awaiting receipt bridge ──────────────────────────────────
+    // Shows POs delivered by carrier but not yet received in Finale.
+    // Bridges Active Purchases → Receivings so the user sees the handoff.
+    const [deliveredAwaiting, setDeliveredAwaiting] = useState<Array<{
+        orderId: string;
+        vendorName: string;
+        deliveredAt: string | null;
+        hoursSinceDelivered: number | null;
+        trackingNumber: string | null;
+        trackingUrl: string | null;
+    }>>([]);
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch("/api/dashboard/active-purchases");
+                if (!res.ok) return;
+                const data = await res.json();
+                if (cancelled) return;
+                const delivered = (data.purchases || [])
+                    .filter((po: any) => {
+                        const m = po.movement;
+                        return m && (m.status === "delivered" || m.receiptLag === "escalate" || m.receiptLag === "flag") && !po.isReceived;
+                    })
+                    .map((po: any) => ({
+                        orderId: po.orderId,
+                        vendorName: po.vendorName,
+                        deliveredAt: po.movement?.deliveredAt || null,
+                        hoursSinceDelivered: po.movement?.hoursSinceDelivered || null,
+                        trackingNumber: po.movement?.trackingNumbers?.[0] || null,
+                        trackingUrl: po.movement?.primaryUrl || null,
+                    }));
+                setDeliveredAwaiting(delivered);
+            } catch { /* best-effort */ }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
     const startResize = useCallback((e: React.MouseEvent) => {
         e.preventDefault();
         dragRef.current = { startY: e.clientY, startH: bodyHeight };
@@ -1010,6 +1048,37 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
+
+            {/* Delivered awaiting receipt — bridge from Active Purchases */}
+            {!effectivelyCollapsed && !loading && deliveredAwaiting.length > 0 && (
+                <div className="px-3 py-1.5 border-b border-zinc-800/50 bg-rose-500/[0.04]">
+                    <div className="text-[9px] font-mono uppercase tracking-wider text-rose-400/80 mb-1">
+                        Delivered · awaiting receipt ({deliveredAwaiting.length})
+                    </div>
+                    {deliveredAwaiting.map(po => (
+                        <div key={po.orderId} className="flex items-center gap-2 text-[10px] font-mono py-0.5">
+                            <span className="text-rose-300 font-semibold">{po.orderId}</span>
+                            <span className="text-zinc-500 truncate">{po.vendorName}</span>
+                            {po.hoursSinceDelivered != null && (
+                                <span className={po.hoursSinceDelivered > 48 ? "text-rose-400" : po.hoursSinceDelivered > 24 ? "text-amber-400" : "text-zinc-500"}>
+                                    {po.hoursSinceDelivered}h
+                                </span>
+                            )}
+                            {po.trackingUrl && (
+                                <a
+                                    href={po.trackingUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-cyan-500 hover:text-cyan-400"
+                                    title={po.trackingNumber || "tracking"}
+                                >
+                                    track
+                                </a>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
 
             {/* AP status strip */}
             {!effectivelyCollapsed && !loading && (
