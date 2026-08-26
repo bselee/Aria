@@ -73,10 +73,11 @@ export const OPENROUTER_MODELS = {
  * Every model is proven for Zod schema generation and tool calling.
  */
 export const OPENROUTER_STRUCTURED_CHAIN = [
-    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },  // $0.056/M — proven, try first
-    { name: 'OpenRouter Ox Alpha (GLM-5.3-Flash)', slug: OPENROUTER_MODELS.oxAlpha }, // $0.075/M — 1M ctx, coding/reasoning
-    { name: 'OpenRouter Qwen 3.7 Flash', slug: OPENROUTER_MODELS.qwen37Flash },    // $0.030/M — cheapest fallback
-    { name: 'OpenRouter Qwen 3.5 Flash', slug: OPENROUTER_MODELS.qwen35Flash },    // $0.065/M
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },  // $0.081/M — proven, structured_outputs, try first
+    { name: 'OpenRouter Qwen 3 30B A3B', slug: OPENROUTER_MODELS.qwen30bA3b },     // $0.048/M — cheapest structured_outputs capable
+    { name: 'OpenRouter Qwen 3.5 Flash', slug: OPENROUTER_MODELS.qwen35Flash },    // $0.065/M — structured_outputs
+    { name: 'OpenRouter Ox Alpha (GLM-5.3-Flash)', slug: OPENROUTER_MODELS.oxAlpha }, // $0.075/M — reasoning fallback, no structured_outputs, fences output
+    { name: 'OpenRouter Qwen 3.7 Flash', slug: OPENROUTER_MODELS.qwen37Flash },    // $0.030/M — cheapest overall but response_format-only
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
     { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
     { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },  // best structured JSON
@@ -87,9 +88,9 @@ export const OPENROUTER_STRUCTURED_CHAIN = [
  * Same models — chat quality is equally important.
  */
 export const OPENROUTER_CHAT_CHAIN = [
-    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 }, // $0.056/M — proven, try first
-    { name: 'OpenRouter Ox Alpha (GLM-5.3-Flash)', slug: OPENROUTER_MODELS.oxAlpha }, // $0.075/M — 1M ctx, coding/reasoning
-    { name: 'OpenRouter Qwen 3 30B A3B', slug: OPENROUTER_MODELS.qwen30bA3b },    // $0.048/M — MoE 3B active, fastest paid chat
+    { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 }, // $0.081/M — proven, try first
+    { name: 'OpenRouter Qwen 3 30B A3B', slug: OPENROUTER_MODELS.qwen30bA3b },    // $0.048/M — MoE 3B active, cheapest tools+structured
+    { name: 'OpenRouter Ox Alpha (GLM-5.3-Flash)', slug: OPENROUTER_MODELS.oxAlpha }, // $0.075/M — 1M ctx, strong reasoning/coding
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
     { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
     { name: 'OpenRouter Claude Haiku 4.5', slug: OPENROUTER_MODELS.claudeHaiku },
@@ -125,8 +126,10 @@ export const OPENROUTER_FREE_CHAIN = [
  * Used by extractor.ts for server-side model fallback (one HTTP call).
  */
 export const OPENROUTER_VISION_MODELS_ARRAY = [
-    OPENROUTER_MODELS.geminiFlash,  // ✅ Supports PDF base64 directly — try first
-    OPENROUTER_MODELS.deepseekV4,   // ✅ Supports PDF base64 — cheap $0.056/M
+    OPENROUTER_MODELS.geminiFlash,  // ✅ Supports PDF base64 directly — try first; ONLY model verified OK on our extractor path (200)
+    OPENROUTER_MODELS.deepseekV4,   // ❌ 404 on image input; retained only for text-path compat
+    // HERMIA(2026-08-26): z-ai/glm-5.3-flash tested live — 400 code 1210 on
+    // data:application/pdf;base64. Do NOT add to OCR fallback despite image support.
     // HERMIA(2026-08-24): GPT-4 removed — $30/M on base64 PDF inputs was a
     // 500x trap for every extractor fallback.
     OPENROUTER_MODELS.claudeHaiku,  // ❌ PDF base64 → 400 error
