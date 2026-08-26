@@ -244,18 +244,19 @@ function freshnessLabel(minutes: number | null | undefined): string {
 }
 
 /**
- * Compact per-PO correlation strip: TRACK · ETA · INV.
+ * Simplified per-PO tracking line: carrier + ETA + exception.
  *
- * Tells the PO-centric story at a glance — tracking evidence (confirmed vs
- * candidate/amber), ETA, and invoice/AP state — without expanding the row.
- * Links out to the carrier URL when a primary tracking number exists.
- * Fail-open: renders nothing if the API didn't include `movement`.
+ * Answers 3 questions at a glance:
+ *   1. What's coming? → carrier + tracking (clickable)
+ *   2. When? → ETA
+ *   3. Anything wrong? → exception badge (only when something IS wrong)
+ *
+ * All other details (INV state, vendor ack, source, receipt lag) move to
+ * the expanded detail section.
  */
 function MovementBadgeStrip({ po }: { po: ActivePurchase }) {
     const movement = po.movement;
     if (!movement) return null;
-
-    const badge = "text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 inline-flex items-center gap-1";
 
     const track = movement.trackingNumbers[0] || null;
     const trackShort = track
@@ -264,136 +265,65 @@ function MovementBadgeStrip({ po }: { po: ActivePurchase }) {
             : track
         : null;
     const trackUrl = movement.primaryUrl || (track ? carrierUrl(track) : null);
+    const carrier = movement.primaryCarrier || null;
 
     const etaIso = movement.primaryEta || po.etaProfile?.expectedDate || po.expectedDate || null;
-    const etaConfidence = po.etaProfile?.confidence ?? "low";
-    const etaTone = etaConfidence === "high"
-        ? "text-emerald-300 border-emerald-500/30 bg-emerald-500/10"
-        : etaConfidence === "medium"
-            ? "text-cyan-300 border-cyan-500/30 bg-cyan-500/10"
-            : "text-zinc-400 border-zinc-600/40 bg-zinc-700/20";
 
-    const invLabel = movement.invoice.state === "paid" ? "INV paid"
-        : movement.invoice.state === "matched" ? "INV matched"
-        : movement.invoice.state === "pending_ap" ? "INV AP"
-        : movement.invoice.state === "discrepancy" ? "INV ±"
-        : null;
-    const invTone = movement.invoice.state === "paid"
-        ? "text-emerald-300 border-emerald-500/30 bg-emerald-500/10"
-        : movement.invoice.state === "matched"
-            ? "text-cyan-300 border-cyan-500/30 bg-cyan-500/10"
-            : movement.invoice.state === "pending_ap"
-                ? "text-amber-300 border-amber-500/30 bg-amber-500/10"
-                : movement.invoice.state === "discrepancy"
-                    ? "text-rose-300 border-rose-500/40 bg-rose-500/10"
-                    : "text-zinc-500 border-zinc-700/50 bg-zinc-800/30";
+    // Exception detection
+    const isDelivered = movement.status === "delivered" || deriveStage(po) === "DELIVERED";
+    const isOverduePo = !po.isReceived && etaIso && new Date(etaIso).getTime() < Date.now();
+    const hasException = !po.isReceived && (
+        (isDelivered && (movement.receiptLag === "escalate" || movement.receiptLag === "flag")) ||
+        isOverduePo ||
+        (!track && po.sentVerification?.verified)
+    );
 
     return (
-        <div className="mt-1 flex items-center gap-1.5 flex-wrap" data-testid={`movement-strip-${po.orderId}`}>
+        <div className="mt-0.5 flex items-center gap-2 text-[11px] font-mono text-zinc-400" data-testid={`movement-strip-${po.orderId}`}>
+            {/* Tracking status: inline text, not a badge */}
             {movement.evidenceLevel === "none" ? (
-                <span
-                    className={`${badge} text-zinc-500 border-zinc-700/60 bg-zinc-900/40 border-dashed`}
-                    title={po.typicalTrackingSource
-                        ? `No tracking evidence yet — ${po.typicalTrackingSource} is this vendor's typical source`
-                        : "No tracking evidence yet"}
-                >
-                    No tracking yet{po.typicalTrackingSource ? ` · ${po.typicalTrackingSource}` : ""}
+                <span className="text-zinc-500" title={po.typicalTrackingSource || "No tracking evidence yet"}>
+                    No tracking yet
                 </span>
             ) : track && trackUrl ? (
-                movement.evidenceLevel === "confirmed" ? (
-                    <a
-                        href={trackUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className={`${badge} text-cyan-300 border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20`}
-                        title={`TRACK ${track} · ${movement.primaryCarrier || "carrier"} · confirmed evidence${movement.correlation.lastSource ? ` · src ${movement.correlation.lastSource}` : ""}`}
-                    >
-                        TRACK {trackShort} <ExternalLink className="w-2 h-2 opacity-60" />
-                    </a>
-                ) : (
-                    <a
-                        href={trackUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className={`${badge} text-amber-300 border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20`}
-                        title={`TRACK ${track} · unconfirmed (candidate evidence) — not driving ETA`}
-                    >
-                        TRACK {trackShort} <span className="text-[9px] uppercase tracking-wide opacity-80">unconfirmed</span>
-                    </a>
-                )
+                <a
+                    href={trackUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="text-cyan-400 hover:text-cyan-300 transition-colors"
+                    title={`${track} · ${carrier || "carrier"} · ${movement.evidenceLevel}`}
+                >
+                    {carrier ? `${carrier} ` : ""}{trackShort}
+                </a>
             ) : null}
 
+            {/* ETA: inline text */}
             {etaIso && (
-                <span
-                    className={`${badge} ${etaTone}`}
-                    title={`ETA ${fmtDateTime(etaIso)} · ${po.etaProfile?.label || po.leadProvenance || ""}`}
-                >
-                    ETA {fmtDate(etaIso)}
+                <span className={isOverduePo ? "text-rose-400" : "text-zinc-400"}>
+                    · ETA {fmtDate(etaIso)}
                 </span>
             )}
 
-            {invLabel && (
-                <span
-                    className={`${badge} ${invTone}`}
-                    title={movement.invoice.invoiceId
-                        ? `Invoice ${movement.invoice.invoiceId}${movement.invoice.hasTrackingFromInvoice ? " · tracking extracted from invoice" : ""}`
-                        : `Invoice state: ${movement.invoice.state}`}
-                >
-                    {invLabel}
+            {/* Exception: only when something is wrong */}
+            {isDelivered && !po.isReceived && movement.receiptLag === "escalate" && (
+                <span className="text-rose-400 font-semibold" title={`Carrier delivered ${movement.hoursSinceDelivered ?? "?"}h ago — not received in Finale (past 48h)`}>
+                    · NEED RECEIVE {movement.hoursSinceDelivered ?? "?"}h
                 </span>
             )}
-
-            {/* Delivered by carrier but not received in Finale — flag at 24h, escalate at 48h */}
-                        {(movement.status === "delivered" || deriveStage(po) === "DELIVERED") && !po.isReceived && (() => {
-                            const lag = movement.receiptLag || "ok";
-                            const label = movement.receiptLagLabel
-                                || (movement.hoursSinceDelivered != null
-                                    ? `DELIVERED ${movement.hoursSinceDelivered}h · need receive`
-                                    : "DELIVERED · need receive");
-                            const tone = lag === "escalate"
-                                ? "text-rose-200 border-rose-500/50 bg-rose-500/20 font-semibold"
-                                : lag === "flag"
-                                    ? "text-amber-100 border-amber-500/50 bg-amber-500/20 font-semibold"
-                                    : "text-violet-200 border-violet-500/40 bg-violet-500/15 font-semibold";
-                            const title = lag === "escalate"
-                                ? `Carrier delivered ${movement.hoursSinceDelivered ?? "?"}h ago — still not received in Finale (past 48h). Escalate to receiving.`
-                                : lag === "flag"
-                                    ? `Carrier delivered ${movement.hoursSinceDelivered ?? "?"}h ago — not received yet (past 24h). Flag for receiving team.`
-                                    : "Carrier reports delivered. Waiting on warehouse Finale receipt (<24h).";
-                            return (
-                                <span
-                                    className={`${badge} ${tone}`}
-                                    title={title}
-                                    data-testid={`need-receive-${po.orderId}`}
-                                    data-receipt-lag={lag}
-                                >
-                                    {label}
-                                </span>
-                            );
-                        })()}
-                        {po.isReceived && (
-                            <span
-                                className={`${badge} text-emerald-200 border-emerald-500/40 bg-emerald-500/10`}
-                                title={po.receiveDate ? `Received ${po.receiveDate}` : "Received in Finale"}
-                            >
-                                RECEIVED
-                            </span>
-                        )}
-
-            {movement.invoice.hasTrackingFromInvoice && movement.correlation.poLinkedShipmentCount === 0 && (
-                <span
-                    className={`${badge} text-amber-200 border-amber-500/50 bg-amber-500/15`}
-                    title="Tracking was found in the invoice/BOL but no shipment row is linked to this PO yet"
-                >
-                    invoice tracking needs link
+            {isDelivered && !po.isReceived && movement.receiptLag === "flag" && (
+                <span className="text-amber-400 font-semibold" title={`Carrier delivered ${movement.hoursSinceDelivered ?? "?"}h ago — not received yet (past 24h)`}>
+                    · NEED RECEIVE {movement.hoursSinceDelivered ?? "?"}h
                 </span>
             )}
-
-            {movement.correlation.lastSource && (
-                <span className="text-[9px] font-mono text-zinc-600 shrink-0" title="Most recent tracking evidence source">
-                    src:{movement.correlation.lastSource}
+            {isOverduePo && !isDelivered && (
+                <span className="text-rose-400 font-semibold">
+                    · OVERDUE
+                </span>
+            )}
+            {!track && po.sentVerification?.verified && !po.isReceived && (
+                <span className="text-zinc-500" title="PO sent but no tracking from vendor yet">
+                    · awaiting vendor
                 </span>
             )}
         </div>
@@ -1108,24 +1038,6 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                         {/* Line 1: Vendor, Date, Tags */}
                                         <div className="flex items-center gap-2 flex-wrap min-w-0 pr-8">
                                             <span className="text-sm font-semibold text-zinc-100 truncate min-w-[120px] max-w-[260px]" title={po.vendorName}>{po.vendorName}</span>
-                                            {(() => {
-                                                const r = relFor(po.vendorName);
-                                                if (!r?.grade) return null;
-                                                const tone = r.grade === 'A' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                                                    : r.grade === 'B' ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
-                                                    : r.grade === 'C' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                                                    : r.grade === 'D' ? 'bg-orange-500/20 text-orange-300 border-orange-500/40'
-                                                    : 'bg-rose-500/20 text-rose-300 border-rose-500/40';
-                                                const reply = r.avgReplyHours != null ? `${Math.round(r.avgReplyHours)}h reply` : 'no reply data';
-                                                const onTime = r.onTimeRate != null ? `${Math.round(r.onTimeRate * 100)}% on-time` : 'no delivery data';
-                                                const deliv = r.avgDaysToDelivery != null ? `${Math.round(r.avgDaysToDelivery)}d avg delivery` : null;
-                                                const title = `${r.poCount} POs · ${reply} · ${onTime}${deliv ? ` · ${deliv}` : ''}`;
-                                                return (
-                                                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${tone}`} title={title}>
-                                                        {r.grade}
-                                                    </span>
-                                                );
-                                            })()}
                                             <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${statusColor}`}>
                                                 {statusLabel}
                                             </span>
@@ -1147,71 +1059,6 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                                     MARGIN TIGHT · {Math.abs(atRisk.worstDaysShort)}d
                                                 </span>
                                             )}
-                                            {overdue && (
-                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/15 text-rose-300 border-rose-500/40 shrink-0">
-                                                    ⚠ OVERDUE {daysLate}d
-                                                </span>
-                                            )}
-                                            {/* Shipment exception flag — visible without expanding */}
-                                            {!po.isReceived && hasShipmentException(po) && (
-                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-500/20 text-rose-300 border-rose-500/40 shrink-0">
-                                                    ⚠ Shipment Exception
-                                                </span>
-                                            )}
-                                            {/* Stale shipment flag — all non-delivered shipments unchecked >24h */}
-                                            {!po.isReceived && allShipmentsStale(po) && !hasShipmentException(po) && (
-                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-300 border-amber-500/40 shrink-0">
-                                                    Stale tracking
-                                                </span>
-                                            )}
-                                            {po.vendorAcknowledgedAt && !po.isReceived && (
-                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-300/90 border-emerald-500/30 shrink-0" title={`Vendor acknowledged ${po.vendorAcknowledgedAt}`}>
-                                                    ✓ Vendor ack
-                                                </span>
-                                            )}
-                                            {(() => {
-                                                                                            const isMatchedApproved = po.invoiceStatus === 'reconciled' || po.invoiceStatus === 'matched_approved';
-                                                                                            const isReview = po.invoiceStatus === 'matched_review';
-                                                                                            if (isMatchedApproved && po.hasDiscrepancies) return (
-                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-blue-500/10 text-blue-300/90 border-blue-500/30 shrink-0">
-                                                                                                    Invoice ±
-                                                                                                </span>
-                                                                                            );
-                                                                                            if (isMatchedApproved) return (
-                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-300/90 border-emerald-500/30 shrink-0">
-                                                                                                    Invoice ✓
-                                                                                                </span>
-                                                                                            );
-                                                                                            if (isReview) return (
-                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-600/20 text-amber-200 border-amber-500/50 shrink-0">
-                                                                                                    Invoice — review
-                                                                                                </span>
-                                                                                            );
-                                                                                            if (po.isReceived && !po.invoiceStatus) return (
-                                                                                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-zinc-600/20 text-zinc-400 border-zinc-500/30 shrink-0">
-                                                                                                    Awaiting invoice
-                                                                                                </span>
-                                                                                            );
-                                                                                            return null;
-                                                                                        })()}
-                                            {daysOut != null && !po.isReceived && !overdue && (() => {
-                                                // PO Aging color-code: green <7d, yellow 7-14d, orange 14-21d, red >21d
-                                                const agingColor = daysOut < 7
-                                                    ? 'text-emerald-400'
-                                                    : daysOut < 14
-                                                    ? 'text-yellow-400'
-                                                    : daysOut < 21
-                                                    ? 'text-orange-400'
-                                                    : 'text-rose-400';
-                                                const noTracking = (!po.trackingNumbers || po.trackingNumbers.length === 0)
-                                                    && confirmedShipments.length === 0
-                                                    && po.lifecycleStage !== 'received';
-                                                return (
-                                                    <span className={`text-[10px] font-mono shrink-0 ${agingColor}`} title={`PO age: ${daysOut} days since sent${noTracking ? ' — no tracking yet' : ''}`}>
-                                                        {daysOut}d out{noTracking && <span className="ml-0.5 opacity-70">⊘</span>}
-                                                    </span>
-                                                );
-                                            })()}
                                             {po.total > 0 && (
                                                 <span className="text-xs font-mono text-zinc-400 shrink-0 ml-auto mr-1">
                                                     ${po.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}
