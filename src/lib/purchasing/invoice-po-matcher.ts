@@ -116,6 +116,7 @@ function scoreAmountProximity(invTotal: number, poTotal: number): { score: numbe
     if (pct <= 0.05) return { score: 25, reason: `${(pct * 100).toFixed(1)}% variance` };
     if (pct <= 0.10) return { score: 18, reason: `${(pct * 100).toFixed(1)}% variance` };
     if (pct <= 0.20) return { score: 8, reason: `${(pct * 100).toFixed(1)}% variance` };
+    if (pct <= 0.30) return { score: 4, reason: `${(pct * 100).toFixed(1)}% variance` };
     return { score: 0, reason: `${(pct * 100).toFixed(1)}% variance` };
 }
 
@@ -276,7 +277,15 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         let vendorScore = scoreVendorName(invoice.vendorName, po.vendor_name || "");
         const dateScore = scoreDateProximity(invoice.invoiceDate, po.issue_date || "");
         const poTotal = Number(po.total_amount || po.total || 0);
-        const amountScore = scoreAmountProximity(invoice.total, poTotal);
+        // Compare invoice SUBTOTAL (goods only) to PO total (goods only).
+        // invoice.total includes freight+tax which inflates the comparison.
+        // If subtotal is 0 (OCR didn't extract it), derive from total - freight - tax.
+        const invGoodsAmount = invoice.subtotal > 0
+            ? invoice.subtotal
+            : (invoice.total > 0 && (invoice.freight > 0 || invoice.tax > 0))
+                ? Math.max(0, invoice.total - invoice.freight - invoice.tax)
+                : invoice.total;
+        const amountScore = scoreAmountProximity(invGoodsAmount, poTotal);
 
         // ── Alias-match detection ───────────────────────────────────────────
         // When the invoice vendor name resolves to a canonical Finale supplier

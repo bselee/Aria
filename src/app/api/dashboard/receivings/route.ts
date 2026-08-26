@@ -621,7 +621,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     });
                     const result = await Promise.race([
                         scorePromise,
-                        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+                        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
                     ]);
                     if (!result) {
                         return { inv, status: 'timed_out' as const };

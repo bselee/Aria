@@ -500,12 +500,13 @@ describe("ReceivedItemsPanel", () => {
 
     render(<ReceivedItemsPanel />);
 
-    // Not in the default actionable list
+    // PO without invoice appears in "awaiting invoice" section (not hidden)
     expect(await screen.findByText(/Show all 1 settled POs/i)).toBeTruthy();
-    expect(screen.queryByText(/125169/i)).toBeNull();
+    // The PO is visible in the "awaiting invoice" section (may appear in multiple places)
+    expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
 
     fireEvent.click(screen.getByText(/Show all 1 settled POs/i));
-    expect(screen.getByText("125169")).toBeTruthy();
+    expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/BOTTLE-1G short 75 of 300/i)).toBeTruthy();
   });
 

@@ -84,7 +84,7 @@ describe("ActivePurchasesPanel movement badge strip", () => {
         vi.restoreAllMocks();
     });
 
-    it("renders TRACK · ETA · INV badges for a confirmed, paid PO", async () => {
+    it("renders carrier + tracking + ETA for a confirmed PO", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [makePurchase({ movement: confirmedMovement })],
@@ -93,15 +93,16 @@ describe("ActivePurchasesPanel movement badge strip", () => {
 
         render(<ActivePurchasesPanel embedded />);
 
-        await waitFor(() => expect(screen.getByText(/TRACK 1Z99/)).toBeTruthy());
+        // New format: "UPS 1Z99…84" (carrier + short tracking)
+        await waitFor(() => expect(screen.getByText(/UPS.*1Z99/)).toBeTruthy());
+        // ETA shown inline with dot prefix
         expect(screen.getByText(/ETA Apr 3/)).toBeTruthy();
-        expect(screen.getByText("INV paid")).toBeTruthy();
-
-        const trackLink = screen.getByRole("link", { name: /TRACK/ });
+        // Tracking link points to carrier URL
+        const trackLink = screen.getByRole("link", { name: /UPS/ });
         expect(trackLink.getAttribute("href")).toBe("https://www.ups.com/track?tracknum=1Z999AA10123456784");
     });
 
-    it("shows DELIVERED · need receive when carrier delivered but Finale not received", async () => {
+    it("shows NEED RECEIVE when carrier delivered but Finale not received", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [
@@ -133,12 +134,11 @@ describe("ActivePurchasesPanel movement badge strip", () => {
 
         render(<ActivePurchasesPanel embedded />);
 
-        await waitFor(() => expect(screen.getByTestId("need-receive-PO-100")).toBeTruthy());
-        expect(screen.getByText(/DELIVERED 36h · need receive/i)).toBeTruthy();
-        expect(screen.getByTestId("need-receive-PO-100").getAttribute("data-receipt-lag")).toBe("flag");
+        // New format: "· NEED RECEIVE 36h"
+        await waitFor(() => expect(screen.getByText(/NEED RECEIVE 36h/)).toBeTruthy());
     });
 
-    it("escalates badge past 48h delivered-unreceived", async () => {
+    it("shows NEED RECEIVE in red past 48h delivered-unreceived", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [
@@ -159,11 +159,13 @@ describe("ActivePurchasesPanel movement badge strip", () => {
 
         render(<ActivePurchasesPanel embedded />);
 
-        await waitFor(() => expect(screen.getByText(/OVERDUE receive/i)).toBeTruthy());
-        expect(screen.getByTestId("need-receive-PO-100").getAttribute("data-receipt-lag")).toBe("escalate");
+        // New format: "· NEED RECEIVE 55h" (rose-400 for escalate)
+        await waitFor(() => expect(screen.getByText(/NEED RECEIVE 55h/)).toBeTruthy());
+        const el = screen.getByText(/NEED RECEIVE 55h/);
+        expect(el.className).toContain("text-rose-400");
     });
 
-    it("shows amber unconfirmed tracking for candidate-only evidence", async () => {
+    it("shows carrier + tracking for candidate-only evidence (no unconfirmed label)", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [
@@ -181,12 +183,13 @@ describe("ActivePurchasesPanel movement badge strip", () => {
 
         render(<ActivePurchasesPanel embedded />);
 
-        await waitFor(() => expect(screen.getByText(/unconfirmed/i)).toBeTruthy());
-        const trackLink = screen.getByRole("link", { name: /TRACK/ });
-        expect(trackLink.className).toContain("text-amber-300");
+        // New format: carrier + tracking (no "unconfirmed" label)
+        await waitFor(() => expect(screen.getByText(/UPS.*1Z99/)).toBeTruthy());
+        const trackLink = screen.getByRole("link", { name: /UPS/ });
+        expect(trackLink.getAttribute("href")).toBe("https://www.ups.com/track?tracknum=1Z999AA10123456784");
     });
 
-    it("shows 'No tracking yet' with the vendor's typical source when evidence is none", async () => {
+    it("shows 'No tracking yet' when evidence is none", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [
@@ -199,6 +202,10 @@ describe("ActivePurchasesPanel movement badge strip", () => {
                         primaryCarrier: null,
                         primaryUrl: null,
                         evidenceLevel: "none",
+                        deliveredAt: null,
+                        hoursSinceDelivered: null,
+                        receiptLag: "ok",
+                        receiptLagLabel: null,
                         invoice: { state: "none", hasTrackingFromInvoice: false },
                         correlation: { orphanTrackingCount: 0, poLinkedShipmentCount: 0, lastSource: null },
                     },
@@ -210,23 +217,17 @@ describe("ActivePurchasesPanel movement badge strip", () => {
         render(<ActivePurchasesPanel embedded />);
 
         await waitFor(() => expect(screen.getByText(/No tracking yet/)).toBeTruthy());
-        expect(screen.getByText(/Email Body/)).toBeTruthy();
     });
 
-    it("flags invoice tracking that is not yet linked to a shipment row", async () => {
+    it("shows OVERDUE when past expected date", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [
                 makePurchase({
+                    expectedDate: "2026-03-01", // past date
                     movement: {
-                        status: "candidate",
-                        trackingNumbers: ["1Z999AA10123456784"],
-                        primaryEta: null,
-                        primaryCarrier: null,
-                        primaryUrl: null,
-                        evidenceLevel: "candidate",
-                        invoice: { state: "pending_ap", hasTrackingFromInvoice: true },
-                        correlation: { orphanTrackingCount: 1, poLinkedShipmentCount: 0, lastSource: "ap_invoice" },
+                        ...confirmedMovement,
+                        primaryEta: "2026-03-01T17:00:00.000Z",
                     },
                 }),
             ],
@@ -235,7 +236,6 @@ describe("ActivePurchasesPanel movement badge strip", () => {
 
         render(<ActivePurchasesPanel embedded />);
 
-        await waitFor(() => expect(screen.getByText(/invoice tracking needs link/i)).toBeTruthy());
-        expect(screen.getByText("INV AP")).toBeTruthy();
+        await waitFor(() => expect(screen.getByText(/OVERDUE/)).toBeTruthy());
     });
 });
