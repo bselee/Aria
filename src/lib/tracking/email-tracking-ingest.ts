@@ -77,6 +77,18 @@ const SKIP_SENDER_DOMAINS: Set<string> = new Set([
     "plutonian.io",
     "info.printful.com",
     "dlwholesale.com",
+    // Carrier billing invoices — these contain tracking numbers for OUTBOUND
+    // shipments (BAS → customer), not inbound vendor shipments. The tracking
+    // numbers are FedEx/UPS's own billing line items, not vendor POs.
+    // HERMIA(2026-08-26): 947 unlinked FedEx shipments traced to a single
+    // FedEx Billing Online invoice email (noreply@fedex.com). These pollute
+    // the tracking board with outbound data that has no PO to match.
+    "noreply@fedex.com",
+    "fedex.com",
+    "billing@fedex.com",
+    "noreply@ups.com",
+    "ups.com",
+    "billing@ups.com",
 ]);
 
 /** Max emails to process per account per run. */
