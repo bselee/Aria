@@ -274,16 +274,14 @@ describe("CommandBoardShell", () => {
         expect(orderingPane).toBeTruthy();
     });
 
-    it("More menu exposes Activity and switches to it", async () => {
+    it("renders lifecycle content directly without tab bar", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        fireEvent.click(await screen.findByTestId("shell-tab-more"));
-        const activityTab = await screen.findByTestId("shell-tab-activity");
-        fireEvent.click(activityTab);
-        // option itself may not keep aria-selected after menu closes; active primary shows via More label
-        expect(await screen.findByTestId("shell-tab-more")).toBeTruthy();
-        expect(screen.getByTestId("shell-tab-more").textContent || "").toMatch(/Activity/i);
+        // No More menu, no tab bar — lifecycle content is always visible
+        expect(screen.queryByTestId("shell-tab-more")).toBeNull();
+        const orderingPane = await screen.findByTestId("lifecycle-pane-ordering");
+        expect(orderingPane).toBeTruthy();
     });
 });
 
