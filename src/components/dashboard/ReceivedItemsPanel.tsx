@@ -232,16 +232,16 @@ function partialDiscrepancy(po: ReceivedPO): string | null {
 }
 
 /** Per-kind visual language — which variance bucket moved, at a glance. */
-const KIND_UI: Record<string, { label: string; icon: string; cls: string }> = {
-    freight:       { label: "Freight",     icon: "🚚", cls: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
-    tax:           { label: "Tax",         icon: "🧾", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
-    tariff:        { label: "Tariff",      icon: "🛃", cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
-    fee:           { label: "Fees",        icon: "➕", cls: "text-orange-300 border-orange-500/30 bg-orange-500/10" },
-    product_price: { label: "Price",       icon: "💲", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-    product_qty:   { label: "Qty",         icon: "📦", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-    sku_unknown:   { label: "Unknown SKU", icon: "❓", cls: "text-rose-300 border-rose-500/30 bg-rose-500/10" },
-    sku_missing:   { label: "Not invoiced",icon: "◻️", cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10" },
-    unexplained:   { label: "Unexplained", icon: "⚠️", cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10" },
+const KIND_UI: Record<string, { label: string; cls: string }> = {
+    freight:       { label: "Freight",     cls: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
+    tax:           { label: "Tax",         cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
+    tariff:        { label: "Tariff",      cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
+    fee:           { label: "Fees",        cls: "text-orange-300 border-orange-500/30 bg-orange-500/10" },
+    product_price: { label: "Price",       cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
+    product_qty:   { label: "Qty",         cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
+    sku_unknown:   { label: "Unknown SKU", cls: "text-rose-300 border-rose-500/30 bg-rose-500/10" },
+    sku_missing:   { label: "Not invoiced",cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10" },
+    unexplained:   { label: "Unexplained", cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10" },
 };
 
 const money = (n: number) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
@@ -720,7 +720,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
 
     const toggleExpand = (key: string) => setExpandedRow(prev => (prev === key ? null : key));
 
-    /** Review row — collapsed: ⚠️ verdict + kind chips + PDF hover; expanded: variance body. */
+    /** Review row — collapsed: BLOCKED/REVIEW label + kind chips + PDF hover; expanded: variance body. */
     function renderReviewRow(row: Extract<ActionRow, { kind: "review" }>) {
         const expanded = expandedRow === row.key;
         const variance = row.variance;
@@ -754,7 +754,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 >
                     <div className="flex items-center gap-2 min-w-0">
                         <span className="text-[10px] text-zinc-500 shrink-0">{expanded ? "▾" : "▸"}</span>
-                        <span className="text-[11px] shrink-0">{hasBlocking ? "🚫" : "⚠️"}</span>
+                        <span className={`text-[11px] font-mono font-semibold shrink-0 ${hasBlocking ? "text-rose-400" : "text-amber-400"}`}>{hasBlocking ? "BLOCKED" : "REVIEW"}</span>
                         <span className="text-[11px] font-mono font-semibold text-zinc-100 shrink-0">PO {row.po.orderId}</span>
                         <span className="text-[10px] font-mono text-zinc-500 truncate hidden sm:inline">{row.po.supplier}</span>
                         <span className="text-[11px] font-mono text-zinc-400 shrink-0">Inv #{row.inv.invoice_number || "—"}</span>
@@ -781,7 +781,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 const ui = KIND_UI[kind] || KIND_UI.unexplained;
                                 return (
                                     <span key={kind} className={`px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
-                                        {ui.icon} {ui.label} {Math.abs(amt as number) > 0.01 ? money(amt as number) : ""}
+                                        {ui.label} {Math.abs(amt as number) > 0.01 ? money(amt as number) : ""}
                                     </span>
                                 );
                             })}
@@ -797,9 +797,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             <div className="px-3 py-1.5 border-b border-zinc-800/40 bg-zinc-950/50 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] font-mono">
                                 <span className="text-zinc-500">PO goods <span className="text-zinc-200">${(cc.po?.subtotal || cc.po?.total || 0).toFixed(2)}</span></span>
                                 <span className="text-zinc-500">Invoice <span className="text-zinc-200">${(cc.invoice?.total || cc.invoice?.subtotal || 0).toFixed(2)}</span></span>
-                                {cc.invoice?.freight > 0 && <span className="text-sky-400/80">🚚 ${cc.invoice.freight.toFixed(2)}</span>}
-                                {cc.invoice?.tax > 0 && <span className="text-violet-400/80">🧾 ${cc.invoice.tax.toFixed(2)}</span>}
-                                {cc.po?.tariffs > 0 && <span className="text-violet-400/80">🛃 ${cc.po.tariffs.toFixed(2)}</span>}
+                                {cc.invoice?.freight > 0 && <span className="text-sky-400/80">Freight ${cc.invoice.freight.toFixed(2)}</span>}
+                                {cc.invoice?.tax > 0 && <span className="text-violet-400/80">Tax ${cc.invoice.tax.toFixed(2)}</span>}
+                                {cc.po?.tariffs > 0 && <span className="text-violet-400/80">Tariff ${cc.po.tariffs.toFixed(2)}</span>}
                             </div>
                         )}
 
@@ -848,7 +848,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         {/* 3-way gate refusal banner (persistent per-row detail) */}
                         {gateReason && (
                             <div className="mx-3 mt-2 px-3 py-2.5 border border-rose-500/30 bg-rose-950/15 rounded flex items-start gap-2">
-                                <span className="text-rose-400 text-[11px] mt-0.5 shrink-0">🚫</span>
+                                <span className="text-rose-400 text-[11px] mt-0.5 shrink-0 font-mono font-semibold">BLOCKED</span>
                                 <div className="flex-1 min-w-0">
                                     <div className="text-[10px] font-mono text-rose-400 font-semibold uppercase tracking-wider mb-0.5">3-Way Match Gate Refused</div>
                                     <div className="text-[11px] font-mono text-rose-200/90 leading-relaxed">{gateReason}</div>
@@ -896,7 +896,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         const completing = completingId === row.po.orderId;
         return (
             <div key={row.key} className="px-4 py-2.5 border-b border-zinc-800/40 flex items-center gap-2 hover:bg-zinc-800/10 transition-colors">
-                <span className="text-[11px] shrink-0">✅</span>
+                <span className="text-[11px] font-mono font-semibold text-emerald-400 shrink-0">READY</span>
                 <span className="text-[11px] font-mono text-emerald-200/90 flex-1 min-w-0 truncate">
                     PO {row.po.orderId} <span className="text-zinc-500">{row.po.supplier}</span> matched Inv #{row.inv.invoice_number || "—"} — ready
                 </span>
@@ -941,7 +941,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 >
                     <div className="flex items-center gap-2 min-w-0">
                         <span className="text-[10px] text-zinc-500 shrink-0">{expanded ? "▾" : "▸"}</span>
-                        <span className="text-[11px] shrink-0">🔍</span>
+                        <span className="text-[11px] font-mono font-semibold text-blue-400 shrink-0">MATCH</span>
                         <span className="text-[11px] font-mono font-semibold text-zinc-100 shrink-0">Inv {s.invoiceNumber || "—"}</span>
                         <span className="text-[10px] font-mono text-zinc-500 truncate hidden sm:inline">{s.vendorName}</span>
                         {s.invoiceTotal > 0 ? (
@@ -1170,7 +1170,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 ? "bg-amber-500/10 border-amber-500/30 text-amber-300"
                                 : "bg-rose-500/10 border-rose-500/30 text-rose-300"
                         }`}>
-                            <span>{actionToast.kind === "ok" ? "✅" : actionToast.kind === "block" ? "🚫" : "❌"}</span>
+                            <span className={`font-mono font-semibold text-[11px] ${actionToast.kind === "ok" ? "text-emerald-400" : actionToast.kind === "block" ? "text-rose-400" : "text-red-400"}`}>{actionToast.kind === "ok" ? "DONE" : actionToast.kind === "block" ? "BLOCKED" : "ERROR"}</span>
                             <span className="flex-1 min-w-0">{actionToast.text}</span>
                             <button onClick={() => setActionToast(null)} className="shrink-0 opacity-60 hover:opacity-100">✕</button>
                         </div>
@@ -1224,7 +1224,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             ) : (
                                 <div className="px-4 py-6 text-center">
                                     <span className="text-xs font-mono text-emerald-400/70">
-                                        ✅ All invoices matched — nothing needs attention
+                                        All invoices matched — nothing needs attention
                                     </span>
                                 </div>
                             )}
@@ -1257,7 +1257,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             {/* ── Auto-processed summary — full trail in Activity tab ── */}
                             {recentAutoCompletions.length > 0 && !showAllReceived && (
                                 <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">
-                                    <span className="text-[10px] font-mono text-emerald-500/50">●</span>
+                                    <span className="text-[10px] font-mono text-emerald-500/50">-</span>
                                     <span className="text-[10px] font-mono text-zinc-600">
                                         {recentAutoCompletions.length} auto-completed
                                     </span>

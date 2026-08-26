@@ -309,9 +309,9 @@ describe("ReceivedItemsPanel", () => {
     const second = screen.getByText(/PO 125138/i);
     expect(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
-    // Blocking row shows 🚫 and expands to the BLOCK chip
+    // Blocking row shows BLOCKED label and expands to the BLOCK chip
     fireEvent.click(first.closest('[role="button"]') as HTMLElement);
-    expect(await screen.findByText(/BLOCK/i)).toBeTruthy();
+    expect((await screen.findAllByText(/BLOCK/i)).length).toBeGreaterThanOrEqual(1);
   });
 
   it("renders PDF link only for allowlisted vendors with a file, and mounts hover preview", async () => {
