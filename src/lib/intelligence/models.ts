@@ -58,6 +58,10 @@ export const OPENROUTER_MODELS = {
     qwen37Flash: 'qwen/qwen3.7-flash',               // $0.030/$0.130, 1M ctx — cheapest Qwen
     qwen35Flash: 'qwen/qwen3.5-flash-02-23',         // $0.065/$0.260, 1M ctx
     qwen30bA3b: 'qwen/qwen3-30b-a3b-instruct-2507',  // $0.048/$0.193 — MoE, 3B active, fastest chat
+    // HERMIA(2026-08-26): Ox Alpha stealth model revealed as ZAI GLM-5.3-Flash
+    // (openrouter.ai/stealth/ox-alpha now redirects to z-ai/glm-5.3-flash).
+    // $0.075/$0.250 per M, 1M ctx, tools + vision input (text/images/video).
+    oxAlpha: 'z-ai/glm-5.3-flash',
 } as const;
 
 // ── Fallback Chains ─────────────────────────────────────────────────────────
@@ -70,6 +74,7 @@ export const OPENROUTER_MODELS = {
  */
 export const OPENROUTER_STRUCTURED_CHAIN = [
     { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 },  // $0.056/M — proven, try first
+    { name: 'OpenRouter Ox Alpha (GLM-5.3-Flash)', slug: OPENROUTER_MODELS.oxAlpha }, // $0.075/M — 1M ctx, coding/reasoning
     { name: 'OpenRouter Qwen 3.7 Flash', slug: OPENROUTER_MODELS.qwen37Flash },    // $0.030/M — cheapest fallback
     { name: 'OpenRouter Qwen 3.5 Flash', slug: OPENROUTER_MODELS.qwen35Flash },    // $0.065/M
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
@@ -83,6 +88,7 @@ export const OPENROUTER_STRUCTURED_CHAIN = [
  */
 export const OPENROUTER_CHAT_CHAIN = [
     { name: 'OpenRouter DeepSeek V4 Flash', slug: OPENROUTER_MODELS.deepseekV4 }, // $0.056/M — proven, try first
+    { name: 'OpenRouter Ox Alpha (GLM-5.3-Flash)', slug: OPENROUTER_MODELS.oxAlpha }, // $0.075/M — 1M ctx, coding/reasoning
     { name: 'OpenRouter Qwen 3 30B A3B', slug: OPENROUTER_MODELS.qwen30bA3b },    // $0.048/M — MoE 3B active, fastest paid chat
     { name: 'OpenRouter GPT-4o Mini', slug: OPENROUTER_MODELS.gpt4oMini },
     { name: 'OpenRouter Gemini 2.5 Flash', slug: OPENROUTER_MODELS.geminiFlash },
