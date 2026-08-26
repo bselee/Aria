@@ -317,12 +317,13 @@ function InvoicePdfLink({ id, number, withHover = false, hovered = false, onHove
     );
 }
 
-const ACTION_ORDER: Record<ActionRow["kind"], number> = { review: 0, ready: 1, match: 2 };
+const ACTION_ORDER: Record<ActionRow["kind"], number> = { match: 0, review: 1, ready: 2 };
 
 /**
- * Build the ONE actionable list from the payload, sorted action-first:
- * 1. review — variance blocking first, then by |net delta| desc
- * 2. ready — clean match (twm.canApprove / variance.clean), newest receipt first
+ * Build the ONE actionable list from the payload, sorted workflow-first:
+ * 1. match — unmatched invoices that need a PO linked (start here)
+ * 2. review — variance blocking first, then by |net delta| desc
+ * 3. ready — clean match (twm.canApprove / variance.clean), newest receipt first
  * 3. match — suggestions (DropshipPO candidates already stripped by the API),
  *    highest score first
  * POs with no matched invoice are excluded — they land in the settled dump.
