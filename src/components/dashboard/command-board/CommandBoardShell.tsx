@@ -20,8 +20,6 @@ import ActivePurchasesPanel from "@/components/dashboard/ActivePurchasesPanel";
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import { PurchasingLifecycleProvider } from "./PurchasingLifecycleContext";
-import AxiomSkuMappingPanel from "./AxiomSkuMappingPanel";
-import KanbanBoard from "@/components/dashboard/KanbanBoard";
 import { PANEL_BY_ID } from "./panelRegistry";
 import { PanelErrorBoundary } from "./PanelErrorBoundary";
 import type { PanelId } from "./useDashboardLayout";
@@ -222,25 +220,6 @@ export function CommandBoardShell({ pollIntervalMs = 5 * 60_000, fetchImpl }: Co
     const tabs: TabDef[] = useMemo(
             () => [
                 { id: "lifecycle", label: "Lifecycle", render: () => <PurchasingLifecyclePanel /> },
-                {
-                    id: "builds",
-                    label: "Builds",
-                    // Schedule + risk consolidated into one stacked view.
-                    // All-needed components surface in Ordering (lifecycle tab), so
-                    // this tab is for situational awareness on the build queue.
-                    render: () => (
-                        <div className="flex flex-col h-full min-h-0 overflow-auto gap-2 p-2">
-                            <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
-                                {panelById("build-schedule")}
-                            </section>
-                            <section className="min-h-0 border border-zinc-800/70 bg-zinc-950/40">
-                                {panelById("build-risk")}
-                            </section>
-                        </div>
-                    ),
-                },
-                { id: "axiom-skus", label: "Axiom SKUs", render: () => <AxiomSkuMappingPanel /> },
-                { id: "kanban", label: "Kanban", render: () => <KanbanBoard /> },
                 { id: "activity", label: "Activity", render: () => panelById("activity") },
             ],
             [panelById],
