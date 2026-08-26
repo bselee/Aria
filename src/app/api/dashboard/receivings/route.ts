@@ -448,13 +448,17 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             if (vendorNames.length > 0) {
                 let unmatchedInvoices: any[] = [];
                 try {
+            // Build case-insensitive vendor name filter using ilike.
+            // .in() is case-sensitive and exact — misses "Uline" vs "ULINE",
+            // "Grassroots Fabric Pots Inc." vs "Grassroots Fabric Pots", etc.
+            const vendorFilters = vendorNames.map(v => `vendor_name.ilike.%${v}%`).join(',');
             const { data } = await sb
                 .from('vendor_invoices')
                 .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, pdf_storage_path')
-                                .is('po_number', null)
-                .in('vendor_name', vendorNames)
+                .is('po_number', null)
+                .or(vendorFilters)
                 .order('created_at', { ascending: false })
-                .limit(20);
+                .limit(50);
             unmatchedInvoices = data || [];
                 } catch (fetchErr: any) {
             console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);

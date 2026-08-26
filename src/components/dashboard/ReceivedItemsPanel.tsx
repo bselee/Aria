@@ -366,6 +366,14 @@ function buildActionRows(pos: ReceivedPO[], suggestions: MatchSuggestion[]): Act
     return rows;
 }
 
+/** Received POs without invoices — awaiting invoice from vendor. */
+function buildAwaitingInvoice(pos: ReceivedPO[]): ReceivedPO[] {
+    return pos.filter(po => {
+        const inv = po._reconciliation?.matchedInvoice;
+        return !inv;
+    }).sort((a, b) => receiveSortValue(b) - receiveSortValue(a));
+}
+
 // ── Component ─────────────────────────────────────────────────────────────
 
 export type ReceivedItemsPanelProps = {
@@ -1033,6 +1041,14 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         {actionRows.length} action
                     </span>
                 )}
+                {(() => {
+                    const awaiting = buildAwaitingInvoice(visiblePos);
+                    return awaiting.length > 0 ? (
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-zinc-800/40 text-zinc-400 border border-zinc-700/30">
+                            {awaiting.length} awaiting invoice
+                        </span>
+                    ) : null;
+                })()}
                 <div className="flex-1" />
                 {!loading && visiblePos.length > 0 && (
                     <span className="text-xs font-mono text-zinc-500">{visiblePos.length} POs</span>
@@ -1210,6 +1226,33 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     </span>
                                 </div>
                             )}
+
+                            {/* ── Awaiting invoice — received but no invoice yet ── */}
+                            {(() => {
+                                const awaiting = buildAwaitingInvoice(visiblePos);
+                                if (awaiting.length === 0) return null;
+                                return (
+                                    <div className="border-b border-zinc-800/40">
+                                        <div className="px-4 py-1.5 bg-zinc-950/40 flex items-center gap-2">
+                                            <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-500">
+                                                Awaiting invoice ({awaiting.length})
+                                            </span>
+                                        </div>
+                                        {awaiting.slice(0, showAllReceived ? undefined : 5).map(po => (
+                                            <div key={po.orderId} className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono border-b border-zinc-800/20">
+                                                <span className="text-zinc-400">{po.orderId}</span>
+                                                <span className="text-zinc-600 truncate">{po.supplier}</span>
+                                                <span className="text-zinc-500 ml-auto shrink-0">Rcvd {fmtDateTime(po.receiveDate)}</span>
+                                            </div>
+                                        ))}
+                                        {awaiting.length > 5 && !showAllReceived && (
+                                            <div className="px-4 py-1 text-[9px] font-mono text-zinc-600">
+                                                +{awaiting.length - 5} more
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })()}
 
                             {/* ── Auto-processed summary — full trail in Activity tab ── */}
                             {recentAutoCompletions.length > 0 && !showAllReceived && (
