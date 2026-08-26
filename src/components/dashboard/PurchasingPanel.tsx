@@ -1523,7 +1523,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     // ── render ─────────────────────────────────────────────────────────────
     return (
         <div className={embedded
-            ? "h-full min-h-0 flex flex-col overflow-hidden"
+            ? "min-h-0 flex flex-col"
             : "border-b border-zinc-800 shrink-0"
         }>
             {/* PO Quantity & Case Rounding Validation Loop Modal */}
@@ -1966,7 +1966,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             )}
 
             {!effectivelyCollapsed && (
-                <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
+                <div className={embedded ? "flex-1 min-h-0 flex flex-col" : undefined}>
                     {selectedItem ? (
                         <>
                             <div
