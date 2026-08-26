@@ -15,7 +15,6 @@ import { APService } from "./services/ap-service";
 import { APIdentifierAgent } from "./workers/ap-identifier";
 import { EmailIngestionWorker } from "./workers/email-ingestion";
 import { APForwarderAgent } from "./workers/ap-forwarder";
-import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import * as agentTask from "./agent-task";
 import { closeFinishedTasks } from "./agent-task-closure";
@@ -100,7 +99,6 @@ export class OpsManager {
     private emailIngestionDefault: EmailIngestionWorker;
     private emailIngestionAP: EmailIngestionWorker;
     private apForwarder: APForwarderAgent;
-    private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
     private supervisor: SupervisorAgent;
     private oversightAgent: OversightAgent;
@@ -130,7 +128,6 @@ export class OpsManager {
         this.emailIngestionDefault = new EmailIngestionWorker("default");
         this.emailIngestionAP = new EmailIngestionWorker("ap");
         this.apForwarder = new APForwarderAgent(bot);
-        this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
 

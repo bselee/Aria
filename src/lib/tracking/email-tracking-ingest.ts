@@ -780,23 +780,13 @@ function extractPONumbersFromText(text: string): string[] {
     return Array.from(seen);
 }
 
-// ── PO Inference Helpers (ported from src/lib/intelligence/tracking-agent.ts) ──
+// ── PO Inference Helpers ──
 //
 // These functions implement a fallback-correlation algorithm for linking
 // carrier auto-notification emails (FedEx/UPS/USPS) to purchase orders when
-// the email text contains no explicit PO number reference. The algorithm scores
-// candidate POs by (a) direct numeric-hint substring match, (b) vendor-name
-// token overlap between the email text and each PO's vendor_name, and
-// (c) tie-breaking by excluding dropship POs when there are multiple matches
-// at the same score.
-//
-// Ported from inferPONumberFromRecentPOs() in tracking-agent.ts — that file's
-// TrackingAgent class is dead code (instantiated in ops-manager.ts but never
-// invoked); this fallback logic was working and unused, so it's ported here
-// into the live ingestion path rather than reinvented. See
-// docs/dashboard-design-audit.md section "P0-4" for the full diagnosis
-// (55% of shipment rows were orphaned from any PO before this fix) and
-// backlog item 24/25 for follow-up (dead TrackingAgent cleanup).
+// the email text contains no explicit PO number reference. The algorithm
+// matches a numeric hint in the email against known PO numbers (exact match
+// only — vendor-name token scoring was removed due to the PO 125178 magnet).
 
 type RecentPurchaseOrder = {
     po_number: string;
