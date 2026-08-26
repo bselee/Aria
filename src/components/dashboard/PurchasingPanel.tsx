@@ -499,6 +499,8 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     // snooze
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
+    // Always start with snoozed hidden — user can toggle to reveal
+    useEffect(() => { setShowSnoozed(false); }, []);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
     const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
     // Default TODAY (order_now). Sorted most-needed-first inside the window.
@@ -1417,7 +1419,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 items: hasDraftPO
                     ? []
                     : sortItemsByNeed(group.items.filter(item =>
-                        itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item)
+                        itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item) && item.suggestedQty > 0
                     )),
             };
         })
