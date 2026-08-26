@@ -298,29 +298,6 @@ export function CommandBoardShell({ pollIntervalMs = 5 * 60_000, fetchImpl }: Co
             <div className="flex flex-col h-screen bg-[#09090b] text-zinc-100" data-testid="command-board-shell">
                 {/* Header — only surface chips that need action. Healthy 0/N agents/crons is noise. */}
                 <header className="px-4 py-2 border-b border-zinc-800/80 flex items-center gap-3 bg-[#09090b]">
-                    <div className="flex items-center gap-2 ml-2">
-                        {needsWill > 0 && (
-                            <HealthChip
-                                label="needs you"
-                                value={needsWill}
-                                accent="bg-amber-400"
-                            />
-                        )}
-                        {agentsUnhealthy && (
-                            <HealthChip
-                                label="agents"
-                                value={`${summaryCounts.agents.healthy}/${summaryCounts.agents.total}`}
-                                accent="bg-amber-400"
-                            />
-                        )}
-                        {cronsUnhealthy && (
-                            <HealthChip
-                                label="crons"
-                                value={`${summaryCounts.crons.healthy}/${summaryCounts.crons.total}`}
-                                accent={cronAccent}
-                            />
-                        )}
-                    </div>
                     <div className="flex-1" />
                     {lastError && (
                         <span title={lastError} className="flex items-center gap-1 text-[10px] font-mono text-rose-400">
