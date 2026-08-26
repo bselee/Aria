@@ -403,6 +403,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
     /** Settled dump toggle — not the default path. */
     const [showAllReceived, setShowAllReceived] = useState(false);
+    /** Awaiting invoice section toggle — collapsed by default. */
+    const [showAwaitingInvoice, setShowAwaitingInvoice] = useState(false);
     /**
      * POs completed this session. Finale still lists completed POs in the
      * 30-day received window, so a plain refetch would resurrect them —
@@ -1233,23 +1235,21 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 if (awaiting.length === 0) return null;
                                 return (
                                     <div className="border-b border-zinc-800/40">
-                                        <div className="px-4 py-1.5 bg-zinc-950/40 flex items-center gap-2">
+                                        <button
+                                            onClick={() => setShowAwaitingInvoice(!showAwaitingInvoice)}
+                                            className="w-full px-4 py-1.5 bg-zinc-950/40 flex items-center gap-2 text-left hover:bg-zinc-900/40 transition-colors"
+                                        >
                                             <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-500">
-                                                Awaiting invoice ({awaiting.length})
+                                                {showAwaitingInvoice ? "▾" : "▸"} Awaiting invoice ({awaiting.length})
                                             </span>
-                                        </div>
-                                        {awaiting.slice(0, showAllReceived ? undefined : 5).map(po => (
+                                        </button>
+                                        {showAwaitingInvoice && awaiting.map(po => (
                                             <div key={po.orderId} className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono border-b border-zinc-800/20">
                                                 <span className="text-zinc-400">{po.orderId}</span>
                                                 <span className="text-zinc-600 truncate">{po.supplier}</span>
                                                 <span className="text-zinc-500 ml-auto shrink-0">Rcvd {fmtDateTime(po.receiveDate)}</span>
                                             </div>
                                         ))}
-                                        {awaiting.length > 5 && !showAllReceived && (
-                                            <div className="px-4 py-1 text-[9px] font-mono text-zinc-600">
-                                                +{awaiting.length - 5} more
-                                            </div>
-                                        )}
                                     </div>
                                 );
                             })()}

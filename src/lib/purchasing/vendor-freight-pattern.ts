@@ -83,6 +83,7 @@ export const VENDOR_PATTERN_OVERRIDES: Array<{
     { match: "colorful",       pattern: "vendor_freight", note: "Will-confirmed: overseas DDP, vendor includes freight on their CC invoice" },
     { match: "garys worm",     pattern: "vendor_freight", note: "Bill-confirmed: always Destination Transportation included on PO email, invoice received" },
     { match: "diamond k",      pattern: "vendor_freight", note: "Bill-confirmed: either Destination Transportation or FedEx Freight, freight on invoice" },
+    { match: "grassroots",     pattern: "vendor_freight", note: "Bill-confirmed: ships themselves, always adds freight to invoice, high trust" },
 ];
 
 function findOverride(vendorName: string): typeof VENDOR_PATTERN_OVERRIDES[number] | null {

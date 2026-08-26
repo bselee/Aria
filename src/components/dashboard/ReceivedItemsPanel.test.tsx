@@ -500,11 +500,19 @@ describe("ReceivedItemsPanel", () => {
 
     render(<ReceivedItemsPanel />);
 
-    // PO without invoice appears in "awaiting invoice" section (not hidden)
+    // PO without invoice appears in collapsed "awaiting invoice" section
     expect(await screen.findByText(/Show all 1 settled POs/i)).toBeTruthy();
-    // The PO is visible in the "awaiting invoice" section (may appear in multiple places)
+    // Awaiting invoice section shows count but PO is hidden
+    expect(screen.getByText(/Awaiting invoice \(1\)/i)).toBeTruthy();
+
+    // Expand awaiting invoice to see the PO
+    fireEvent.click(screen.getByText(/▸ Awaiting invoice/i));
     expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
 
+    // Settled section still shows independently
+    expect(screen.getByText(/Show all 1 settled POs/i)).toBeTruthy();
+
+    // Expand settled to see full details
     fireEvent.click(screen.getByText(/Show all 1 settled POs/i));
     expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/BOTTLE-1G short 75 of 300/i)).toBeTruthy();
