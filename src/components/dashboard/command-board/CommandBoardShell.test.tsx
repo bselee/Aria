@@ -230,23 +230,21 @@ describe("CommandBoardShell", () => {
         vi.stubGlobal("fetch", fetchImpl);
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
         const orderingPane = screen.getByTestId("lifecycle-pane-ordering");
         const purchasesPane = screen.getByTestId("lifecycle-pane-purchases");
         const rcvPane = screen.getByTestId("lifecycle-pane-rcv");
 
-        expect(lifecycleTab.textContent).toBe("Lifecycle");
-        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
+        // Lifecycle content is always visible (no tab button needed)
         expect(orderingPane.textContent).toContain("Ordering");
         expect(purchasesPane.textContent).toContain("Purchases");
         expect(rcvPane.textContent).toContain("Receivings");
     });
 
-    it("labels the shell Ops Board and removes redundant lifecycle drill-in tabs", async () => {
+    it("has no Ops Board header — clean header with health chips only", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        expect(await screen.findByText("Ops Board")).toBeTruthy();
+        expect(screen.queryByText("Ops Board")).toBeNull();
         expect(screen.queryByTestId("shell-tab-ordering")).toBeNull();
         expect(screen.queryByTestId("shell-tab-purchases")).toBeNull();
         expect(screen.queryByTestId("shell-tab-rcv")).toBeNull();
@@ -267,12 +265,13 @@ describe("CommandBoardShell", () => {
         });
     });
 
-    it("default tab is Lifecycle because purchasing needs ordering, active purchases, and RCV together", async () => {
+    it("lifecycle content is always visible — no tab selection needed", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
-        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
+        // Lifecycle content is the default view, always rendered
+        const orderingPane = await screen.findByTestId("lifecycle-pane-ordering");
+        expect(orderingPane).toBeTruthy();
     });
 
     it("More menu exposes Activity and switches to it", async () => {
