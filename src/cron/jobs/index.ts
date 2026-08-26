@@ -498,9 +498,9 @@ defineJob({
 // Refresh carrier status for every active shipment.
 defineJob({
     name: "carrier-poll",
-    schedule: "0 6,14 * * *", // 6am + 2pm daily — catches afternoon deliveries
+    schedule: "0 6,10,14,18 * * *", // 4x/day — catches morning shipments, midday updates, afternoon deliveries, evening confirmations
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Refresh live carrier status for active shipments (2x/day).",
+    description: "Refresh live carrier status for active shipments (4x/day).",
     handler: async () => {
         const { pollActiveShipments } = await import("@/lib/purchasing/carrier-poll");
         const outcomes = await pollActiveShipments();
