@@ -41,6 +41,9 @@ type ReceivingsPayload = {
     recentAutoCompletions?: any[];
     cachedAt?: string;
     cacheAgeMs?: number;
+    /** True unmatched backlog (30d, PO-matchable, after no-PO/junk filter). */
+    unmatchedTotal?: number;
+    unmatchedDollars?: number;
 };
 let _getCache: { at: number; key: string; payload: ReceivingsPayload } | null = null;
 const GET_CACHE_TTL_MS = 3 * 60 * 1000;
@@ -444,121 +447,125 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         }
                         }
 
-            // ── Match suggestions: find unmatched invoices for received PO vendors ──
-            const vendorNames = [...new Set(received.map((r: any) => r.supplier).filter(Boolean))] as string[];
+            // ── Match suggestions: ALL unmatched invoices (30d window) ──────
+            // Bill (2026-08-27): "We have tons of constant invoices... only so
+            // few matches... not flowing correctly." Root cause: the query only
+            // looked for invoices whose vendor matches a CURRENTLY-RECEIVED PO,
+            // and scoring capped at 6 — so CR Mineral ($4.6k), Novelty ($2.6k),
+            // Concentrates ($916) etc. never surfaced. Now: query every unmatched
+            // invoice in the window, exclude flagged no-PO vendors (vendor_profiles
+            // requires_po=false: AAA Cooper, FedEx, Culligan...), score up to a
+            // paint-safe budget, and report the true backlog counts.
             const matchSuggestions: any[] = [];
+            let unmatchedTotal = 0;
+            let unmatchedDollars = 0;
 
-            if (vendorNames.length > 0) {
-                let unmatchedInvoices: any[] = [];
-                try {
-            // Build case-insensitive vendor name filter using ilike.
-            // .in() is case-sensitive and exact — misses "Uline" vs "ULINE",
-            // "Grassroots Fabric Pots Inc." vs "Grassroots Fabric Pots", etc.
-            const vendorFilters = vendorNames.map(v => `vendor_name.ilike.%${v}%`).join(',');
-            const { data } = await sb
-                .from('vendor_invoices')
-                .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, pdf_storage_path')
-                .is('po_number', null)
-                .or(vendorFilters)
-                .order('created_at', { ascending: false })
-                .limit(50);
-            unmatchedInvoices = data || [];
-                } catch (fetchErr: any) {
-            console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
-            unmatchedInvoices = [];
-                }
+            // No-PO vendors: service/freight vendors flagged requires_po=false
+            // never need a PO match — they route through Bill.com directly.
+            let noPoVendorNames: string[] = [];
+            try {
+                const { data: vp } = await sb
+                    .from('vendor_profiles')
+                    .select('vendor_name')
+                    .eq('requires_po', false);
+                noPoVendorNames = ((vp as any[]) || []).map((v: any) => String(v.vendor_name || '').toLowerCase().trim()).filter(Boolean);
+            } catch { /* profiles optional */ }
+            const isNoPoVendor = (name: string) =>
+                noPoVendorNames.some((n) => String(name || '').toLowerCase().includes(n));
+
+            let unmatchedInvoices: any[] = [];
+            try {
+                // ALL unmatched invoices in the window — not just vendors of
+                // currently-received POs (that filter hid the real backlog).
+                const cutoff30d = new Date(Date.now() - 30 * 86_400_000).toISOString();
+                const { data } = await sb
+                    .from('vendor_invoices')
+                    .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, pdf_storage_path')
+                    .is('po_number', null)
+                    .gte('created_at', cutoff30d)
+                    .order('created_at', { ascending: false })
+                    .limit(200);
+                unmatchedInvoices = (data as any[]) || [];
+            } catch (fetchErr: any) {
+                console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
+                unmatchedInvoices = [];
+            }
 
                 // Local invoice_cache fallback when PostgREST is empty/down (photo invoices etc.)
                 try {
-            const { getUnmatchedInvoices, getInvoiceCacheByVendor } = await import(
-                '@/lib/storage/purchasing-cache'
-            );
-            const localUnmatched = getUnmatchedInvoices();
-            const seen = new Set(
-                unmatchedInvoices.map(
-                    (i) =>
-                `${(i.vendor_name || '').toLowerCase()}|${i.invoice_number || ''}|${i.total || 0}`,
-                ),
-            );
-            for (const v of vendorNames) {
-                const rows = [
-                    ...localUnmatched.filter((r) =>
-                (r.vendor_name || '').toLowerCase().includes(String(v).toLowerCase().slice(0, 12)),
-                    ),
-                    ...getInvoiceCacheByVendor(v).filter((r) => !r.matched_po && !r.po_number),
-                ];
-                for (const row of rows) {
-                    const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
-                    if (seen.has(key)) continue;
-                    // Only skip confirmed matches — OCR may set po_number as candidate
-                    if (row.matched_po) continue;
-                    seen.add(key);
-                    unmatchedInvoices.push({
-                id: row.vendor_invoice_id || key,
-                invoice_number: row.invoice_number,
-                vendor_name: row.vendor_name,
-                invoice_date: row.invoice_date,
-                subtotal: row.total || 0,
-                freight: row.freight || 0,
-                tax: row.tax || 0,
-                total: row.total || 0,
-                raw_data: {
-                    lineItems: (() => {
-                        try {
-                    return JSON.parse(row.line_items || '[]');
-                        } catch {
-                    return [];
-                        }
-                    })(),
-                    source: 'invoice_cache',
-                    ocrPoCandidate: row.po_number || null,
-                },
-                _fromCache: true,
-                    });
-                }
-            }
-            // Also surface DTE / recent AP photo invoices even if vendor name on PO differs slightly
-            for (const row of localUnmatched.slice(0, 30)) {
-                const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
-                if (seen.has(key)) continue;
-                if (row.matched_po) continue;
-                seen.add(key);
-                unmatchedInvoices.push({
-                    id: row.vendor_invoice_id || key,
-                    invoice_number: row.invoice_number,
-                    vendor_name: row.vendor_name,
-                    invoice_date: row.invoice_date,
-                    subtotal: row.total || 0,
-                    freight: row.freight || 0,
-                    tax: row.tax || 0,
-                    total: row.total || 0,
-                    raw_data: {
-                source: 'invoice_cache',
-                ocrPoCandidate: row.po_number || null,
-                    },
-                    _fromCache: true,
-                });
-            }
+                    const { getUnmatchedInvoices } = await import(
+                        '@/lib/storage/purchasing-cache'
+                    );
+                    const localUnmatched = getUnmatchedInvoices();
+                    const seen = new Set(
+                        unmatchedInvoices.map(
+                            (i) =>
+                                `${(i.vendor_name || '').toLowerCase()}|${i.invoice_number || ''}|${i.total || 0}`,
+                        ),
+                    );
+                    // Surface recent AP photo invoices from the local cache (no vendor
+                    // filter — the PostgREST query above already covers the window).
+                    for (const row of localUnmatched.slice(0, 40)) {
+                        const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
+                        if (seen.has(key)) continue;
+                        if (row.matched_po) continue;
+                        if (isNoPoVendor(row.vendor_name)) continue;
+                        seen.add(key);
+                        unmatchedInvoices.push({
+                            id: row.vendor_invoice_id || key,
+                            invoice_number: row.invoice_number,
+                            vendor_name: row.vendor_name,
+                            invoice_date: row.invoice_date,
+                            subtotal: row.total || 0,
+                            freight: row.freight || 0,
+                            tax: row.tax || 0,
+                            total: row.total || 0,
+                            raw_data: {
+                                source: 'invoice_cache',
+                                ocrPoCandidate: row.po_number || null,
+                            },
+                            _fromCache: true,
+                        });
+                    }
                 } catch (cacheErr: any) {
             console.warn('[receivings] invoice_cache fallback failed:', cacheErr?.message || cacheErr);
                 }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
-                    // HERMIA(2026-08-06): Drop junk invoices before scoring
+                    // HERMIA(2026-08-06): Drop junk invoices before scoring.
+                    // HERMIA(2026-08-27): Also drop flagged no-PO vendors (AAA
+                    // Cooper, FedEx, Culligan...) — they route via Bill.com, not
+                    // a PO match. The backlog counts (unmatchedTotal/Dollars)
+                    // reflect only invoices that CAN be PO-matched.
                     unmatchedInvoices = unmatchedInvoices.filter((inv: any) => {
                         const total = Number(inv.total || 0);
                         const invNo = String(inv.invoice_number || "").trim();
                         if (total < 1 && !invNo) return false;
                         if (total < 1) return false; // $0 placeholders
+                        if (isNoPoVendor(inv.vendor_name)) return false;
+                        // OCR-garbage vendor names (header words read as the
+                        // vendor): "I N V O I C E", "QUANTITYUMITEM...", "From:",
+                        // "CONSIGNEE", "BUILDASOIL" — never matchable, hide.
+                        const vn = String(inv.vendor_name || "").trim();
+                        if (!vn) return false;
+                        // Strip spaces so spaced-OCR ("I N V O I C E") matches
+                        // the same junk patterns as normal text.
+                        const vnTight = vn.replace(/\s+/g, "").toLowerCase();
+                        if (/(^|\s)(invoice|from:|consignee|quantity|bill to|ship to|page|total)\b/i.test(vn)) return false;
+                        if (/^(invoice|from|consignee|quantity|bill|ship|page|total|buildasoil|buildasoilorganics)/.test(vnTight)) return false;
+                        if (/^buildasoil\b/i.test(vnTight)) return false;
+                        if (/^(buildasoil|build a soil)\b/i.test(vn) && !/ inc| llc|co\b/i.test(vn)) return false;
                         return true;
                     });
+                    unmatchedTotal = unmatchedInvoices.length;
+                    unmatchedDollars = unmatchedInvoices.reduce((s, i) => s + Number(i.total || 0), 0);
                 }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
-                    // HERMIA(2026-08-06): Paint budget. Was 12×4s sequential-ish scoring
-                    // + Finale auto-reconcile on GET → 45s panel timeouts.
-                    // Cap hard: 6 invoices, 2s each, concurrency 4. NO writes on GET.
-                    const toScore = unmatchedInvoices.slice(0, 6);
+                    // HERMIA(2026-08-27): Paint budget raised 6 → 12 (concurrency 4,
+                    // 2s each worst-case ≈ 6s; outer route guard is 20s). NO writes
+                    // on GET. The remaining backlog is visible via unmatchedTotal.
+                    const toScore = unmatchedInvoices.slice(0, 12);
                     // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
                     const { classifyInvoice } = await import('@/config/invoice-classification');
                     const filteredToScore = toScore.filter((inv: any) => {
@@ -728,7 +735,6 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         }
                         }
                         }
-                        }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
             let recentAutoCompletions: Array<{
@@ -763,6 +769,10 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             }
 
             // ── Freight classifications for received PO vendors ──
+            // (vendorNames = vendors of POs in the received window — used only
+            // for freight classification, NOT for filtering match suggestions;
+            // 2026-08-27 the match backlog now queries ALL unmatched invoices.)
+            const vendorNames = [...new Set(received.map((r: any) => r.supplier).filter(Boolean))] as string[];
                 // DECISION(2026-07-27): This loop was 40 sequential ~2.2s PostgREST
                 // round-trips and is now bounded-parallel at 8. These are local-DB
                 // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
@@ -797,6 +807,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     matchSuggestions,
                     freightClasses,
                     recentAutoCompletions,
+                    unmatchedTotal,
+                    unmatchedDollars,
                 };
                 _getCache = { at: Date.now(), key: cacheKey, payload };
                 return NextResponse.json(payload, {
@@ -804,6 +816,9 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 });
             }
 
+            // ── Fallback: no DB client or no received POs in window ──
+            // (Original emptyPayload path — restored so the route always returns
+            // a JSON payload instead of falling through to the catch as undefined.)
             const emptyPayload: ReceivingsPayload = {
                 received,
                 days: daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS,
@@ -812,6 +827,9 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 asOf: todayStr,
                 matchSuggestions: [],
                 freightClasses: {},
+                recentAutoCompletions: [],
+                unmatchedTotal: 0,
+                unmatchedDollars: 0,
             };
             _getCache = { at: Date.now(), key: cacheKey, payload: emptyPayload };
             return NextResponse.json(emptyPayload, {

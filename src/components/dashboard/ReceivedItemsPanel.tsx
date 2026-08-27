@@ -406,6 +406,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const lifecycle = usePurchasingLifecycle();
     const [pos, setPos] = useState<ReceivedPO[]>([]);
     const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
+    /** True unmatched backlog (30d, PO-matchable) — NOT the scored slice. */
+    const [unmatchedTotal, setUnmatchedTotal] = useState(0);
+    const [unmatchedDollars, setUnmatchedDollars] = useState(0);
     const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -576,6 +579,11 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             setPos(sorted);
             setMatchSuggestions(data.matchSuggestions || []);
             setRecentAutoCompletions(data.recentAutoCompletions || []);
+            // True unmatched backlog (30d, PO-matchable, after no-PO/junk filter).
+            // Bill (2026-08-27): the panel must show the real count, not the
+            // paint-budget-scored slice — so the header can say "37 unmatched".
+            setUnmatchedTotal(Number(data.unmatchedTotal ?? 0));
+            setUnmatchedDollars(Number(data.unmatchedDollars ?? 0));
 
             if (trackingRes && trackingRes.ok) {
                 const trackingData = await trackingRes.json();
@@ -942,6 +950,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             <button
                                 onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
                                 disabled={completing}
+                                title="Complete: run the 3-way gate (PO vs invoice vs receipt), then close the PO in Finale. This is the final step."
                                 className={`w-full px-3 py-2 rounded text-[11px] font-mono font-semibold transition-colors ${
                                     completing
                                         ? "bg-zinc-700/20 text-zinc-500 border border-zinc-700/40 cursor-wait"
@@ -975,6 +984,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 <button
                     onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
                     disabled={completing}
+                    title="Complete: run the 3-way gate (PO vs invoice vs receipt), then close the PO in Finale. This is the final step."
                     className="shrink-0 px-3 py-1 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-wait"
                 >
                     {completing ? "Completing…" : "Complete"}
@@ -1030,6 +1040,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         {best && (
                             <button
                                 onClick={e => { e.stopPropagation(); handleMatchInvoice(s.invoiceId, best.orderId); }}
+                                title="Match: link this invoice to the PO. Does NOT complete the PO — Complete is the final step."
                                 className="shrink-0 px-2.5 py-1 rounded text-[10px] font-mono font-semibold border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 cursor-pointer transition-colors"
                             >
                                 Match
@@ -1091,6 +1102,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                 )}
                                                 <button
                                                     onClick={() => handleMatchInvoice(s.invoiceId, c.orderId)}
+                                                    title="Match: link this invoice to the PO. Does NOT complete the PO — Complete is the final step."
                                                     className="ml-auto shrink-0 px-2 py-0.5 rounded text-[9px] font-mono border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 cursor-pointer transition-colors"
                                                 >
                                                     Match
@@ -1122,6 +1134,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                         </div>
                                     );
                                 })}
+                            </div>
+                        )}
+                        {/* No candidates — honest no-PO state (Bill 2026-08-27).
+                            Some vendors legitimately have no PO (service/freight);
+                            those were filtered upstream. For the rest, either the
+                            PO is archived or the vendor name differs — manual entry
+                            below is the path. */}
+                        {s.candidates.length === 0 && (
+                            <div className="text-[10px] font-mono text-zinc-500 py-0.5">
+                                No PO match found{s.vendorName ? ` for ${s.vendorName}` : ""} — enter the PO # below, or this may be a non-PO invoice (routes to Bill.com without a match)
                             </div>
                         )}
                         {/* Manual PO input — one line under expand */}
@@ -1241,6 +1263,17 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             </span>
                         </>
                     )}
+                    {/* True unmatched backlog — Bill (2026-08-27): the panel must
+                        show the real count of PO-matchable unmatched invoices, not
+                        the paint-budget slice (was capped at 6). */}
+                    {unmatchedTotal > 0 && (
+                        <>
+                            <span className="text-zinc-700">·</span>
+                            <span className="text-amber-400/90">
+                                {unmatchedTotal} unmatched · {fmtDollars(unmatchedDollars)}
+                            </span>
+                        </>
+                    )}
                 </div>
             )}
 
@@ -1286,13 +1319,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             {matchCount > 0 && (
                                 <button
                                     onClick={() => setFilterTab("match")}
+                                    title={unmatchedTotal > matchCount
+                                        ? `${unmatchedTotal} unmatched in the last 30 days — showing the ${matchCount} newest scored`
+                                        : "Invoices waiting to be linked to their PO"}
                                     className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
                                         filterTab === "match"
                                             ? "bg-amber-400 text-zinc-950 border-amber-400 font-semibold"
                                             : "bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20"
                                     }`}
                                 >
-                                    {matchCount} Match
+                                    {unmatchedTotal > matchCount ? `${unmatchedTotal} Match` : `${matchCount} Match`}
                                 </button>
                             )}
                             {settledPos.length > 0 && (

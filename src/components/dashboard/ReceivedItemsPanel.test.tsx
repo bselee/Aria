@@ -548,6 +548,45 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/not on invoice/i)).toBeTruthy();
   });
 
+  it("shows the true unmatched backlog in the context strip (not the scored slice)", async () => {
+    stubLocalStorage();
+    // 3 unmatched invoices; API scores only the newest 2 (paint budget).
+    // The panel must still show the full count + dollars in the header line.
+    const suggestion = {
+      invoiceId: "uuid-sug-3",
+      invoiceNumber: "1001",
+      vendorName: "CR Mineral Company, LLC",
+      invoiceTotal: 2403.12,
+      invoiceDate: "2026-08-25",
+      pdfStoragePath: null,
+      pdfAvailable: false,
+      candidates: [
+        {
+          orderId: "124310",
+          vendorName: "CR Mineral Company, LLC",
+          orderDate: "2026-08-01",
+          total: 2403.12,
+          status: "open",
+          score: 95,
+          reasons: ["vendor + amount match"],
+          isOpen: true,
+        },
+      ],
+      autoApplyReady: false,
+    };
+    // Tabs render only when visiblePos.length > 0 — settled PO provides the
+    // canvas without creating review/ready action rows.
+    stubFetch({ ...basePayload([settledPO()], [suggestion]), unmatchedTotal: 32, unmatchedDollars: 65674.2 });
+
+    render(<ReceivedItemsPanel />);
+
+    // Match tab shows the TRUE count (32), not the scored slice (1)
+    await screen.findByText(/32 Match/i);
+    // Context strip carries the backlog dollars
+    expect(screen.getByText(/32 unmatched/i)).toBeTruthy();
+    expect(screen.getByText(/\$65,674/i)).toBeTruthy();
+  });
+
   it("hides settled POs by default and reveals them under the Settled tab", async () => {
     stubLocalStorage();
     stubFetch(basePayload([settledPO()]));
