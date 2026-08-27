@@ -27,7 +27,7 @@ async function main() {
     }
 
     // Load all active unlinked shipments
-    let allUnlinked: any[] = [];
+    const allUnlinked: any[] = [];
     let offset = 0;
     while (true) {
         const { data } = await db

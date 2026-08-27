@@ -15,7 +15,7 @@ async function main() {
     if (!db) { console.error("No DB"); process.exit(1); }
 
     // Load all invoices with po_number
-    let allInvoices: any[] = [];
+    const allInvoices: any[] = [];
     let offset = 0;
     while (true) {
         const { data } = await db
@@ -38,7 +38,7 @@ async function main() {
     }
 
     // Load PO freight adjustments from purchase_orders
-    let allPOs: any[] = [];
+    const allPOs: any[] = [];
     offset = 0;
     while (true) {
         const { data } = await db

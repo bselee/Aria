@@ -37,7 +37,7 @@ async function main() {
     }
 
     // Find all active shipments from these billing emails
-    let allBilling: any[] = [];
+    const allBilling: any[] = [];
     let offset = 0;
     while (true) {
         const { data } = await db
