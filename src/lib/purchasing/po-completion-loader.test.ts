@@ -33,8 +33,35 @@ describe("po completion loader", () => {
         expect(signal.hasMatchedInvoice).toBe(true);
         expect(signal.reconciliationVerdict).toBe("needs_approval");
         expect(signal.freightResolved).toBe(false);
+        expect(signal.allFeesResolved).toBe(false);
         expect(signal.unresolvedBlockers).toContain("needs_approval");
-        expect(signal.unresolvedBlockers).toContain("freight_review");
+        expect(signal.unresolvedBlockers).toContain("fee_review");   // tax/tariff/freight covered
+    });
+
+    it("treats tax as unresolved (not just freight) when a TAX change needs approval", () => {
+        const signal = summarizePOCompletionSignal(buildRow({
+            metadata: {
+                orderId: "124547",
+                verdict: "needs_approval",
+                feeChanges: [{ type: "TAX", verdict: "needs_approval" }],
+                errors: [],
+            },
+        }));
+        expect(signal.allFeesResolved).toBe(false);
+        expect(signal.unresolvedBlockers).toContain("fee_review");
+    });
+
+    it("treats tariff as unresolved when a TARIFF change needs approval", () => {
+        const signal = summarizePOCompletionSignal(buildRow({
+            metadata: {
+                orderId: "124547",
+                verdict: "needs_approval",
+                feeChanges: [{ type: "TARIFF", verdict: "needs_approval" }],
+                errors: [],
+            },
+        }));
+        expect(signal.allFeesResolved).toBe(false);
+        expect(signal.unresolvedBlockers).toContain("fee_review");
     });
 
     it("extracts a clean resolved signal from an applied reconciliation", () => {

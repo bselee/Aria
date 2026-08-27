@@ -8,11 +8,16 @@ export interface POCompletionSignal {
     hasMatchedInvoice: boolean;
     reconciliationVerdict: string | null;
     freightResolved: boolean;
+    allFeesResolved: boolean;   // freight + tax + tariff + shipping + labor
     unresolvedBlockers: string[];
     lastActivityAt: string | null;
 }
 
 const RESOLVED_CHANGE_VERDICTS = new Set(["auto_approve", "no_change", "duplicate"]);
+// Fee types the reconciler can apply to a Finale PO. A fee change with a
+// non-resolved verdict keeps the PO out of "complete" regardless of pattern —
+// the safety rule "never complete until freight/tax/fees are applied".
+const GATED_FEE_TYPES = new Set(["FREIGHT", "SHIPPING", "TAX", "TARIFF", "LABOR", "DISCOUNT_20"]);
 
 function unique(values: string[]): string[] {
     return [...new Set(values)];
@@ -37,15 +42,28 @@ export function summarizePOCompletionSignal(row: APActivityRow): POCompletionSig
         unresolvedBlockers.push("price_review");
     }
 
-    const freightChanges = feeChanges.filter((change: any) => `${change?.type || change?.feeType || ""}`.toUpperCase() === "FREIGHT");
+    // Any fee type (freight/tax/tariff/shipping/labor/discount) with an
+    // unresolved verdict is a blocker. Previously only FREIGHT was gated —
+    // a PO could reach "complete" with tax/tariff still pending approval.
+    const gatedFees = feeChanges.filter((change: any) => {
+        const type = `${change?.type || change?.feeType || ""}`.toUpperCase();
+        return GATED_FEE_TYPES.has(type);
+    });
+    const feesResolved = gatedFees.length === 0 ||
+        gatedFees.every((change: any) => RESOLVED_CHANGE_VERDICTS.has((change?.verdict || "").toLowerCase()));
+    if (!feesResolved) unresolvedBlockers.push("fee_review");
+
+    // Keep the legacy freight-specific field for backward callers.
+    const freightChanges = gatedFees.filter((change: any) =>
+        `${change?.type || change?.feeType || ""}`.toUpperCase() === "FREIGHT");
     const freightResolved = freightChanges.length === 0 ||
         freightChanges.every((change: any) => RESOLVED_CHANGE_VERDICTS.has((change?.verdict || "").toLowerCase()));
-    if (!freightResolved) unresolvedBlockers.push("freight_review");
 
     return {
         hasMatchedInvoice: row.intent === "RECONCILIATION" && !!metadata.orderId,
         reconciliationVerdict: verdict,
         freightResolved,
+        allFeesResolved: feesResolved,
         unresolvedBlockers: unique(unresolvedBlockers),
         lastActivityAt: row.created_at || null,
     };

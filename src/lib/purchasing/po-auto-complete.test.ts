@@ -11,7 +11,11 @@ function basPO(overrides: Partial<POForCompletion> = {}): POForCompletion {
         completionState: "complete",
         completionStateSince: new Date(NOW - 50 * 3600 * 1000).toISOString(), // 50h before NOW
         poFreightAmount: 0,
+        poTaxAmount: 0,
+        poTariffAmount: 0,
         invoiceFreight: 0,
+        invoiceTax: 0,
+        invoiceTariff: 0,
         hasMatchedInvoice: true,
         ...overrides,
     };
@@ -106,7 +110,7 @@ describe("checkAutoCompleteEligibility — Gate 2 (dwell time)", () => {
 
 // ── Gate 3: HARD RULE — invoice freight without matching PO freight ────────
 
-describe("checkAutoCompleteEligibility — Gate 3 (red flag: invoice freight without PO match)", () => {
+describe("checkAutoCompleteEligibility — Gate 3 (red flag: invoice fees without PO match)", () => {
     it("not eligible when invoice has freight but PO has none", () => {
         const r = checkAutoCompleteEligibility(
             basPO({
@@ -149,6 +153,48 @@ describe("checkAutoCompleteEligibility — Gate 3 (red flag: invoice freight wit
         );
         expect(r.eligible).toBe(false);
         if (!r.eligible) expect(r.reason).toMatch(/red flag/);
+    });
+
+    it("not eligible when invoice has tax but PO has none", () => {
+        const r = checkAutoCompleteEligibility(
+            basPO({
+                vendorName: "Bulk Freight Vendor",
+                invoiceTax: 50,
+                poTaxAmount: 0,
+            }),
+            highVendorFreightEvidence(),
+            NOW,
+        );
+        expect(r.eligible).toBe(false);
+        if (!r.eligible) expect(r.reason).toMatch(/tax/);
+    });
+
+    it("not eligible when invoice tax does not match PO tax", () => {
+        const r = checkAutoCompleteEligibility(
+            basPO({
+                vendorName: "Bulk Freight Vendor",
+                invoiceTax: 50,
+                poTaxAmount: 40,
+            }),
+            highVendorFreightEvidence(),
+            NOW,
+        );
+        expect(r.eligible).toBe(false);
+        if (!r.eligible) expect(r.reason).toMatch(/tax/);
+    });
+
+    it("not eligible when invoice has tariff but PO has none", () => {
+        const r = checkAutoCompleteEligibility(
+            basPO({
+                vendorName: "Bulk Freight Vendor",
+                invoiceTariff: 75,
+                poTariffAmount: 0,
+            }),
+            highVendorFreightEvidence(),
+            NOW,
+        );
+        expect(r.eligible).toBe(false);
+        if (!r.eligible) expect(r.reason).toMatch(/tariff/);
     });
 });
 
