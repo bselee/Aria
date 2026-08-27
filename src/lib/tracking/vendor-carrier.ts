@@ -38,8 +38,13 @@ export function normalizeCarrierToken(value: string | null | undefined): string 
  * "fedex" matches both "FedEx" (parcel) and "FedEx Freight" (LTL).
  *
  * Seeded from Bill's domain knowledge + high-signal learned pairs
- * (explicit-PO shipments: ULINE→UPS ×4, Thrive→Oak Harbor ×4,
- * Organics Alive→FedEx Freight ×2, Grassroots→AAA Cooper ×2, etc.).
+ * (explicit-PO: ULINE→UPS ×4, Thrive→Oak Harbor ×4,
+ * Organics Alive→FedEx Freight ×2, Grassroots→AAA Cooper ×2 (inbound LTL)).
+ * Note: AAA Cooper — like FedEx — is bidirectional: it carries inbound
+ * vendor LTL (Grassroots, C&S Plastics) AND produces outbound billing
+ * noise. Ingest filters OUTBOUND at the SOURCE (billing email domains /
+ * message IDs), not by carrier name, so vendor→AAA Cooper inbound seeds
+ * are legitimate.
  */
 export const VENDOR_CARRIER_SEEDS: Record<string, string[]> = {
     "rootwise": ["fedex"],
@@ -48,7 +53,7 @@ export const VENDOR_CARRIER_SEEDS: Record<string, string[]> = {
     "organics alive": ["fedex"],
     "grassroots fabric pots": ["aaa cooper", "ups"],
     "diamond k gypsum": ["fedex"],
-    "fertilell": ["old dominion"],
+    "ferticell": ["old dominion"],
     "c and s plastics": ["aaa cooper"],
     "the amazing dr. zymes": ["fedex"],
     "emro usa": ["fedex"],
