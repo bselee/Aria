@@ -107,14 +107,35 @@ async function main() {
         return;
     }
 
-    // Insert in batches (no unique constraint on order_id, so use insert)
+    // Load existing order_ids so a re-run is idempotent. Since 20260827
+    // added a UNIQUE constraint on order_id, a blind INSERT would fail on
+    // any PO already seeded. Skip POs we already have evidence for.
+    const existingIds = new Set<string>();
+    {
+        let off = 0;
+        while (true) {
+            const { data } = await db
+                .from("po_freight_evidence")
+                .select("order_id")
+                .limit(1000)
+                .offset(off);
+            const rows = (data || []) as { order_id: string }[];
+            for (const r of rows) if (r.order_id) existingIds.add(r.order_id);
+            if (rows.length < 1000) break;
+            off += 1000;
+        }
+    }
+    const toInsert = records.filter(r => !existingIds.has(r.order_id));
+    console.log(`\n${existingIds.size} existing POs already have evidence; inserting ${toInsert.length} new.`);
+
+    // Upsert on order_id so a concurrent partial write can't duplicate.
     const BATCH = 50;
     let written = 0;
-    for (let i = 0; i < records.length; i += BATCH) {
-        const batch = records.slice(i, i + BATCH);
+    for (let i = 0; i < toInsert.length; i += BATCH) {
+        const batch = toInsert.slice(i, i + BATCH);
         const { error } = await db
             .from("po_freight_evidence")
-            .insert(batch);
+            .upsert(batch, { onConflict: "order_id" });
         if (error) {
             console.error(`Batch ${i} error:`, error.message);
         } else {
