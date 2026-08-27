@@ -274,14 +274,19 @@ describe("3-way match — acceptance: real receipt quantities catch the faked-da
         expect(short?.message).toContain("short 40");
     });
 
-    it("treats null receivedQty as zero received (over-bill detected)", () => {
-        // When receipt data is unavailable (receivedQty = null), the module
-        // treats it as zero. Invoice of 100 against zero received = over-bill.
+    it("does NOT assert over-bill when receivedQty is null (unknown receipt, deferred load)", () => {
+        // HERMIA(2026-08-27): the dashboard GET path defers Finale shipment
+        // detail fetches to POST complete_po for latency, so receivedQty is
+        // null on paint even for a fully-received PO. null ≠ 0: the module
+        // must not claim "billed 100 but received 0" when the receipt leg
+        // simply hasn't been loaded yet. PO 125212: Finale auto-completed it
+        // (amounts matched), yet the panel showed a fake blocking overbill.
         const r = evaluateThreeWayMatch(input([cleanLine({ receivedQty: null })]));
-        expect(r.verdict).toBe("exception");
-        expect(r.canApprove).toBe(false);
-        const d = r.discrepancies.find((x) => x.kind === "qty_over_billed");
-        expect(d?.blocking).toBe(true);
+        const over = r.discrepancies.find((x) => x.kind === "qty_over_billed");
+        expect(over).toBeUndefined();
+        // Price agreement still verified (unit prices are in the bulk payload).
+        const price = r.discrepancies.find((x) => x.kind === "price_variance");
+        expect(price).toBeUndefined();
     });
 
     it("BLOCKS over-billing through case-normalized quantity (pack multiplier)", () => {

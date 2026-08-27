@@ -195,7 +195,11 @@ export function evaluateThreeWayMatch(input: ThreeWayMatchInput): ThreeWayMatchR
         const pack = line.packMultiplier && line.packMultiplier > 0 ? line.packMultiplier : 1;
         const invoiceQtyBase = line.invoiceQty * pack;
         const invoiceUnitPriceBase = line.invoiceUnitPrice / pack;
-        const receivedQty = line.receivedQty ?? 0;
+        // HERMIA(2026-08-27): receivedQty can be NULL on the dashboard GET path
+        // (shipment detail fetches are deferred to POST complete_po for latency).
+        // null ≠ 0: an unknown receipt must NOT trigger a blocking overbill
+        // ("billed 20 but received 0") on a PO Finale already auto-completed.
+        const receivedQty = line.receivedQty;
         const label = line.description ? `${line.productId} (${line.description})` : line.productId;
 
         // Invoice line that isn't on the PO at all.
@@ -211,18 +215,23 @@ export function evaluateThreeWayMatch(input: ThreeWayMatchInput): ThreeWayMatchR
         }
 
         // ── Billing for more than was received. The cardinal 3-way failure. ──
-        const qtyAllowance = Math.max(tol.qtyAbsUnits, receivedQty * tol.qtyOverPct);
-        if (invoiceQtyBase > receivedQty + qtyAllowance) {
-            const over = invoiceQtyBase - receivedQty;
-            discrepancies.push({
-                productId: line.productId,
-                kind: "qty_over_billed",
-                blocking: true,
-                dollarImpact: money(over * invoiceUnitPriceBase),
-                message:
-                    `${label}: billed ${invoiceQtyBase} but received ${receivedQty} ` +
-                    `(${money(over)} unit overbill). Do not pay until resolved.`,
-            });
+        // Only evaluated when the receipt quantity is actually known (POST path);
+        // a null receivedQty means the receipt leg hasn't been loaded, so an
+        // overbill cannot be asserted.
+        if (receivedQty != null) {
+            const qtyAllowance = Math.max(tol.qtyAbsUnits, receivedQty * tol.qtyOverPct);
+            if (invoiceQtyBase > receivedQty + qtyAllowance) {
+                const over = invoiceQtyBase - receivedQty;
+                discrepancies.push({
+                    productId: line.productId,
+                    kind: "qty_over_billed",
+                    blocking: true,
+                    dollarImpact: money(over * invoiceUnitPriceBase),
+                    message:
+                        `${label}: billed ${invoiceQtyBase} but received ${receivedQty} ` +
+                        `(${money(over)} unit overbill). Do not pay until resolved.`,
+                });
+            }
         }
 
         // ── Price agreement against the PO ──────────────────────────────────

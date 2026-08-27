@@ -10,6 +10,13 @@
  *          gap between Finale vendor names and OCR-extracted vendor names
  *          from invoices.
  *
+ *          SYNCES THE TERMINAL TRUTH (2026-08-27): Finale auto-completes POs
+ *          when product amounts match, but normalizePOStatus() collapses
+ *          "Completed" -> "received" for the simple `status` enum. That means
+ *          the raw COMPLETED state must be preserved in lifecycle_state +
+ *          receive_date, or a Finale-completed PO never leaves the Receivings
+ *          action list (its completed-exclusion reads lifecycle_state).
+ *
  *          Runs as a cron job every 2 hours. Idempotent — upsert on po_number.
  *
  * @author  Hermia
@@ -58,7 +65,30 @@ export async function syncPurchaseOrders(daysBack = 90): Promise<POSyncStats> {
             try {
                 const isNew = !existingSet.has(po.orderId);
 
-                await db.from("purchase_orders").upsert({
+                // Preserve Finale's terminal truth. normalizePOStatus() collapses
+                // "Completed" -> "received" for the display enum, so COMPLETED and
+                // CANCELLED must be stamped from the raw status — otherwise a
+                // Finale-auto-completed PO never leaves the Receivings action
+                // list (its completed-exclusion reads lifecycle_state).
+                //
+                // ONLY terminal states are stamped: intermediate lifecycle states
+                // (ACKNOWLEDGED / INVOICED / RECONCILED / REVIEW / RECEIVED) are
+                // owned by the pipeline (po-reply-watcher, invoice matching,
+                // reconcilers). Overwriting them with "OPEN" here would erase
+                // vendor-ack and invoicing signals (observed 2026-08-27:
+                // 125223 INVOICED→OPEN, 125180 ACKNOWLEDGED→OPEN).
+                const rawStatus = String((po as any).status ?? "").toLowerCase();
+                const isCancelled = rawStatus.includes("cancel");
+                const isCompleted = rawStatus.includes("complete");
+                const terminalState = isCancelled ? "CANCELLED" : isCompleted ? "COMPLETED" : null;
+
+                // receive_date mirrors Finale only when Finale reports one —
+                // never clear a pipeline-set date because the sync window sees null.
+                const receiveDate = (po as any).receiveDate
+                    ? new Date((po as any).receiveDate).toISOString()
+                    : null;
+
+                const row: Record<string, unknown> = {
                     po_number: po.orderId,
                     vendor_name: po.vendorName || null,
                     vendor_party_id: (po as any).vendorPartyId || null,
@@ -67,7 +97,14 @@ export async function syncPurchaseOrders(daysBack = 90): Promise<POSyncStats> {
                     total_amount: po.total || 0,
                     line_items: po.items || [],
                     updated_at: new Date().toISOString(),
-                }, { onConflict: "po_number" });
+                };
+                if (terminalState) {
+                    row.lifecycle_state = terminalState;
+                    row.lifecycle_stage = terminalState;
+                }
+                if (receiveDate) row.receive_date = receiveDate;
+
+                await db.from("purchase_orders").upsert(row, { onConflict: "po_number" });
 
                 stats.synced++;
                 if (isNew) stats.newPOs++;

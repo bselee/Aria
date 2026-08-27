@@ -219,22 +219,25 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 .map((r: any) => r.poNumber || r.orderId)
                 .filter(Boolean);
 
-            // ── Exclude COMPLETED POs (durable fix; mirrors the UI's session-side
-            // completedIds). Finale still lists completed POs in its 30d received
-            // window, but a completed PO has left the actionable receivings list
-            // for good — drop it here so refresh/new sessions never see it back.
+            // ── Exclude COMPLETED + CANCELLED POs (durable fix; mirrors the
+            // UI's session-side completedIds). Finale still lists completed and
+            // cancelled POs in its 30d received window, but neither belongs in
+            // the actionable receivings list — drop them here so refresh/new
+            // sessions never see them back. PO 125212 was the live case:
+            // Finale auto-completed it (amounts matched) but the cache said
+            // RECEIVED, so it sat in the action list as a phantom "REVIEW".
             if (poNumbers.length > 0) {
-                const { data: completedRows } = await sb
+                const { data: doneRows } = await sb
                     .from('purchase_orders')
                     .select('po_number')
                     .in('po_number', poNumbers)
-                    .eq('lifecycle_state', 'COMPLETED');
-                const completedPoNums = new Set(
-                    (completedRows || []).map((r: any) => String(r.po_number)),
+                    .in('lifecycle_state', ['COMPLETED', 'CANCELLED']);
+                const donePoNums = new Set(
+                    (doneRows || []).map((r: any) => String(r.po_number)),
                 );
-                if (completedPoNums.size > 0) {
+                if (donePoNums.size > 0) {
                     received = received.filter(
-                        (r: any) => !completedPoNums.has(String(r.poNumber || r.orderId)),
+                        (r: any) => !donePoNums.has(String(r.poNumber || r.orderId)),
                     );
                     poNumbers = received
                         .map((r: any) => r.poNumber || r.orderId)
