@@ -85,6 +85,20 @@ function scoreVendorName(a: string, b: string): { score: number; reason: string 
     if (al === bl) return { score: 40, reason: "exact vendor match" };
     if (al.includes(bl) || bl.includes(al)) return { score: 30, reason: "vendor substring match" };
 
+    // HERMIA(2026-08-27): "Concentrates, Inc" vs "Concentrates Inc." —
+    // normalizeVendorName deliberately preserves ASCII punctuation (the
+    // "DIA!OND K GYPSUM, INC." test asserts the ! survives), so comma/period
+    // variants of the SAME vendor scored 0 and only the blind confirmed-95
+    // override kept them visible — the panel then showed 3× 95% with 0/N SKU
+    // match. Compare punctuation-stripped forms as an exact tier before
+    // falling back to word overlap.
+    const stripPunct = (s: string) => s.replace(/[^A-Z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+    const alClean = stripPunct(al);
+    const blClean = stripPunct(bl);
+    if (alClean && blClean && alClean === blClean) {
+        return { score: 40, reason: "exact vendor match (punct-insensitive)" };
+    }
+
     const wa = new Set(al.split(/\s+/).filter(w => w.length > 2));
     const wb = new Set(bl.split(/\s+/).filter(w => w.length > 2));
     const overlap = [...wa].filter(w => wb.has(w)).length;
@@ -217,7 +231,13 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // "Miles Filippelli" from OCR should match "Miles Nursery LLC" in purchase_orders.
     const searchTerms = extractSearchTerms(invoice.vendorName);
 
-    // Search purchase_orders: try exact ilike first, then word-based if no results
+    // Search purchase_orders: exact ilike FIRST, then UNION in word-term
+    // results (dedup by po_number). Punctuation variants split one vendor
+    // into two strings ("Concentrates, Inc" vs "Concentrates Inc.") — the
+    // direct ILIKE can return only one half of the vendor's POs, and the old
+    // replace-when-empty fallback silently dropped the other half entirely
+    // (observed 2026-08-27: Concentrates PO 125184 never appeared as a
+    // candidate because its name lacks the comma the invoice has).
     let { data: pos } = await db
         .from("purchase_orders")
         .select("po_number, vendor_name, issue_date, total_amount, total, status")
@@ -225,21 +245,23 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         .order("issue_date", { ascending: false })
         .limit(20);
 
-    // If no direct match, try each significant search term
-    if ((!pos || pos.length === 0) && searchTerms.length > 0) {
-        for (const term of searchTerms) {
-            const { data: termResults } = await db
-                .from("purchase_orders")
-                .select("po_number, vendor_name, issue_date, total_amount, total, status")
-                .ilike("vendor_name", `%${term}%`)
-                .order("issue_date", { ascending: false })
-                .limit(20);
-            if (termResults && termResults.length > 0) {
-                pos = termResults;
-                break;
+    const posList = [...(pos || [])];
+    const seenUnionPo = new Set<string>(posList.map((p: any) => p.po_number));
+    for (const term of searchTerms) {
+        const { data: termResults } = await db
+            .from("purchase_orders")
+            .select("po_number, vendor_name, issue_date, total_amount, total, status")
+            .ilike("vendor_name", `%${term}%`)
+            .order("issue_date", { ascending: false })
+            .limit(20);
+        for (const tp of (termResults || [])) {
+            if (!seenUnionPo.has(tp.po_number)) {
+                posList.push(tp);
+                seenUnionPo.add(tp.po_number);
             }
         }
     }
+    pos = posList;
 
     // If the invoice vendor name resolves to a canonical name (via vendor_aliases),
     // ALSO search for POs matching the canonical name or any of its alias values.
@@ -344,7 +366,19 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
 
         let total = vendorScore.score + dateScore.score + amountScore.score;
         if (confirmedMatchReason) {
-            total = 95;
+            // Bill (2026-08-27): a confirmed vendor+PO pair used to BLIND-SET
+            // 95 regardless of evidence — Concentrates showed 3× 95% while
+            // every candidate was 0/N SKU match and 3-9× the invoice amount,
+            // so the panel gave no way to tell the real candidate from memory.
+            // Keep 95 ONLY when the amount is close (genuine repeat billing);
+            // otherwise apply a bounded boost and say the amount differs, so
+            // the score reflects the actual evidence instead of overriding it.
+            if (amountScore.score > 0) {
+                total = Math.max(total, 95);
+            } else {
+                total = Math.min(95, total + 20);
+                confirmedMatchReason += " (amount differs from PO)";
+            }
         }
 
         // When invoice total is $0 (bad OCR), still surface the match on

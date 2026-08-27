@@ -1115,16 +1115,24 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 ))}
                             </div>
                         )}
+                        {(!s.invoiceLineItems || s.invoiceLineItems.length === 0) && (
+                            <div className="text-[9px] font-mono italic text-zinc-600">
+                                No line items on invoice — compare by vendor, date, and amount
+                            </div>
+                        )}
 
                         {s.candidates.length > 0 && (
                             <div className="pt-1">
                                 <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-600">Candidates</div>
-                                {s.candidates.slice(0, 3).map(c => {
+                                {s.candidates.map(c => {
                                     const invSkus = new Set(
                                         (s.invoiceLineItems || []).map(li => String(li.sku || "").trim().toUpperCase()).filter(Boolean),
                                     );
                                     const poSkus = (c.items || []).map((it: any) => String(it.productId || it.sku || "").trim().toUpperCase()).filter(Boolean);
                                     const overlap = poSkus.filter(sku => invSkus.has(sku)).length;
+                                    const invTotal = Number(s.invoiceTotal || 0);
+                                    const poTotal = Number(c.total || 0);
+                                    const delta = Math.abs(invTotal - poTotal);
                                     return (
                                         <div key={c.orderId} className="border-b border-zinc-800/30 last:border-0 py-1">
                                             <div className="flex items-center gap-2 text-[10px] font-mono">
@@ -1134,7 +1142,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                 <span className={`shrink-0 ${c.score >= 70 ? "text-emerald-400" : c.score >= 50 ? "text-amber-300" : "text-zinc-500"}`}>
                                                     {c.score}%
                                                 </span>
-                                                {c.items && c.items.length > 0 && (
+                                                {c.items && c.items.length > 0 && invSkus.size > 0 && (
                                                     <span className={`shrink-0 ${overlap > 0 ? "text-emerald-400" : "text-zinc-600"}`}>
                                                         {overlap}/{c.items.length} SKU match
                                                     </span>
@@ -1149,6 +1157,15 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                 >
                                                     Match
                                                 </button>
+                                            </div>
+                                            {/* Evidence line — what the invoice says vs what the PO says */}
+                                            <div className="flex items-baseline gap-1.5 pl-1 text-[9px] font-mono text-zinc-600">
+                                                <span className={delta < 1 ? "text-emerald-400" : "text-zinc-500"}>
+                                                    Inv {fmtDollars(invTotal)} vs PO {fmtDollars(poTotal)}
+                                                </span>
+                                                {delta >= 1 && <span className="text-amber-400/80">Δ{fmtDollars(delta)}</span>}
+                                                {c.orderDate && <span>· {(c.orderDate || "").slice(0, 10)}</span>}
+                                                {c.status && <span>· {c.status}</span>}
                                             </div>
                                             {/* PO line items with overlap highlighting */}
                                             {c.items && c.items.length > 0 && (

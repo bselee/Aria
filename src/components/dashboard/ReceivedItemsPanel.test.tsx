@@ -585,6 +585,85 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/not on invoice/i)).toBeTruthy();
   });
 
+  it("match row without invoice line items explains and lists ALL candidates with evidence", async () => {
+    stubLocalStorage();
+    const suggestion = {
+      invoiceId: "uuid-sug-noitems",
+      invoiceNumber: "300419889380",
+      vendorName: "Concentrates, Inc",
+      invoiceTotal: 916.33,
+      invoiceDate: "2026-08-19",
+      pdfStoragePath: null,
+      pdfAvailable: false,
+      invoiceLineItems: [], // OCR got no line items — must say so, not fake 0/N
+      candidates: [
+        {
+          orderId: "125184",
+          vendorName: "Concentrates Inc.",
+          orderDate: "2026-08-11",
+          total: 5261.68,
+          status: "received",
+          score: 62,
+          reasons: ["vendor match", "8d apart"],
+          isOpen: false,
+          items: [{ productId: "SB104", quantity: 100 }],
+        },
+        {
+          orderId: "124909",
+          vendorName: "Concentrates, Inc",
+          orderDate: "2026-06-10",
+          total: 8451.75,
+          status: "received",
+          score: 60,
+          reasons: ["previously confirmed by user (vendor=Concentrates, Inc, PO=124909) (amount differs from PO)"],
+          isOpen: false,
+          items: [{ productId: "FM104", quantity: 55 }, { productId: "SB104", quantity: 80 }],
+        },
+        {
+          orderId: "124856",
+          vendorName: "Concentrates, Inc",
+          orderDate: "2026-05-26",
+          total: 2328,
+          status: "received",
+          score: 60,
+          reasons: ["previously confirmed by user"],
+          isOpen: false,
+        },
+        {
+          orderId: "124578",
+          vendorName: "Concentrates, Inc",
+          orderDate: "2026-03-31",
+          total: 3204.19,
+          status: "received",
+          score: 60,
+          reasons: ["previously confirmed by user"],
+          isOpen: false,
+        },
+      ],
+      autoApplyReady: false,
+    };
+    stubFetch(basePayload([], [suggestion]));
+
+    render(<ReceivedItemsPanel />);
+    expect(await screen.findByText(/Inv 300419889380/i)).toBeTruthy();
+
+    const header = screen.getByText(/Inv 300419889380/i).closest('[role="button"]') as HTMLElement;
+    fireEvent.click(header);
+
+    // Honest "no line items" note instead of a fake 0/N SKU counter
+    expect(await screen.findByText(/No line items on invoice/i)).toBeTruthy();
+    expect(screen.queryByText(/0\/1 SKU match/i)).toBeNull();
+
+    // ALL candidates render (no slice(0,3) cap) — 4th PO visible
+    expect(screen.getByText("125184")).toBeTruthy();
+    expect(screen.getByText("124578")).toBeTruthy();
+
+    // Evidence line: invoice amount vs PO amount + delta + date + status
+    expect(screen.getByText(/Inv \$916 vs PO \$5,262/i)).toBeTruthy();
+    expect(screen.getAllByText(/Δ/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/2026-08-11/)).toBeTruthy();
+  });
+
   it("shows the true unmatched backlog in the context strip (not the scored slice)", async () => {
     stubLocalStorage();
     // 3 unmatched invoices; API scores only the newest 2 (paint budget).
