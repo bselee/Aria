@@ -99,15 +99,34 @@ function maxPastShipmentReceiveDate(
     return past.sort().at(-1) || null;
 }
 
-async function readCachedPos(): Promise<FullPO[]> {
+/**
+ * Read cached POs for the Active Purchases view.
+ *
+ * HERMIA(2026-08-27): ordering by `updated_at` desc + limit(500) silently
+ * excluded every in-flight PO. A cache-wide refresh stamps ~1,300 rows with a
+ * near-identical updated_at, so that ordering is effectively arbitrary — 538
+ * rows sorted ahead of PO 125235, pushing live POs past the 500 cutoff and
+ * showing 8 where Finale had 19. Order by `issue_date` desc (newest ORDERS
+ * first, which is what "active" means) and drop terminal `closed` rows
+ * server-side so the window is spent on live POs.
+ */
+async function readCachedPos(daysBack = 60): Promise<FullPO[]> {
     const db = createClient();
     if (!db) return [];
+
+    // Match the live Finale path's window — getRecentPurchaseOrders(daysBack).
+    // Without this the cache returned POs of ANY age, so the cached branch
+    // disagreed with the bust branch on which POs even exist.
+    const cutoff = new Date(Date.now() - daysBack * 86400_000)
+        .toISOString().slice(0, 10);
 
     try {
         const { data, error } = await db
             .from("purchase_orders")
             .select("*")
-            .order("updated_at", { ascending: false })
+            .neq("status", "closed")
+            .gte("issue_date", cutoff)
+            .order("issue_date", { ascending: false })
             .limit(500);
 
         if (error || !data || data.length === 0) return [];
@@ -183,7 +202,7 @@ export async function getCachedOrFresh(
             try {
                 const lastSync = await getCacheAge();
                 if (lastSync && isCacheFresh(lastSync)) {
-                    const cached = await readCachedPos();
+                    const cached = await readCachedPos(daysBack);
                     if (cached.length > 0) {
                         console.log(`[po-cache] HIT — ${cached.length} POs (synced ${timeAgo(lastSync)})`);
                         return { pos: cached, fromCache: true };

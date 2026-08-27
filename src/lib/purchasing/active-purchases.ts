@@ -355,12 +355,31 @@ export async function loadActivePurchases(
 
     const activePos: ActivePurchase[] = [];
 
+    // HERMIA(2026-08-27): Statuses arrive in TWO vocabularies and both must pass.
+    // Finale (live/bust path) yields "Committed"/"Completed". The purchase_orders
+    // cache is written by po-sync's normalizePOStatus(), which collapses
+    // "Committed" -> "open" and "Completed"/"Received" -> "received". Gating on
+    // only ["committed","completed"] meant EVERY cached PO was dropped: the
+    // dashboard logged "0 active of 500 Finale POs (fromCache=true)" while
+    // ?bust=1 returned 19, so Bill's Active Purchases column rendered EMPTY
+    // whenever the 15-min cache was fresh.
+    //
+    // Deliberately NOT admitting the normalized "received" bucket: it is
+    // terminal (Completed/Received), and only 134 of 949 such cached rows carry
+    // a receive_date, so isHighConfidenceReceived() cannot exit them and 48
+    // long-settled POs leaked back into Active (67 vs Finale's 19). "partial" is
+    // a partially-received PO — genuinely still in flight.
+    const ACTIVE_STATUSES = new Set([
+        "committed", "completed",   // Finale raw
+        "open", "partial",          // po-sync normalized
+    ]);
+
     for (const po of pos) {
         if (!po.orderId) continue;
         if (po.orderId.toLowerCase().includes("dropship")) continue;
 
         const status = (po.status || "").toLowerCase();
-        if (!["committed", "completed"].includes(status)) continue;
+        if (!ACTIVE_STATUSES.has(status)) continue;
 
         const shipments = (shipmentMap.get(po.orderId) || []).map((shipment) => {
             const classification = classifyShipmentEvidence(shipment);
