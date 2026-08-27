@@ -76,6 +76,10 @@ describe("assertValidTransition", () => {
         expect(() => assertValidTransition("INVOICED", "RECONCILED")).not.toThrow();
     });
 
+    it("allows INVOICED → ACKNOWLEDGED (operator unmatch rollback)", () => {
+        expect(() => assertValidTransition("INVOICED", "ACKNOWLEDGED")).not.toThrow();
+    });
+
     it("allows RECONCILED → RECEIVED", () => {
         expect(() => assertValidTransition("RECONCILED", "RECEIVED")).not.toThrow();
     });

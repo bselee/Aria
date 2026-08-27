@@ -52,7 +52,7 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
     SENT: ["ACKNOWLEDGED", "INVOICED", "RECEIVED"],
     ACKNOWLEDGED: ["INVOICED", "RECEIVED"],
     // Invoice / fulfillment pipeline
-    INVOICED: ["RECONCILED", "RECEIVED"],
+    INVOICED: ["RECONCILED", "RECEIVED", "ACKNOWLEDGED"], // ACKNOWLEDGED = operator unmatch rollback (dashboard-receivings)
     RECONCILED: ["RECEIVED", "COMPLETED"],
     RECEIVED: ["RECONCILED", "COMPLETED"],
     COMPLETED: [], // terminal state

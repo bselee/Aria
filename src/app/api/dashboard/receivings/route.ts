@@ -1320,6 +1320,67 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ matched: true, invoiceId, poNumber });
         }
 
+        if (action === 'unmatch_invoice') {
+            // Bill (2026-08-27): "what if the match is not correct?" — a wrong
+            // match must be undoable. Clears vendor_invoices.po_number and rolls
+            // the PO lifecycle back INVOICED → ACKNOWLEDGED so it re-enters the
+            // match pool. Refuses when the PO is already RECEIVED/COMPLETED
+            // (receipt evidence makes unmatching misleading — re-match instead).
+            const { invoiceId } = body;
+            if (!invoiceId) {
+                return NextResponse.json({ error: 'invoiceId required' }, { status: 400 });
+            }
+
+            const sb = createClient();
+            if (!sb) return NextResponse.json({ error: 'DB unavailable' }, { status: 500 });
+
+            const { data: inv } = await sb
+                .from('vendor_invoices')
+                .select('po_number')
+                .eq('id', invoiceId)
+                .maybeSingle();
+
+            const poNumber = (inv as any)?.po_number;
+            if (!poNumber) {
+                return NextResponse.json({ error: 'invoice is not matched to a PO' }, { status: 400 });
+            }
+
+            // Refuse rollback only in terminal/sent states. INVOICED (matched
+            // pre-receipt) rolls fully back to ACKNOWLEDGED. RECEIVED (matched
+            // post-receipt — the READY row, where a wrong match is spotted at
+            // "verify reception matches amount") clears the link and keeps the
+            // receipt: the PO returns to awaiting-invoice, the invoice re-enters
+            // the match pool. COMPLETED/CANCELLED/RECONCILED are final.
+            const { data: poRow } = await sb
+                .from('purchase_orders')
+                .select('lifecycle_state, receive_date')
+                .eq('po_number', poNumber)
+                .maybeSingle();
+            const lc = String((poRow as any)?.lifecycle_state || '');
+            if (/(COMPLETED|CANCELLED|RECONCILED)/i.test(lc)) {
+                return NextResponse.json(
+                    { error: `PO ${poNumber} is ${lc || 'in a final state'} — unmatch refused (already closed / sent to Bill.com).` },
+                    { status: 409 },
+                );
+            }
+
+            await sb
+                .from('vendor_invoices')
+                .update({ po_number: null })
+                .eq('id', invoiceId);
+
+            // INVOICED → ACKNOWLEDGED rollback only when the PO is not yet
+            // received; a received PO keeps RECEIVED (receipt is a fact).
+            if (!/(RECEIVED)/i.test(lc) && !(poRow as any)?.receive_date) {
+                const tl = await transitionLifecycleState(poNumber, 'ACKNOWLEDGED', 'dashboard-receivings', { unmatchInvoiceId: invoiceId });
+                if (!tl.ok) {
+                    console.warn(`[receivings] unmatch lifecycle rollback refused for ${poNumber}: ${tl.blockReason}`);
+                }
+            }
+
+            return NextResponse.json({ unmatched: true, invoiceId, poNumber });
+        }
+
         if (action === 'mark_freight_pattern') {
             const { vendorName, pattern } = body;
             if (!vendorName || !pattern) {

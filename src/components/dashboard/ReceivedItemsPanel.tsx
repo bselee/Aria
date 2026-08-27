@@ -417,6 +417,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const [actionToast, setActionToast] = useState<ActionToast>(null);
     /** PO currently completing — button shows "Completing…" while in flight. */
     const [completingId, setCompletingId] = useState<string | null>(null);
+    /** PO currently unmatching — the Unmatch button shows "Unmatching…" while in flight. */
+    const [unmatchingId, setUnmatchingId] = useState<string | null>(null);
     /** Which ActionRow is expanded (single-expand accordion). */
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
     /** Invoice id being hovered for the PDF preview iframe (null = none mounted). */
@@ -720,6 +722,30 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         }
     }
 
+    async function handleUnmatchInvoice(invoiceId: string, poNumber: string) {
+        setUnmatchingId(poNumber);
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "unmatch_invoice", invoiceId }),
+            });
+            const json = await res.json();
+            if (res.ok) {
+                setActionToast({ kind: "ok", text: `Invoice unlinked from PO ${poNumber} — back in the Match list` });
+                fetchReceivings(true);
+            } else if (res.status === 409 && json.error) {
+                setActionToast({ kind: "block", text: json.error });
+            } else {
+                throw new Error(json.error || `HTTP ${res.status}`);
+            }
+        } catch (e: unknown) {
+            setActionToast({ kind: "err", text: errMsg(e) || "Unmatch failed" });
+        } finally {
+            setUnmatchingId(null);
+        }
+    }
+
     // ── Derived: the ONE actionable list + counts ──────────────────────────
     const filteredSuggestions = useMemo(
         () => matchSuggestions.filter(s =>
@@ -979,8 +1005,24 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 <span className="text-[11px] font-mono text-emerald-200/90 flex-1 min-w-0 truncate">
                     PO {row.po.orderId} <span className="text-zinc-500">{row.po.supplier}</span> matched Inv #{row.inv.invoice_number || "—"} — ready
                 </span>
+                {Number(row.inv.total) > 0 && Number(row.po.total) > 0 && (
+                    <span
+                        className={`text-[10px] font-mono shrink-0 ${Math.abs(Number(row.inv.total) - Number(row.po.total)) < 0.01 ? "text-emerald-400/80" : "text-amber-400/90"}`}
+                        title="Verify reception matches amount: invoice total vs PO total (the 3-way gate re-checks SKU-level qty at Complete)"
+                    >
+                        {fmtDollars(row.inv.total)} vs {fmtDollars(row.po.total)}
+                    </span>
+                )}
                 {age && <span className={`text-[9px] font-mono shrink-0 ${age.cls}`} title={`Received ${fmtDateTime(row.po.receiveDate || row.po.receiveDateTime)}`}>{age.text}</span>}
                 {pdfUrl && <InvoicePdfLink id={row.inv.id!} number={row.inv.invoice_number} />}
+                <button
+                    onClick={() => row.inv.id && handleUnmatchInvoice(row.inv.id, row.po.orderId)}
+                    disabled={!row.inv.id || unmatchingId === row.po.orderId}
+                    title="Unmatch: undo the link if this invoice belongs to a different PO. The invoice returns to the Match list; the PO goes back to awaiting-invoice."
+                    className="shrink-0 px-2 py-1 rounded text-[10px] font-mono border border-zinc-700/50 bg-zinc-800/30 text-zinc-400 hover:bg-zinc-700/40 hover:text-zinc-200 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-wait"
+                >
+                    {unmatchingId === row.po.orderId ? "Unmatching…" : "Unmatch"}
+                </button>
                 <button
                     onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
                     disabled={completing}

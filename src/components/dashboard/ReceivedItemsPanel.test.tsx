@@ -418,6 +418,43 @@ describe("ReceivedItemsPanel", () => {
     });
   });
 
+  it("ready row shows amount verification and Unmatch undoes a wrong match", async () => {
+    stubLocalStorage();
+    const ready = readyPO({
+      total: 877.5,
+      _reconciliation: {
+        ...readyPO()._reconciliation,
+        matchedInvoice: {
+          ...readyPO()._reconciliation.matchedInvoice,
+          id: "uuid-inv-ready",
+          total: 877.5,
+        },
+      },
+    });
+    stubFetch(basePayload([ready]));
+
+    render(<ReceivedItemsPanel />);
+
+    // Verification evidence inline: invoice total vs PO total
+    // (fmtDollars rounds to whole dollars: 877.5 → $878)
+    expect(await screen.findByText(/PO 125080/i)).toBeTruthy();
+    expect(screen.getByText(/\$878 vs \$878/i)).toBeTruthy();
+
+    // Unmatch posts unmatch_invoice and returns the invoice to the Match list
+    fireEvent.click(screen.getByRole("button", { name: "Unmatch" }));
+
+    const postCalls = (
+      fetch as unknown as { mock: { calls: Array<[RequestInfo | URL, RequestInit?]> } }
+    ).mock.calls.filter(
+      (c) => c[1]?.method === "POST" && String(c[0]).includes("/api/dashboard/receivings"),
+    );
+    expect(postCalls.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.parse(String(postCalls[0][1]?.body))).toMatchObject({
+      action: "unmatch_invoice",
+      invoiceId: "uuid-inv-ready",
+    });
+  });
+
   it("shows a block toast with the gate detail on 409, plus a persistent banner", async () => {
     stubLocalStorage();
     stubFetch(
