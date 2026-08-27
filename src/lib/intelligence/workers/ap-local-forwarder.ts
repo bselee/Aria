@@ -601,6 +601,11 @@ async function enrichInvoiceForPoMatch(args: {
     let id: string | null = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
+            // photo_invoice reflects reality: vision OCR only ran when the
+            // pdf-parse text layer was thin (<40 chars). A clean text PDF
+            // (e.g. Aloe Corp 3327) is NOT a photo invoice — marking it so
+            // misled diagnostics and quality gating (2026-08-27).
+            const isPhoto = rawText.length < 40;
             id = await upsertVendorInvoice({
                 vendor_name: norm.vendorName,
                 invoice_number: norm.invoiceNumber, // null OK, never "UNKNOWN"
@@ -620,11 +625,11 @@ async function enrichInvoiceForPoMatch(args: {
                     email_subject: args.emailSubject,
                     pdf_filename: args.pdfFilename,
                     ocr_chars: rawText.length,
-                    photo_invoice: true,
+                    photo_invoice: isPhoto,
                     local_cache_id: localId,
                 },
                 notes:
-                    rawText.length < 40
+                    isPhoto
                         ? "Photo invoice — OCR thin; match may need manual total/PO"
                         : null,
             });

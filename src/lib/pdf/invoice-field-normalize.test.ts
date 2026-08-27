@@ -130,3 +130,91 @@ describe("computeExtractionQuality", () => {
         expect(computeExtractionQuality({ total: 1250.5, invoiceNumber: null })).toBe("partial");
     });
 });
+
+// ── ALOECORP 3327 (PO 125212) — real invoice that produced a phantom
+// "Unexplained -$3960" dashboard row on 2026-08-27 because the LLM
+// hallucinated poNumber="C0000275" (customer number), total=0, and
+// invoiceDate=today. Deterministic regex must WIN over LLM garbage.
+const ALOE_RAW = `Customer No.
+Customer PO Number
+Sales Person
+SHIP TO
+1/1
+125212
+C0000275
+08/21/2026
+BUILDASOIL
+Document Number
+3327
+ALOECORP
+Due Date
+09/20/2026
+Currency: $
+Invoice Subtotal:
+ 3,960.00 $
+Total Amount: 3,960.00 $
+`;
+
+const ALOE_LLM_GARBAGE = {
+    documentType: "invoice",
+    invoiceNumber: null,
+    poNumber: "C0000275", // customer NUMBER, not the PO
+    vendorName: "ALOECORP",
+    invoiceDate: "2026-08-27", // hallucinated "today"
+    lineItems: [],
+    subtotal: 0,
+    total: 0,
+    freight: 0,
+    tax: 0,
+};
+
+const ALOE_LLM_PARTIAL = {
+    ...ALOE_LLM_GARBAGE,
+    invoiceNumber: "3327", // LLM got the number right this run
+};
+
+describe("extractInvoiceFieldsFromOcrText — ALOECORP layout (Document Number, trailing $)", () => {
+    it("extracts inv# 3327 from 'Document Number' label", () => {
+        const fb = extractInvoiceFieldsFromOcrText(ALOE_RAW);
+        expect(fb.invoiceNumber).toBe("3327");
+    });
+
+    it("extracts PO 125212 from 'Customer PO Number' label", () => {
+        const fb = extractInvoiceFieldsFromOcrText(ALOE_RAW);
+        expect(fb.poNumber).toBe("125212");
+    });
+
+    it("extracts $3,960 from 'Total Amount: 3,960.00 $' (trailing dollar)", () => {
+        const fb = extractInvoiceFieldsFromOcrText(ALOE_RAW);
+        expect(fb.total).toBe(3960);
+    });
+
+    it("uses 08/21/2026 as invoice date, NOT the Due Date 09/20/2026", () => {
+        const fb = extractInvoiceFieldsFromOcrText(ALOE_RAW);
+        expect(fb.invoiceDate).toBe("2026-08-21");
+    });
+});
+
+describe("normalizeInvoiceForDb — regex beats LLM hallucination (PO 125212)", () => {
+    it("full-garbage LLM (8/25 failure mode) still yields PO 125212 + $3960 + inv 3327", () => {
+        const norm = normalizeInvoiceForDb(ALOE_LLM_GARBAGE, ALOE_RAW, {});
+        expect(norm.poNumber).toBe("125212");
+        expect(norm.invoiceNumber).toBe("3327");
+        expect(norm.total).toBe(3960);
+        expect(norm.invoiceDate).toBe("2026-08-21");
+    });
+
+    it("partial LLM (8/27 failure mode) — regex corrects PO/date/total, keeps LLM inv#", () => {
+        const norm = normalizeInvoiceForDb(ALOE_LLM_PARTIAL, ALOE_RAW, {});
+        expect(norm.poNumber).toBe("125212");
+        expect(norm.invoiceNumber).toBe("3327");
+        expect(norm.total).toBe(3960);
+        expect(norm.invoiceDate).toBe("2026-08-21");
+    });
+
+    it("computed quality is complete (not failed) once total+number are real", () => {
+        const norm = normalizeInvoiceForDb(ALOE_LLM_GARBAGE, ALOE_RAW, {});
+        expect(computeExtractionQuality({ total: norm.total, invoiceNumber: norm.invoiceNumber }))
+            .toBe("complete");
+    });
+});
