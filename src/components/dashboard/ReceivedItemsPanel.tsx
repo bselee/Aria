@@ -231,20 +231,38 @@ function partialDiscrepancy(po: ReceivedPO): string | null {
     return result;
 }
 
-/** Per-kind visual language — which variance bucket moved, at a glance. */
-const KIND_UI: Record<string, { label: string; cls: string }> = {
-    freight:       { label: "Freight",     cls: "text-sky-300 border-sky-500/30 bg-sky-500/10" },
-    tax:           { label: "Tax",         cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
-    tariff:        { label: "Tariff",      cls: "text-violet-300 border-violet-500/30 bg-violet-500/10" },
-    fee:           { label: "Fees",        cls: "text-orange-300 border-orange-500/30 bg-orange-500/10" },
-    product_price: { label: "Price",       cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-    product_qty:   { label: "Qty",         cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" },
-    sku_unknown:   { label: "Unknown SKU", cls: "text-rose-300 border-rose-500/30 bg-rose-500/10" },
-    sku_missing:   { label: "Not invoiced",cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10" },
-    unexplained:   { label: "Unexplained", cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10" },
+/** Per-kind visual language — which variance bucket moved, at a glance.
+ *  `hint` is a short resolution guidance shown on the expanded variance row. */
+const KIND_UI: Record<string, { label: string; cls: string; hint: string }> = {
+    freight:       { label: "Freight",      cls: "text-sky-300 border-sky-500/30 bg-sky-500/10",    hint: "PO has no freight charge — add freight to PO or remove from invoice" },
+    tax:           { label: "Tax",          cls: "text-violet-300 border-violet-500/30 bg-violet-500/10", hint: "Tax on invoice differs from PO — verify tax status with vendor" },
+    tariff:        { label: "Tariff",       cls: "text-violet-300 border-violet-500/30 bg-violet-500/10", hint: "Tariff charge on invoice not on PO — add to PO or dispute with vendor" },
+    fee:           { label: "Fees",         cls: "text-orange-300 border-orange-500/30 bg-orange-500/10", hint: "Fee on invoice not on PO — verify fee type (handling, fuel surcharge, etc.)" },
+    product_price: { label: "Price",        cls: "text-amber-300 border-amber-500/30 bg-amber-500/10", hint: "Unit price differs — check for recent price increase or promo discount" },
+    product_qty:   { label: "Qty",          cls: "text-amber-300 border-amber-500/30 bg-amber-500/10", hint: "Quantity mismatch — verify received qty against PO and invoice" },
+    sku_unknown:   { label: "Unknown SKU",  cls: "text-rose-300 border-rose-500/30 bg-rose-500/10",   hint: "Invoice SKU not on PO — verify correct PO or check for substitute item" },
+    sku_missing:   { label: "Not invoiced", cls: "text-zinc-400 border-zinc-600/30 bg-zinc-700/10",   hint: "PO line item not on invoice — may ship separately or be backordered" },
+    unexplained:   { label: "Unexplained",  cls: "text-zinc-300 border-zinc-500/30 bg-zinc-600/10",   hint: "Compare PO line items to invoice — check for freight allocation or SKU mismatch" },
 };
 
 const money = (n: number) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(2)}`;
+
+/** Days since a date string (receiveDate or orderDate). Returns null if unparseable. */
+function daysSince(dateStr: string | undefined): number | null {
+    if (!dateStr) return null;
+    const d = parseDenverDate(dateStr);
+    if (!d) return null;
+    return Math.floor((Date.now() - d.getTime()) / 86_400_000);
+}
+
+/** Aging badge: "3d" / "2w" / "1mo" with color coding. */
+function agingBadge(days: number | null): { text: string; cls: string } | null {
+    if (days == null || days < 1) return null;
+    if (days < 7) return { text: `${days}d`, cls: "text-zinc-500" };
+    if (days < 14) return { text: days < 10 ? `${days}d` : `${Math.round(days / 7)}w`, cls: "text-amber-400" };
+    const weeks = Math.round(days / 7);
+    return { text: weeks < 8 ? `${weeks}w` : `${Math.round(days / 30)}mo`, cls: "text-rose-400" };
+}
 
 /** Safe error-message extraction for catch blocks. */
 function errMsg(e: unknown): string {
@@ -317,15 +335,13 @@ function InvoicePdfLink({ id, number, withHover = false, hovered = false, onHove
     );
 }
 
-const ACTION_ORDER: Record<ActionRow["kind"], number> = { match: 0, review: 1, ready: 2 };
+const ACTION_ORDER: Record<ActionRow["kind"], number> = { review: 0, match: 1, ready: 2 };
 
 /**
  * Build the ONE actionable list from the payload, sorted workflow-first:
- * 1. match — unmatched invoices that need a PO linked (start here)
- * 2. review — variance blocking first, then by |net delta| desc
+ * 1. review — variance blocking first, then by |net delta| desc (biggest $ first)
+ * 2. match — unmatched invoices that need a PO linked
  * 3. ready — clean match (twm.canApprove / variance.clean), newest receipt first
- * 3. match — suggestions (DropshipPO candidates already stripped by the API),
- *    highest score first
  * POs with no matched invoice are excluded — they land in the settled dump.
  */
 function buildActionRows(pos: ReceivedPO[], suggestions: MatchSuggestion[]): ActionRow[] {
@@ -406,6 +422,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const [showAllReceived, setShowAllReceived] = useState(false);
     /** Awaiting invoice section toggle — collapsed by default. */
     const [showAwaitingInvoice, setShowAwaitingInvoice] = useState(false);
+    /** Active filter tab — "action" (all) is default; others narrow the list. */
+    const [filterTab, setFilterTab] = useState<"action" | "ready" | "review" | "match" | "settled">("action");
     /**
      * POs completed this session. Finale still lists completed POs in the
      * 30-day received window, so a plain refetch would resurrect them —
@@ -710,18 +728,35 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const reviewCount = actionRows.filter(r => r.kind === "review").length;
     const readyCount = actionRows.filter(r => r.kind === "ready").length;
     const matchCount = visibleSuggestions.length;
-    const matchDollars = visibleSuggestions.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
     const actionPoIds = useMemo(
         () => new Set(actionRows.filter(r => r.kind !== "match").map(r => r.po.orderId)),
         [actionRows],
     );
     const settledPos = visiblePos.filter(p => !actionPoIds.has(p.orderId));
 
+    /** Rows visible under the active filter tab. */
+    const visibleActionRows = useMemo(() => {
+        if (filterTab === "action") return actionRows;
+        if (filterTab === "settled") return actionRows; // settled handled separately below
+        return actionRows.filter(r => r.kind === filterTab);
+    }, [actionRows, filterTab]);
+    /** Oldest age among action rows — drives the one-line context strip. */
+    const oldestActionDays = useMemo(() => {
+        let max = 0;
+        for (const r of actionRows) {
+            const days = r.kind === "match"
+                ? daysSince(r.suggestion.invoiceDate)
+                : daysSince(r.po.receiveDate || r.po.receiveDateTime);
+            if (days != null && days > max) max = days;
+        }
+        return max;
+    }, [actionRows]);
+
     // ── Row renderers (inside component for state access) ──────────────────
 
     const toggleExpand = (key: string) => setExpandedRow(prev => (prev === key ? null : key));
 
-    /** Review row — collapsed: BLOCKED/REVIEW label + kind chips + PDF hover; expanded: variance body. */
+    /** Review row — collapsed: BLOCKED/REVIEW label + aging + kind chips + PDF + Review button; expanded: variance body. */
     function renderReviewRow(row: Extract<ActionRow, { kind: "review" }>) {
         const expanded = expandedRow === row.key;
         const variance = row.variance;
@@ -732,6 +767,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         const items = variance?.items || [];
         const gateReason = gateBlockReason.get(row.po.orderId);
         const completing = completingId === row.po.orderId;
+        const age = agingBadge(daysSince(row.po.receiveDate || row.po.receiveDateTime));
 
         return (
             <div key={row.key} className={`border-b border-zinc-800/40 ${hasBlocking ? "bg-rose-500/[0.03]" : "bg-amber-500/[0.02]"}`}>
@@ -764,6 +800,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 {money(variance.netDelta)}
                             </span>
                         )}
+                        {age && <span className={`text-[9px] font-mono shrink-0 ${age.cls}`} title={`Received ${fmtDateTime(row.po.receiveDate || row.po.receiveDateTime)}`}>{age.text}</span>}
                         <div className="flex-1" />
                         {pdfUrl && (
                             <InvoicePdfLink
@@ -774,6 +811,25 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 onHoverChange={setHoverPdfId}
                             />
                         )}
+                        {/* Inline Review button — the action is visible without expanding */}
+                        <button
+                            onClick={e => {
+                                e.stopPropagation();
+                                if (!expanded) {
+                                    toggleExpand(row.key);
+                                    lifecycle.setLockedFocus({ source: "rcv", vendorName: row.po.supplier, orderId: row.po.orderId, productIds: poProductIds });
+                                }
+                            }}
+                            className={`shrink-0 px-2.5 py-1 rounded text-[10px] font-mono font-semibold border transition-colors cursor-pointer ${
+                                expanded
+                                    ? "border-zinc-700/50 bg-zinc-800/60 text-zinc-300 hover:bg-zinc-700/60"
+                                    : hasBlocking
+                                    ? "border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20"
+                                    : "border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
+                            }`}
+                        >
+                            {expanded ? "Close" : hasBlocking ? "Resolve" : "Review"}
+                        </button>
                     </div>
                     {/* Per-kind chips — WHICH bucket moved, without expanding */}
                     {variance && Object.keys(variance.byKind).length > 0 && (
@@ -804,7 +860,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             </div>
                         )}
 
-                        {/* One row per classified difference */}
+                        {/* One row per classified difference — each with a resolution hint */}
                         {items.length > 0 ? (
                             <div className="border-b border-zinc-800/40 bg-zinc-950/30 divide-y divide-zinc-800/30">
                                 {items.map((it, i) => {
@@ -813,7 +869,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                         <div key={i} className="px-3 py-1.5">
                                             <div className="flex items-start gap-2">
                                                 <span className={`shrink-0 px-1.5 py-0.5 rounded border text-[9px] font-mono ${ui.cls}`}>
-                                                    {ui.icon} {ui.label}
+                                                    {ui.label}
                                                 </span>
                                                 <span className="text-[10px] font-mono text-zinc-300 font-semibold truncate min-w-0" title={it.label}>
                                                     {it.label}
@@ -834,6 +890,10 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             <div className="mt-0.5 text-[9px] font-mono text-zinc-500 leading-relaxed pl-1">
                                                 {it.message}
                                             </div>
+                                            {/* Resolution hint — tells the human WHAT to do about this variance */}
+                                            <div className="mt-0.5 text-[9px] font-mono text-zinc-600 leading-relaxed pl-1 italic">
+                                                {ui.hint}
+                                            </div>
                                         </div>
                                     );
                                 })}
@@ -844,6 +904,18 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     No variance breakdown available — review totals in Finale before completing.
                                 </div>
                             )
+                        )}
+
+                        {/* BLOCKED resolution checklist — the human's path out of BLOCKED */}
+                        {hasBlocking && (
+                            <div className="px-3 py-2 border-b border-rose-500/20 bg-rose-950/10">
+                                <div className="text-[9px] font-mono uppercase tracking-wider text-rose-400/80 mb-1">How to resolve</div>
+                                <ol className="pl-4 text-[9px] font-mono text-rose-200/70 leading-relaxed list-decimal space-y-0.5">
+                                    <li>Open the invoice PDF and compare line items to the PO.</li>
+                                    <li>Fix what's wrong: match the correct PO, add the missing SKU, or confirm the charge with the vendor.</li>
+                                    <li>Click Apply Invoice &amp; Complete — the gate re-checks automatically.</li>
+                                </ol>
+                            </div>
                         )}
 
                         {/* 3-way gate refusal banner (persistent per-row detail) */}
@@ -861,20 +933,12 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             </div>
                         )}
 
-                        {/* Footer: Finale link + Apply & Complete */}
-                        <div className="px-3 py-2 flex items-center gap-2 justify-end bg-zinc-950/60 border-t border-zinc-800/40">
-                            <a
-                                href={row.po.finaleUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-[10px] font-mono text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30 mr-auto"
-                            >
-                                Open PO in Finale
-                            </a>
+                        {/* Footer: full-width Apply & Complete — no Finale link (context switch) */}
+                        <div className="px-3 py-2 bg-zinc-950/60 border-t border-zinc-800/40">
                             <button
                                 onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
                                 disabled={completing}
-                                className={`px-3 py-1 rounded text-[10px] font-mono font-semibold transition-colors ${
+                                className={`w-full px-3 py-2 rounded text-[11px] font-mono font-semibold transition-colors ${
                                     completing
                                         ? "bg-zinc-700/20 text-zinc-500 border border-zinc-700/40 cursor-wait"
                                         : hasBlocking
@@ -882,7 +946,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                         : "bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 cursor-pointer"
                                 }`}
                             >
-                                {completing ? "Completing…" : "Apply Invoice & Complete"}
+                                {completing ? "Completing…" : `Apply Invoice & Complete PO ${row.po.orderId}`}
                             </button>
                         </div>
                     </div>
@@ -895,12 +959,14 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     function renderReadyRow(row: Extract<ActionRow, { kind: "ready" }>) {
         const pdfUrl = invoicePdfUrl(row.inv);
         const completing = completingId === row.po.orderId;
+        const age = agingBadge(daysSince(row.po.receiveDate || row.po.receiveDateTime));
         return (
             <div key={row.key} className="px-4 py-2.5 border-b border-zinc-800/40 flex items-center gap-2 hover:bg-zinc-800/10 transition-colors">
                 <span className="text-[11px] font-mono font-semibold text-emerald-400 shrink-0">READY</span>
                 <span className="text-[11px] font-mono text-emerald-200/90 flex-1 min-w-0 truncate">
                     PO {row.po.orderId} <span className="text-zinc-500">{row.po.supplier}</span> matched Inv #{row.inv.invoice_number || "—"} — ready
                 </span>
+                {age && <span className={`text-[9px] font-mono shrink-0 ${age.cls}`} title={`Received ${fmtDateTime(row.po.receiveDate || row.po.receiveDateTime)}`}>{age.text}</span>}
                 {pdfUrl && <InvoicePdfLink id={row.inv.id!} number={row.inv.invoice_number} />}
                 <button
                     onClick={() => handleCompletePO(row.po.orderId, row.po.supplier)}
@@ -920,6 +986,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         const best = s.candidates[0];
         const pdfUrl = suggestionPdfUrl(s);
         const manual = manuallyMatching.get(s.invoiceId);
+        const age = agingBadge(daysSince(s.invoiceDate));
 
         return (
             <div key={row.key} className="border-b border-zinc-800/40">
@@ -953,6 +1020,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         {best && (
                             <span className="text-[10px] font-mono text-zinc-500 shrink-0">→ {best.orderId}</span>
                         )}
+                        {age && <span className={`text-[9px] font-mono shrink-0 ${age.cls}`} title={`Invoice ${s.invoiceDate || ""}`}>{age.text}</span>}
                         <div className="flex-1" />
                         {pdfUrl && <InvoicePdfLink id={s.invoiceId} number={s.invoiceNumber} />}
                         {best && (
@@ -1098,32 +1166,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 </div>
             )}
 
-            {/* AP status strip */}
-            {!effectivelyCollapsed && !loading && (
-                <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
-                    <span className="text-zinc-600 uppercase tracking-wider shrink-0">AP</span>
-                    {matchCount > 0 ? (
-                        <>
-                            <span className="text-amber-300">{matchCount} match{matchCount === 1 ? "" : "es"}</span>
-                            {matchDollars > 0 && (
-                                <span className="text-amber-200/90">${Math.round(matchDollars).toLocaleString()}</span>
-                            )}
-                        </>
-                    ) : (
-                        <span className="text-emerald-400/80">0 open matches</span>
-                    )}
-                    <span className="text-zinc-700">·</span>
-                    <span>{visiblePos.length} receipt{visiblePos.length === 1 ? "" : "s"}</span>
-                    {reviewCount > 0 && (
+            {/* One-line context — replaces the redundant AP stats strip */}
+            {!effectivelyCollapsed && !loading && actionRows.length > 0 && (
+                <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
+                    <span className="text-zinc-500">{actionRows.length} item{actionRows.length === 1 ? "" : "s"} need attention</span>
+                    {oldestActionDays > 0 && (
                         <>
                             <span className="text-zinc-700">·</span>
-                            <span className="text-rose-300">{reviewCount} need review</span>
-                        </>
-                    )}
-                    {readyCount > 0 && (
-                        <>
-                            <span className="text-zinc-700">·</span>
-                            <span className="text-emerald-400/80">{readyCount} ready</span>
+                            <span className={oldestActionDays >= 14 ? "text-rose-400" : oldestActionDays >= 7 ? "text-amber-400" : "text-zinc-500"}>
+                                oldest {oldestActionDays >= 14 ? `${Math.round(oldestActionDays / 7)}w` : `${oldestActionDays}d`}
+                            </span>
                         </>
                     )}
                 </div>
@@ -1131,31 +1183,69 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
 
             {!effectivelyCollapsed && (
                 <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
-                    {/* Action chips */}
+                    {/* Filter tabs — active one is FILLED, inactive are outline */}
                     {!loading && !error && visiblePos.length > 0 && (
                         <div className="px-4 py-1.5 flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/30">
-                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
+                            <button
+                                onClick={() => setFilterTab("action")}
+                                className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                                    filterTab === "action"
+                                        ? "bg-zinc-200 text-zinc-900 border-zinc-200 font-semibold"
+                                        : "bg-transparent border-zinc-700/50 text-zinc-400 hover:bg-zinc-800/60"
+                                }`}
+                            >
                                 {actionRows.length} Action
-                            </span>
+                            </button>
                             {readyCount > 0 && (
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+                                <button
+                                    onClick={() => setFilterTab("ready")}
+                                    className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                                        filterTab === "ready"
+                                            ? "bg-emerald-400 text-zinc-950 border-emerald-400 font-semibold"
+                                            : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20"
+                                    }`}
+                                >
                                     {readyCount} Ready
-                                </span>
+                                </button>
                             )}
                             {reviewCount > 0 && (
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-500/10 border border-rose-500/30 text-rose-300">
+                                <button
+                                    onClick={() => setFilterTab("review")}
+                                    className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                                        filterTab === "review"
+                                            ? "bg-rose-400 text-zinc-950 border-rose-400 font-semibold"
+                                            : "bg-rose-500/10 border-rose-500/30 text-rose-300 hover:bg-rose-500/20"
+                                    }`}
+                                >
                                     {reviewCount} Review
-                                </span>
+                                </button>
                             )}
                             {matchCount > 0 && (
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300">
+                                <button
+                                    onClick={() => setFilterTab("match")}
+                                    className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                                        filterTab === "match"
+                                            ? "bg-amber-400 text-zinc-950 border-amber-400 font-semibold"
+                                            : "bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20"
+                                    }`}
+                                >
                                     {matchCount} Match
-                                </span>
+                                </button>
                             )}
                             {settledPos.length > 0 && (
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/40 border border-zinc-700/30 text-zinc-500">
+                                <button
+                                    onClick={() => {
+                                        setFilterTab("settled");
+                                        setShowAllReceived(true);
+                                    }}
+                                    className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                                        filterTab === "settled"
+                                            ? "bg-zinc-500 text-zinc-950 border-zinc-500 font-semibold"
+                                            : "bg-transparent border-zinc-700/50 text-zinc-500 hover:bg-zinc-800/60"
+                                    }`}
+                                >
                                     {settledPos.length} Settled
-                                </span>
+                                </button>
                             )}
                         </div>
                     )}
@@ -1216,21 +1306,21 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 </div>
                             )}
 
-                            {/* ── ONE actionable list: review → ready → match ── */}
-                            {actionRows.length > 0 ? (
+                            {/* ── ONE actionable list (filtered by tab) ── */}
+                            {filterTab !== "settled" && (visibleActionRows.length > 0 ? (
                                 <div>
-                                    {actionRows.map(row => renderActionRow(row))}
+                                    {visibleActionRows.map(row => renderActionRow(row))}
                                 </div>
                             ) : (
                                 <div className="px-4 py-6 text-center">
                                     <span className="text-xs font-mono text-emerald-400/70">
-                                        All invoices matched — nothing needs attention
+                                        {actionRows.length > 0 ? `No ${filterTab} items — switch tabs to see the rest` : "All invoices matched — nothing needs attention"}
                                     </span>
                                 </div>
-                            )}
+                            ))}
 
                             {/* ── Awaiting invoice — received but no invoice yet ── */}
-                            {(() => {
+                            {filterTab !== "settled" && (() => {
                                 const awaiting = buildAwaitingInvoice(visiblePos);
                                 if (awaiting.length === 0) return null;
                                 return (
@@ -1242,20 +1332,34 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-500">
                                                 {showAwaitingInvoice ? "▾" : "▸"} Awaiting invoice ({awaiting.length})
                                             </span>
+                                            <span className="ml-auto text-[9px] font-mono text-zinc-600">
+                                                {(() => {
+                                                    const stale = awaiting.filter(po => (daysSince(po.receiveDate || po.receiveDateTime) ?? 0) >= 14).length;
+                                                    return stale > 0 ? `${stale} stale ≥14d` : "";
+                                                })()}
+                                            </span>
                                         </button>
-                                        {showAwaitingInvoice && awaiting.map(po => (
-                                            <div key={po.orderId} className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono border-b border-zinc-800/20">
-                                                <span className="text-zinc-400">{po.orderId}</span>
-                                                <span className="text-zinc-600 truncate">{po.supplier}</span>
-                                                <span className="text-zinc-500 ml-auto shrink-0">Rcvd {fmtDateTime(po.receiveDate)}</span>
-                                            </div>
-                                        ))}
+                                        {showAwaitingInvoice && awaiting.map(po => {
+                                            const age = agingBadge(daysSince(po.receiveDate || po.receiveDateTime));
+                                            return (
+                                                <div key={po.orderId} className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono border-b border-zinc-800/20">
+                                                    <span className="text-zinc-400">{po.orderId}</span>
+                                                    <span className="text-zinc-600 truncate">{po.supplier}</span>
+                                                    {age && (
+                                                        <span className={`text-[9px] font-mono shrink-0 ${age.cls}`} title={`Received ${fmtDateTime(po.receiveDate)}`}>
+                                                            {age.text}
+                                                        </span>
+                                                    )}
+                                                    <span className="text-zinc-500 ml-auto shrink-0">Rcvd {fmtDateTime(po.receiveDate)}</span>
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 );
                             })()}
 
                             {/* ── Auto-processed summary — full trail in Activity tab ── */}
-                            {recentAutoCompletions.length > 0 && !showAllReceived && (
+                            {recentAutoCompletions.length > 0 && filterTab !== "settled" && (
                                 <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">
                                     <span className="text-[10px] font-mono text-emerald-500/50">-</span>
                                     <span className="text-[10px] font-mono text-zinc-600">
@@ -1270,8 +1374,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 </div>
                             )}
 
-                            {/* ── Settled dump — hidden by default ── */}
-                            {settledPos.length > 0 && (
+                            {/* ── Settled dump — only under the Settled tab ── */}
+                            {filterTab === "settled" && settledPos.length > 0 && (
                                 <div>
                                     <button
                                         onClick={() => setShowAllReceived(!showAllReceived)}
@@ -1307,6 +1411,11 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             </div>
                                         );
                                     })}
+                                </div>
+                            )}
+                            {filterTab === "settled" && settledPos.length === 0 && (
+                                <div className="px-4 py-6 text-center">
+                                    <span className="text-xs font-mono text-zinc-500">No settled POs in this window</span>
                                 </div>
                             )}
                         </div>

@@ -246,19 +246,21 @@ describe("ReceivedItemsPanel", () => {
 
     render(<ReceivedItemsPanel />);
 
-    // Collapsed: verdict line with net delta + variance chips, no item details yet
+    // Collapsed: verdict line with net delta + variance chips + visible Review button,
+    // no item details yet
     expect(await screen.findByText(/PO 125138/i)).toBeTruthy();
     expect(screen.getByText(/Inv #32654/i)).toBeTruthy();
     expect(screen.getByText("+$221.60")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.queryByText(/Goods differ by/i)).toBeNull();
     expect(screen.queryByText(/Apply Invoice & Complete/i)).toBeNull();
 
-    // Click the header → variance item message + action buttons appear
-    const header = screen.getByText(/PO 125138/i).closest('[role="button"]') as HTMLElement;
-    fireEvent.click(header);
+    // Click the Review button → variance item message + resolution hint + action button
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
 
     expect(await screen.findByText(/Goods differ by/i)).toBeTruthy();
-    expect(screen.getByText(/Open PO in Finale/i)).toBeTruthy();
+    // Resolution hint tells the human what to do about the unexplained variance
+    expect(screen.getByText(/Compare PO line items to invoice/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Apply Invoice & Complete/i })).toBeTruthy();
   });
 
@@ -494,28 +496,27 @@ describe("ReceivedItemsPanel", () => {
     await waitFor(() => expect(screen.queryByText(/Inv 32751/i)).toBeNull());
   });
 
-  it("hides settled POs by default and reveals them under the toggle", async () => {
+  it("hides settled POs by default and reveals them under the Settled tab", async () => {
     stubLocalStorage();
     stubFetch(basePayload([settledPO()]));
 
     render(<ReceivedItemsPanel />);
 
-    // PO without invoice appears in collapsed "awaiting invoice" section
-    expect(await screen.findByText(/Show all 1 settled POs/i)).toBeTruthy();
-    // Awaiting invoice section shows count but PO is hidden
-    expect(screen.getByText(/Awaiting invoice \(1\)/i)).toBeTruthy();
+    // Default (Action tab): settled toggle is NOT shown; awaiting invoice shows count but PO is hidden
+    await screen.findByText(/Awaiting invoice \(1\)/i);
+    expect(screen.queryByText(/Show all 1 settled POs/i)).toBeNull();
 
     // Expand awaiting invoice to see the PO
     fireEvent.click(screen.getByText(/▸ Awaiting invoice/i));
     expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
 
-    // Settled section still shows independently
-    expect(screen.getByText(/Show all 1 settled POs/i)).toBeTruthy();
-
-    // Expand settled to see full details
-    fireEvent.click(screen.getByText(/Show all 1 settled POs/i));
+    // Settled tab reveals the settled list immediately (auto-expanded), hiding the action list
+    fireEvent.click(screen.getByRole("button", { name: "1 Settled" }));
+    expect(await screen.findByText(/Hide settled POs/i)).toBeTruthy();
     expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/BOTTLE-1G short 75 of 300/i)).toBeTruthy();
+    // Action list + awaiting section are not shown on the Settled tab
+    expect(screen.queryByText(/Awaiting invoice \(1\)/i)).toBeNull();
   });
 
   it("auto-clears the complete toast after 5 seconds", async () => {
