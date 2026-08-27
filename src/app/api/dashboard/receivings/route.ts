@@ -673,28 +673,62 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         const result = sr.result!;
                         // Strip dropship POs from candidates — never match those
                         result.candidates = (result.candidates || []).filter(
-                    (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                        (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
                         );
                         result.bestMatch = result.candidates[0] || null;
                         if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
-                    result.autoApplyReady = false;
+                        result.autoApplyReady = false;
                         }
                         matchSuggestions.push({
-                    invoiceId: inv.id,
-                    invoiceNumber: inv.invoice_number,
-                    vendorName: inv.vendor_name,
-                    invoiceDate: inv.invoice_date,
-                    invoiceTotal: inv.total,
-                    pdfStoragePath: inv.pdf_storage_path || null,
-                    pdfAvailable: !!(inv.pdf_storage_path && isReceivingsPdfVendor(inv.vendor_name)),
-                    candidates: result.candidates.slice(0, 5),
-                    autoApplyReady: result.autoApplyReady ?? false,
+                        invoiceId: inv.id,
+                        invoiceNumber: inv.invoice_number,
+                        vendorName: inv.vendor_name,
+                        invoiceDate: inv.invoice_date,
+                        invoiceTotal: inv.total,
+                        pdfStoragePath: inv.pdf_storage_path || null,
+                        pdfAvailable: !!(inv.pdf_storage_path && isReceivingsPdfVendor(inv.vendor_name)),
+                        candidates: result.candidates.slice(0, 5),
+                        autoApplyReady: result.autoApplyReady ?? false,
                                         fromCache: !!inv._fromCache,
                                                                                 invoiceLineItems: extractLineItems(inv),
                                                                                     });
-                    }
-                }
-                    }
+                        }
+                        }
+
+                        // ── Enrich candidates with PO line items (educated match) ────────
+                        // Bill (2026-08-27): "still do not understand how to make an educated
+                        // match between received PO items and invoice." Candidates carried
+                        // only PO# + score; the human could not see what was on each PO vs
+                        // what the invoice billed. One batch cache read (zero Finale calls,
+                        // E2-safe) attaches items to every candidate so the panel can render
+                        // invoice-items vs PO-items with SKU-overlap highlighting.
+                        const candidatePoNums = [...new Set(
+                        (matchSuggestions || []).flatMap((s: any) =>
+                        (s.candidates || []).map((c: any) => String(c.orderId || '')).filter(Boolean),
+                        ),
+                        )];
+                        if (sb && candidatePoNums.length > 0) {
+                        const { data: poRows } = await sb
+                        .from('purchase_orders')
+                        .select('po_number, line_items')
+                        .in('po_number', candidatePoNums);
+                        const poItemMap = new Map<string, any[]>();
+                        for (const pr of (poRows || []) as any[]) {
+                        let items: any[] = [];
+                        if (typeof pr.line_items === 'string') {
+                            try { items = JSON.parse(pr.line_items); } catch { items = []; }
+                        } else if (Array.isArray(pr.line_items)) {
+                            items = pr.line_items;
+                        }
+                        poItemMap.set(String(pr.po_number), items);
+                        }
+                        for (const s of (matchSuggestions || [])) {
+                        for (const c of (s.candidates || [])) {
+                            (c as any).items = poItemMap.get(String(c.orderId)) || [];
+                        }
+                        }
+                        }
+                        }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
             let recentAutoCompletions: Array<{

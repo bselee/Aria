@@ -113,6 +113,8 @@ type MatchCandidate = {
     score: number;
     reasons: string[];
     isOpen: boolean;
+    /** PO line items from the local purchase_orders cache (educated match). */
+    items?: Array<{ productId?: string; sku?: string; quantity?: number | string; unitPrice?: number | string; description?: string }>;
 };
 
 type MatchSuggestion = {
@@ -127,6 +129,8 @@ type MatchSuggestion = {
     autoApplyReady: boolean;
     fromCache?: boolean;
     timedOut?: boolean;
+    /** OCR line items from the invoice (SKU × qty) — the other half of the educated match. */
+    invoiceLineItems?: Array<{ sku?: string; qty?: number | string; description?: string }> | null;
 };
 
 /**
@@ -1034,32 +1038,91 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     </div>
                 </div>
 
-                {/* Expanded — candidates + manual PO input */}
+                {/* Expanded — invoice items vs PO items, candidates + manual PO input */}
                 {expanded && (
                     <div className="px-4 py-2 border-t border-zinc-800/40 bg-zinc-950/40 space-y-1.5">
-                        {s.candidates.length > 0 && (
-                            <>
-                                <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-600">Candidates</div>
-                                {s.candidates.slice(0, 3).map(c => (
-                                    <div key={c.orderId} className="flex items-center gap-2 text-[10px] font-mono">
-                                        <span className="text-zinc-200 font-semibold shrink-0">{c.orderId}</span>
-                                        <span className="text-zinc-500 truncate hidden sm:inline">{c.vendorName}</span>
-                                        <span className="text-zinc-400 shrink-0">{fmtDollars(c.total)}</span>
-                                        <span className={`shrink-0 ${c.score >= 70 ? "text-emerald-400" : c.score >= 50 ? "text-amber-300" : "text-zinc-500"}`}>
-                                            {c.score}%
-                                        </span>
-                                        {c.reasons?.[0] && (
-                                            <span className="text-zinc-600 truncate hidden md:inline">{c.reasons[0]}</span>
+                        {/* ── Educated match: invoice line items vs candidate PO items ──
+                            Bill (2026-08-27): "still do not understand how to make an
+                            educated match between received PO items and invoice."
+                            Show what the invoice billed (SKU × qty) and what each
+                            candidate PO contains; highlight SKUs present on both. */}
+                        {s.invoiceLineItems && s.invoiceLineItems.length > 0 && (
+                            <div>
+                                <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-600">
+                                    Invoice items ({s.invoiceLineItems.length})
+                                </div>
+                                {s.invoiceLineItems.map((li, i) => (
+                                    <div key={i} className="flex items-baseline gap-1.5 text-[10px] font-mono text-zinc-300">
+                                        <span className="font-semibold text-amber-300 shrink-0">{li.sku || "—"}</span>
+                                        <span className="text-zinc-500 shrink-0">×{li.qty ?? ""}</span>
+                                        {li.description && (
+                                            <span className="text-zinc-600 truncate">{li.description}</span>
                                         )}
-                                        <button
-                                            onClick={() => handleMatchInvoice(s.invoiceId, c.orderId)}
-                                            className="ml-auto shrink-0 px-2 py-0.5 rounded text-[9px] font-mono border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 cursor-pointer transition-colors"
-                                        >
-                                            Match
-                                        </button>
                                     </div>
                                 ))}
-                            </>
+                            </div>
+                        )}
+
+                        {s.candidates.length > 0 && (
+                            <div className="pt-1">
+                                <div className="text-[9px] font-mono uppercase tracking-wider text-zinc-600">Candidates</div>
+                                {s.candidates.slice(0, 3).map(c => {
+                                    const invSkus = new Set(
+                                        (s.invoiceLineItems || []).map(li => String(li.sku || "").trim().toUpperCase()).filter(Boolean),
+                                    );
+                                    const poSkus = (c.items || []).map((it: any) => String(it.productId || it.sku || "").trim().toUpperCase()).filter(Boolean);
+                                    const overlap = poSkus.filter(sku => invSkus.has(sku)).length;
+                                    return (
+                                        <div key={c.orderId} className="border-b border-zinc-800/30 last:border-0 py-1">
+                                            <div className="flex items-center gap-2 text-[10px] font-mono">
+                                                <span className="text-zinc-200 font-semibold shrink-0">{c.orderId}</span>
+                                                <span className="text-zinc-500 truncate hidden sm:inline">{c.vendorName}</span>
+                                                <span className="text-zinc-400 shrink-0">{fmtDollars(c.total)}</span>
+                                                <span className={`shrink-0 ${c.score >= 70 ? "text-emerald-400" : c.score >= 50 ? "text-amber-300" : "text-zinc-500"}`}>
+                                                    {c.score}%
+                                                </span>
+                                                {c.items && c.items.length > 0 && (
+                                                    <span className={`shrink-0 ${overlap > 0 ? "text-emerald-400" : "text-zinc-600"}`}>
+                                                        {overlap}/{c.items.length} SKU match
+                                                    </span>
+                                                )}
+                                                {c.reasons?.[0] && (
+                                                    <span className="text-zinc-600 truncate hidden md:inline">{c.reasons[0]}</span>
+                                                )}
+                                                <button
+                                                    onClick={() => handleMatchInvoice(s.invoiceId, c.orderId)}
+                                                    className="ml-auto shrink-0 px-2 py-0.5 rounded text-[9px] font-mono border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 cursor-pointer transition-colors"
+                                                >
+                                                    Match
+                                                </button>
+                                            </div>
+                                            {/* PO line items with overlap highlighting */}
+                                            {c.items && c.items.length > 0 && (
+                                                <div className="mt-0.5 pl-1 space-y-0.5">
+                                                    {c.items.map((it: any, i: number) => {
+                                                        const sku = String(it.productId || it.sku || "").trim().toUpperCase();
+                                                        const onInvoice = !!sku && invSkus.has(sku);
+                                                        return (
+                                                            <div key={i} className="flex items-baseline gap-1.5 text-[9px] font-mono">
+                                                                <span className={`shrink-0 font-semibold ${onInvoice ? "text-emerald-400" : "text-zinc-500"}`}>
+                                                                    {onInvoice ? "✓" : ""}{it.productId || it.sku || "—"}
+                                                                </span>
+                                                                <span className="text-zinc-500 shrink-0">×{it.quantity ?? ""}</span>
+                                                                {it.unitPrice != null && Number(it.unitPrice) > 0 && (
+                                                                    <span className="text-zinc-600 shrink-0">{fmtDollars(Number(it.unitPrice))}</span>
+                                                                )}
+                                                                <span className={`shrink-0 ${onInvoice ? "text-emerald-500" : "text-zinc-600"}`}>
+                                                                    {onInvoice ? "on invoice" : "not on invoice"}
+                                                                </span>
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
                         )}
                         {/* Manual PO input — one line under expand */}
                         <div className="flex items-center gap-1.5 pt-1.5 border-t border-zinc-800/30">

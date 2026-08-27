@@ -484,7 +484,7 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/→ 124731/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Match" })).toBeTruthy();
 
-    // Expand → alternative candidates + manual input
+    // Expand → invoice items + alternative candidates + manual input
     const header = screen.getByText(/Inv 32751/i).closest('[role="button"]') as HTMLElement;
     fireEvent.click(header);
     expect(await screen.findByText(/124705/i)).toBeTruthy();
@@ -494,6 +494,58 @@ describe("ReceivedItemsPanel", () => {
     // after the follow-up refetch returns the same payload.
     fireEvent.click(screen.getAllByRole("button", { name: "Match" })[0]);
     await waitFor(() => expect(screen.queryByText(/Inv 32751/i)).toBeNull());
+  });
+
+  it("educated match: shows invoice items vs candidate PO items with SKU overlap", async () => {
+    stubLocalStorage();
+    const suggestion = {
+      invoiceId: "uuid-sug-2",
+      invoiceNumber: "212277431",
+      vendorName: "ULINE",
+      invoiceTotal: 1553.67,
+      invoiceDate: "2026-08-19",
+      pdfStoragePath: null,
+      pdfAvailable: false,
+      invoiceLineItems: [
+        { sku: "S-15625", qty: 72, description: "SECURITY TAPE" },
+        { sku: "ULS455", qty: 240, description: "CORRUGATED BOXES" },
+      ],
+      candidates: [
+        {
+          orderId: "9125221",
+          vendorName: "ULINE",
+          orderDate: "2026-08-10",
+          total: 1553.67,
+          status: "open",
+          score: 70,
+          reasons: ["OCR PO# candidate"],
+          isOpen: true,
+          items: [
+            { productId: "S-15625", quantity: 72 },
+            { productId: "ULS455", quantity: 240 },
+            { productId: "S-9999", quantity: 10 },
+          ],
+        },
+      ],
+      autoApplyReady: false,
+    };
+    stubFetch(basePayload([], [suggestion]));
+
+    render(<ReceivedItemsPanel />);
+    expect(await screen.findByText(/Inv 212277431/i)).toBeTruthy();
+
+    const header = screen.getByText(/Inv 212277431/i).closest('[role="button"]') as HTMLElement;
+    fireEvent.click(header);
+
+    // Invoice items block with SKUs
+    expect(await screen.findByText(/Invoice items \(2\)/i)).toBeTruthy();
+    expect(screen.getByText("S-15625")).toBeTruthy();
+    expect(screen.getByText("ULS455")).toBeTruthy();
+
+    // PO candidate items with overlap markers
+    expect(screen.getByText(/2\/3 SKU match/i)).toBeTruthy();
+    expect(screen.getAllByText("on invoice").length).toBe(2);
+    expect(screen.getByText(/not on invoice/i)).toBeTruthy();
   });
 
   it("hides settled POs by default and reveals them under the Settled tab", async () => {
