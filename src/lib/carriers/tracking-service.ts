@@ -459,8 +459,39 @@ async function getFedExTrackingStatus(trackingNumber: string): Promise<TrackingS
 // ──────────────────────────────────────────────────
 
 /**
+ * Does the fetched carrier page actually reference THIS tracking number?
+ *
+ * Proof that the shipment's own row rendered, rather than a generic
+ * JS-shell page. Carriers display PROs with spaces or dashes
+ * ("780-882-40060", "7808824 0060"), so compare digits-only.
+ *
+ * @param pageText     tag-stripped text of the fetched carrier page
+ * @param trackingNumber the raw PRO / tracking number (no Carrier::: prefix)
+ * @returns true when the page text contains the tracking number
+ */
+export function pageMentionsTrackingNumber(
+    pageText: string,
+    trackingNumber: string,
+): boolean {
+    const wanted = (trackingNumber || "").replace(/\D/g, "");
+    if (wanted.length < 6) return false;
+    if (pageText.includes(trackingNumber)) return true;
+    return pageText.replace(/\D/g, "").includes(wanted);
+}
+
+/**
  * Fetch tracking status by scraping the LTL carrier's tracking page.
  * Returns null if tracking fails or carrier is unknown.
+ *
+ * HERMIA(2026-08-20): added a proof-of-shipment guard. ODFL (and most modern
+ * LTL portals) render tracking results client-side, so the server HTML is just
+ * page chrome — and that chrome contains a notification-preferences block
+ * listing "Out for Delivery" and "Delivered" as toggles. parseTrackingContent
+ * matched the bare word "Delivered" and Ferticell PO 125211's in-transit
+ * shipment came back `delivered`, which would have driven a false
+ * delivered_at + PO lifecycle advance to RECEIVED. A status is only trusted
+ * when the PRO number itself appears in the fetched text, proving the page
+ * actually rendered THIS shipment rather than a generic shell.
  */
 async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
     // trackingNumber must be "CarrierName:::PRO#" format
@@ -468,6 +499,8 @@ async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingSta
     const url = carrierUrl(trackingNumber);
     // parcelsapp fallback means unknown carrier — skip fetch
     if (url.includes("parcelsapp.com")) return null;
+
+    const pro = trackingNumber.split(":::", 2)[1] ?? "";
 
     try {
         const res = await fetch(url, {
@@ -482,6 +515,13 @@ async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingSta
         const html = await res.text();
         // Strip HTML tags, collapse whitespace
         const text = html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ');
+
+        // Proof-of-shipment gate: the PRO must appear in the rendered text.
+        // A JS-only portal returns a shell whose static copy mentions
+        // "Delivered"/"Out for Delivery" as notification options — parsing that
+        // fabricates a delivery. No PRO on the page = no usable status.
+        if (!pageMentionsTrackingNumber(text, pro)) return null;
+
         const parsed = parseTrackingContent(text);
         if (parsed) return { ...parsed, public_url: url };
     } catch (e: any) {

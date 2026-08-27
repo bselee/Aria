@@ -20,6 +20,7 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../gmail/auth";
 import { createClient } from "@/lib/db";
 import { upsertShipmentEvidence } from "@/lib/tracking/shipment-intelligence";
+import { extractTrackingNumbers as canonicalExtractTrackingNumbers, detectLTLCarrier, carrierUrl } from "@/lib/carriers/tracking-service";
 import { syncPOETA } from "./po-eta-sync";
 
 /** Sent emails from our side come from these addresses. */
@@ -87,32 +88,26 @@ function extractTextFromPayload(payload: any): string {
 }
 
 /**
- * Extract tracking numbers from reply body text using regex.
- * Returns an array of unique tracking numbers found.
+ * Extract tracking numbers from reply body text.
+ *
+ * HERMIA(2026-08-20): was a hand-rolled duplicate of the canonical patterns in
+ * @/lib/carriers/tracking-service — it drifted (no urlPro, no BOL, no ltlPro,
+ * no TRK#, buggy USPS capture group that pushed the 2-digit prefix instead of
+ * the full number) and missed the same Ferticell PO 125211 ODFL trace-URL that
+ * email-tracking-ingest missed. Delegate to the single source of truth so a
+ * pattern fix lands everywhere at once.
+ *
+ * @param text vendor reply body (plain text)
+ * @returns unique, upper-cased tracking numbers found in the text
  */
 function extractTrackingNumbers(text: string): string[] {
-    const found: string[] = [];
-    // UPS: 1Z followed by 16 alphanumeric characters
-    const upsRe = /(1Z[A-Z0-9]{16})/gi;
-    let m;
-    while ((m = upsRe.exec(text)) !== null) found.push(m[1].toUpperCase());
-    // FedEx: 12-15 digits or 96XXXXXXXXXXXXXXX format
-    const fedexRe = /\b(96\d{18}|\d{15}|\d{12})\b/g;
-    while ((m = fedexRe.exec(text)) !== null) found.push(m[1]);
-    // USPS: 20-22 digits
-    const uspsRe = /\b(94|92|93|95)\d{20}\b/g;
-    while ((m = uspsRe.exec(text)) !== null) found.push(m[1]);
-    // DHL: JD + 18 digits
-    const dhlRe = /\bJD\d{18}\b/gi;
-    while ((m = dhlRe.exec(text)) !== null) found.push(m[1].toUpperCase());
-    // LTL PRO numbers
-    const proRe = /\bPRO[\s\-]+#?\s*([0-9]{7,15})\b/gi;
-    while ((m = proRe.exec(text)) !== null) found.push(m[1]);
-    // Generic tracking keyword patterns
-    const genericRe = /\b(?:tracking|track|waybill)\s*[#:]\s*([0-9][0-9A-Z]{9,24})\b/gi;
-    while ((m = genericRe.exec(text)) !== null) found.push(m[1].toUpperCase());
-
-    return [...new Set(found)];
+    return [
+        ...new Set(
+            canonicalExtractTrackingNumbers(text).map((hit) =>
+                hit.trackingNumber.toUpperCase(),
+            ),
+        ),
+    ];
 }
 
 /**
@@ -376,17 +371,35 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
                         `[po-reply-watcher] Extracted ${foundTracking.length} tracking number(s) from vendor reply for ${send.po_number}: ${foundTracking.join(", ")}`
                     );
 
-                    // Register each tracking number for carrier polling
+                    // Register each tracking number for carrier polling.
+                    // HERMIA(2026-08-20): this block passed `poNumbers`/
+                    // `vendorNames` (plural) — ShipmentUpsertInput takes the
+                    // SINGULAR `poNumber`/`vendorName`, and the `as any` cast
+                    // silenced it, so every shipment registered here landed
+                    // with an EMPTY po_numbers array and never linked back to
+                    // the PO. Also carry the carrier detected from the reply
+                    // text (Carrier:::Number encoding) so the tracking URL
+                    // resolves to the carrier's own trace page instead of the
+                    // parcelsapp fallback.
+                    const replyCarrier = detectLTLCarrier(replyBody);
                     for (const tn of foundTracking) {
                         try {
+                            const encoded =
+                                replyCarrier && !tn.includes(":::")
+                                    ? `${replyCarrier}:::${tn}`
+                                    : tn;
                             await upsertShipmentEvidence({
-                                trackingNumber: tn,
+                                trackingNumber: encoded,
                                 statusCategory: "in_transit",
                                 statusDisplay: "Vendor reply — awaiting carrier scan",
-                                poNumbers: [send.po_number],
-                                vendorNames: [send.vendor_name],
+                                poNumber: send.po_number,
+                                vendorName: send.vendor_name,
                                 source: "po-reply-watcher",
-                            } as any);
+                                sourceRef: `gmail:${msg.id}`,
+                                confidence: 0.9,
+                                publicTrackingUrl: carrierUrl(encoded),
+                                active: true,
+                            });
                         } catch (regErr: any) {
                             console.warn(`[po-reply-watcher] Shipment registration failed for ${tn}:`, regErr.message);
                         }

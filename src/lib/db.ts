@@ -191,6 +191,12 @@ class QueryBuilder {
   private _offset: number | null = null;
   private _single: boolean = false;
   private _maybeSingle: boolean = false;
+  /**
+   * True once .select() has been called explicitly. Distinguishes
+   * `.upsert(x)` (fire-and-forget, PostgREST returns 201 + empty body) from
+   * `.upsert(x).select("*")` (caller wants the row back).
+   */
+  private _selectCalled: boolean = false;
   private _method: "GET" | "POST" | "PATCH" | "DELETE" = "GET";
   private _body: any = null;
   private _onConflict: string | null = null;
@@ -205,6 +211,7 @@ class QueryBuilder {
 
   select(columns: string = "*"): this {
     this._select = columns;
+    this._selectCalled = true;
     return this;
   }
 
@@ -216,13 +223,28 @@ class QueryBuilder {
     } else if (Array.isArray(val)) {
       if (op === "in") this._filters.push(`${col}=in.(${val.join(",")})`);
       else if (op === "contains")
-        this._filters.push(`${col}=cs.${JSON.stringify(val)}`);
+        // HERMIA(2026-08-20): array columns need PG array-literal braces, not
+        // JSON brackets. `cs.["125211"]` made Postgres throw 22P02 "malformed
+        // array literal", so syncLegacyPurchaseOrderTracking silently wrote an
+        // EMPTY tracking_numbers array for every PO (Ferticell PO 125211 had a
+        // linked shipment but the PO row read as untracked). Mirrors `overlap`.
+        this._filters.push(
+          `${col}=cs.{${val.map((v: any) => encodeURIComponent(String(v))).join(",")}}`
+        );
       else if (op === "overlap")
         this._filters.push(`${col}=ov.{${val.map((v: any) => encodeURIComponent(String(v))).join(",")}}`);
       else
         this._filters.push(
           `${col}=${op}.${val.map((v: any) => encodeURIComponent(String(v))).join(",")}`
         );
+    } else if (op === "contains" && typeof val === "object") {
+      // jsonb containment: `metadata=cs.{"thread_id":"..."}`. PostgREST parses
+      // the JSON itself, so pass the raw object literal — a fully
+      // URL-encoded body makes PG throw 22P02 (Token "%" is invalid). Only the
+      // ampersand needs escaping so it can't split the query string.
+      this._filters.push(
+        `${col}=cs.${JSON.stringify(val).replace(/&/g, "%26")}`
+      );
     } else {
       this._filters.push(`${col}=${op}.${val}`);
     }
@@ -415,9 +437,15 @@ class QueryBuilder {
       // PostgREST uses ?on_conflict= query param for upsert
       url.searchParams.set("on_conflict", this._onConflict);
     }
+    // HERMIA(2026-08-20): the representation gate was `this._select !== "*"`,
+    // so `.upsert(row).select("*").single()` — the exact shape
+    // upsertShipmentEvidence uses — asked for no representation and got a null
+    // `data` back. Every PO-linked write chained off that row (PO
+    // tracking_numbers sync, po_shipment_legs, lifecycle) was skipped in
+    // silence. Gate on "did the caller call .select() at all" instead.
     if (
       (this._method === "POST" || this._method === "PATCH") &&
-      this._select !== "*"
+      this._selectCalled
     ) {
       preferValues.push("return=representation");
     }
@@ -464,7 +492,7 @@ class QueryBuilder {
       url.searchParams.set("select", this._select);
     } else if (
       (this._method === "POST" || this._method === "PATCH") &&
-      this._select !== "*"
+      this._selectCalled
     ) {
       url.searchParams.set("select", this._select);
     }

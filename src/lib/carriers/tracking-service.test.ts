@@ -14,6 +14,7 @@ import {
     carrierUrl,
     parseTrackingContent,
     detectLTLCarrier,
+    pageMentionsTrackingNumber,
     isFedExNumber,
     buildFollowUpEmail,
     TRACKING_PATTERNS,
@@ -598,5 +599,39 @@ describe('TRACKING_PATTERNS', () => {
         it('should not match TRK when part of another word', () => {
             expect(TRACKING_PATTERNS.trk.test('intrk 12345678')).toBe(false);
         });
+    });
+});
+
+// ──────────────────────────────────────────────────
+// pageMentionsTrackingNumber (LTL proof-of-shipment guard)
+// ──────────────────────────────────────────────────
+
+describe('pageMentionsTrackingNumber', () => {
+    // HERMIA(2026-08-20): ODFL renders tracking client-side. The server HTML is
+    // page chrome whose notification-preferences block literally contains the
+    // words "Out for Delivery" and "Delivered", so parseTrackingContent reported
+    // Ferticell PO 125211's in-transit LTL shipment as DELIVERED. This guard is
+    // what stops a JS shell from fabricating a delivery.
+    const odflShellChrome =
+        'Tracking Notifications Appointment Set/Confirmed Email On Off Text On Off ' +
+        'Out for Delivery Email On Off Text On Off Returned to Dock Email On Off ' +
+        'Delivered Email On Off Text On Off Email Address Required';
+
+    it('rejects a JS-shell page that never rendered the PRO', () => {
+        expect(pageMentionsTrackingNumber(odflShellChrome, '78088240060')).toBe(false);
+    });
+
+    it('accepts a page that renders the PRO verbatim', () => {
+        expect(
+            pageMentionsTrackingNumber(`PRO 78088240060 Delivered Aug 21, 2026`, '78088240060'),
+        ).toBe(true);
+    });
+
+    it('accepts a PRO formatted with separators by the carrier', () => {
+        expect(pageMentionsTrackingNumber('PRO 780-882-40060 In Transit', '78088240060')).toBe(true);
+    });
+
+    it('rejects an unusably short tracking number', () => {
+        expect(pageMentionsTrackingNumber('12345 Delivered', '12345')).toBe(false);
     });
 });
