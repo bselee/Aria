@@ -218,3 +218,32 @@ describe("normalizeInvoiceForDb — regex beats LLM hallucination (PO 125212)", 
             .toBe("complete");
     });
 });
+
+describe("extractInvoiceFieldsFromOcrText — PO# printed on invoice (Bill 2026-08-27)", () => {
+    it("extracts PO 125172 from table-header layout (Novelty style: label row, value in row below)", () => {
+        // Novelty 41131538: "DateInvoice #Order #Purchase Order #Cust IDTerms"
+        // header row, the PO value mid-line in the row below.
+        const raw = `INVOICE
+DateInvoice #Order #Purchase Order #Cust IDTerms
+08/26/26   41131538      475749       125172   BUI001   Net 30 Days
+80201          75 EA    ECS CONTAINER GARDEN SYSTEM - GREEN       20.96     1572.00
+Subtotal       2,220.56
+Shipping       424.24
+AMOUNT DUE    2,644.80`;
+        const f = extractInvoiceFieldsFromOcrText(raw);
+        expect(f.poNumber).toBe("125172");
+    });
+
+    it("never captures header words as the invoice number (Invoice #Order jam)", () => {
+        const raw = `DateInvoice #Order #Purchase Order #Cust IDTerms
+08/26/26   41131538      475749       125172   BUI001`;
+        const f = extractInvoiceFieldsFromOcrText(raw);
+        expect(f.invoiceNumber).not.toBe("Order");
+        if (f.invoiceNumber) expect(f.invoiceNumber).not.toMatch(/^order$/i);
+    });
+
+    it("still extracts box-style 'PO Number\\n125184' (Concentrates layout)", () => {
+        const f = extractInvoiceFieldsFromOcrText("Customer ID: 10626\nPO Number\n125184");
+        expect(f.poNumber).toBe("125184");
+    });
+});

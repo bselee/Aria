@@ -479,10 +479,15 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 // currently-received POs (that filter hid the real backlog).
                 const cutoff30d = new Date(Date.now() - 30 * 86_400_000).toISOString();
                 const { data } = await sb
-                    .from('vendor_invoices')
+                    .from("vendor_invoices")
                     .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, pdf_storage_path')
                     .is('po_number', null)
                     .gte('created_at', cutoff30d)
+                    // LTL Select freight archive rows (source_ref ltlselect-*,
+                    // PRO numbers as "invoice_number", BOL as PDF) are NOT
+                    // invoices — they never get a PO match (freight flows via
+                    // the reconcile-ltlselect pipeline / Bill.com).
+                    .not('source_ref', 'ilike', 'ltlselect-%')
                     .order('created_at', { ascending: false })
                     .limit(200);
                 unmatchedInvoices = (data as any[]) || [];
@@ -497,6 +502,29 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         '@/lib/storage/purchasing-cache'
                     );
                     const localUnmatched = getUnmatchedInvoices();
+                    // Cache rows are keyed "apfwd:{source_ref}:{file}". Join
+                    // them back to vendor_invoices (via source_ref) so (a)
+                    // rows whose PO link ALREADY exists in vendor_invoices
+                    // don't re-enter the pool (the cache's own matched_po
+                    // flag lags behind — observed 2026-08-27: 1694/5600/5612
+                    // were matched but still listed), and (b) the suggestion
+                    // carries the REAL invoice id the Match endpoint needs,
+                    // not the cache key.
+                    const cacheRefs = localUnmatched
+                        .map((r: any) => String(r.vendor_invoice_id || r.id || '').replace(/^apfwd:/, '').split(':')[0])
+                        .filter((x: string) => x && x.length > 4);
+                    let refInvoiceMap = new Map<string, { id: string; po_number: string | null }>();
+                    if (cacheRefs.length > 0) {
+                        try {
+                            const { data: refRows } = await sb
+                                .from('vendor_invoices')
+                                .select('id, source_ref, po_number')
+                                .in('source_ref', cacheRefs);
+                            refInvoiceMap = new Map(
+                                ((refRows as any[]) || []).map((r: any) => [r.source_ref, { id: r.id, po_number: r.po_number }]),
+                            );
+                        } catch { /* best effort */ }
+                    }
                     const seen = new Set(
                         unmatchedInvoices.map(
                             (i) =>
@@ -510,9 +538,12 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         if (seen.has(key)) continue;
                         if (row.matched_po) continue;
                         if (isNoPoVendor(row.vendor_name)) continue;
+                        const ref = String(row.vendor_invoice_id || row.id || '').replace(/^apfwd:/, '').split(':')[0];
+                        const refInfo = refInvoiceMap.get(ref);
+                        if (refInfo?.po_number) continue; // already matched in vendor_invoices
                         seen.add(key);
                         unmatchedInvoices.push({
-                            id: row.vendor_invoice_id || key,
+                            id: refInfo?.id || row.vendor_invoice_id || key,
                             invoice_number: row.invoice_number,
                             vendor_name: row.vendor_name,
                             invoice_date: row.invoice_date,

@@ -112,7 +112,9 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
     ];
     for (const re of invPatterns) {
         const m = text.match(re);
-        if (m?.[1] && !/^unknown$/i.test(m[1]) && !looksLikeDate(m[1])) {
+        // Guard: never accept bare header words ("Invoice #Order" jammed by
+        // OCR table headers) as the invoice number (2026-08-27).
+        if (m?.[1] && !/^unknown$/i.test(m[1]) && !looksLikeDate(m[1]) && !/^(order|number|no|num|date|total|page|ship|due|paid|cust)$/i.test(m[1].trim())) {
             invoiceNumber = m[1].trim();
             break;
         }
@@ -143,6 +145,25 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         if (m?.[1]) {
             poNumber = m[1].padStart(5, "0");
             break;
+        }
+    }
+
+    // Table-header layout (Novelty 2026-08-27): "DateInvoice #Order #Purchase
+    // Order #Cust IDTerms" label row with the PO value in the ROW BELOW
+    // ("08/26/26 41131538 475749 125172 BUI001") — the inline patterns above
+    // can't see across the newline. BAS POs are 6-digit 12xxxx. Require the
+    // invoice date on the same line so line-item quantities (120,000+ units)
+    // can't win. The lookahead stays on one line (no claims-paragraph
+    // swallowing).
+    if (!poNumber) {
+        const header = text.match(/(?:PURCHASE\s+ORDER\s*#|P\.?\s*O\.?\s*#|PO\s*#)[^\n]{0,80}/i);
+        if (header) {
+            const after = text.slice((header.index ?? 0) + header[0].length);
+            const line = after
+                .split("\n")
+                .find((l) => /\b12\d{4}\b/.test(l) && /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(l));
+            const tok = line?.match(/\b(12\d{4})\b/);
+            if (tok?.[1]) poNumber = tok[1];
         }
     }
 
