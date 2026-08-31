@@ -2322,6 +2322,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const skuObsBom = getObservedSkuLeadDays(compSku);
                     const resolvedLead = resolveLeadTimeDays({
                         productId: compSku,
+                        vendorName: groupName,
                         vendorPolicyLeadDays: bomPolicy?.leadTimeOverrideDays,
                         skuObservedLeadDays: skuObsBom?.days ?? null,
                         skuObservedProvenance: skuObsBom?.provenance ?? null,
@@ -3052,6 +3053,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const skuObs = getObservedSkuLeadDays(sku);
                     const resolvedLead = resolveLeadTimeDays({
                         productId: sku,
+                        vendorName: party.groupName,
                         vendorPolicyLeadDays: reorderPolicy?.leadTimeOverrideDays,
                         skuObservedLeadDays: skuObs?.days ?? null,
                         skuObservedProvenance: skuObs?.provenance ?? null,
