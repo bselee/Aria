@@ -397,6 +397,28 @@ export function runForwardVerificationSweep(opts?: {
       return { ...zeroed, refStale: true, refAgeHours };
     }
 
+    // ── Data-currency guard (2026-09-02) ─────────────────────────────────
+    // MAX(imported_at) is fooled when a stale or single-vendor CSV is
+    // re-imported: it bumps imported_at without refreshing coverage. That is
+    // exactly what happened — a single-vendor Gro-Kashi export kept
+    // imported_at fresh while Bill.com data stayed frozen at 2026-08-13.
+    // The newest bill's invoice_date is the real currency signal. A fixed
+    // 10-day window (not `staleHours`) is deliberate: invoice dates lag a
+    // few days by nature, a weekly export always clears 10 days, and a
+    // frozen reference trips it.
+    const DATA_CURRENCY_STALE_HOURS = 240; // 10 days
+    const newestInvoice = db
+      .prepare(
+        "SELECT MAX(invoice_date) AS m FROM billcom_bills_ref WHERE invoice_date IS NOT NULL AND invoice_date != ''",
+      )
+      .get() as { m: string | null };
+    if (newestInvoice.m) {
+      const dataAgeHours = hoursBetween(new Date(), parseRefInvoiceDate(newestInvoice.m));
+      if (dataAgeHours > DATA_CURRENCY_STALE_HOURS) {
+        return { ...zeroed, refStale: true, refAgeHours: dataAgeHours };
+      }
+    }
+
     const refs = db
       .prepare(
         "SELECT invoice_number, vendor_name, invoice_amount, invoice_date FROM billcom_bills_ref",

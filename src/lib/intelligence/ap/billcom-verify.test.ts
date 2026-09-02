@@ -569,10 +569,12 @@ describe("runForwardVerificationSweep", () => {
   it("forwards older than the alert horizon are counted unadjudicable, never alerted", () => {
     // Paid bills age off the Bill.com export entirely (31 paid AAA Cooper bills
     // = $19,228.45 dropped off Apr–Jun 2026), so an old absence proves nothing.
+    // Ref invoice_date is RECENT so the data-currency guard (2026-09-02) does
+    // not flag the reference as frozen — this test is about the FORWARD's age.
     insertRef({
       invoiceNumber: "999999",
       vendorName: "Some Vendor",
-      invoiceDate: dateMMDDYYYY(new Date(Date.now() - 40 * 86_400_000)),
+      invoiceDate: dateMMDDYYYY(new Date()),
     });
     insertForward({
       pdfFilename: "ancient.pdf",

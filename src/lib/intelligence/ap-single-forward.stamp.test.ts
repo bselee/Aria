@@ -142,20 +142,26 @@ describe("forwardInvoiceOnce stamp wiring", () => {
         expect(row.ocr_invoice_number).toBe("64058435");
     });
 
-    it("does NOT stamp vendors outside the stamp list", async () => {
+    it("forwards non-stamped invoices byte-identical (no tampering outside the stamp list)", async () => {
+        const original = await makePdf("uline");
         const result = await forwardInvoiceOnce({
             gmailMessageId: "msg-uline-1",
             emailFrom: "Uline <orders@uline.com>",
             emailSubject: "Uline Invoice 211897049 ID# 16",
             pdfFilename: "Uline_Invoice.pdf",
-            pdfBuffer: await makePdf("uline"),
+            pdfBuffer: original,
             vendorName: "Uline",
             invoiceNumber: "211897049",
             source: "local-forwarder",
         });
 
         expect(result.status).toBe("forwarded");
-        const { filename } = decodeMime();
+        const { filename, pdfBuffer } = decodeMime();
         expect(filename).toBe("Uline_Invoice.pdf");
+        // THE invariant Bill cares about: outside the stamp list the bytes sent
+        // are EXACTLY the original attachment — no re-encode, no OCR rewrite,
+        // no pdf-lib resave. Only the explicitly-listed stamp vendors (AAA
+        // Cooper) may alter the PDF. Filename sanitize is metadata, not content.
+        expect(pdfBuffer.equals(original)).toBe(true);
     });
 });
