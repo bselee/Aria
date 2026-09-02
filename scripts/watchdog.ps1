@@ -141,6 +141,41 @@ function Restart-AriaBot {
     Send-TelegramAlert $msg
 }
 
+# -- Helper: sweep orphaned aria-bot processes (duplicate cron schedulers) --
+# PM2 on Windows cannot guarantee SIGTERM kills the child, so a restart can
+# leave an invisible orphan still firing node-cron. Enumerate every
+# `node --import tsx` fork-wrapper and kill any PID that is NOT the
+# PM2-supervised one. See src/lib/persistence/pid-guard.ts (2026-09-02).
+function Invoke-OrphanSweep {
+    $supervisedRaw = (& pm2 pid aria-bot 2>$null | Out-String).Trim()
+    $supervisedPid = 0
+    if ($supervisedRaw -match '^\d+$') { $supervisedPid = [int]$supervisedRaw }
+    # Only sweep when we positively know the supervised PID — never when the
+    # bot is mid-boot/down, to avoid racing PM2's own restart.
+    if ($supervisedPid -le 0) { return }
+
+    try {
+        # AGE GATE (2026-09-02): never kill a process younger than 60s — during
+        # `pm2 restart` the old pid may still be listed while the NEW process is
+        # mid-boot; a young process is a sibling, not an orphan. Mirrors
+        # pid-guard.ts MIN_ORPHAN_AGE_MS = 60_000.
+        $cutoff = (Get-Date).AddSeconds(-60)
+        $zombies = Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {
+            $_.CommandLine -match '--import tsx' -and `
+            $_.CommandLine -match 'ProcessContainerFork' -and `
+            $_.ProcessId -ne $supervisedPid -and `
+            $_.CreationDate -and `
+            $_.CreationDate -lt $cutoff
+        }
+        foreach ($z in $zombies) {
+            Write-Log "CRITICAL: Killing orphaned aria-bot PID $($z.ProcessId) (duplicate cron scheduler)"
+            Stop-Process -Id $z.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Log "WARN: Orphan sweep failed: $($_.Exception.Message)"
+    }
+}
+
 # -- Main watchdog logic --
 try {
     $controlRequest = Invoke-OpsControlLease
@@ -155,6 +190,9 @@ try {
     }
 
     $isOnline = Test-AriaBotOnline
+
+    # Sweep any orphaned aria-bot processes every tick (safe no-op when none).
+    Invoke-OrphanSweep
 
     if (-not $isOnline) {
         Restart-AriaBot "Process missing or stopped in PM2"
