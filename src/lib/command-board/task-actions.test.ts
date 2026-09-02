@@ -240,19 +240,13 @@ describe('Telegram bridge', () => {
         expect((globalThis as any).fetch).not.toHaveBeenCalled();
     });
 
-    it('calls telegram once on will-dashboard actor (generic approve)', async () => {
+    it('does NOT call telegram on will-dashboard actor (telegram disabled 2026-09-02)', async () => {
         vi.mocked(agentTask.getById).mockResolvedValue({
             id: 't1', source_table: null, source_id: null,
         } as any);
         vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
         await approveTask('t1', 'will-dashboard');
-        expect((globalThis as any).fetch).toHaveBeenCalledTimes(1);
-        const [url, init] = (globalThis as any).fetch.mock.calls[0];
-        expect(url).toBe('https://api.telegram.org/bottest-token/sendMessage');
-        const body = JSON.parse(init.body);
-        expect(body.chat_id).toBe('12345');
-        expect(body.text).toContain('Approved via dashboard');
-        expect(body.text).toContain('Approved.');
+        expect((globalThis as any).fetch).not.toHaveBeenCalled();
     });
 
     it('does NOT call telegram when token is missing', async () => {

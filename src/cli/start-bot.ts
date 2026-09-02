@@ -431,7 +431,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
             console.warn(`[boot] PostgREST readiness wait failed (non-fatal): ${e.message}`);
         }
 
-        if (process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+        if (false) {
             bot.launch({ dropPendingUpdates: true })
                 .catch((err: any) => console.error('❌ Bot launch error:', err.message));
         } else {
@@ -654,7 +654,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         if (heapUsed > HEAP_THRESHOLD && Date.now() - lastMemAlertSent > COOLDOWN) {
             const mb = Math.round(heapUsed / 1024 / 1024);
             const chatId = process.env.TELEGRAM_CHAT_ID;
-            if (chatId && isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+            if (chatId && isBusinessHours() && false) {
                 await bot.telegram.sendMessage(
                     chatId,
                     `⚠️ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) — consider restarting if this persists.`
@@ -709,7 +709,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
             if (stale.length > 0 && Date.now() - lastCronWatchdogAlert > 60 * 60 * 1000) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId && isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                if (chatId && isBusinessHours() && false) {
                     const names = stale.map(s => `${s.name} (>${s.maxStaleMin}m)`).join(', ');
                     await bot.telegram.sendMessage(
                         chatId,

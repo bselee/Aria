@@ -31,7 +31,7 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
 async function tg(msg: string, retries = 3) {
-    if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') {
+    if (true) {
         console.log(`[ap-pipeline] Telegram disabled — skipped: "${msg.slice(0, 60).replace(/\n/g, ' ')}..."`);
         return;
     }

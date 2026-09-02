@@ -9,8 +9,6 @@ import { _resetRegistry, listJobs, getJob } from "../registry";
 const EXPECTED_JOBS = [
     "ap-polling",
     "build-risk",
-    "daily-summary",
-    "weekly-summary",
     "nightshift-enqueue",
     "housekeeping",
     "stat-indexing",
@@ -54,8 +52,8 @@ describe("cron/jobs/index registration", () => {
         }
     });
 
-    it("ap-polling morning window is 7:30 Denver; noon and 5pm stay on the hour", () => {
-        expect(getJob("ap-polling")?.schedule).toEqual(["30 7 * * *", "0 12,17 * * *"]);
+    it("ap-polling runs once daily at 7:30 Denver (2026-09-02: 3x/day → 1x/day)", () => {
+        expect(getJob("ap-polling")?.schedule).toBe("30 7 * * *");
     });
 
     it("every job uses America/Denver tz", () => {

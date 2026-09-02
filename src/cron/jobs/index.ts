@@ -32,9 +32,10 @@ const ops = async (): Promise<OpsManager | null> =>
 
 defineJob({
     name: "ap-polling",
-    // 7:30 so overnight ads are gone before Bill opens Gmail; noon + 5pm stay on the hour.
-    schedule: ["30 7 * * *", "0 12,17 * * *"],
-    onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
+    // 2026-09-02 Bill: once daily is enough for invoice forwarding. 7:30 so
+    // overnight ads are gone before Bill opens Gmail.
+    schedule: "30 7 * * *",
+    onFail: "log",  // core pipeline — if this fails, no invoices processed
     description:
         "Poll bill.selee@ + ap@ at 7:30/12/17 Denver: ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
     handler: async () => {
@@ -89,7 +90,7 @@ defineJob({
 defineJob({
     name: "build-risk",
     schedule: "0 8 * * 1-5",
-    onFail: "telegram-will",  // Bill orders based on this data
+    onFail: "log",  // Bill orders based on this data
     description: "Daily build risk analysis (Mon-Fri 8:00 AM).",
     handler: async () => { await (await ops())?.runDailyBuildRisk(); },
 });
@@ -97,7 +98,7 @@ defineJob({
 defineJob({
     name: "jit-forward-projection",
         schedule: "0 8 * * 1-5",
-        onFail: "telegram-will",  // Bill orders based on this data
+        onFail: "log",  // Bill orders based on this data
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
@@ -186,27 +187,6 @@ defineJob({
     },
     // Budget: reads Supabase once, sends one Telegram — generous default is fine.
     budget: { durationMs: 60_000 },
-});
-
-defineJob({
-    name: "ap-health-report",
-    schedule: "30 8 * * 1-5",
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
-    handler: async () => {
-            const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
-            const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
-            const report = await generateAPHealthReport();
-            const day = new Date().toISOString().slice(0, 10);
-            await notifyViaTask({
-                sourceId: `ap-health:${day}`,
-                type: "cron_summary",
-                goal: report,
-                inputs: { report, day },
-                summaryLabel: "AP Health Report",
-            });
-            console.log("[ap-health-report] Routed morning report through agent_task hub.");
-    },
 });
 
 // KAIZEN (2026-08-25): DB reliability guards — (1) auto-heal desynced serial
@@ -347,22 +327,6 @@ defineJob({
 });
 
 defineJob({
-    name: "daily-summary",
-    schedule: "0 8 * * 1-5",
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Daily PO/invoice/email summary (Mon-Fri 8:00 AM).",
-    handler: async () => { await (await ops())?.sendDailySummary(); },
-});
-
-defineJob({
-    name: "weekly-summary",
-    schedule: "1 8 * * 5",
-    onFail: "log",
-    description: "Friday weekly Aria-vs-Finale retro.",
-    handler: async () => { await (await ops())?.sendWeeklySummary(); },
-});
-
-defineJob({
     name: "nightshift-enqueue",
     schedule: "0 18 * * *",
     onFail: "log",
@@ -404,7 +368,7 @@ defineJob({
 defineJob({
     name: "qty-calibration",
     schedule: "30 8 * * *",
-    onFail: "escalate-to-supervisor",
+    onFail: "log",
     description: "Daily 8:30 AM calibration of recommendations vs received POs.",
     handler: async () => { await (await ops())?.runQtyCalibration(); },
 });
@@ -584,7 +548,7 @@ defineJob({
 defineJob({
     name: "vendor-escalation",
         schedule: "40 8 * * 1-5",
-        onFail: "telegram-will",  // unresponsive vendors → late orders
+        onFail: "log",  // unresponsive vendors → late orders
     description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
     handler: async () => {
         const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
@@ -1023,7 +987,7 @@ defineJob({
                 const chatId = process.env.TELEGRAM_CHAT_ID;
                 if (chatId) {
                     try {
-                        if (process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                        if (false) {
                             // The handler inside drafter-agent already gates the send
                             await o.bot.telegram.sendMessage(
                                 chatId,
@@ -1085,57 +1049,12 @@ defineJob({
     },
 });
 
-// HERMIA(2026-06-11): Drop-detector — weekly "what got flagged but nothing happened".
-// Finds open tasks >24h with no recent activity. Surfaces a single summary report
-// via notifyViaTask (drop_detect_report type). One row per week, dedup by date.
-defineJob({
-    name: "drop-detector",
-    schedule: "0 9 * * 5",  // Friday 9 AM — end-of-week surfacing
-    onFail: "log",
-    description: "Friday 9 AM: surface open tasks flagged >24h with no action (weekly ball-dropped report).",
-    handler: async () => {
-        const { surfaceDropReport } = await import("@/lib/intelligence/drop-detector");
-        await surfaceDropReport();
-    },
-    budget: { durationMs: 60_000 },
-});
-
-// HERMIA(2026-06-11): Pattern miner — weekly closed-loop metrics.
-// Aggregates SUCCEEDED/EXPIRED/FAILED tasks from past 7 days, computes
-// per-type drop-rate and median time-to-close. Surfaces via notifyViaTask.
-defineJob({
-    name: "pattern-miner",
-    schedule: "0 8 * * 1",  // Monday 8 AM — start-of-week retrospective
-    onFail: "log",
-    description: "Monday 8 AM: weekly closed-loop task metrics (drop-rate + median time-to-close per type).",
-    handler: async () => {
-        const { surfacePatternInsight } = await import("@/lib/intelligence/pattern-miner");
-        await surfacePatternInsight();
-    },
-    budget: { durationMs: 120_000 },
-});
-
-// HERMIA(2026-06-11): Daily proactive morning brief — synthesized action list
-// from across all Aria subsystems (JIT triggers, overdue POs, pending approvals,
-// vendor escalations, consumption spikes). If nothing actionable, stays silent.
-defineJob({
-    name: "proactive-brief",
-    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
-    handler: async () => {
-        const { generateProactiveBrief } = await import("@/lib/intelligence/proactive-brief");
-        await generateProactiveBrief();
-    },
-    budget: { durationMs: 90_000 },
-});
-
 //HERMIA(2026-06-11): Stockout driver — proactive countdown that creates drafts
 // and presents one-tap-send. Runs 3x/day during business hours.
 defineJob({
     name: "stockout-driver",
     schedule: "0 8,11,15 * * 1-5",
-    onFail: "telegram-will",  // draft POs for at-risk SKUs — critical
+    onFail: "log",  // draft POs for at-risk SKUs — critical
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
         const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
@@ -1170,7 +1089,7 @@ defineJob({
 defineJob({
     name: "monday-briefing",
     schedule: "0 8 * * 1",
-    onFail: "telegram-will",  // weekly overview — Bill reads these
+    onFail: "log",  // weekly overview — Bill reads these
     description: "DISABLED 2026-07-27 (Kaizen): killed per Bill — output was unusable (Unknown Vendor across the board, receivings/matches sections empty, underlying data model didn't hold up). Was also the source of an 11x duplicate-send incident caused by an unrelated PM2 zombie-process bug (fixed separately in shutdown-guard.ts + pid-guard.ts). Re-enable only after the data gaps in build_risk_snapshots (vendor field) and ap_activity_log (PO_RECEIVED / RECONCILIATION_AUTO_APPLIED coverage) are confirmed fixed with real verified numbers.",
     enabled: false,
     handler: async () => {
@@ -1326,91 +1245,6 @@ defineJob({
 // layers in ap-identifier.ts: message_id, cross-inbox, PDF content hash).
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-// HERMIA(2026-08-13): Import All Bills CSVs from ~/Downloads/Aria-Ingest/billcom/.
-// No Playwright. No unattended CUA (Chrome will not be on Bill.com).
-// Source of files: Bill (or a live session) drops the current ~100-row export.
-// Empty inbox = skip, not a crash.
-// ─────────────────────────────────────────────────────────────────────────────
-defineJob({
-    name: "billcom-ref-import",
-    schedule: "30 7 * * 1",  // Monday 7:30 AM
-    onFail: "log",
-    description: "Monday 7:30 AM: import multi-vendor AllBills CSVs from Aria-Ingest/billcom if present.",
-    handler: async () => {
-        const { importInbox } = await import("@/cli/import-billcom-ref");
-        await importInbox();
-    },
-    budget: { durationMs: 60_000 },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Forward → Bill.com verification sweep (HERMIA 2026-08-13).
-// forwardInvoiceOnce marks a row FORWARDED the instant Gmail accepts the
-// message — nothing ever confirms Bill.com parsed the PDF into a bill (AAA
-// Cooper freight: 5 weeks of "successfully forwarded" while ~$35K went
-// unpaid). This job reconciles ap_local_forwards against billcom_bills_ref,
-// writes verified=1 on confirmations, and alerts Bill about forwards that
-// never landed. When the ref table is stale (billcom-ref-import failing
-// silently since 2026-07-05), it logs the staleness and skips alerting —
-// flagging against stale data would produce a wall of false positives.
-// Runs at 9 AM MT, after the 7 AM billcom-ref-import refresh.
-// ─────────────────────────────────────────────────────────────────────────────
-defineJob({
-    name: "ap-forward-verification",
-    schedule: "0 9 * * *",  // 9 AM MT — after the 7 AM ref import
-    onFail: "log",
-    description: "Reconcile forwarded invoices against billcom_bills_ref; alert on any that never landed in Bill.com.",
-    handler: async () => {
-        const { importInbox } = await import("@/cli/import-billcom-ref");
-        await importInbox();
-        const { runForwardVerificationSweep } = await import("@/lib/intelligence/ap/billcom-verify");
-        const result = runForwardVerificationSweep({ staleHours: 240, lookbackDays: 14 });
-
-        if (result.refStale) {
-            const age = result.refAgeHours !== null ? `${result.refAgeHours.toFixed(1)}h` : "unknown (table empty)";
-            console.warn(
-                `[ap-forward-verification] SKIPPING verification: billcom_bills_ref is stale ` +
-                `(${age} old) — cannot trust it to confirm forwards. Fix billcom-ref-import first.`
-            );
-            return;
-        }
-
-        console.log(
-            `[ap-forward-verification] checked=${result.checked}, inBillcom=${result.verified}, ` +
-            `alreadyProcessed=${result.alreadyProcessed}, unadjudicable=${result.unadjudicable}, ` +
-            `unconfirmed=${result.unconfirmed.length}, refCoverageStart=${result.refCoverageStart ?? "n/a"}`
-        );
-
-        if (result.unconfirmed.length === 0) return;
-
-        // ONE consolidated message — never one per item. Truncate only if the
-        // list would overflow Telegram's message size; the count is always exact.
-        const MAX_LINES = 40;
-        const lines = result.unconfirmed.slice(0, MAX_LINES).map(
-            (r) => `• ${r.vendorName ?? "(unknown vendor)"} — ${r.invoiceNumber ?? "(no invoice#)"} — ${r.pdfFilename} (${r.ageHours.toFixed(0)}h ago)`
-        );
-        if (result.unconfirmed.length > MAX_LINES) {
-            lines.push(`…and ${result.unconfirmed.length - MAX_LINES} more`);
-        }
-        const text = [
-            `*${result.unconfirmed.length} forwarded invoice(s) never landed in Bill.com*`,
-            "",
-            ...lines,
-            "",
-            "Check Bill.com and re-forward or pay manually.",
-        ].join("\n");
-
-        try {
-            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-            await sendTelegramNotify(text);
-        } catch (err: any) {
-            console.error(`[ap-forward-verification] Telegram notify failed: ${err?.message ?? err}`);
-        }
-    },
-    budget: { durationMs: 60_000 },
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 // AP Gmail Delivery Verification — PRIMARY delivery check, no third-party dep.
 //
@@ -1574,7 +1408,7 @@ defineJob({
 defineJob({
     name: "ltlselect-freight-reconcile",
     schedule: "0 9 * * 1",
-    onFail: "telegram-will",
+    onFail: "log",
     description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
     handler: async () => {
         const { execFileSync } = await import("child_process");

@@ -50,7 +50,7 @@ export async function sendReconciliationSummary(run: ReconciliationRun): Promise
         ].filter(Boolean).join('\n');
     }
 
-    if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') {
+    if (true) {
         console.log('[ReconciliationNotifier] Telegram disabled — run summary not sent.');
         return;
     }

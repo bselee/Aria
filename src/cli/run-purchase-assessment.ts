@@ -223,7 +223,7 @@ async function main() {
         if (newRequests.length > 20) message += `...and ${newRequests.length - 20} more\n`;
     }
 
-    if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') {
+    if (true) {
         console.log('  ⏹️ Telegram disabled — assessment summary not sent.');
     } else {
         try {

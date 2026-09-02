@@ -103,7 +103,7 @@ async function notifyTelegramOfDashboardAction(
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     if (!token || !chatId) return;
-    if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') return; // Bill: no Telegram (2026-08-19)
+    if (true) return; // Bill: no Telegram (2026-08-19)
     try {
         const summary = `${actionLabel} via dashboard (task ${taskId.slice(0, 8)})\n${replyText}`;
         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {

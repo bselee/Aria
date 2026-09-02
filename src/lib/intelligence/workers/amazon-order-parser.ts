@@ -317,7 +317,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         const token = process.env.TELEGRAM_BOT_TOKEN;
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!token || !chatId) return;
-        if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') return; // Bill: no Telegram (2026-08-19)
+        if (true) return; // Bill: no Telegram (2026-08-19)
         if (!isBusinessHours()) { console.log("[amazon-order-parser] Gated (outside business hours)"); return; }
 
         const itemList = order.items
@@ -360,7 +360,7 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         const token = process.env.TELEGRAM_BOT_TOKEN;
         const chatId = process.env.TELEGRAM_CHAT_ID;
         if (!token || !chatId) return;
-        if (process.env.ARIA_TELEGRAM_ENABLED !== 'true') return; // Bill: no Telegram (2026-08-19)
+        if (true) return; // Bill: no Telegram (2026-08-19)
         if (!isBusinessHours()) { console.log("[amazon-order-parser] Gated (outside business hours)"); return; }
 
         let message = `Amazon Order Shipped\n\n`;

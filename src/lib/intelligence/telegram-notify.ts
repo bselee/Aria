@@ -11,10 +11,12 @@
 import { isBusinessHours } from './alert-gate';
 
 /**
- * Master switch for ALL Telegram outbound (2026-08-19, Bill: no more Telegram).
- * Default OFF. Set ARIA_TELEGRAM_ENABLED=true in the environment to re-enable.
+ * Master switch for ALL Telegram outbound.
+ * HARD-DISABLED (2026-09-02, Bill): no more Telegram notifications, period.
+ * Always false — the env escape hatch is intentionally removed so this can
+ * never be silently re-enabled.
  */
-export const isTelegramEnabled = (): boolean => process.env.ARIA_TELEGRAM_ENABLED === 'true';
+export const isTelegramEnabled = (): boolean => false;
 
 /**
  * Send a Markdown message to Bill's Telegram chat.

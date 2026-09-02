@@ -119,7 +119,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     // ── Gated: only notify during business hours ──
                     if (!isBusinessHours()) {
                         console.log('[autonomy] Draft PO detected but outside business hours — skipping Telegram.');
-                    } else if (process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                    } else if (false) {
                         await bot.telegram.sendMessage(
                             chatId,
                             `*Draft PO #${draft.orderId} Detected!*\n` +
@@ -152,7 +152,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
 
                 if (!email) {
                     console.warn(`[autonomy] Missing email for vendor ${review.vendorName} on PO #${draft.orderId}`);
-                    if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                    if (isBusinessHours() && false) {
                         await bot.telegram.sendMessage(
                             chatId,
                             `*Autonomy Blocked on PO #${draft.orderId}*\n` +
@@ -184,7 +184,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                                 `*Total*: $${review.total.toFixed(2)}\n\n` +
                                 `_Aria auto-generated this draft. Tap below to review details and confirm sending:_`;
 
-                    if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                    if (isBusinessHours() && false) {
                         await bot.telegram.sendMessage(chatId, msg, {
                             parse_mode: 'Markdown',
                             reply_markup: {
@@ -217,7 +217,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     // Level 2 POs get the same review prompt as Level 1
                     // Auto-send disabled intentionally — trust building phase
                     const link = `https://app.finaleinventory.com/buildasoilorganics/purchaseOrder?orderId=${draft.orderId}`;
-                    if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                    if (isBusinessHours() && false) {
                         await bot.telegram.sendMessage(
                             chatId,
                             `*PO #${draft.orderId} Auto-Reviewed (Level 2 → Manual Send)*\n` +
@@ -238,7 +238,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
 
             } catch (innerErr: any) {
                 console.error(`[autonomy] Error processing PO #${draft.orderId}:`, innerErr);
-                if (isBusinessHours() && process.env.ARIA_TELEGRAM_ENABLED === 'true') {
+                if (isBusinessHours() && false) {
                     await bot.telegram.sendMessage(
                         chatId,
                         `*Autonomous PO #${draft.orderId} Failed*\n` +
