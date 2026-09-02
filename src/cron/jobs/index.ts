@@ -416,9 +416,9 @@ defineJob({
 
 defineJob({
     name: "receiving-sync",
-    schedule: "*/30 8-17 * * 1-5", // every 30m M-F business hours — one pass for builds, receivings, receipts
+    schedule: "0 8-17 * * 1-5", // hourly M-F business hours — one pass for builds, receivings, receipts
     onFail: "log",
-    description: "Receiving pipeline (every 30m M-F): poll completed builds, poll received POs, sync Finale receipt data, re-check reconciled invoices. Merged 2026-09-02 from build-completion-watcher + po-receiving-watcher + po-receipt-recheck.",
+    description: "Receiving pipeline (hourly M-F 8-17): poll completed builds, poll received POs, sync Finale receipt data, re-check reconciled invoices. 2026-09-02: 30m -> hourly to halve Finale poll rounds. Merged from build-completion-watcher + po-receiving-watcher + po-receipt-recheck.",
     handler: async () => {
         await (await ops())?.pollBuildCompletions();
         await (await ops())?.pollPOReceivings();
@@ -667,7 +667,7 @@ defineJob({
     name: "sync-queue",
     schedule: "*/5 * * * *",
     onFail: "log",
-    description: "Process sync queue: SQLite → PostgREST (every 60s).",
+    description: "Process sync queue: SQLite → PostgREST (every 5m).",
     handler: async () => {
         const { processSyncQueue, getQueueDepth, cleanFailedSyncs } = await import("@/lib/storage/sync-queue");
         const depth = getQueueDepth();
@@ -689,9 +689,9 @@ defineJob({
 // Runs every 15min. Writes to po_cache (SQLite) for sub-ms dashboard queries.
 defineJob({
     name: "po-finale-sync",
-    schedule: "*/15 * * * *",
+    schedule: ["*/15 7-19 * * 1-5", "0 8 * * 0,6"],
     onFail: "log",
-    description: "Sync Finale PO data into local SQLite cache (every 15min).",
+    description: "Sync Finale PO data into local SQLite cache. 2026-09-02: 24/7 15m -> 7am-7pm M-F 15m + weekends 8am (Finale rate-limit care: ~43% fewer runs, zero overnight/weekend polling).",
     handler: async () => {
         const { default: PQueue } = await import("p-queue");
         const { upsertPOCache, getPOCache, getPurchasingCacheStats } = await import("@/lib/storage/purchasing-cache");
@@ -941,7 +941,7 @@ defineJob({
 // unhealthy (rate-limited 30 min per probe). All-healthy ticks stay silent.
 defineJob({
     name: "system-heartbeat",
-    schedule: "*/10 * * * *",
+    schedule: "*/30 * * * *",
     onFail: "log",  // Don't escalate cron framework failures for the heartbeat itself
     description: "Proactive liveness probes for all critical Aria systems (every 10 min).",
     budget: { durationMs: 30_000 },  // 30s total — probes should complete well under this
