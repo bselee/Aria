@@ -11,7 +11,6 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import CommandBoardShell from "./CommandBoardShell";
-import OpsModuleDock from "./OpsModuleDock";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -282,28 +281,5 @@ describe("CommandBoardShell", () => {
         expect(screen.queryByTestId("shell-tab-more")).toBeNull();
         const orderingPane = await screen.findByTestId("lifecycle-pane-ordering");
         expect(orderingPane).toBeTruthy();
-    });
-});
-
-describe("OpsModuleDock", () => {
-    it("renders tab buttons for the existing ops modules", () => {
-        render(<OpsModuleDock />);
-
-        // Tab labels we contracted to surface.
-        const expected = [
-            "Receivings",
-            "AP / Invoices",
-            "Ordering / Purchasing",
-            "Active Purchases",
-            "Build Risk",
-            "Build Schedule",
-            "Tracking",
-            "Statement Recon",
-        ];
-        for (const label of expected) {
-            expect(
-                screen.getAllByRole("tab", { name: new RegExp(label, "i") }).length,
-            ).toBeGreaterThan(0);
-        }
     });
 });

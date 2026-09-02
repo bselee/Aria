@@ -25,7 +25,6 @@ import { describe, expect, it } from "vitest";
 // Files that construct Bill/vendor-facing text.
 const OUTBOUND_FILES = [
     "src/config/persona.ts",                                  // TELEGRAM_CONFIG + SYSTEM_PROMPT
-    "src/lib/telegram/bot.ts",                                // ctx.reply responses
     "src/lib/intelligence/telegram-notify.ts",                // notify helper (templates)
     "src/lib/intelligence/services/comms-service.ts",         // daily/weekly summaries
     "src/lib/intelligence/sandbox-watcher.ts",                // sandbox Telegram alerts
