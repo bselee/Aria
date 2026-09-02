@@ -99,7 +99,7 @@ defineJob({
     name: "jit-forward-projection",
         schedule: "0 8 * * 1-5",
         onFail: "log",  // Bill orders based on this data
-    description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
+    description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and creates dashboard task-hub entries for any component whose order-trigger date is today or within the next 7 days. No news is good news. (2026-09-02: description corrected - routing is notifyViaTask/task hub, Telegram era text removed; job KEPT - it feeds Bill's task list.)",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
 
@@ -185,7 +185,7 @@ defineJob({
         }
         console.log(`[jit-forward-projection] Routed ${triggers.length} triggers through agent_task hub.`);
     },
-    // Budget: reads Supabase once, sends one Telegram — generous default is fine.
+    // Budget: reads Supabase once, writes a handful of agent_task rows.
     budget: { durationMs: 60_000 },
 });
 
@@ -367,7 +367,7 @@ defineJob({
 
 defineJob({
     name: "qty-calibration",
-    schedule: "30 8 * * *",
+    schedule: "30 8 * * 1-5",
     onFail: "log",
     description: "Daily 8:30 AM calibration of recommendations vs received POs.",
     handler: async () => { await (await ops())?.runQtyCalibration(); },
@@ -655,8 +655,8 @@ defineJob({
 // granularity is plenty.
 defineJob({
     name: "po-auto-complete-watcher",
-    // STAGGER(2026-08-21): was "0 */4 * * *".
-    schedule: "24 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *". 2026-09-02: M-F business slots only.
+    schedule: "0 8,12,16 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-complete eligible POs (every 4h; default OFF via PO_AUTO_COMPLETE_ENABLED).",
     handler: async () => { await (await ops())?.runPOAutoCompleteWatcher(); },
@@ -785,7 +785,7 @@ defineJob({
 // Runs every 60s. Syncs up to 20 records per tick with exponential backoff.
 defineJob({
     name: "sync-queue",
-    schedule: "* * * * *",
+    schedule: "*/5 * * * *",
     onFail: "log",
     description: "Process sync queue: SQLite → PostgREST (every 60s).",
     handler: async () => {
@@ -1165,7 +1165,7 @@ defineJob({
     // ─────────────────────────────────────────────────────────────────────────────
     defineJob({
         name: "reconciliation-auto-apply",
-        schedule: "15 * * * *",
+        schedule: "30 8,12,16 * * 1-5",
         onFail: "log",  // was telegram-will — demoted in frequency+alert audit
         description: "Auto-apply auto_approve/no_change reconciliation results to Finale POs (hourly at :15).",
         handler: async () => {
@@ -1324,7 +1324,7 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "invoice-po-auto-match",
-    schedule: "*/30 * * * *",
+    schedule: "0 8,12,16 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-match unmatched vendor invoices to purchase orders (every 30m).",
     handler: async () => {
@@ -1502,7 +1502,7 @@ defineJob({
 // The ACK agent reads those rules before composing any routine draft.
 defineJob({
     name: "draft-correction-watch",
-    schedule: "*/30 8-18 * * *",
+    schedule: "*/30 8-18 * * 1-5",
     onFail: "log",
     description:
         "Every 30m: watch threads Aria drafted into → learn Bill's edits/deletes as reply rules.",
