@@ -15,8 +15,7 @@ const EXPECTED_JOBS = [
     "po-sync",
     "qty-calibration",
     // KAIZEN #5: po-sweep folded into ap-polling as post-pass
-    "build-completion-watcher",
-    "po-receiving-watcher",
+    "receiving-sync",
     "purchasing-calendar-sync",
     "missing-reconciliation-watchdog",
     "close-finished-tasks",

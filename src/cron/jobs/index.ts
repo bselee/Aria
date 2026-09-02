@@ -415,37 +415,18 @@ defineJob({
 // if needed for ad-hoc verification. No automated cron necessary.
 
 defineJob({
-    name: "build-completion-watcher",
-    schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — build team hours only
+    name: "receiving-sync",
+    schedule: "*/30 8-17 * * 1-5", // every 30m M-F business hours — one pass for builds, receivings, receipts
     onFail: "log",
-    description: "Poll Finale for completed production builds (every 30m during business hours).",
-    handler: async () => { await (await ops())?.pollBuildCompletions(); },
-});
-
-defineJob({
-    name: "po-receiving-watcher",
-    schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — warehouse hours only
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Poll Finale for received POs (every 30m during business hours).",
-    handler: async () => { await (await ops())?.pollPOReceivings(); },
-});
-
-// KAIZEN(2026-06-01): Post-reconciliation receiving check. When goods arrive
-// after an invoice was reconciled, re-checks quantities and alerts if short.
-// KAIZEN(2026-08-12): Also syncs Finale receipt data into po_receipt_data
-// (the receiving leg for three-way match / variance views) before re-checking.
-defineJob({
-    name: "po-receipt-recheck",
-    schedule: "*/30 8-17 * * 1-5",  // KAIZEN (2026-07-23): weekdays only. No goods arrive off-hours.
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Re-check reconciled invoices against newly received goods + sync Finale receipts (every 30m).",
+    description: "Receiving pipeline (every 30m M-F): poll completed builds, poll received POs, sync Finale receipt data, re-check reconciled invoices. Merged 2026-09-02 from build-completion-watcher + po-receiving-watcher + po-receipt-recheck.",
     handler: async () => {
+        await (await ops())?.pollBuildCompletions();
+        await (await ops())?.pollPOReceivings();
         const { syncFinaleReceiptData } = await import("@/lib/purchasing/finale-receipt-sync");
         const syncResult = await syncFinaleReceiptData();
         if (syncResult.errors > 0) {
-            console.warn(`[po-receipt-recheck] receipt sync had ${syncResult.errors} error(s)`);
+            console.warn(`[receiving-sync] receipt sync had ${syncResult.errors} error(s)`);
         }
-
         const { recheckReconciledInvoices } = await import("@/lib/purchasing/po-receipt-recheck");
         await recheckReconciledInvoices();
     },
