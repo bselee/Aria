@@ -571,7 +571,7 @@ defineJob({
 defineJob({
     name: "flows-tick",
     schedule: "*/5 * * * *",
-    enabled: (process.env.FLOWS_ENABLED ?? "true").toLowerCase() !== "false",
+    enabled: (process.env.FLOWS_ENABLED ?? "false").toLowerCase() === "true",
     onFail: "log",
     description: "Flow runner: drain flow_events, spawn/advance flow_runs (every 5m).",
     handler: async () => {
@@ -885,36 +885,6 @@ defineJob({
         if (!o || !o.bot) return;
         const { autoProcessAutonomyDrafts } = await import("../../lib/purchasing/autonomy-engine");
         await autoProcessAutonomyDrafts(o.bot);
-    },
-});
-
-// ── CORE-04: Follow-up SOP ───────────────────────────────────────────────
-// HERMIA(2026-06-04): The legacy followup-sop logic was deleted in the 2026-05
-// refactor. Its five responsibilities split:
-//
-//   • PO acknowledgements + reorder nudges  → po-followup-watcher cron
-//   • L2/L3 vendor escalation                → vendor-escalation cron
-//   • Delivery exception escalation          → delivery-exception-escalator cron
-//   • AP invoices stuck in ERROR_FORWARDING  → email-forwarding-alert (this handler)
-//
-// The three PO-side crons run on weekday business hours. The AP-forwarding
-// alert that needs 24/7 coverage runs on this cron's 2-hour schedule via
-// this handler. The module early-returns + logs when there's nothing to
-// surface, so a quiet hour is silent.
-//
-// The autonomy engine (purchasing-followup worker + comms-master master)
-// tracks heartbeat status for this cron via notifyCronOutcome (wired in
-// ops-manager.safeRun).
-defineJob({
-    name: "followup-sop",
-    schedule: "0 */2 * * *", // every 2 hours, 24/7
-    onFail: "log",
-    description: "Follow-up SOP fan-out: AP forwarding alerts (email-forwarding-alert). PO-side work lives in three dedicated crons.",
-    handler: async () => {
-        // HERMIA(2026-08-20): Slack removed. Only the AP-forwarding
-        // escalation module remains on this schedule.
-        const { runForwardingEscalation } = await import("@/lib/intelligence/email-forwarding-alert");
-        await runForwardingEscalation();
     },
 });
 
