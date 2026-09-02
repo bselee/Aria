@@ -22,8 +22,6 @@ const EXPECTED_JOBS = [
     "close-finished-tasks",
     "migration-tripwire",
     "task-self-healer",
-    "issue-projection",
-    "issue-orchestrator",
     "expire-stale-approvals",
     "vendor-lead-time-tracker",
 ];

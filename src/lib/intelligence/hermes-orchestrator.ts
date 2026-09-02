@@ -372,8 +372,6 @@ export class HermesOrchestrator {
             "vendor-escalation": ["purchasing-followup", "comms-master"],
             "cognitive-round": ["cognitive-round", "ops-master"],
             "close-finished-tasks": ["cron-scheduler", "ops-master"],
-            "issue-projection": ["ops-master"],
-            "issue-orchestrator": ["ops-master"],
             "task-self-healer": ["supervisor", "ops-master"],
             "build-completion-watcher": ["tracking-master"],
             "po-receiving-watcher": ["tracking-master", "carrier-poller"],

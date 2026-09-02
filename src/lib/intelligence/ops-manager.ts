@@ -440,24 +440,6 @@ export class OpsManager {
         return this.poService.runPOArrivalRiskCheck();
     }
 
-    /** Phase 1 issue ledger: project recent tasks into agent_issue rows. */
-    public async runIssueProjection(): Promise<void> {
-        const { runIssueProjection } = await import("./issue-projection-cron");
-        const summary = await runIssueProjection();
-        if (summary.issues_created_or_advanced > 0 || summary.tasks_linked > 0) {
-            console.log("[OpsManager] IssueProjection:", summary);
-        }
-    }
-
-    /** Plan task 4: issue orchestrator. Gated by ISSUE_ORCHESTRATOR_ENABLED. */
-    public async runIssueOrchestrator(): Promise<void> {
-        const { runIssueOrchestratorOnce } = await import("./issue-orchestrator");
-        const summary = await runIssueOrchestratorOnce({ limit: 10 });
-        if (summary.evaluated > 0) {
-            console.log("[OpsManager] IssueOrchestrator:", summary);
-        }
-    }
-
     /** Housekeeping wrapper. */
     public async runHousekeeping(): Promise<void> {
         await runHousekeeping();

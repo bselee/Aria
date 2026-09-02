@@ -639,15 +639,6 @@ defineJob({
     handler: async () => { await (await ops())?.runTaskSelfHealer(); },
 });
 
-// HERMIA(2026-06-24): 15m → 30m. Issue projection rarely finds new work per cycle.
-// Saves ~96 invocations/day. Supabase free-tier friendliness.
-defineJob({
-    name: "issue-projection",
-    schedule: "*/30 * * * *",
-    onFail: "log",
-    description: "Phase 1 issue ledger projection (every 15m).",
-    handler: async () => { await (await ops())?.runIssueProjection(); },
-});
 
 // Auto-complete POs that satisfy all eligibility gates AND have settled
 // for ≥48h. Default OFF behind PO_AUTO_COMPLETE_ENABLED — dry-runs log
@@ -952,17 +943,6 @@ defineJob({
     },
 });
 
-// Gated cron — preserved env flag from inline registration.
-// HERMIA(2026-05-28): 5m → 15m. Already gated on ISSUE_ORCHESTRATOR_ENABLED.
-// When enabled, 15m is plenty for orchestrating issue remediation cycles.
-defineJob({
-    name: "issue-orchestrator",
-    schedule: "*/15 * * * *",
-    enabled: (process.env.ISSUE_ORCHESTRATOR_ENABLED ?? "false").toLowerCase() === "true",
-    onFail: "log",
-    description: "Issue orchestrator (every 5m, gated by ISSUE_ORCHESTRATOR_ENABLED).",
-    handler: async () => { await (await ops())?.runIssueOrchestrator(); },
-});
 
 // ── DRAFTER AGENT: Autonomous PO draft creation ──────────────────────
 // HERMIA(2026-06-09): Creates draft POs in Finale for vetted vendors whose
