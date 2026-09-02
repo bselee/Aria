@@ -346,14 +346,15 @@ const ACTION_ORDER: Record<ActionRow["kind"], number> = { review: 0, match: 1, r
  * 1. review — variance blocking first, then by |net delta| desc (biggest $ first)
  * 2. match — unmatched invoices that need a PO linked
  * 3. ready — clean match (twm.canApprove / variance.clean), newest receipt first
- * POs with no matched invoice are excluded — they land in the settled dump.
+ * POs with no matched invoice are excluded — they land in the Awaiting
+ * invoice section below (received, vendor invoice not yet arrived).
  */
 function buildActionRows(pos: ReceivedPO[], suggestions: MatchSuggestion[]): ActionRow[] {
     const rows: ActionRow[] = [];
     for (const po of pos) {
         const rec = po._reconciliation;
         const inv = rec?.matchedInvoice ?? null;
-        if (!inv) continue; // no invoice → no in-panel decision (settled dump)
+        if (!inv) continue; // no invoice → no in-panel decision (awaiting invoice)
         const variance = rec?.variance ?? null;
         const twm = rec?.threeWayMatch;
         const clean = !!variance && variance.clean;
@@ -427,12 +428,10 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const [gateBlockReason, setGateBlockReason] = useState<Map<string, string>>(new Map());
     /** Manual match state: invoiceId → manual PO input. */
     const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
-    /** Settled dump toggle — not the default path. */
-    const [showAllReceived, setShowAllReceived] = useState(false);
     /** Awaiting invoice section toggle — collapsed by default. */
     const [showAwaitingInvoice, setShowAwaitingInvoice] = useState(false);
     /** Active filter tab — "action" (all) is default; others narrow the list. */
-    const [filterTab, setFilterTab] = useState<"action" | "ready" | "review" | "match" | "settled">("action");
+    const [filterTab, setFilterTab] = useState<"action" | "ready" | "review" | "match">("action");
     /**
      * POs completed this session. Finale still lists completed POs in the
      * 30-day received window, so a plain refetch would resurrect them —
@@ -766,16 +765,12 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const reviewCount = actionRows.filter(r => r.kind === "review").length;
     const readyCount = actionRows.filter(r => r.kind === "ready").length;
     const matchCount = visibleSuggestions.length;
-    const actionPoIds = useMemo(
-        () => new Set(actionRows.filter(r => r.kind !== "match").map(r => r.po.orderId)),
-        [actionRows],
-    );
-    const settledPos = visiblePos.filter(p => !actionPoIds.has(p.orderId));
+    /** Received POs with no matched invoice — awaiting the vendor's invoice. */
+    const awaitingPos = useMemo(() => buildAwaitingInvoice(visiblePos), [visiblePos]);
 
     /** Rows visible under the active filter tab. */
     const visibleActionRows = useMemo(() => {
         if (filterTab === "action") return actionRows;
-        if (filterTab === "settled") return actionRows; // settled handled separately below
         return actionRows.filter(r => r.kind === filterTab);
     }, [actionRows, filterTab]);
     /** Oldest age among action rows — drives the one-line context strip. */
@@ -1255,14 +1250,11 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         {actionRows.length} action
                     </span>
                 )}
-                {(() => {
-                    const awaiting = buildAwaitingInvoice(visiblePos);
-                    return awaiting.length > 0 ? (
-                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-zinc-800/40 text-zinc-400 border border-zinc-700/30">
-                            {awaiting.length} awaiting invoice
-                        </span>
-                    ) : null;
-                })()}
+                {awaitingPos.length > 0 && (
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-zinc-800/40 text-zinc-400 border border-zinc-700/30">
+                        {awaitingPos.length} awaiting invoice
+                    </span>
+                )}
                 <div className="flex-1" />
                 {!loading && visiblePos.length > 0 && (
                     <span className="text-xs font-mono text-zinc-500">{visiblePos.length} POs</span>
@@ -1390,21 +1382,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     {unmatchedTotal > matchCount ? `${unmatchedTotal} Match` : `${matchCount} Match`}
                                 </button>
                             )}
-                            {settledPos.length > 0 && (
-                                <button
-                                    onClick={() => {
-                                        setFilterTab("settled");
-                                        setShowAllReceived(true);
-                                    }}
-                                    className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors cursor-pointer ${
-                                        filterTab === "settled"
-                                            ? "bg-zinc-500 text-zinc-950 border-zinc-500 font-semibold"
-                                            : "bg-transparent border-zinc-700/50 text-zinc-500 hover:bg-zinc-800/60"
-                                    }`}
-                                >
-                                    {settledPos.length} Settled
-                                </button>
-                            )}
                         </div>
                     )}
 
@@ -1465,101 +1442,62 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             )}
 
                             {/* ── ONE actionable list (filtered by tab) ── */}
-                            {filterTab !== "settled" && (visibleActionRows.length > 0 ? (
+                            {visibleActionRows.length > 0 ? (
                                 <div>
                                     {visibleActionRows.map(row => renderActionRow(row))}
                                 </div>
                             ) : (
                                 <div className="px-4 py-6 text-center">
-                                    <span className="text-xs font-mono text-emerald-400/70">
-                                        {actionRows.length > 0 ? `No ${filterTab} items — switch tabs to see the rest` : "All invoices matched — nothing needs attention"}
+                                    <span className={`text-xs font-mono ${awaitingPos.length > 0 ? "text-zinc-400" : "text-emerald-400/70"}`}>
+                                        {actionRows.length > 0
+                                            ? `No ${filterTab} items — switch tabs to see the rest`
+                                            : awaitingPos.length > 0
+                                                ? `No invoices to match — ${awaitingPos.length} PO${awaitingPos.length === 1 ? "" : "s"} received, awaiting vendor invoice`
+                                                : "All invoices matched — nothing needs attention"}
                                     </span>
                                 </div>
-                            ))}
+                            )}
 
                             {/* ── Awaiting invoice — received but no invoice yet ── */}
-                            {filterTab !== "settled" && (() => {
-                                const awaiting = buildAwaitingInvoice(visiblePos);
-                                if (awaiting.length === 0) return null;
-                                return (
-                                    <div className="border-b border-zinc-800/40">
-                                        <button
-                                            onClick={() => setShowAwaitingInvoice(!showAwaitingInvoice)}
-                                            className="w-full px-4 py-1.5 bg-zinc-950/40 flex items-center gap-2 text-left hover:bg-zinc-900/40 transition-colors"
-                                        >
-                                            <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-500">
-                                                {showAwaitingInvoice ? "▾" : "▸"} Awaiting invoice ({awaiting.length})
-                                            </span>
-                                            <span className="ml-auto text-[9px] font-mono text-zinc-600">
-                                                {(() => {
-                                                    const stale = awaiting.filter(po => (daysSince(po.receiveDate || po.receiveDateTime) ?? 0) >= 14).length;
-                                                    return stale > 0 ? `${stale} stale ≥14d` : "";
-                                                })()}
-                                            </span>
-                                        </button>
-                                        {showAwaitingInvoice && awaiting.map(po => {
-                                            const age = agingBadge(daysSince(po.receiveDate || po.receiveDateTime));
-                                            return (
-                                                <div key={po.orderId} className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono border-b border-zinc-800/20">
-                                                    <span className="text-zinc-400">{po.orderId}</span>
+                            {awaitingPos.length > 0 && (
+                                <div className="border-b border-zinc-800/40">
+                                    <button
+                                        onClick={() => setShowAwaitingInvoice(!showAwaitingInvoice)}
+                                        className="w-full px-4 py-1.5 bg-zinc-950/40 flex items-center gap-2 text-left hover:bg-zinc-900/40 transition-colors"
+                                    >
+                                        <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-500">
+                                            {showAwaitingInvoice ? "▾" : "▸"} Awaiting invoice ({awaitingPos.length})
+                                        </span>
+                                        <span className="ml-auto text-[9px] font-mono text-zinc-600">
+                                            {(() => {
+                                                const stale = awaitingPos.filter(po => (daysSince(po.receiveDate || po.receiveDateTime) ?? 0) >= 14).length;
+                                                return stale > 0 ? `${stale} stale ≥14d` : "";
+                                            })()}
+                                        </span>
+                                    </button>
+                                    {showAwaitingInvoice && awaitingPos.map(po => {
+                                        const age = agingBadge(daysSince(po.receiveDate || po.receiveDateTime));
+                                        const discrepancy = partialDiscrepancy(po);
+                                        const badge = receiptBadge(po);
+                                        return (
+                                            <div key={po.orderId} className="border-b border-zinc-800/20">
+                                                <div className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono hover:bg-zinc-800/10 transition-colors">
+                                                    <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
+                                                        className="text-blue-500 hover:text-blue-300 shrink-0 font-semibold">
+                                                        {po.orderId}
+                                                    </a>
                                                     <span className="text-zinc-600 truncate">{po.supplier}</span>
                                                     {age && (
                                                         <span className={`text-[9px] font-mono shrink-0 ${age.cls}`} title={`Received ${fmtDateTime(po.receiveDate)}`}>
                                                             {age.text}
                                                         </span>
                                                     )}
-                                                    <span className="text-zinc-500 ml-auto shrink-0">Rcvd {fmtDateTime(po.receiveDate)}</span>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                );
-                            })()}
-
-                            {/* ── Auto-processed summary — full trail in Activity tab ── */}
-                            {recentAutoCompletions.length > 0 && filterTab !== "settled" && (
-                                <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">
-                                    <span className="text-[10px] font-mono text-emerald-500/50">-</span>
-                                    <span className="text-[10px] font-mono text-zinc-600">
-                                        {recentAutoCompletions.length} auto-completed
-                                    </span>
-                                    <button
-                                        onClick={() => (document.querySelector('[role="tab"][aria-label="Activity"]') as HTMLElement | null)?.click()}
-                                        className="text-[9px] font-mono text-blue-500/50 hover:text-blue-400 underline underline-offset-2 decoration-blue-500/20 transition-colors"
-                                    >
-                                        view in Activity
-                                    </button>
-                                </div>
-                            )}
-
-                            {/* ── Settled dump — only under the Settled tab ── */}
-                            {filterTab === "settled" && settledPos.length > 0 && (
-                                <div>
-                                    <button
-                                        onClick={() => setShowAllReceived(!showAllReceived)}
-                                        className="w-full px-4 py-1 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1"
-                                    >
-                                        {showAllReceived ? "−" : "+"}
-                                        <span>{showAllReceived ? "Hide settled POs" : `Show all ${settledPos.length} settled POs`}</span>
-                                    </button>
-                                    {showAllReceived && settledPos.map(po => {
-                                        const discrepancy = partialDiscrepancy(po);
-                                        const badge = receiptBadge(po);
-                                        return (
-                                            <div key={po.orderId} className="border-b border-zinc-800/30">
-                                                <div className="px-4 py-1.5 flex items-center gap-2 text-[10px] font-mono hover:bg-zinc-800/10 transition-colors">
-                                                    <span className="text-zinc-500 shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
-                                                    <a href={po.finaleUrl} target="_blank" rel="noopener noreferrer"
-                                                        className="text-blue-500 hover:text-blue-300 shrink-0 font-semibold">
-                                                        {po.orderId}
-                                                    </a>
-                                                    <span className="text-zinc-300 truncate">{po.supplier}</span>
                                                     {badge && (
                                                         <span className={`text-[9px] font-mono px-1 py-px rounded border shrink-0 ${badge.cls}`}>
                                                             {badge.label}
                                                         </span>
                                                     )}
-                                                    <span className="text-zinc-500 shrink-0 ml-auto">{fmtDollars(po.total)}</span>
+                                                    <span className="text-zinc-500 ml-auto shrink-0">Rcvd {fmtDateTime(po.receiveDate)}</span>
                                                 </div>
                                                 {discrepancy && (
                                                     <div className="px-4 pb-1.5 text-[10px] font-mono text-amber-300/80 -mt-0.5">
@@ -1571,9 +1509,20 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     })}
                                 </div>
                             )}
-                            {filterTab === "settled" && settledPos.length === 0 && (
-                                <div className="px-4 py-6 text-center">
-                                    <span className="text-xs font-mono text-zinc-500">No settled POs in this window</span>
+
+                            {/* ── Auto-processed summary — full trail in Activity tab ── */}
+                            {recentAutoCompletions.length > 0 && (
+                                <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">
+                                    <span className="text-[10px] font-mono text-emerald-500/50">-</span>
+                                    <span className="text-[10px] font-mono text-zinc-600">
+                                        {recentAutoCompletions.length} auto-completed
+                                    </span>
+                                    <button
+                                        onClick={() => (document.querySelector('[role="tab"][aria-label="Activity"]') as HTMLElement | null)?.click()}
+                                        className="text-[9px] font-mono text-blue-500/50 hover:text-blue-400 underline underline-offset-2 decoration-blue-500/20 transition-colors"
+                                    >
+                                        view in Activity
+                                    </button>
                                 </div>
                             )}
                         </div>

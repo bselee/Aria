@@ -136,6 +136,22 @@ function lineMatches(invLine: InvoiceLine, poLine: GatePoLine): boolean {
  *          ok=false with a clear blockReason.
  */
 export function evaluateCompletionGate(input: CompletionGateInput): CompletionGateResult {
+    // ── CRITICAL AP RULE (2026-09-01) ───────────────────────────────────────
+    // No matched invoice AT ALL → the invoice leg is missing, so completion
+    // must NOT proceed. This is distinct from the fail-open case below, where
+    // an invoice EXISTS but OCR extracted no line items (hasInvoice=true,
+    // invoiceLines=[]) — that is a legitimate skip, not a missing document.
+    // Conflating the two let a received PO be marked COMPLETED with no invoice
+    // ever matched, i.e. goods received and never payable against the AP cycle.
+    if (!input.hasInvoice) {
+        return {
+            ok: false,
+            blockReason:
+                `PO ${input.orderId} has no matched invoice — the invoice leg is ` +
+                `missing, so the 3-way match cannot approve completion.`,
+        };
+    }
+
     // Fail-open: no line data on either side → nothing to compare → skip.
     if (input.poLines.length === 0 || input.invoiceLines.length === 0) {
         return {

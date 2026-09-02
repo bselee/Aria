@@ -72,11 +72,11 @@ describe("extractInvoiceLines", () => {
     });
 });
 
-describe("evaluateCompletionGate — fail-open on missing data", () => {
-    it("skips (ok) when no invoice is matched", () => {
+describe("evaluateCompletionGate — missing invoice is a hard block", () => {
+    it("BLOCKS when no invoice is matched (the invoice leg is missing)", () => {
         const r = evaluateCompletionGate(gateInput({ hasInvoice: false, invoiceLines: [] }));
-        expect(r.ok).toBe(true);
-        expect(r.summary).toMatch(/skipped/);
+        expect(r.ok).toBe(false);
+        expect(r.blockReason).toMatch(/no matched invoice/);
     });
 
     it("skips (ok) when the PO has no line-item data", () => {
@@ -85,7 +85,7 @@ describe("evaluateCompletionGate — fail-open on missing data", () => {
         expect(r.summary).toMatch(/skipped/);
     });
 
-    it("skips (ok) when the invoice has no extractable line items", () => {
+    it("skips (ok) when the invoice exists but has no extractable line items (OCR gap)", () => {
         const r = evaluateCompletionGate(gateInput({ invoiceLines: [] }));
         expect(r.ok).toBe(true);
         expect(r.summary).toMatch(/skipped/);

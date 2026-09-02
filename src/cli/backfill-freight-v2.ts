@@ -80,7 +80,7 @@ async function main() {
 
   for (let i = 0; i < PUSHES.length; i++) {
     const p = PUSHES[i];
-    const note = `Freight from invoice (backfill) — ${p.vendor}`;
+    const note = "Freight";
     try {
       await finale.updateOrderAdjustmentAmount(p.orderId, 'FREIGHT', p.freight, note);
       console.log(`  ✅ [${i + 1}/${PUSHES.length}] PO ${p.orderId}: $${p.freight.toFixed(2)} — ${p.vendor}`);

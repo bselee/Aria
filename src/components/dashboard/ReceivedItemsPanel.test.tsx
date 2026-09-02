@@ -703,27 +703,29 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/\$65,674/i)).toBeTruthy();
   });
 
-  it("hides settled POs by default and reveals them under the Settled tab", async () => {
+  it("shows invoice-less POs only under Awaiting invoice (no Settled tab)", async () => {
     stubLocalStorage();
     stubFetch(basePayload([settledPO()]));
 
     render(<ReceivedItemsPanel />);
 
-    // Default (Action tab): settled toggle is NOT shown; awaiting invoice shows count but PO is hidden
-    await screen.findByText(/Awaiting invoice \(1\)/i);
-    expect(screen.queryByText(/Show all 1 settled POs/i)).toBeNull();
+    // No action rows + one awaiting-invoice PO → the empty-state banner must
+    // NOT claim "nothing needs attention" or treat the PO as settled.
+    expect(
+      await screen.findByText(/No invoices to match — 1 PO received, awaiting vendor invoice/i),
+    ).toBeTruthy();
 
-    // Expand awaiting invoice to see the PO
+    // No "Settled" tab exists — invoice-less POs are an open AP item, not settled.
+    expect(screen.queryByRole("button", { name: /Settled/ })).toBeNull();
+
+    // Awaiting invoice section is collapsed by default (PO hidden until expanded).
+    await screen.findByText(/Awaiting invoice \(1\)/i);
+    expect(screen.queryByText("125169")).toBeNull();
+
+    // Expand to reveal the PO, its partial-receipt badge, and discrepancy.
     fireEvent.click(screen.getByText(/▸ Awaiting invoice/i));
     expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
-
-    // Settled tab reveals the settled list immediately (auto-expanded), hiding the action list
-    fireEvent.click(screen.getByRole("button", { name: "1 Settled" }));
-    expect(await screen.findByText(/Hide settled POs/i)).toBeTruthy();
-    expect(screen.getAllByText("125169").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/BOTTLE-1G short 75 of 300/i)).toBeTruthy();
-    // Action list + awaiting section are not shown on the Settled tab
-    expect(screen.queryByText(/Awaiting invoice \(1\)/i)).toBeNull();
   });
 
   it("auto-clears the complete toast after 5 seconds", async () => {
