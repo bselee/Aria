@@ -5,7 +5,7 @@
  *          The 12 operational panels (AP, Receivings, Ordering, Tracking,
  *          Builds, etc.) get FULL CANVAS now — they were previously crammed
  *          into a 320px bottom dock. The "Blocking Me" tab is the default
- *          and renders the issue-ledger surface (IssuesPanel).
+ *          Purchasing lifecycle only (issue-ledger surfaces removed 2026-09-02).
  *
  *          Tab switching is instant after first visit: every visited tab
  *          stays mounted (CSS-hidden when inactive) so JIT compile + data

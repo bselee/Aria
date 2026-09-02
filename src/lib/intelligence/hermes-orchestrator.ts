@@ -392,11 +392,7 @@ export class HermesOrchestrator {
             "missing-reconciliation-watchdog": ["ap-reconciler"],
             "missing-reconciliation": ["ap-reconciler"],
             "expire-stale-approvals": ["ap-reconciler", "ops-master"],
-            "drop-detector": ["tracking-master", "ops-master"],
-            "pattern-miner": ["ops-master", "cognitive-round"],
-            "proactive-brief": ["ops-master", "comms-master"],
             "system-heartbeat": ["ops-master"],
-            "monday-briefing": ["ops-master", "comms-master"],
             "aria-bot-startup": ["ops-master", "cron-scheduler"],
         };
 

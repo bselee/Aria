@@ -95,99 +95,7 @@ defineJob({
     handler: async () => { await (await ops())?.runDailyBuildRisk(); },
 });
 
-defineJob({
-    name: "jit-forward-projection",
-        schedule: "0 8 * * 1-5",
-        onFail: "log",  // Bill orders based on this data
-    description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and creates dashboard task-hub entries for any component whose order-trigger date is today or within the next 7 days. No news is good news. (2026-09-02: description corrected - routing is notifyViaTask/task hub, Telegram era text removed; job KEPT - it feeds Bill's task list.)",
-    handler: async () => {
-        const { createClient } = await import("@/lib/supabase");
 
-        // Bill's rule: don't ping daily. Only alert when an orderTriggerDate is
-        // imminent (≤7 days away). If every component is far in the future,
-        // stay silent — "no news is good news".
-        const ALERT_BUFFER_DAYS = 7;
-
-        const db = createClient();
-        if (!db) {
-            console.log("[jit-forward-projection] Supabase unavailable — skipping.");
-            return;
-        }
-
-        // Latest snapshot that has components JSON with orderTriggerDate fields
-        // (written by the build-risk job that already fired at 8:00).
-        const { data, error } = await db
-            .from("build_risk_snapshots")
-            .select("generated_at,components")
-            .order("generated_at", { ascending: false })
-            .limit(1);
-
-        if (error || !data || !data[0]) {
-            console.log("[jit-forward-projection] No snapshot available. Will surface at 8:00 run.");
-            return;
-        }
-        const snap = data[0] as any;
-        const comps = (snap.components ?? {}) as Record<string, any>;
-        const snapshotDate = new Date(snap.generated_at);
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const todayISO = today.toISOString().slice(0, 10);
-        const bufferEnd = new Date(today.getTime() + ALERT_BUFFER_DAYS * 86_400_000);
-        const bufferISO = bufferEnd.toISOString().slice(0, 10);
-
-        // Collect components whose orderTriggerDate is in [today, today+7]
-        const triggers: Array<{
-            sku: string;
-            riskLevel: string;
-            triggerDate: string;
-            coverageDays?: number | null;
-            vendorName?: string | null;
-            stockoutDays?: number | null;
-            onHand?: number | null;
-            usedIn: string[];
-        }> = [];
-
-        for (const [sku, c] of Object.entries(comps)) {
-            if (!c || !c.orderTriggerDate) continue;
-            const d = c.orderTriggerDate;
-            if (d < todayISO) continue;          // already past — no alert
-            if (d > bufferISO) continue;         // not within the window yet
-            triggers.push({
-                sku,
-                riskLevel: c.riskLevel,
-                triggerDate: d,
-                coverageDays: c.coverageDays,
-                vendorName: c.vendorName,
-                stockoutDays: c.stockoutDays,
-                onHand: c.onHand,
-                usedIn: Array.isArray(c.usedIn) ? c.usedIn : Object.keys(c.usedIn ?? {}),
-            });
-        }
-
-        if (triggers.length === 0) {
-            console.log("[jit-forward-projection] No JIT triggers in the next 7d — silent.");
-            return;
-        }
-
-        // Task-first: one agent_task per trigger, then a single summary view.
-        triggers.sort((a, b) => a.triggerDate.localeCompare(b.triggerDate));
-        const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
-        for (const t of triggers) {
-            await notifyViaTask({
-                sourceId: `jit:${t.sku}:${t.triggerDate}`,
-                type: "jit_order_trigger",
-                goal: `Order ${t.sku} by ${t.triggerDate} — ${t.riskLevel}`,
-                inputs: { sku: t.sku, triggerDate: t.triggerDate, vendor: t.vendorName, onHand: t.onHand, usedIn: t.usedIn },
-                priority: t.riskLevel === "CRITICAL" ? 0 : 2,
-                // KAIZEN #7: removed critical: true — JIT triggers wait for business hours
-                summaryLabel: "JIT Forward Projection",
-            });
-        }
-        console.log(`[jit-forward-projection] Routed ${triggers.length} triggers through agent_task hub.`);
-    },
-    // Budget: reads Supabase once, writes a handful of agent_task rows.
-    budget: { durationMs: 60_000 },
-});
 
 // KAIZEN (2026-08-25): DB reliability guards — (1) auto-heal desynced serial
 // sequences via setval (heal-first, not alert-only; past incident left
@@ -1066,20 +974,7 @@ defineJob({
 // Monday Briefing Cron (new 2026-06-15)
 // Runs only on Mondays at 8:00 AM MDT. Sends formatted email to Bill.
 // ─────────────────────────────────────────────────────────────────────────────
-defineJob({
-    name: "monday-briefing",
-    schedule: "0 8 * * 1",
-    onFail: "log",  // weekly overview — Bill reads these
-    description: "DISABLED 2026-07-27 (Kaizen): killed per Bill — output was unusable (Unknown Vendor across the board, receivings/matches sections empty, underlying data model didn't hold up). Was also the source of an 11x duplicate-send incident caused by an unrelated PM2 zombie-process bug (fixed separately in shutdown-guard.ts + pid-guard.ts). Re-enable only after the data gaps in build_risk_snapshots (vendor field) and ap_activity_log (PO_RECEIVED / RECONCILIATION_AUTO_APPLIED coverage) are confirmed fixed with real verified numbers.",
-    enabled: false,
-    handler: async () => {
-        const { generateAndSendMondayBriefing } = await import(
-            "@/lib/intelligence/monday-briefing"
-        );
-        await generateAndSendMondayBriefing();
-    },
-    budget: { durationMs: 120_000 },
-});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scans Watcher — CR/CRMIN & Benny scan processing (added 2026-06-16)
