@@ -41,6 +41,7 @@ import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
+import { isStatement, isStatementOcrText } from "@/lib/purchasing/eow-report";
 import {
     deriveCanonicalVendorName,
     extractInvoiceNumber,
@@ -248,17 +249,12 @@ export function isNonInvoiceEmail(args: { from: string; subject: string }): bool
     return false;
 }
 
-/** Statement / collections attachments that must never hit Bill.com. */
-function isStatementAttachment(filename: string, from: string, subject: string): boolean {
-    const f = (filename || "").toLowerCase();
-    const fromLower = (from || "").toLowerCase();
-    const subjectLower = (subject || "").toLowerCase();
-    if (!f) return false;
-    if (f.includes("statement") || f.includes("aging") || f.includes("account_summary")) return true;
-    // Belt Power remitto invoices are Inv######.pdf — statements are BuildASoil_LLC_Statement.pdf
-    if (fromLower.includes("beltpower") && f.includes("statement")) return true;
-    if (fromLower.includes("beltpower") && subjectLower.includes("reminder") && !f.startsWith("inv")) return true;
-    return false;
+/** Statement / collections attachments that must never hit Bill.com.
+ *  Phone photos are named IMG_*.jpg — filename-only checks miss them.
+ *  Use from + subject + snippet + filename (AAA Cooper Stmt subjects stay invoices).
+ */
+function isStatementAttachment(filename: string, from: string, subject: string, snippet = ""): boolean {
+    return isStatement(from, `${subject} ${snippet}`, filename);
 }
 
 // ── Paid Invoice Detection (ported from ap-identifier.ts) ──────────────────
@@ -1277,6 +1273,7 @@ export async function runLocalApForward(): Promise<{
             const subject = headers.find((h: any) => h.name === "Subject")?.value || "(no subject)";
             const from = headers.find((h: any) => h.name === "From")?.value || "unknown";
             const gmailMessageId = msg.id;
+            const snippet = msgRes.data.snippet || "";
 
             // Skip known non-invoice senders / junk classes BEFORE send and
             // BEFORE vendor routing (tracking notifications, FedEx Billing
@@ -1410,7 +1407,7 @@ export async function runLocalApForward(): Promise<{
             let allPdfsForwarded = true;
             for (const att of invoiceAttachments) {
                 // Statement / collections PDFs — log, never Bill.com
-                if (isStatementAttachment(att.filename, from, subject)) {
+                if (isStatementAttachment(att.filename, from, subject, snippet)) {
                     console.log(`   [AP-Local] Statement attachment — log only: ${att.filename}`);
                     recordSkippedForward({
                         gmailMessageId,
@@ -1499,6 +1496,19 @@ export async function runLocalApForward(): Promise<{
                 // FedEx multi-page packets: still run block check on extractable text
                 // but never trim pages before send.
                 const paidCheck = await checkPaidInvoiceBlock(pdfBuffer);
+                if (!paidCheck.blocked && isStatementOcrText(paidCheck.rawText || "")) {
+                    console.log(`   [AP-Local] Statement OCR — log only: ${pdfFilename}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename,
+                        reason: "statement/non-invoice OCR text",
+                        vendorRoutingAction: "skip",
+                    });
+                    summary.skipped++;
+                    continue;
+                }
                 if (paidCheck.blocked) {
                     recordError(gmailMessageId, from, subject, pdfFilename, pdfHash,
                         `BLOCKED: ${paidCheck.reason}`);
