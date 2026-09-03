@@ -161,7 +161,7 @@ export async function extractBolText(args: {
 async function runPdfParse(buffer: Buffer): Promise<any> {
     let pdfParse: any;
     try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
+         
         const mod: any = await import("pdf-parse");
         pdfParse = mod.default || mod;
     } catch {

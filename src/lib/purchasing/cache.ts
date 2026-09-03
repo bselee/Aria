@@ -190,9 +190,10 @@ export async function prewarmPurchasingCaches(): Promise<void> {
             console.warn('[purchasing/prewarm] lead-time dist warmup failed (non-fatal):', err?.message || err),
         );
 
-        // KAIZEN(2026-08-04): Populate receiving_cache before the scan so
-        // coverageStockOnOrder can distinguish fully-received single-shipment
-        // POs from partially-received blanket POs.
+        // KAIZEN(2026-08-21): receiving_cache refresh is retained as a receipt
+        // diagnostic source, but coverageStockOnOrder no longer depends on it —
+        // line-level remaining (po-remaining-inbound) replaced the delivered
+        // subtraction that previously consumed isPOFullyReceived here.
         const { refreshReceivingCache } = await import('./receiving-cache');
         await refreshReceivingCache().catch((err: any) =>
             console.warn('[purchasing/prewarm] receiving-cache refresh failed (non-fatal):', err?.message || err),

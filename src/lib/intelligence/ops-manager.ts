@@ -4,7 +4,6 @@ import { createClient } from "../db";
 import { getLocalDb, dedupSeen, dedupMark, dedupCount } from "../storage/local-db";
 import { type ScheduledTask } from "node-cron";
 import { Telegraf } from "telegraf";
-import { WebClient } from "@slack/web-api";
 import { SYSTEM_PROMPT } from "../../config/persona";
 import { indexOperationalContext } from "./pinecone";
 import { unifiedTextGeneration } from "./llm";
@@ -16,7 +15,6 @@ import { APService } from "./services/ap-service";
 import { APIdentifierAgent } from "./workers/ap-identifier";
 import { EmailIngestionWorker } from "./workers/email-ingestion";
 import { APForwarderAgent } from "./workers/ap-forwarder";
-import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import * as agentTask from "./agent-task";
 import { closeFinishedTasks } from "./agent-task-closure";
@@ -97,13 +95,10 @@ export class OpsManager {
 
     public bot: Telegraf;
     private scheduledTasks: ScheduledTask[] = [];
-    private slack: WebClient | null;
-    private slackChannel: string;
     private apIdentifier: APIdentifierAgent;
     private emailIngestionDefault: EmailIngestionWorker;
     private emailIngestionAP: EmailIngestionWorker;
     private apForwarder: APForwarderAgent;
-    private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
     private supervisor: SupervisorAgent;
     private oversightAgent: OversightAgent;
@@ -128,23 +123,11 @@ export class OpsManager {
         this.bot = bot;
         OpsManager.singleton = this;
 
-        // DECISION(2026-02-25): Initialize Slack client alongside Telegram.
-        // Slack posting is best-effort — if SLACK_BOT_TOKEN is missing, we
-        // gracefully skip Slack without blocking the Telegram message.
-        const slackToken = process.env.SLACK_BOT_TOKEN;
-        this.slack = slackToken ? new WebClient(slackToken) : null;
-        this.slackChannel = process.env.SLACK_MORNING_CHANNEL || "#purchasing";
-
-        if (!this.slack) {
-            console.warn("\u26a0\ufe0f OpsManager: SLACK_BOT_TOKEN not set \u2014 Slack cross-posting disabled.");
-        }
-
         // Initialize dedicated AP agents
         this.apIdentifier = new APIdentifierAgent(bot);
         this.emailIngestionDefault = new EmailIngestionWorker("default");
         this.emailIngestionAP = new EmailIngestionWorker("ap");
         this.apForwarder = new APForwarderAgent(bot);
-        this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
 
@@ -455,24 +438,6 @@ export class OpsManager {
 
     public async runPOArrivalRiskCheck(): Promise<void> {
         return this.poService.runPOArrivalRiskCheck();
-    }
-
-    /** Phase 1 issue ledger: project recent tasks into agent_issue rows. */
-    public async runIssueProjection(): Promise<void> {
-        const { runIssueProjection } = await import("./issue-projection-cron");
-        const summary = await runIssueProjection();
-        if (summary.issues_created_or_advanced > 0 || summary.tasks_linked > 0) {
-            console.log("[OpsManager] IssueProjection:", summary);
-        }
-    }
-
-    /** Plan task 4: issue orchestrator. Gated by ISSUE_ORCHESTRATOR_ENABLED. */
-    public async runIssueOrchestrator(): Promise<void> {
-        const { runIssueOrchestratorOnce } = await import("./issue-orchestrator");
-        const summary = await runIssueOrchestratorOnce({ limit: 10 });
-        if (summary.evaluated > 0) {
-            console.log("[OpsManager] IssueOrchestrator:", summary);
-        }
     }
 
     /** Housekeeping wrapper. */

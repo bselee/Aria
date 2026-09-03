@@ -178,24 +178,9 @@ export async function processDocument(
             }).select().single();
             savedDoc = data;
 
-            // Type-specific DB storage
+            // Type-specific DB storage — single write path: vendor_invoices only
+            // (legacy `invoices` table is a read-only view over vendor_invoices since 2026-08-12)
             if (classification.type === "INVOICE") {
-                await db.from("invoices").upsert({
-                    invoice_number: (extractedData as Record<string, unknown>).invoiceNumber,
-                    vendor_id: vendorId,
-                    vendor_name: (extractedData as Record<string, unknown>).vendorName,
-                    po_number: (extractedData as Record<string, unknown>).poNumber,
-                    invoice_date: (extractedData as Record<string, unknown>).invoiceDate,
-                    due_date: (extractedData as Record<string, unknown>).dueDate,
-                    total: (extractedData as Record<string, unknown>).total,
-                    status: matchResult?.autoApprove ? "matched" : "unmatched",
-                    matched_po_id: matchResult?.matchedPO ? (extractedData as Record<string, unknown>).poNumber : null,
-                    discrepancies: matchResult?.discrepancies ?? [],
-                    document_id: savedDoc?.id,
-                    raw_data: extractedData,
-                }, { onConflict: "invoice_number" });
-
-                // Also archive into the unified vendor_invoices table
                 const ed = extractedData as Record<string, unknown>;
                 await upsertVendorInvoice({
                     vendor_name: String(ed.vendorName ?? meta.emailFrom ?? "Unknown"),

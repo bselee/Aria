@@ -41,7 +41,7 @@ const productCommand: BotCommand = {
             const report = await deps.finale.productReport(sku);
             await ctx.reply(report.telegramMessage, {
                 parse_mode: 'Markdown',
-                // @ts-ignore — Telegraf types don't include disable_web_page_preview
+                // @ts-expect-error — Telegraf types don't include disable_web_page_preview
                 disable_web_page_preview: true,
             });
         } catch (err: any) {
@@ -64,7 +64,7 @@ const receivingsCommand: BotCommand = {
             const received = await deps.finale.getTodaysReceivedPOs();
             const digest = deps.finale.formatReceivingsDigest(received);
 
-            // Send to Telegram (convert Slack mrkdwn to Telegram Markdown)
+            // Send to Telegram (convert markdown to Telegram Markdown)
             const telegramMsg = digest
                 .replace(/:package:/g, '📦')
                 .replace(/:white_check_mark:/g, '✅')
@@ -72,7 +72,7 @@ const receivingsCommand: BotCommand = {
 
             await ctx.reply(telegramMsg, {
                 parse_mode: 'Markdown',
-                // @ts-ignore
+                // @ts-expect-error — Telegraf types don't include disable_web_page_preview
                 disable_web_page_preview: true,
             });
 

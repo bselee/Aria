@@ -18,7 +18,7 @@ type Params = { procName: string };
 
 // Only restart processes we explicitly know about. Defense against a
 // malicious or buggy task row injecting `; rm -rf /` style payloads.
-const ALLOWED_PROCS = new Set(["aria-bot", "aria-slack"]);
+const ALLOWED_PROCS = new Set(["aria-bot"]);
 
 export const restartStalePm2Proc: Playbook<Params> = {
     kind: "restart_stale_pm2_proc",

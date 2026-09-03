@@ -14,6 +14,7 @@ import {
     getPOLifecycleHistory,
     PO_LIFECYCLE_STATES,
     INITIAL_LIFECYCLE_STATE,
+    isTransientGateError,
 } from "./po-lifecycle";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +74,10 @@ describe("assertValidTransition", () => {
     // --- Existing pipeline ---
     it("allows INVOICED → RECONCILED", () => {
         expect(() => assertValidTransition("INVOICED", "RECONCILED")).not.toThrow();
+    });
+
+    it("allows INVOICED → ACKNOWLEDGED (operator unmatch rollback)", () => {
+        expect(() => assertValidTransition("INVOICED", "ACKNOWLEDGED")).not.toThrow();
     });
 
     it("allows RECONCILED → RECEIVED", () => {
@@ -225,25 +230,25 @@ describe("getPOLifecycleHistory (best-effort)", () => {
 });
 
 describe("transitionLifecycleState (best-effort)", () => {
-    it("resolves undefined without throwing on any input", async () => {
-        await expect(
-            transitionLifecycleState("PO-001", "REVIEW", "test")
-        ).resolves.toBeUndefined();
+    it("resolves to { ok } without throwing on any input", async () => {
+        const result = await transitionLifecycleState("PO-001", "REVIEW", "test");
+        expect(result).toHaveProperty("ok");
+        expect(typeof result.ok).toBe("boolean");
     });
 
-    it("handles invalid transitions by silently returning", async () => {
-        await expect(
-            transitionLifecycleState("PO-001", "CANCELLED", "test")
-        ).resolves.toBeUndefined();
+    it("handles invalid transitions by returning { ok: false }", async () => {
+        const result = await transitionLifecycleState("PO-001", "CANCELLED", "test");
+        expect(result).toHaveProperty("ok");
+        expect(typeof result.ok).toBe("boolean");
     });
 
     it("accepts optional metadata", async () => {
-        await expect(
-            transitionLifecycleState("PO-002", "RECEIVED", "receiver", {
-                invoiceId: "INV-001",
-                source: "manual",
-            })
-        ).resolves.toBeUndefined();
+        const result = await transitionLifecycleState("PO-002", "RECEIVED", "receiver", {
+            invoiceId: "INV-001",
+            source: "manual",
+        });
+        expect(result).toHaveProperty("ok");
+        expect(typeof result.ok).toBe("boolean");
     });
 });
 
@@ -274,5 +279,31 @@ describe("PO_LIFECYCLE_STATES", () => {
 
     it("INITIAL_LIFECYCLE_STATE is REVIEW", () => {
         expect(INITIAL_LIFECYCLE_STATE).toBe("REVIEW");
+    });
+});
+
+// ---------------------------------------------------------------------------
+// isTransientGateError — gate error classification (transient vs structural)
+// ---------------------------------------------------------------------------
+describe("isTransientGateError", () => {
+    it("classifies network/DB errors as transient (fail-open)", () => {
+        expect(isTransientGateError(new Error("fetch failed: ECONNREFUSED"))).toBe(true);
+        expect(isTransientGateError(new Error("PostgREST request timed out"))).toBe(true);
+        expect(isTransientGateError(new Error("connection refused"))).toBe(true);
+    });
+
+    it("classifies 5xx status codes as transient", () => {
+        expect(isTransientGateError(Object.assign(new Error("server error"), { status: 503 }))).toBe(true);
+    });
+
+    it("classifies structural errors as NOT transient (fail-closed)", () => {
+        expect(isTransientGateError(new TypeError("Cannot read properties of undefined (reading 'map')"))).toBe(false);
+        expect(isTransientGateError(new ReferenceError("extractInvoiceLines is not defined"))).toBe(false);
+        expect(isTransientGateError(new Error("Cannot find module './three-way-match'"))).toBe(false);
+    });
+
+    it("treats non-Error values as structural", () => {
+        expect(isTransientGateError("some string")).toBe(false);
+        expect(isTransientGateError(undefined)).toBe(false);
     });
 });

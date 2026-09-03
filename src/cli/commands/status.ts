@@ -77,7 +77,6 @@ const statusCommand: BotCommand = {
             `🧠 Memory (Pinecone): ${memStatus}\n` +
             `📦 Finale: ${process.env.FINALE_API_KEY ? '✅ Connected' : '❌ Not configured'}\n` +
             `🔍 Perplexity: ${deps.perplexityKey ? '✅ Ready' : '❌ Not configured'}\n` +
-            `🦊 Slack Watchdog: ${deps.watchdog ? '✅ Running' : '❌ Not started'}\n` +
             `🎙️ Voice: ${deps.elevenLabsKey ? '✅ ElevenLabs' : '❌ Not configured'}\n\n` +
             `*🧠 Background LLM Chain:*\n` +
             `${llmHealthLines}\n\n` +

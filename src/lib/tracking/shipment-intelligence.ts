@@ -199,6 +199,14 @@ function parseDisplayDates(display: string): { estimatedDeliveryAt?: string | nu
     return {};
 }
 
+/**
+ * Parcel carrier keys (from detectCarrier) that are NOT LTL freight. When a
+ * number arrives as "FedEx:::…" / "UPS:::…" the carrier tag is parcel, so
+ * tracking_kind must be "parcel", not "ltl_pro". "fedex freight" (LTL) is
+ * intentionally absent — it stays ltl_pro.
+ */
+const PARCEL_CARRIER_KEYS = new Set(["ups", "usps", "dhl", "fedex"]);
+
 export function normalizeTrackingIdentity(trackingNumber: string): {
     trackingNumber: string;
     normalizedTrackingNumber: string;
@@ -217,7 +225,10 @@ export function normalizeTrackingIdentity(trackingNumber: string): {
         const [carrierNameRaw, actualNumberRaw] = trimmed.split(":::", 2);
         const carrierName = titleCaseCarrierName(carrierNameRaw.trim()) || "Freight";
         const actualNumber = actualNumberRaw.trim();
-        const kind: ShipmentTrackingKind = "ltl_pro";
+        // Parcel carriers tagged via "Carrier:::Number" are parcel, not LTL.
+        const kind: ShipmentTrackingKind = PARCEL_CARRIER_KEYS.has(carrierName.toLowerCase())
+            ? "parcel"
+            : "ltl_pro";
         return {
             trackingNumber: `${carrierName}:::${actualNumber}`,
             normalizedTrackingNumber: actualNumber,
@@ -635,18 +646,75 @@ export function getShipmentsDueForRefresh(
         .slice(0, limit);
 }
 
-async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
+/**
+ * Sources that INFER the PO link instead of reading it explicitly from the
+ * email/document. These are the magnet-poisoning class — PO 125178 accrued 567
+ * inferred FedEx numbers because nothing filtered them — and must never be
+ * stamped onto a real Finale PO.
+ */
+const INFERRED_PO_SOURCES = new Set([
+    "email_ingest_inferred",
+    "email_tracking_inferred_po",
+    "email_tracking_llm_po",
+]);
+
+/**
+ * Collapse bare + carrier-prefixed duplicates of the same tracking number
+ * (e.g. "383269682926" + "FedEx:::383269682926") into one entry, preferring
+ * the carrier-prefixed form so the Finale tracking link resolves to the
+ * carrier's own page instead of a parcelsapp fallback. Preserves the original
+ * string (never lets titleCaseCarrierName munge "AAA Cooper" → "Aaa Cooper").
+ *
+ * @param trackingNumbers - raw tracking strings from the shipments table
+ * @returns deduped, canonical-ordered tracking strings
+ */
+export function canonicalizeTrackingNumbers(trackingNumbers: string[]): string[] {
+    const best = new Map<string, string>(); // normalized suffix → best original string
+    const order: string[] = [];
+
+    for (const raw of trackingNumbers) {
+        const tn = String(raw || "").trim();
+        if (!tn) continue;
+
+        let suffix: string;
+        try {
+            suffix = normalizeTrackingIdentity(tn).normalizedTrackingNumber.toLowerCase();
+        } catch {
+            suffix = tn.toLowerCase();
+        }
+
+        const existing = best.get(suffix);
+        const preferThis = !existing || (tn.includes(":::") && !existing.includes(":::"));
+        if (preferThis) {
+            if (!existing) order.push(suffix);
+            best.set(suffix, tn);
+        }
+    }
+
+    return order.map((key) => best.get(key)).filter((v): v is string => Boolean(v));
+}
+
+export async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
     const db = createClient();
     if (!db || !poNumber) return;
 
     const { data: shipments } = await db
         .from("shipments")
-        .select("tracking_number, public_tracking_url")
+        .select("tracking_number, public_tracking_url, last_source")
         .contains("po_numbers", [poNumber])
         .eq("active", true);
 
-    const trackingNumbers = uniqueStrings((shipments || []).map((s: any) => s.tracking_number));
-    const publicUrls = uniqueStrings((shipments || []).map((s: any) => s.public_tracking_url));
+    // Exclude inferred-PO evidence: a guessed PO link must not be pushed onto a
+    // real Finale PO. Explicit/document sources (email_ingest, email_ingest_pdf,
+    // ap_invoice, po_thread_sync, carrier_api, …) all pass.
+    const explicit = (shipments || []).filter(
+        (s: any) => !INFERRED_PO_SOURCES.has(s.last_source),
+    );
+
+    const trackingNumbers = canonicalizeTrackingNumbers(
+        explicit.map((s: any) => s.tracking_number),
+    );
+    const publicUrls = uniqueStrings(explicit.map((s: any) => s.public_tracking_url));
 
     // 1. Sync to local Supabase cache
     await db
@@ -834,6 +902,107 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
     }
 }
 
+/**
+ * Upsert a po_shipment_legs row for a PO from a shipment evidence record.
+ *
+ * This is the tracking-link join: the shipments table is the canonical
+ * tracking store and po_shipment_legs is the PO↔shipment join table.
+ * Each (PO, tracking_number) pair maps to one leg row carrying the carrier,
+ * expected/actual dates, and tracking number. Legacy bulk-delivery legs
+ * entered via /legs (with real expected_qty) are never overwritten — the
+ * upsert keys on (po_number, tracking_number) and only touches rows it
+ * created (notes = 'auto from tracking evidence').
+ *
+ * Bulk vendors (is_bulk_vendor=true) are skipped: their legs are real
+ * delivery schedules managed via /legs, not tracking-link placeholders.
+ */
+export async function syncShipmentLegForPO(
+    poNumber: string,
+    shipment: ShipmentRecord,
+): Promise<void> {
+    const db = createClient();
+    if (!db || !poNumber || !shipment?.tracking_number) return;
+
+    try {
+        // Resolve vendor identity for the PO (party id + name for the leg row).
+        const { data: poRow } = await db
+            .from("purchase_orders")
+            .select("vendor_party_id, vendor_name")
+            .eq("po_number", poNumber)
+            .maybeSingle();
+        const vendorPartyId = poRow?.vendor_party_id ?? null;
+        const vendorName = poRow?.vendor_name ?? null;
+
+        // Skip bulk vendors — their legs are real delivery schedules.
+        if (vendorPartyId) {
+            const { data: policy } = await db
+                .from("vendor_reorder_policies")
+                .select("is_bulk_vendor")
+                .eq("vendor_party_id", vendorPartyId)
+                .maybeSingle();
+            if (policy?.is_bulk_vendor === true) return;
+        }
+
+        // Find an existing leg for this (PO, tracking) pair.
+        const { data: existingLegs } = await db
+            .from("po_shipment_legs")
+            .select("id, tracking_number, carrier_name, expected_date, actual_date, notes")
+            .eq("po_number", poNumber);
+        const existing = (existingLegs || []).find(
+            (l: any) => l.tracking_number === shipment.tracking_number,
+        );
+
+        const now = new Date().toISOString();
+        const expectedDate =
+            shipment.estimated_delivery_at || shipment.delivered_at || shipment.created_at
+                ? String(shipment.estimated_delivery_at || shipment.delivered_at || shipment.created_at).slice(0, 10)
+                : new Date().toISOString().slice(0, 10);
+        const actualDate = shipment.status_category === "delivered" && shipment.delivered_at
+            ? String(shipment.delivered_at).slice(0, 10)
+            : null;
+
+        if (existing) {
+            // Only update tracking-link rows we created; never clobber /legs schedules.
+            const isAuto = String(existing.notes || "").includes("auto from tracking evidence");
+            const update: Record<string, any> = { updated_at: now };
+            if (isAuto) {
+                if (shipment.carrier_name) update.carrier_name = shipment.carrier_name;
+                if (!existing.expected_date && expectedDate) update.expected_date = expectedDate;
+                if (!existing.actual_date && actualDate) update.actual_date = actualDate;
+            }
+            await db.from("po_shipment_legs").update(update).eq("id", existing.id);
+            return;
+        }
+
+        // Insert a new tracking-link leg. expected_qty is a required placeholder
+        // (>0) — the real delivery qty for bulk vendors is managed via /legs and
+        // non-bulk vendors' recommender never reads legs.
+        const { data: maxLegRow } = await db
+            .from("po_shipment_legs")
+            .select("leg_number")
+            .eq("po_number", poNumber)
+            .order("leg_number", { ascending: false })
+            .limit(1);
+        const nextLegNumber = Number(maxLegRow?.[0]?.leg_number ?? 0) + 1;
+
+        await db.from("po_shipment_legs").insert({
+            po_number: poNumber,
+            vendor_party_id: vendorPartyId,
+            vendor_name: vendorName,
+            leg_number: nextLegNumber,
+            expected_qty: 1,
+            expected_date: expectedDate,
+            actual_date: actualDate,
+            tracking_number: shipment.tracking_number,
+            carrier_name: shipment.carrier_name ?? null,
+            notes: "auto from tracking evidence",
+            updated_at: now,
+        });
+    } catch (err: any) {
+        console.warn(`[shipment-intelligence] syncShipmentLegForPO ${poNumber} failed: ${err.message}`);
+    }
+}
+
 export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promise<ShipmentRecord | null> {
     // ── Phase 1: Write to local SQLite cache FIRST ──
     // This ensures tracking data survives even if PostgREST is unavailable.
@@ -906,9 +1075,17 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
         throw new Error(`Shipment upsert failed: ${error.message}`);
     }
 
-    if (data && input.poNumber && classifyShipmentEvidence(data as ShipmentRecord).level === "confirmed") {
+    if (data && input.poNumber) {
+        // Write purchase_orders.tracking_numbers + po_shipment_legs join rows for
+        // every PO-linked shipment — plain email_ingest evidence included. The
+        // lifecycle sync stays gated on "confirmed" so candidate links don't
+        // advance PO state, but tracking intel must not wait for confirmation.
         await syncLegacyPurchaseOrderTracking(input.poNumber);
-        await syncPOLifecycleFromShipment(input.poNumber, data as ShipmentRecord);
+        await syncShipmentLegForPO(input.poNumber, data as ShipmentRecord);
+
+        if (classifyShipmentEvidence(data as ShipmentRecord).level === "confirmed") {
+            await syncPOLifecycleFromShipment(input.poNumber, data as ShipmentRecord);
+        }
     }
 
     return data as ShipmentRecord;
@@ -1147,4 +1324,129 @@ export async function getBestTrackingAnswerForQuery(query: string): Promise<Best
         shipments,
         now: new Date().toISOString(),
     });
+}
+
+// ──────────────────────────────────────────────────
+// OPEN-PO TRACKING COVERAGE (gap surface)
+// ──────────────────────────────────────────────────
+
+export interface OpenPOTrackingGap {
+    poNumber: string;
+    vendorName: string | null;
+    status: string | null;
+    sentAt: string | null;
+    acknowledgedAt: string | null;
+    daysSinceSent: number | null;
+    /** True when a tracking request has been sent to the vendor (tracking_requested_at). */
+    trackingRequested: boolean;
+    /** True when the vendor has been flagged no-track (tracking_unavailable_at). */
+    noTrackFlagged: boolean;
+    shipmentEvidenceCount: number;
+    trackingNumberCount: number;
+}
+
+export interface OpenPOTrackingCoverage {
+    totalOpen: number;
+    withTrackingIntel: number;
+    withoutTracking: OpenPOTrackingGap[];
+    coveragePct: number;
+    asOf: string;
+}
+
+/**
+ * List open POs that have NO shipment intel — no tracking numbers on the PO,
+ * no shipment rows linked, no legs. This is the "gaps are visible" surface
+ * for the dashboard (Phase 2.2): a PO with any of those signals counts as
+ * covered; everything else is an explicit gap Bill can chase or flag no-track.
+ *
+ * Best-effort: returns an empty coverage record when the DB is unavailable.
+ */
+export async function getOpenPOTrackingCoverage(
+    limit = 200,
+): Promise<OpenPOTrackingCoverage> {
+    const db = createClient();
+    if (!db) {
+        return { totalOpen: 0, withTrackingIntel: 0, withoutTracking: [], coveragePct: 0, asOf: new Date().toISOString() };
+    }
+
+    try {
+        const { data: openPOs } = await db
+            .from("purchase_orders")
+            .select(
+                "po_number, vendor_name, status, po_sent_verified_at, vendor_acknowledged_at, " +
+                "tracking_numbers, tracking_requested_at, tracking_unavailable_at",
+            )
+            .eq("status", "open")
+            .limit(limit);
+
+        const pos = (openPOs || []) as any[];
+        const poNumbers = pos.map((p) => p.po_number);
+
+        // One query for all shipment links (shipments.po_numbers overlap).
+        const shipmentRows = poNumbers.length > 0
+            ? await listShipmentsForPurchaseOrders(poNumbers)
+            : [];
+
+        const shipmentsByPO = new Map<string, number>();
+        for (const s of shipmentRows) {
+            for (const po of (s.po_numbers || []) as string[]) {
+                shipmentsByPO.set(po, (shipmentsByPO.get(po) ?? 0) + 1);
+            }
+        }
+
+        const now = new Date();
+        const withoutTracking: OpenPOTrackingGap[] = [];
+        let withTrackingIntel = 0;
+
+        for (const po of pos) {
+            const trackingNumbers: string[] = Array.isArray(po.tracking_numbers) ? po.tracking_numbers : [];
+            const shipmentCount = shipmentsByPO.get(po.po_number) ?? 0;
+            const noTrackFlagged = Boolean(po.tracking_unavailable_at);
+            // KAIZEN(2026-08-12, t_1cb3c67c): a PO whose vendor has been flagged
+            // no-track (tracking_unavailable_at) counts as COVERED — the plan's
+            // acceptance is "tracking coverage ≥40% OR explicit vendor no-track
+            // flag". Without this, flagging a vendor made the gap list grow
+            // forever instead of resolving the PO.
+            const hasIntel = trackingNumbers.length > 0 || shipmentCount > 0 || noTrackFlagged;
+            if (hasIntel) {
+                withTrackingIntel++;
+                continue;
+            }
+
+            const sentAt = po.po_sent_verified_at ?? null;
+            const daysSinceSent = sentAt
+                ? Math.max(0, Math.floor((now.getTime() - new Date(sentAt).getTime()) / 86_400_000))
+                : null;
+
+            withoutTracking.push({
+                poNumber: po.po_number,
+                vendorName: po.vendor_name ?? null,
+                status: po.status ?? null,
+                sentAt,
+                acknowledgedAt: po.vendor_acknowledged_at ?? null,
+                daysSinceSent,
+                trackingRequested: Boolean(po.tracking_requested_at),
+                noTrackFlagged: Boolean(po.tracking_unavailable_at),
+                shipmentEvidenceCount: shipmentCount,
+                trackingNumberCount: trackingNumbers.length,
+            });
+        }
+
+        const totalOpen = pos.length;
+        const coveragePct = totalOpen > 0 ? Math.round((withTrackingIntel / totalOpen) * 100) : 0;
+
+        // Oldest gaps first — the ones that have been silent the longest.
+        withoutTracking.sort((a, b) => (b.daysSinceSent ?? -1) - (a.daysSinceSent ?? -1));
+
+        return {
+            totalOpen,
+            withTrackingIntel,
+            withoutTracking: withoutTracking.slice(0, limit),
+            coveragePct,
+            asOf: now.toISOString(),
+        };
+    } catch (err: any) {
+        console.warn(`[shipment-intelligence] getOpenPOTrackingCoverage failed: ${err.message}`);
+        return { totalOpen: 0, withTrackingIntel: 0, withoutTracking: [], coveragePct: 0, asOf: new Date().toISOString() };
+    }
 }

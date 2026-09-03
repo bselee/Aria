@@ -25,6 +25,27 @@ const BAD_SENTINELS = new Set([
     "—",
 ]);
 
+/**
+ * Is a string plausibly a real invoice number?
+ *
+ * Rejects pure-alpha OCR junk like "oice", "Reminder", "From", "Invoice",
+ * "INVOICE", "Statement", "Attachments" — these are subject tokens or
+ * truncated labels, not invoice numbers. A real invoice number almost always
+ * contains at least one digit, or matches a vendor alphanumeric format
+ * (e.g. APUS-244677, S4O551, 928882, MA-P-M2162, Invoice124424).
+ */
+export function isInvoiceLikeNumber(value: string | null | undefined): boolean {
+    const t = cleanInvoiceField(value);
+    if (!t) return false;
+    if (BAD_SENTINELS.has(t.toLowerCase())) return false;
+    // Pure alpha with spaces (e.g. "Invoice", "From", "Reminder", "Payment",
+    // "Attachments") is never an invoice number.
+    if (/^[a-zA-Z][a-zA-Z -]{1,30}$/.test(t)) return false;
+    // Must contain a digit OR be a known vendor prefix format (APUS-123, S-123).
+    if (/\d/.test(t)) return true;
+    return /^[A-Za-z]{2,6}-\d/.test(t) || /^[A-Za-z]{2,6}\d{3,}/.test(t);
+}
+
 /** Treat model/schema sentinels as missing. */
 export function cleanInvoiceField(value: string | null | undefined): string | null {
     if (value == null) return null;
@@ -32,6 +53,31 @@ export function cleanInvoiceField(value: string | null | undefined): string | nu
     if (!t) return null;
     if (BAD_SENTINELS.has(t.toLowerCase())) return null;
     return t;
+}
+
+export type ExtractionQuality = "complete" | "partial" | "failed";
+
+/**
+ * Gate a normalized invoice record's extraction quality BEFORE it is written.
+ *
+ * failed:  total=0 AND (invoice_number missing OR not invoice-like) — OCR
+ *          garbage, reminders, or statements mis-classified as invoices.
+ *          These rows must never be marked reconciled (DB CHECK enforces).
+ * complete: total>0 AND invoice_number is invoice-like.
+ * partial:  anything else (some usable fields, but not a clean full invoice).
+ */
+export function computeExtractionQuality(args: {
+    total: number;
+    invoiceNumber: string | null | undefined;
+}): ExtractionQuality {
+    const total = Number(args.total) || 0;
+    if (total === 0 && !isInvoiceLikeNumber(args.invoiceNumber)) {
+        return "failed";
+    }
+    if (total > 0 && isInvoiceLikeNumber(args.invoiceNumber)) {
+        return "complete";
+    }
+    return "partial";
 }
 
 /**
@@ -54,15 +100,21 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
 
     // INVOICE # 1682  /  Invoice No. 1682  /  Invoice Number:\n1682
     // DTE paper layout: "INVOICE #\n4/24/2026\n1682" — date then number.
+    // ALOECORP layout: "Document Number\n3327" (2026-08-27) — label first,
+    // number on its own line. Prefer explicit labels over bare-number guesswork.
     const invPatterns = [
         /INVOICE\s*#\s*\n\s*\d{1,2}\/\d{1,2}\/\d{2,4}\s*\n\s*([0-9]{3,8})\b/i,
-        /INVOICE\s*(?:NO|NUM|NUMBER)\.?\s*[:.]?\s*([A-Z0-9][A-Z0-9\-\/]{1,20})/i,
-        /INVOICE\s*#\s*[:.]?\s*([A-Z0-9][A-Z0-9\-\/]{1,20})/i,
+        /INVOICE\s*(?:NO|NUM|NUMBER)\s*[:.]?\s*([A-Z0-9][A-Z0-9\-/]{1,20})/i,
+        /INVOICE\s*#\s*[:.]?\s*([A-Z0-9][A-Z0-9\-/]{1,20})/i,
+        /DOCUMENT\s+NUMBER\s*[:.]?\s*([A-Z0-9][A-Z0-9\-/]{1,20})/i,
+        /INVOICE\s*NUMBER\s*[:.]?\s*([A-Z0-9][A-Z0-9\-/]{1,20})/i,
         /\bINV[#\s\-]*([0-9]{3,8})\b/i,
     ];
     for (const re of invPatterns) {
         const m = text.match(re);
-        if (m?.[1] && !/^unknown$/i.test(m[1]) && !looksLikeDate(m[1])) {
+        // Guard: never accept bare header words ("Invoice #Order" jammed by
+        // OCR table headers) as the invoice number (2026-08-27).
+        if (m?.[1] && !/^unknown$/i.test(m[1]) && !looksLikeDate(m[1]) && !/^(order|number|no|num|date|total|page|ship|due|paid|cust)$/i.test(m[1].trim())) {
             invoiceNumber = m[1].trim();
             break;
         }
@@ -78,10 +130,14 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         }
     }
 
-    // PO: dedicated field or bare 5–6 digit Finale-style after P.O. NUMBER
+    // PO: dedicated field or bare 5–6 digit Finale-style after P.O. NUMBER.
+    // ALOECORP layout (2026-08-27): "Customer PO Number\n125212" — the label
+    // ends with "PO Number" and the number is on the next line. Also match
+    // bare 12xxxx lines (Finale PO prefix) as a last resort.
     const poPatterns = [
         /P\.?\s*O\.?\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(\d{4,6})\b/i,
         /PURCHASE\s+ORDER\s*#?\s*[:#\-]?\s*(\d{4,6})\b/i,
+        /CUSTOMER\s+PO\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(\d{4,6})\b/i,
         /(?:^|\n)\s*#?(12\d{3,4})\b/, // Finale POs often 12xxxx
     ];
     for (const re of poPatterns) {
@@ -92,11 +148,35 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         }
     }
 
-    // Total: $7,875.00 / Total\n$7,875.00 / AMOUNT DUE
+    // Table-header layout (Novelty 2026-08-27): "DateInvoice #Order #Purchase
+    // Order #Cust IDTerms" label row with the PO value in the ROW BELOW
+    // ("08/26/26 41131538 475749 125172 BUI001") — the inline patterns above
+    // can't see across the newline. BAS POs are 6-digit 12xxxx. Require the
+    // invoice date on the same line so line-item quantities (120,000+ units)
+    // can't win. The lookahead stays on one line (no claims-paragraph
+    // swallowing).
+    if (!poNumber) {
+        const header = text.match(/(?:PURCHASE\s+ORDER\s*#|P\.?\s*O\.?\s*#|PO\s*#)[^\n]{0,80}/i);
+        if (header) {
+            const after = text.slice((header.index ?? 0) + header[0].length);
+            const line = after
+                .split("\n")
+                .find((l) => /\b12\d{4}\b/.test(l) && /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(l));
+            const tok = line?.match(/\b(12\d{4})\b/);
+            if (tok?.[1]) poNumber = tok[1];
+        }
+    }
+
+    // Total: $7,875.00 / Total\n$7,875.00 / AMOUNT DUE.
+    // ALOECORP layout (2026-08-27): "Total Amount: 3,960.00 $" — the dollar
+    // sign trails the number. Accept $ on either side; prefer labeled totals
+    // ("Total Amount", "Grand Total", "Total Due") over bare "TOTAL" which can
+    // hit "Total Tax Amount: 0.00" or a line-item column header first.
     const totalPatterns = [
-        /\bTOTAL\s*[:.]?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/i,
-        /AMOUNT\s+DUE\s*[:.]?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/i,
-        /\$\s*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})\s*(?:$|\n)/,
+        /(?:GRAND\s+TOTAL|TOTAL\s+AMOUNT|TOTAL\s+DUE|INVOICE\s+TOTAL)\s*[:.]?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\s*\$?/i,
+        /\bTOTAL\b\s*[:.]?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\s*\$?/i,
+        /AMOUNT\s+DUE\s*[:.]?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\s*\$?/i,
+        /\$?\s*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})\s*\$?(?:$|\n)/,
     ];
     for (const re of totalPatterns) {
         const m = text.match(re);
@@ -107,16 +187,26 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         }
     }
 
-    // Date near INVOICE / DATE
+    // Date near INVOICE / DATE.
+    // ALOECORP layout (2026-08-27): "Invoice DatePage" then the date appears
+    // later in the jumbled column text ("08/21/2026" on its own line), and
+    // "Due Date\n09/20/2026" appears too. NEVER let "Due Date" win the
+    // invoice-date slot — reject any date whose label is Due/Paid/Expiry.
     const datePatterns = [
         /(?:INVOICE\s*)?DATE\s*[:.]?\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i,
-        /\b(\d{1,2}\/\d{1,2}\/202\d)\b/,
-        /\b(202\d-\d{2}-\d{2})\b/,
+        /\b(?:202\d|20\d{2})-(\d{2})-(\d{2})\b/,
+        /\b(\d{1,2})\/(\d{1,2})\/(202\d)\b/,
     ];
     for (const re of datePatterns) {
         const m = text.match(re);
         if (m?.[1]) {
-            invoiceDate = normalizeLooseDate(m[1]);
+            // Never use a Due/Paid/Expiry date as the invoice date
+            const before = text.slice(Math.max(0, (m.index ?? 0) - 60), m.index ?? 0);
+            if (/(due|paid|expiry|expires)\s*$/i.test(before)) continue;
+            const mm = String(m[1]).padStart(2, "0");
+            const dd = String(m[2]).padStart(2, "0");
+            const candidate = m[3] ? `${m[3]}-${mm}-${dd}` : m[1];
+            invoiceDate = normalizeLooseDate(candidate);
             if (invoiceDate) break;
         }
     }
@@ -163,11 +253,43 @@ export function normalizeInvoiceForDb(
     lineItems: Array<{ sku: string; description: string; qty: number; unit_price: number; ext_price: number }>;
 } {
     const fb = extractInvoiceFieldsFromOcrText(rawText);
-    const inv = cleanInvoiceField(parsed?.invoiceNumber ?? null) || fb.invoiceNumber;
-    const po = cleanInvoiceField(parsed?.poNumber ?? null) || fb.poNumber;
-    let total = Number(parsed?.total) || 0;
-    if (!total && fb.total) total = fb.total;
-    let invoiceDate = cleanInvoiceField(parsed?.invoiceDate ?? null) || fb.invoiceDate;
+    // FIX(2026-08-12, t_3d2c50e0): also reject non-invoice-like numbers
+    // ("oice", "Reminder", "From", "Invoice" — truncated subject tokens the LLM
+    // sometimes emits as invoiceNumber). These poisoned vendor_invoices with
+    // garbage invoice numbers and total=0 rows. If the value isn't
+    // invoice-like, treat it as missing (null) — extraction_quality will be
+    // 'failed' and the row can never be reconciled.
+    const rawInv = cleanInvoiceField(parsed?.invoiceNumber ?? null) || fb.invoiceNumber;
+    // Regex wins when it found an explicitly-labeled number (INVOICE #,
+    // DOCUMENT NUMBER) — the LLM can hallucinate a plausible-but-wrong number.
+    const inv = fb.invoiceNumber && isInvoiceLikeNumber(fb.invoiceNumber)
+        ? fb.invoiceNumber
+        : isInvoiceLikeNumber(rawInv) ? rawInv : null;
+
+    // ── PRECEDENCE (2026-08-27, PO 125212 / Aloe Corp 3327) ────────────────
+    // The LLM is NON-DETERMINISTIC: the same clean PDF produced different
+    // garbage across runs — poNumber="C0000275" (the CUSTOMER NUMBER, not the
+    // PO), total=0, invoiceDate=today. Deterministic regex anchored to
+    // explicit labels ("Total Amount:", "Customer PO Number") is the source of
+    // truth for money/identity fields; the LLM only FILLS GAPS.
+    const llmPo = cleanInvoiceField(parsed?.poNumber ?? null);
+    const llmTotal = Number(parsed?.total) || 0;
+    const llmDate = cleanInvoiceField(parsed?.invoiceDate ?? null);
+
+    // PO: regex wins when it found a Finale-style 5-6 digit number (12xxxx).
+    // LLM "C0000275" is an account/customer number, not a PO.
+    const po = fb.poNumber && /^\d{5,6}$/.test(fb.poNumber)
+        ? fb.poNumber
+        : llmPo || fb.poNumber;
+
+    // Total: regex wins when anchored to a labeled total; the LLM returning 0
+    // for "$3,960.00 Total Amount:" is a hallucination, not a zero invoice.
+    const total = fb.total && fb.total > 0 ? fb.total : llmTotal;
+
+    // Date: regex wins (Due Date now excluded); the LLM hallucinating
+    // "today" for an invoice dated 8/21 is worse than missing.
+    const invoiceDate = fb.invoiceDate || llmDate;
+
     let vendorName =
         cleanInvoiceField(parsed?.vendorName ?? null) ||
         opts?.vendorHint ||

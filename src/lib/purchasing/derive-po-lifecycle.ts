@@ -83,11 +83,9 @@ export function derivePOLifecycleState(po: POInput): POLifecycleResult {
 }
 
 export const FOLLOW_UP_TEMPLATES_L1 = [
-    "Hi,\n\nFollowing up on PO #{po} sent {date}. Do you have an expected ship date or tracking?\n\nThanks!",
-    "Hi,\n\nChecking in on PO #{po} — any update on tracking or estimated arrival?\n\nThanks!",
-    "Hi,\n\nJust wanted to check on PO #{po} sent {date}. Tracking or ETA would be great!\n\nThanks!",
-    "Hi,\n\nFollowing up on our PO #{po}. Do you have shipping info or an ETA?\n\nThanks!",
-    "Hi,\n\nPO #{po} from {date} — do you have tracking or ship date?\n\nThanks!",
+    "Hi,\n\nJust making sure you received PO #{po} sent {date}.\n\nCould you confirm receipt when you get a chance?\n\nThanks!",
+    "Hi,\n\nQuick check: did PO #{po} from {date} come through OK?\n\nThanks!",
+    "Hi,\n\nMaking sure PO #{po} made it to you. Can you confirm receipt?\n\nThanks!",
 ] as const;
 
 export const FOLLOW_UP_TEMPLATES_L2 = [

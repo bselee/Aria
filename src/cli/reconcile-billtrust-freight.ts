@@ -87,11 +87,15 @@ async function applyFreightToPo(
     if (zeroFreightIdx >= 0 && adjustments.length === 1) {
         adjustments[zeroFreightIdx] = replacement;
     } else if (!isMultiDelivery) {
-        const nonFreight = adjustments.filter(
-            (a) => !(a.productPromoUrl ?? "").includes("/10007"),
+        // Single-delivery: remove existing REAL freight lines, but keep
+        // house/service charges (Uline $1.50) and non-freight adjustments.
+        const keep = adjustments.filter(
+            (a) =>
+                !(a.productPromoUrl ?? "").includes("/10007") ||
+                Number(a.amount) <= HOUSE_CHARGE_THRESHOLD,
         );
         adjustments.length = 0;
-        adjustments.push(...nonFreight, replacement);
+        adjustments.push(...keep, replacement);
     } else {
         adjustments.push(replacement);
     }
@@ -113,8 +117,10 @@ function freightAlreadyPresent(
     opts: { bol?: string; invoiceNumber?: string; isMulti: boolean },
 ): boolean {
     const adjustments = po.orderAdjustmentList ?? [];
-    const freight = adjustments.filter((a) =>
-        (a.productPromoUrl ?? "").includes("/10007"),
+    const freight = adjustments.filter(
+        (a) =>
+            (a.productPromoUrl ?? "").includes("/10007") &&
+            Number(a.amount) > HOUSE_CHARGE_THRESHOLD,
     );
     if (freight.length === 0) return false;
     const needles = [opts.bol, opts.invoiceNumber].filter(Boolean).map((s) => String(s).toLowerCase());
@@ -131,6 +137,11 @@ function freightAlreadyPresent(
     }
     return false;
 }
+
+// Uline house charge is $1.50 — NOT freight. Anything ≤ this threshold is a
+// service charge, not carrier freight. The reconciler ignores it (never
+// counts as "already has freight", never removes it).
+const HOUSE_CHARGE_THRESHOLD = 2.5;
 
 // ── CSV types ────────────────────────────────────────────────────────────────
 
@@ -346,6 +357,7 @@ function extractFinalePoFromRef(poNumberStr: string): string | null {
 async function matchToFinalePOs(
     invoices: BilltrustInvoice[],
     recentPOs: FullPO[],
+    finaleVerify?: FinaleWriteSurface,
 ): Promise<FreightApplyResult[]> {
     const results: FreightApplyResult[] = [];
 
@@ -380,6 +392,25 @@ async function matchToFinalePOs(
                 base.wouldApply = true;
                 results.push(base);
                 continue;
+            }
+            // Fallback: PO# may be older than the 500-PO fetch window — verify directly
+            if (finaleVerify && /^\d{6}$/.test(poFromRef)) {
+                try {
+                    const direct = await finaleVerify.getOrderDetails(poFromRef);
+                    if (direct?.orderId) {
+                        base.finalePoId = poFromRef;
+                        base.matchSource = "po_ref";
+                        base.confidence = "high";
+                        base.confidenceReasons.push(
+                            `PO# ${poFromRef} verified directly in Finale (outside 500-PO window)`,
+                        );
+                        base.wouldApply = true;
+                        results.push(base);
+                        continue;
+                    }
+                } catch {
+                    // PO# doesn't exist — fall through to vendor window
+                }
             }
         }
 
@@ -435,7 +466,12 @@ async function matchToFinalePOs(
         }
 
         // 3. Vendor + date window match (issueDate often empty; fall back to orderDate)
-        if (inv.vendorName) {
+        // GUARD: Uline PO# fields like "9226398101-646135168" are freight-bill
+        // numbers, NOT Finale PO references. Never vendor-window match Uline on
+        // these — wrong-PO risk is high (multiple Uline POs same window).
+        const isAccountCompositePo = /-\d{9}$/.test(inv.poNumber.trim());
+        const skipVendorWindow = inv.vendorName === "Uline" && isAccountCompositePo;
+        if (inv.vendorName && !skipVendorWindow) {
             const vendorKey = inv.vendorName.split(" ")[0].toLowerCase();
             const vendorPOs = recentPOs.filter((p) => {
                 const name = (p.vendorName || "").toLowerCase();
@@ -553,7 +589,7 @@ async function main() {
     console.log(`POs: ${recentPOs.length} (365d)\n`);
 
     // Match
-    const results = await matchToFinalePOs(invoices, recentPOs);
+    const results = await matchToFinalePOs(invoices, recentPOs, finale);
 
     // Pre-apply freight-already gate for HIGH candidates (read-only GET)
     for (const r of results) {

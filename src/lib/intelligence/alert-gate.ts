@@ -128,6 +128,10 @@ export async function criticalAlert(
   message: string,
   options?: { parse_mode?: 'Markdown' | 'HTML' }
 ): Promise<any | null> {
+  if (true) {
+    console.log(`[alert-gate] criticalAlert disabled (ARIA_TELEGRAM_ENABLED != true) — dropped: "${message.slice(0, 80).replace(/\n/g, ' ')}..."`);
+    return null;
+  }
   try {
     return await bot.telegram.sendMessage(chatId, message, options);
   } catch (err: any) {

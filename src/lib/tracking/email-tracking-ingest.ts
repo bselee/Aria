@@ -2,7 +2,7 @@
  * @file    src/lib/tracking/email-tracking-ingest.ts
  * @purpose Scans Gmail (both main + AP inbox) for vendor shipping confirmations,
  *          extracts tracking numbers + PO numbers, detects carrier, and upserts
- *          to the shipments table so the dashboard, carrier-poll, and Slack
+ *          to the shipments table so the dashboard and carrier-poll can
  *          detector can all surface tracking status.
  *
  *          Solves the "manual tracking insert" workflow: vendor emails a tracking
@@ -31,6 +31,9 @@ import {
     extractTrackingNumbers,
 } from "@/lib/carriers/tracking-service";
 import * as shipmentIntelligence from '@/lib/tracking/shipment-intelligence';
+import { matchTrackingToPo } from "./tracking-po-match";
+import { learnVendorCarrierCounts } from "./vendor-carrier";
+import { leadTimeService } from "@/lib/builds/lead-time-service";
 import { extractBolText } from "./bol-ocr";
 import { createClient } from "@/lib/db";
 import { sendTelegramNotify } from "@/lib/intelligence/telegram-notify";
@@ -74,6 +77,18 @@ const SKIP_SENDER_DOMAINS: Set<string> = new Set([
     "plutonian.io",
     "info.printful.com",
     "dlwholesale.com",
+    // Carrier billing invoices — these contain tracking numbers for OUTBOUND
+    // shipments (BAS → customer), not inbound vendor shipments. The tracking
+    // numbers are FedEx/UPS's own billing line items, not vendor POs.
+    // HERMIA(2026-08-26): 947 unlinked FedEx shipments traced to a single
+    // FedEx Billing Online invoice email (noreply@fedex.com). These pollute
+    // the tracking board with outbound data that has no PO to match.
+    "noreply@fedex.com",
+    "fedex.com",
+    "billing@fedex.com",
+    "noreply@ups.com",
+    "ups.com",
+    "billing@ups.com",
 ]);
 
 /** Max emails to process per account per run. */
@@ -363,14 +378,122 @@ async function processMessage(
                 const recentCutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
                 const { data: recentPOs } = await db
                     .from("purchase_orders")
-                    .select("po_number, vendor_name, created_at")
+                    .select("po_number, vendor_name, created_at, lifecycle_state")
                     .gte("created_at", recentCutoff)
                     .limit(200);
 
-                inferredPO = inferPONumberFromRecentPOs(
-                    { subject, bodySnippet: body, fromEmail },
-                    (recentPOs || []) as RecentPurchaseOrder[],
-                );
+                // Fallback 1: tracking number already in vendor_invoices or purchase_orders.
+                // This is the strongest signal — if an invoice/PO already has this tracking
+                // number, it belongs to that PO. Checks the normalized number (strips carrier prefix).
+                for (const hit of extracted) {
+                    if (inferredPO) break;
+                    const rawNum = hit.trackingNumber;
+                    const normalized = rawNum.includes(":::") ? rawNum.split(":::")[1].trim() : rawNum;
+                    if (!normalized || normalized.length < 8) continue;
+
+                    // Check vendor_invoices
+                    try {
+                        const { data: invMatch } = await db
+                            .from("vendor_invoices")
+                            .select("po_number")
+                            .not("po_number", "is", null)
+                            .or(`tracking_numbers.cs.{${normalized}},tracking_numbers.cs.{"${normalized}"}`)
+                            .limit(1);
+                        if (invMatch && invMatch.length > 0 && invMatch[0].po_number) {
+                            inferredPO = invMatch[0].po_number;
+                            console.log(`[email-tracking-ingest] Matched tracking ${normalized} → PO ${inferredPO} via vendor_invoices`);
+                            break;
+                        }
+                    } catch { /* non-fatal */ }
+
+                    // Check purchase_orders
+                    try {
+                        const { data: poMatch } = await db
+                            .from("purchase_orders")
+                            .select("po_number")
+                            .or(`tracking_numbers.cs.{${normalized}},tracking_numbers.cs.{"${normalized}"}`)
+                            .limit(1);
+                        if (poMatch && poMatch.length > 0 && poMatch[0].po_number) {
+                            inferredPO = poMatch[0].po_number;
+                            console.log(`[email-tracking-ingest] Matched tracking ${normalized} → PO ${inferredPO} via purchase_orders`);
+                            break;
+                        }
+                    } catch { /* non-fatal */ }
+                }
+
+                // Fallback 2: exact numeric PO hint (highest precision).
+                if (!inferredPO) {
+                    inferredPO = inferPONumberFromRecentPOs(
+                        { subject, bodySnippet: body, fromEmail },
+                        (recentPOs || []) as RecentPurchaseOrder[],
+                    );
+                }
+
+                // Fallback 3: vendor + carrier + open-PO matching. Carrier-aware
+                // (Rootwise ships FedEx ⇒ Oak Harbor can't be Rootwise), open-only,
+                // and date-window disambiguated by vendor lead time — replaces the
+                // old vendor-token guessing that piled 567 shipments onto PO 125178.
+                if (!inferredPO) {
+                    const shipmentCarrier =
+                        textCarrier ||
+                        (extracted.length > 0
+                            ? detectCarrier(extracted[0].trackingNumber)
+                            : null);
+
+                    // Learned vendor→carrier map (self-improving, from PO tracking).
+                    const vendorCarriers = await learnVendorCarrierCounts(db);
+
+                    // Vendor lead times for date-window disambiguation.
+                    let leadTimeDays: Map<string, number> | null = null;
+                    try {
+                        await leadTimeService.warmCache();
+                        leadTimeDays = new Map();
+                        for (const po of (recentPOs || [])) {
+                            if (!po.vendor_name) continue;
+                            const key = po.vendor_name.trim().toLowerCase();
+                            if (leadTimeDays.has(key)) continue;
+                            const lt = await leadTimeService.getForVendor(po.vendor_name);
+                            leadTimeDays.set(key, lt.days);
+                        }
+                    } catch (err: any) {
+                        console.warn(`[email-tracking-ingest] lead-time warm failed: ${err.message}`);
+                        leadTimeDays = null;
+                    }
+
+                    inferredPO = matchTrackingToPo({
+                        text: `${fullText}\n${from}\n${fromEmail}`,
+                        carrier: shipmentCarrier,
+                        recentPOs: (recentPOs || []) as Array<{
+                            po_number: string;
+                            vendor_name?: string | null;
+                            created_at?: string | null;
+                            lifecycle_state?: string | null;
+                        }>,
+                        learnedCarriers: vendorCarriers,
+                        leadTimeDays,
+                    });
+                }
+
+                if (inferredPO) {
+                    // Per-PO cap: don't let a single PO accumulate a magnet
+                    // of inferred-only shipments. After 10 inferred links,
+                    // store tracking numbers unlinked so they don't poison
+                    // the PO's shipment count. (P0 fix: PO 125178 / 567 rows)
+                    const { data: capData } = await db
+                        .from("shipments")
+                        .select("id")
+                        .overlap("po_numbers", [inferredPO])
+                        .eq("last_source", "email_ingest_inferred");
+                    const inferredCount = (capData || []).length;
+
+                    if (inferredCount >= 10) {
+                        console.log(
+                            `[email-tracking-ingest] Skipping inferred PO #${inferredPO} — ` +
+                            `already has ${inferredCount} inferred shipments (cap=10)`,
+                        );
+                        inferredPO = null;
+                    }
+                }
 
                 if (inferredPO) {
                     console.log(
@@ -497,7 +620,7 @@ async function extractPdfAttachmentText(
 
     let pdfParse: any;
     try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
+         
         pdfParse = (await import("pdf-parse")).default || (await import("pdf-parse"));
     } catch {
         console.warn("[email-tracking-ingest] pdf-parse unavailable — skipping PDF OCR");
@@ -624,7 +747,7 @@ function htmlToPlainText(html: string): string {
 
 /**
  * Extract PO numbers from text. Reuses the same patterns as
- * po-correlator / Slack request-detector. Handles:
+ * po-correlator. Handles:
  *   "PO #124833", "PO-124833", "PO 124833", "order 124833",
  *   "71473626-1124833" (Finale vendor-ref format)
  */
@@ -657,23 +780,13 @@ function extractPONumbersFromText(text: string): string[] {
     return Array.from(seen);
 }
 
-// ── PO Inference Helpers (ported from src/lib/intelligence/tracking-agent.ts) ──
+// ── PO Inference Helpers ──
 //
 // These functions implement a fallback-correlation algorithm for linking
 // carrier auto-notification emails (FedEx/UPS/USPS) to purchase orders when
-// the email text contains no explicit PO number reference. The algorithm scores
-// candidate POs by (a) direct numeric-hint substring match, (b) vendor-name
-// token overlap between the email text and each PO's vendor_name, and
-// (c) tie-breaking by excluding dropship POs when there are multiple matches
-// at the same score.
-//
-// Ported from inferPONumberFromRecentPOs() in tracking-agent.ts — that file's
-// TrackingAgent class is dead code (instantiated in ops-manager.ts but never
-// invoked); this fallback logic was working and unused, so it's ported here
-// into the live ingestion path rather than reinvented. See
-// docs/dashboard-design-audit.md section "P0-4" for the full diagnosis
-// (55% of shipment rows were orphaned from any PO before this fix) and
-// backlog item 24/25 for follow-up (dead TrackingAgent cleanup).
+// the email text contains no explicit PO number reference. The algorithm
+// matches a numeric hint in the email against known PO numbers (exact match
+// only — vendor-name token scoring was removed due to the PO 125178 magnet).
 
 type RecentPurchaseOrder = {
     po_number: string;
@@ -681,40 +794,22 @@ type RecentPurchaseOrder = {
     created_at?: string | null;
 };
 
-const VENDOR_NAME_STOP_WORDS = new Set([
-    "inc", "llc", "ltd", "co", "company", "corp", "corporation",
-    "usa", "the", "and",
-]);
-
-function normalizeComparisonText(value: string | null | undefined): string {
-    return String(value || "")
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function vendorNameTokens(vendorName: string | null | undefined): string[] {
-    return normalizeComparisonText(vendorName)
-        .split(" ")
-        .filter((token) => token.length >= 3 && !VENDOR_NAME_STOP_WORDS.has(token));
-}
-
 function extractNumericHints(text: string): string[] {
     return Array.from(new Set((text.match(/\b\d{6,}\b/g) || []).map((value) => value.trim())));
 }
 
 /**
- * Attempt to infer the PO number for a carrier notification email by scoring
- * recent purchase orders against the email's subject, body, and sender address.
- * Returns the best-matching PO number or null if no confident match exists.
+ * Attempt to infer the PO number for a carrier notification email by matching
+ * a numeric hint in the email against known PO numbers. Returns the PO number
+ * only when a numeric hint EXACTLY matches exactly one PO number.
  *
- * Scoring logic:
- * 1. Direct numeric-hint match against po_number (returns immediately if
- *    exactly one candidate matches).
- * 2. Vendor-name token overlap: full vendor name substring match scores +10,
- *    individual token matches score +1 each.
- * 3. Tie-breaking: excludes dropship POs when there is ambiguity.
+ * DECISION(2026-08-25): Vendor-name token-overlap scoring was REMOVED. It
+ * produced the PO 125178 magnet — vendor "Rootwise Soil Dynamics" contains the
+ * token "soil", and nearly every BuildASoil carrier email (ship-to address,
+ * signature, product lines) contains "soil"/"BuildASoil", so 567 shipments
+ * across FedEx/UPS/Oak Harbor/pro were all guessed onto that one PO. A single
+ * PO cannot ship hundreds of times across six carriers. Guessing from
+ * vendor-name tokens is net-negative; only exact numeric PO matches are kept.
  *
  * @exportedForTesting — exported so unit tests can exercise the pure
  * inference logic without mocking Gmail/Postgres.
@@ -729,44 +824,24 @@ export function inferPONumberFromRecentPOs(
     const bodySnippet = String(message.bodySnippet || "");
     const fromEmail = String(message.fromEmail || "");
     const combinedText = `${subject}\n${bodySnippet}\n${fromEmail}`;
-    const normalizedCombined = normalizeComparisonText(combinedText);
     const numericHints = extractNumericHints(combinedText);
 
-    // Step 1: Direct numeric-hint match against po_number
-    const directOrderMatch = recentPOs.filter((po) =>
-        numericHints.some((hint) => String(po.po_number || "").toLowerCase().startsWith(hint.toLowerCase()))
+    // DECISION(2026-08-25): Vendor-name token-overlap inference is REMOVED.
+    // It produced the PO 125178 magnet — 567 tracking links across FedEx/UPS/
+    // Oak Harbor/pro all guessed onto a single Rootwise PO (impossible: one PO
+    // can't ship hundreds of times across six carriers). Guessing a PO from
+    // vendor-name tokens was net-negative (wrong links ≫ useful links).
+    //
+    // Now: only infer when the email contains a number that EXACTLY matches a
+    // known PO number AND exactly one such PO exists. Explicit-PO extraction
+    // (the primary path) is unaffected; this fallback just stops guessing.
+    const exactMatches = recentPOs.filter((po) =>
+        numericHints.some(
+            (hint) => String(po.po_number || "").toLowerCase() === hint.toLowerCase(),
+        ),
     );
-    if (directOrderMatch.length === 1) {
-        return directOrderMatch[0].po_number;
-    }
-
-    // Step 2: Vendor-name token overlap scoring
-    const scored = recentPOs
-        .map((po) => {
-            const tokens = vendorNameTokens(po.vendor_name);
-            if (!tokens.length) return { po, score: 0 };
-
-            const fullVendor = normalizeComparisonText(po.vendor_name);
-            const fullMatch = fullVendor.length >= 5 && normalizedCombined.includes(fullVendor);
-            const tokenMatches = tokens.filter((token) => normalizedCombined.includes(token)).length;
-            return { po, score: (fullMatch ? 10 : 0) + tokenMatches };
-        })
-        .filter((entry) => entry.score > 0)
-        .sort((a, b) => b.score - a.score);
-
-    if (!scored.length) return null;
-
-    // Step 3: Tie-breaking — prefer non-dropship POs
-    const topScore = scored[0].score;
-    const topMatches = scored.filter((entry) => entry.score === topScore).map((entry) => entry.po);
-    const nonDropship = topMatches.filter((po) => !/dropship/i.test(String(po.po_number || "")));
-
-    if (nonDropship.length === 1) {
-        return nonDropship[0].po_number;
-    }
-
-    if (topMatches.length === 1 && numericHints.length === 0) {
-        return topMatches[0].po_number;
+    if (exactMatches.length === 1) {
+        return exactMatches[0].po_number;
     }
 
     return null;

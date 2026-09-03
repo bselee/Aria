@@ -131,7 +131,7 @@ export async function handlePoConfirmSend(ctx: Context, sendId: string): Promise
         const expectedStr = expectedDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
         const link = `https://app.finaleinventory.com/buildasoilorganics/purchaseOrder?orderId=${details.orderId}`;
         await ctx.reply(
-            `🦊 *Slack copy-paste response:*\n` +
+            `🦊 *Copy-paste response:*\n` +
             `\`PO #${details.orderId} committed. Expected arrival: ${expectedStr}. ${link}\``,
             { parse_mode: 'Markdown' }
         );

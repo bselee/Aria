@@ -87,7 +87,7 @@ const SOPsToPublish: SOP[] = [
         steps: [
           "Verify quantities, prices, supplier, location, date.",
           "Under $500: self-approve and commit.",
-          "$500+: send to Ops Manager in Slack for review.",
+          "$500+: send to Ops Manager for review.",
           "Once approved: click Commit. Email PO as PDF to supplier."
         ],
         video: "", image: "", links: []
@@ -96,7 +96,7 @@ const SOPsToPublish: SOP[] = [
         title: "Communicate the Order",
         steps: [
           "Add note in Finale with supplier details.",
-          "If out-of-stock: post PO number and ETA in Slack thread."
+          "If out-of-stock: note PO number and ETA on the order.",
         ],
         video: "", image: "", links: []
       }
@@ -107,7 +107,7 @@ const SOPsToPublish: SOP[] = [
       "Lead time recorded for tracking"
     ],
     crossDept: [
-      "Notify Inventory of urgent POs via Slack",
+      "Notify Inventory of urgent POs",
       "AP uses PO data for invoice matching"
     ],
     related_sops: ["SOP How to Research Purchase Orders in Finale Inventory"],
@@ -155,7 +155,7 @@ const SOPsToPublish: SOP[] = [
         title: "Handle Discrepancies",
         steps: [
           "Shortage: note on packing slip.",
-          "Damage: photograph, notify Purchasing via Slack.",
+          "Damage: photograph, notify Purchasing.",
           "Wrong product: do not receive, contact Purchasing.",
           "Over-shipment: get approval before accepting."
         ],

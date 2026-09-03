@@ -55,6 +55,33 @@ function mean(values: number[]): number | null {
 }
 
 /**
+ * Derive the recommender's safety multiplier from a vendor's calibration
+ * signal. Pure and unit-tested.
+ *
+ *   sample_count <  5  -> 1.0 (no signal yet)
+ *   |median| < 25%      -> 1.0 (within tolerance)
+ *   median < -50%       -> 1.5  (substantial under-ordering — widen 50%)
+ *   median < -25%       -> 1.25 (under-ordering — widen 25%)
+ *   median > +50%       -> 0.75 (substantial over-ordering — tighten 25%)
+ *   median > +25%       -> 0.85 (over-ordering — tighten 15%)
+ *
+ * Uses the MEDIAN, not the mean: the mean is outlier-skewed (e.g. Thrive
+ * median -65% but mean +18.7% from a few huge over-orders), and the robust
+ * central tendency is what must drive self-correction. A vendor genuinely
+ * under-ordering by 65% on half its lines must widen, not sit at 1.0.
+ */
+export function deriveSafetyMultiplier(sampleCount: number, medianErrorPct: number | null): number {
+    if (sampleCount < 5) return 1.0;
+    if (medianErrorPct == null) return 1.0;
+    if (Math.abs(medianErrorPct) < 25) return 1.0;
+    if (medianErrorPct <= -50) return 1.5;
+    if (medianErrorPct <= -25) return 1.25;
+    if (medianErrorPct >= 50) return 0.75;
+    if (medianErrorPct >= 25) return 0.85;
+    return 1.0;
+}
+
+/**
  * Walk recently-received POs, look up the recommendation that drove each line,
  * and stamp `actual_consumed_eaches` + `error_pct`. Idempotent — already-
  * calibrated rows are skipped.
@@ -210,15 +237,12 @@ export async function recomputeVendorCalibrationStats(): Promise<{ vendors: numb
 
         const med = median(errors);
         const avg = mean(errors);
+        // Robust bias for the multiplier decision — median, not mean (see
+        // deriveSafetyMultiplier). bias_pct keeps the mean for diagnostic
+        // continuity; the multiplier is driven by the outlier-resistant median.
         const bias = avg;
 
-        let safetyMultiplier = 1.0;
-        if (sampleCount >= 5 && bias != null && Math.abs(bias) >= 25) {
-            if (bias <= -50) safetyMultiplier = 1.5;
-            else if (bias <= -25) safetyMultiplier = 1.25;
-            else if (bias >= 50) safetyMultiplier = 0.75;
-            else if (bias >= 25) safetyMultiplier = 0.85;
-        }
+        const safetyMultiplier = deriveSafetyMultiplier(sampleCount, med);
 
         const { error } = await db
             .from("vendor_calibration_stats")

@@ -13,11 +13,17 @@ import {
 } from "./ap-boot-catchup";
 
 describe("mostRecentApPollingWindow", () => {
-    it("picks 8:00 Denver on a morning after 8", () => {
+    it("picks 7:30 Denver on a morning after 7:30", () => {
         // 2026-08-07 09:30 MDT = 15:30 UTC (MDT = UTC-6)
         const now = new Date("2026-08-07T15:30:00.000Z");
         const w = mostRecentApPollingWindow(now);
-        expect(w.toISOString()).toBe(denverLocalToUtc(2026, 8, 7, 8, 0).toISOString());
+        expect(w.toISOString()).toBe(denverLocalToUtc(2026, 8, 7, 7, 30).toISOString());
+    });
+
+    it("picks 7:30 Denver at 7:40, not yesterday 17:00", () => {
+        const now = new Date("2026-08-07T13:40:00.000Z"); // 07:40 MDT
+        const w = mostRecentApPollingWindow(now);
+        expect(w.toISOString()).toBe(denverLocalToUtc(2026, 8, 7, 7, 30).toISOString());
     });
 
     it("picks 12:00 Denver after noon", () => {

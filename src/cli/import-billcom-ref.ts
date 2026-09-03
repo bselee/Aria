@@ -15,14 +15,13 @@
  *
  * Usage:
  *   npx tsx src/cli/import-billcom-ref.ts
+ *   npx tsx src/cli/import-billcom-ref.ts --inbox
  *   npx tsx src/cli/import-billcom-ref.ts --csv=path/to/custom.csv
  */
 
 import { getLocalDb } from "@/lib/storage/local-db";
+import { resolveBillComCsv, isRefDataStale, listBillComInboxCsvs } from "@/lib/intelligence/ap/billcom-csv-source";
 import fs from "fs";
-import path from "path";
-
-const DEFAULT_CSV = path.resolve(process.cwd(), "data", "AllBillsPage.csv");
 
 // ── CSV Column Mapping ───────────────────────────────────────────────────────
 // Bill.com "All Bills" CSV → billcom_bills_ref columns.
@@ -42,12 +41,15 @@ interface ColumnMap {
 }
 
 const COLUMN_MAP: ColumnMap = {
-  invoiceNumber: ["invoice #", "invoice number", "inv #", "invoice#", "number", "inv num"],
+  // 'Invoice no.' is the real Bill.com export header (verified 2026-08-13 on
+  // ~/Downloads/AllBillsPage (16).csv) — 'no.' needed as an alias.
+  invoiceNumber: ["invoice #", "invoice number", "inv #", "invoice#", "number", "inv num", "invoice no."],
   vendorName: ["vendor", "vendor name", "supplier", "payee", "from"],
   invoiceAmount: ["amount", "total", "invoice amount", "bill amount", "total amount", "amt"],
   invoiceDate: ["invoice date", "date", "inv date", "bill date", "issued"],
   dueDate: ["due date", "due", "payment due", "pay by"],
-  poNumber: ["po #", "po number", "purchase order", "po#", "reference"],
+  // 'PO no.' is likewise the real export header.
+  poNumber: ["po #", "po number", "purchase order", "po#", "reference", "po no."],
   chartOfAccount: ["chart of account", "category", "account", "gl account", "coa"],
   billType: ["bill type", "type", "entry type", "source", "origin"],
   paymentStatus: ["payment status", "status", "pay status", "state"],
@@ -241,7 +243,7 @@ function parseCSV(filePath: string): ParsedRow[] {
 function importRows(rows: ParsedRow[]): { inserted: number; updated: number; errors: number } {
   const db = getLocalDb();
   let inserted = 0;
-  let updated = 0;
+  const updated = 0;
   let errors = 0;
 
   const upsert = db.prepare(`
@@ -296,17 +298,94 @@ function importRows(rows: ParsedRow[]): { inserted: number; updated: number; err
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-export async function main(): Promise<void> {
-  // Allow custom CSV path via --csv= argument
-  const csvArg = process.argv.find((a) => a.startsWith("--csv="));
-  const csvPath = csvArg ? csvArg.split("=")[1] : DEFAULT_CSV;
+export async function importInbox(): Promise<void> {
+  const files = listBillComInboxCsvs().filter((f) => (f.vendorCount ?? 0) > 1);
+  if (files.length === 0) {
+    console.log("[billcom-import] inbox empty — drop AllBillsPage.csv in Downloads/Aria-Ingest/billcom/ then re-run");
+    return;
+  }
+  console.log(`[billcom-import] inbox: ${files.length} multi-vendor file(s)`);
+  for (const f of files) {
+    console.log(`[billcom-import] CSV: ${f.path} (vendors=${f.vendorCount})`);
+    const rows = parseCSV(f.path);
+    const result = importRows(rows);
+    console.log(`[billcom-import]   wrote ${result.inserted + result.updated} (err ${result.errors})`);
+  }
+  const db = getLocalDb();
+  const total = (db.prepare("SELECT COUNT(*) AS cnt FROM billcom_bills_ref").get() as { cnt: number }).cnt;
+  console.log(`[billcom-import] ✓ inbox done. Table total: ${total} rows.`);
+}
 
+export async function importCsvFile(csvPath: string): Promise<void> {
+  if (!fs.existsSync(csvPath)) {
+    throw new Error(`CSV not found: ${csvPath}`);
+  }
+  const rows = parseCSV(csvPath);
+  const result = importRows(rows);
+  const db = getLocalDb();
+  const total = (db.prepare("SELECT COUNT(*) AS cnt FROM billcom_bills_ref").get() as { cnt: number }).cnt;
+  console.log(
+    `[billcom-import] ${csvPath}: wrote ${result.inserted + result.updated} (err ${result.errors}). Table total: ${total}`,
+  );
+}
+
+export async function main(): Promise<void> {
   console.log(`[billcom-import] Importing Bill.com reference data...`);
+
+  const inboxMode = process.argv.includes("--inbox");
+  if (inboxMode) {
+    try {
+      await importInbox();
+    } catch (err: any) {
+      console.error(`[billcom-import] --inbox: ${err?.message ?? err}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  // Explicit --csv= override wins over auto-resolution.
+  const csvArg = process.argv.find((a) => a.startsWith("--csv="));
+
+  // Auto-resolve: data/AllBillsPage.csv (Playwright) first, then the newest
+  // manual export in ~/Downloads/AllBillsPage*.csv — whichever is newer by mtime.
+  // Keeps the ingest alive when the Playwright login fails (which it has been
+  // since 2026-07-05) by falling back to Bill's hand-made exports.
+  const resolved = csvArg ? null : resolveBillComCsv();
+  if (resolved) {
+    if (resolved.path) {
+      console.log(
+        `[billcom-import] Source: ${resolved.source} — ${resolved.path} ` +
+        `(age ${resolved.ageHours !== null ? resolved.ageHours.toFixed(1) : "?"}h, mtime ${resolved.mtime ?? "?"})`,
+      );
+    } else {
+      console.log(
+        "[billcom-import] No Bill.com CSV found from any source (checked data/AllBillsPage.csv and ~/Downloads/AllBillsPage*.csv).",
+      );
+    }
+  }
+
+  // Make staleness loud instead of silent — a frozen billcom_bills_ref silently
+  // disables duplicate detection in ap-single-forward.ts.
+  const staleness = isRefDataStale();
+  if (staleness.stale) {
+    console.warn(
+      `[billcom-import] ⚠ billcom_bills_ref is STALE ` +
+        `(${staleness.ageHours !== null ? `${staleness.ageHours.toFixed(1)}h since last import` : "table empty or unreadable"}) ` +
+        `— this import refreshes it.`,
+    );
+  } else {
+    console.log(
+      `[billcom-import] billcom_bills_ref is fresh (last import ${staleness.ageHours !== null ? staleness.ageHours.toFixed(1) : "?"}h ago).`,
+    );
+  }
+
+  const csvPath = csvArg ? csvArg.split("=")[1] : resolved?.path ?? null;
+
   console.log(`[billcom-import] CSV: ${csvPath}`);
 
-  if (!fs.existsSync(csvPath)) {
-    console.error(`[billcom-import] CSV not found at ${csvPath}`);
-    console.error("[billcom-import] Run download-billcom-ref.ts first, or provide --csv=path/to/file.csv");
+  if (!csvPath || !fs.existsSync(csvPath)) {
+    console.error(`[billcom-import] CSV not found${csvPath ? ` at ${csvPath}` : " from any source"}`);
+    console.error("[billcom-import] Run download-billcom-ref.ts first (or export from Bill.com), or provide --csv=path/to/file.csv");
     process.exitCode = 1;
     return;
   }

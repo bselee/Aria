@@ -7,7 +7,8 @@
  * @author  Hermia
  * @created 2026-07-10
  * @updated 2026-07-10 — ERROR reclaim, hash-first claim, health-check ready
- * @deps    local-db, gmail, crypto
+ * @updated 2026-08-13 — fuzzy vendor+amount+date dedup layer (Workstream D)
+ * @deps    local-db, gmail, crypto, ./ap-dedup
  * @env     BILL_COM_FORWARD_EMAIL (default: buildasoilap@bill.com)
  *
  * INVARIANT (Bill Selee, 2026-07-10):
@@ -20,6 +21,12 @@ import { createHash, randomBytes } from "crypto";
 import { getLocalDb } from "@/lib/storage/local-db";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
+import { findFuzzyDuplicate } from "./ap-dedup";
+import {
+    buildStampedFilename,
+    shouldStampInvoice,
+    stampInvoicePdf,
+} from "@/lib/pdf/invoice-overlay";
 
 const BILL_COM_EMAIL =
   process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
@@ -48,6 +55,8 @@ export interface SingleForwardRequest {
   pdfBuffer: Buffer;
   vendorName?: string;
   invoiceNumber?: string;
+  /** Invoice total in dollars — feeds the LAST-RESORT fuzzy dedup layer. */
+  invoiceTotal?: number;
   source: SingleForwardSource;
   gmail?: any;
   ocrRawText?: string;
@@ -119,6 +128,7 @@ export function isAlreadyClaimedOrForwarded(
   pdfHash: string,
   vendorName?: string,
   invoiceNumber?: string,
+  invoiceTotal?: number,
 ): { hit: boolean; reason: string; billcomSentMessageId?: string | null } {
   const db = getLocalDb();
   expireStaleClaims(db);
@@ -163,6 +173,56 @@ export function isAlreadyClaimedOrForwarded(
     };
   }
 
+  if (invoiceNumber) {
+    const inv = invoiceNumber.trim();
+    const invNormalized = inv.replace(/\D/g, "").replace(/^0+/, "");
+    if (invNormalized.length >= 5) {
+      // Layer 4: prior forward row carrying the same OCR invoice# (vendor-agnostic
+      // for LTL Pro#-style numbers — OCR vendor name is unreliable).
+      try {
+        const byOcr = db
+          .prepare(
+            `SELECT status, billcom_sent_message_id FROM ap_local_forwards
+             WHERE status IN (${TAKEN_IN_CLAUSE})
+               AND ocr_invoice_number IS NOT NULL
+               AND (
+                 ocr_invoice_number = ?
+                 OR REPLACE(ocr_invoice_number, '-', '') = ?
+                 OR LTRIM(ocr_invoice_number, '0') = ?
+               )
+             LIMIT 1`,
+          )
+          .get(...taken, inv, invNormalized, invNormalized) as
+          | { status: string; billcom_sent_message_id: string | null }
+          | undefined;
+        if (byOcr) {
+          return {
+            hit: true,
+            reason: `ocr invoice# (${byOcr.status})`,
+            billcomSentMessageId: byOcr.billcom_sent_message_id,
+          };
+        }
+      } catch {
+        /* column may be absent in some envs */
+      }
+
+      // Layer 5: local invoice_cache (365d AP logs)
+      try {
+        const byCache = db
+          .prepare(
+            `SELECT 1 FROM invoice_cache
+             WHERE invoice_number = ?
+               AND expire_at > datetime('now')
+             LIMIT 1`,
+          )
+          .get(inv);
+        if (byCache) return { hit: true, reason: "invoice_cache invoice#" };
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
   if (vendorName && invoiceNumber) {
     try {
       const ref = db
@@ -178,6 +238,28 @@ export function isAlreadyClaimedOrForwarded(
       }
     } catch {
       /* ref table missing */
+    }
+  }
+
+  // ── LAST-RESORT layer: fuzzy vendor + amount + date window ──────────────
+  // Runs DEAD LAST, only after hash, message+filename, invoice#, and
+  // billcom_bills_ref have all missed. Catches a vendor re-sending the same
+  // invoice as a freshly-generated PDF (different bytes, different filename,
+  // invoice# absent or OCR-garbled — e.g. AAA Cooper's ocr_invoice_number
+  // has yielded "3746570" (account number) and "==Start of OCR for page 1==").
+  // Requires BOTH vendor and a finite positive total — never guesses.
+  if (vendorName && typeof invoiceTotal === "number" && Number.isFinite(invoiceTotal) && invoiceTotal > 0) {
+    try {
+      const fuzzy = findFuzzyDuplicate({ vendorName, total: invoiceTotal });
+      if (fuzzy.hit) {
+        return {
+          hit: true,
+          reason: fuzzy.reason,
+          billcomSentMessageId: fuzzy.existingBillcomMessageId,
+        };
+      }
+    } catch {
+      /* fuzzy layer must never block a legitimate forward */
     }
   }
 
@@ -206,6 +288,7 @@ function claimForward(
     pdfHash,
     req.vendorName,
     req.invoiceNumber,
+    req.invoiceTotal,
   );
   if (existing.hit) {
     return {
@@ -245,6 +328,9 @@ function claimForward(
              pdf_content_hash = ?,
              vendor_routing_action = ?,
              ocr_raw_text = COALESCE(?, ocr_raw_text),
+             ocr_vendor_name = COALESCE(?, ocr_vendor_name),
+             ocr_invoice_number = COALESCE(?, ocr_invoice_number),
+             ocr_total = COALESCE(?, ocr_total),
              billcom_sent_message_id = NULL,
              error_message = ?,
              forwarded_at = datetime('now')
@@ -257,6 +343,9 @@ function claimForward(
         pdfHash,
         req.vendorRoutingAction || req.source,
         req.ocrRawText || null,
+        req.vendorName || null,
+        req.invoiceNumber || null,
+        req.invoiceTotal != null ? String(req.invoiceTotal) : null,
         `reclaim:${req.source}`,
         reclaimable.id,
       );
@@ -270,10 +359,11 @@ function claimForward(
     const info = db
       .prepare(
         `INSERT INTO ap_local_forwards
-           (gmail_message_id, email_from, email_subject, pdf_filename,
-            pdf_content_hash, status, vendor_routing_action, ocr_raw_text,
-            error_message, forwarded_at)
-         VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, datetime('now'))`,
+          (gmail_message_id, email_from, email_subject, pdf_filename,
+           pdf_content_hash, status, vendor_routing_action, ocr_raw_text,
+           ocr_vendor_name, ocr_invoice_number, ocr_total,
+           error_message, forwarded_at)
+        VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?, ?, ?, datetime('now'))`,
       )
       .run(
         req.gmailMessageId,
@@ -283,6 +373,9 @@ function claimForward(
         pdfHash,
         req.vendorRoutingAction || req.source,
         req.ocrRawText || null,
+        req.vendorName || null,
+        req.invoiceNumber || null,
+        req.invoiceTotal != null ? String(req.invoiceTotal) : null,
         `claim:${req.source}`,
       );
     return { claimed: true, claimId: Number(info.lastInsertRowid) };
@@ -294,6 +387,7 @@ function claimForward(
       pdfHash,
       req.vendorName,
       req.invoiceNumber,
+      req.invoiceTotal,
     );
     if (again.hit) {
       return {
@@ -350,16 +444,21 @@ function claimForward(
   }
 }
 
-function markClaimForwarded(claimId: number, billcomSentMessageId: string): void {
-  const db = getLocalDb();
-  db.prepare(
-    `UPDATE ap_local_forwards
-     SET status = 'FORWARDED',
-         billcom_sent_message_id = ?,
-         forwarded_at = datetime('now'),
-         error_message = NULL
-     WHERE id = ?`,
-  ).run(billcomSentMessageId, claimId);
+function markClaimForwarded(
+    claimId: number,
+    billcomSentMessageId: string,
+    sentFilename?: string,
+): void {
+    const db = getLocalDb();
+    db.prepare(
+        `UPDATE ap_local_forwards
+         SET status = 'FORWARDED',
+             pdf_filename = COALESCE(?, pdf_filename),
+             billcom_sent_message_id = ?,
+             forwarded_at = datetime('now'),
+             error_message = NULL
+         WHERE id = ?`,
+    ).run(sentFilename || null, billcomSentMessageId, claimId);
 }
 
 function markClaimError(claimId: number, message: string): void {
@@ -472,12 +571,40 @@ export async function forwardInvoiceOnce(
       gmail = GmailApi({ version: "v1", auth });
     }
 
+    // ── Invoice# stamp (2026-08-18, Bill): vendors whose PDFs mis-OCR (AAA
+    // Cooper reads the CUSTOMER/account number instead of the Pro#) get the
+    // reliable subject-derived invoice number stamped onto page 1 BEFORE the
+    // send, so Bill.com's own extraction keys the bill on the right number.
+    // Never blocks the forward — on stamp failure we send the original.
+    let sendBuffer = req.pdfBuffer;
+    let sendFilename = safeFilename;
+    if (shouldStampInvoice(req.emailFrom, req.invoiceNumber)) {
+      try {
+        sendBuffer = await stampInvoicePdf(
+            req.pdfBuffer,
+            {
+                invoiceNumber: req.invoiceNumber!,
+                vendorName: req.vendorName,
+            },
+            req.emailFrom,
+        );
+        sendFilename = buildStampedFilename(req.invoiceNumber!, req.vendorName);
+        console.log(
+          `[ap-single-forward] 📌 Stamped invoice# ${req.invoiceNumber} → ${sendFilename}`,
+        );
+      } catch (stampErr: any) {
+        console.warn(
+          `[ap-single-forward] Stamp failed (sending original): ${stampErr?.message || stampErr}`,
+        );
+      }
+    }
+
     const sentId = await sendMime(
       gmail,
       req.emailSubject,
       req.emailFrom,
-      safeFilename,
-      req.pdfBuffer,
+      sendFilename,
+      sendBuffer,
     );
     if (!sentId) {
       markClaimError(claimId, "Gmail send returned no message id");
@@ -488,10 +615,43 @@ export async function forwardInvoiceOnce(
       };
     }
 
-    markClaimForwarded(claimId, sentId);
+    markClaimForwarded(claimId, sentId, sendFilename);
     console.log(
-      `[ap-single-forward] OK ${safeFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
+      `[ap-single-forward] OK ${sendFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
     );
+
+    // ── Immediate verify-in-Sent (2026-08-18): fetch the sent message back and
+    // confirm it carries the PDF. Sets verified=1 so the log answers "did it
+    // send?" at forward time, not at the 8 AM sweep. Best-effort — a lookup
+    // failure must not turn a successful forward into an ERROR row.
+    try {
+      const sent = await gmail.users.messages.get({
+        userId: "me",
+        id: sentId,
+        format: "full",
+      });
+      const hasPdf = (function walkPdf(part: any): boolean {
+        if (!part) return false;
+        if ((part.mimeType || "").toLowerCase() === "application/pdf") return true;
+        if ((part.filename || "").toLowerCase().endsWith(".pdf")) return true;
+        return Array.isArray(part.parts) && part.parts.some(walkPdf);
+      })(sent.data?.payload);
+      if (hasPdf) {
+        getLocalDb()
+          .prepare("UPDATE ap_local_forwards SET verified = 1 WHERE billcom_sent_message_id = ?")
+          .run(sentId);
+        console.log(`[ap-single-forward] ✅ Verified in Sent: ${sendFilename}`);
+      } else {
+        console.warn(
+          `[ap-single-forward] ⚠️ Sent message ${sentId} has no PDF attachment — investigate`,
+        );
+      }
+    } catch (verifyErr: any) {
+      console.warn(
+        `[ap-single-forward] Verify-in-Sent skipped: ${verifyErr?.message || verifyErr}`,
+      );
+    }
+
     return {
       status: "forwarded",
       billcomSentMessageId: sentId,

@@ -184,10 +184,18 @@ async function extractScannedPDF(
     // Strategy 2: cheap fallback models on OpenRouter when Gemini fails
     if (!extractedText) {
             console.log(`[extractor] Trying cheap fallback models...`);
+            // HERMIA(2026-08-26) live-verified on data:application/pdf;base64:
+            //   gemini-2.5-flash-preview -> DEAD slug (404)
+            //   deepseek/deepseek-v4-flash -> 404 (no image input)
+            //   qwen/qwen3.7-flash -> 400 (rejects raw PDF payload, image works)
+            //   z-ai/glm-5.3-flash -> 400 (code 1210, image works)
+            //   qwen/qwen3-8b -> text-only, was silently useless here. Replaced
+            //   with gemini-2.2-flash-lite as a cheaper second Gemini-class try,
+            //   then qwen3.7-flash as last-resort raw-text model for edge cases
+            //   where pdfParse produced partial text and a model can clean it.
             const freeModels = [
-                "google/gemini-2.5-flash-preview",  // free tier — try first
-                "deepseek/deepseek-v4-flash",        // KAIZEN(2026-06-04): reliable, $0.14/M
-                "qwen/qwen3-8b",                     // free, good at text
+                "google/gemini-2.5-flash-lite",      // $0.10/M, LIVE — same Gemini PDF base64 support as 2.5-flash at 1/3 cost
+                "qwen/qwen3.7-flash",                // $0.030/M text fallback (no PDF base64)
             ];
             for (const model of freeModels) {
                 if (await callOpenRouter(model)) {

@@ -247,22 +247,22 @@
     },
     {
       "id": "cf724d948b75",
-      "name": "basauto-poll",
-      "prompt": "Run the BASAUTO purchasing poll and report results.\n\n1. Execute: cd C:/Users/BuildASoil/Documents/Projects/aria && python scripts/basauto_poll.py\n\n2. The script already sends Telegram pings directly for:\n   - New pending purchase requests (not yet seen)\n   - Request status changes (pending → ordered)\n   - Auth failures (session expired)\n\n3. Your job: Read the script output and deliver a brief summary. Include:\n   - Count of pending purchase requests with one-liner per item\n   - Any flagged items NOT on order (urgency: Overdue/Urgent, on_order=0)\n   - Auth status (session alive or expired)\n\n4. Keep it terse. One-line per item max. No bullet points, no headers, no fluff.\n   Format like: \"Shipping wants S-4738 boxes (480)\" not \"• Shipping Department: S-4738...\"\n\n5. If script fails, say so and include the error.",
+      "name": "basauto-recon",
+      "prompt": "Crawl basauto.vercel.app purchasing data, reconcile against Aria, write data/basauto-recon.json for the dashboard panel, and print the morning report.",
       "skills": [],
       "skill": null,
       "model": null,
       "provider": null,
       "base_url": null,
-      "script": null,
-      "no_agent": false,
+      "script": "basauto-recon.sh",
+      "no_agent": true,
       "context_from": null,
       "schedule": {
         "kind": "cron",
-        "expr": "0 6 * * *",
-        "display": "0 6 * * *"
+        "expr": "0 7 * * *",
+        "display": "0 7 * * *"
       },
-      "schedule_display": "0 6 * * *",
+      "schedule_display": "0 7 * * *",
       "repeat": {
         "times": null,
         "completed": 24
@@ -277,11 +277,9 @@
       "last_status": "ok",
       "last_error": null,
       "last_delivery_error": null,
-      "deliver": "local",
+      "deliver": "origin",
       "origin": null,
-      "enabled_toolsets": [
-        "terminal"
-      ],
+      "enabled_toolsets": [],
       "workdir": null,
       "profile": null,
       "fire_claim": null

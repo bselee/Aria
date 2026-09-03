@@ -8,7 +8,9 @@ import { writeInvoiceSummary } from "../../obsidian/bridge";
 import { getLocalDb } from "../../storage/local-db";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 
-const supabase = createClient();
+// DECISION(2026-08-19): NEVER module-level createClient() here — in a circular
+// import chain it resolves undefined at import time (see aria-local-dataplane →
+// circular-init-supabase-race). Every method resolves its own client.
 
 /**
  * @file ap-forwarder.ts
@@ -170,7 +172,7 @@ export class APForwarderAgent {
         if (!sourceMessageId) return;
 
         const expectedForwardCount = this.getExpectedForwardCount(item);
-        const { data: relatedItems, error } = await supabase
+        const { data: relatedItems, error } = await db
             .from("ap_inbox_queue")
             .select("message_id, status, extracted_json")
             .like("message_id", `${sourceMessageId}%`);
@@ -215,13 +217,13 @@ export class APForwarderAgent {
             }
 
             // HERMIA(2026-06-10): Also retry ERROR_FORWARDING items
-            const { data: pendingItems, error: pendingError } = await supabase
+            const { data: pendingItems, error: pendingError } = await db
                 .from('ap_inbox_queue')
                 .select('*')
                 .eq('status', 'PENDING_FORWARD')
                 .limit(10);
 
-            const { data: retryItems, error: retryError } = await supabase
+            const { data: retryItems, error: retryError } = await db
                 .from('ap_inbox_queue')
                 .select('*')
                 .eq('status', 'ERROR_FORWARDING')
@@ -253,7 +255,7 @@ export class APForwarderAgent {
                 try {
                     // Try to lock the row by updating status to PROCESSING_FORWARD
                     // HERMIA(2026-06-10): Accept both PENDING_FORWARD and ERROR_FORWARDING
-                    const { error: lockError, count: lockCount } = await supabase
+                    const { error: lockError, count: lockCount } = await db
                         .from('ap_inbox_queue')
                         .update({ status: 'PROCESSING_FORWARD' })
                         .eq('id', item.id)
@@ -279,12 +281,12 @@ export class APForwarderAgent {
                                                 ? `content-hash dedup (${pdfHash.slice(0, 12)}...)`
                                                 : 'email+subject+filename dedup';
                                             console.log(`   ⏭️ Already forwarded locally: ${item.pdf_filename} (${dedupReason}) — marking FORWARDED, skip`);
-                                            await supabase
+                                            await db
                                                 .from('ap_inbox_queue')
                                                 .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
                                                 .eq('id', item.id);
                                             await this.logActivity(
-                                                supabase,
+                                                db,
                                                 item.email_from,
                                                 item.email_subject,
                                                 item.intent || 'INVOICE',
@@ -304,20 +306,20 @@ export class APForwarderAgent {
                                             // break the infinite retry loop (forwarder now fetches ERROR_FORWARDING).
                                             if ((item.extracted_json as any)?.vendor_routing_action === "dropship") {
                                                 console.log(`     🚚 Dropship (no PDF — notification only): ${item.email_subject?.slice(0, 60)}`);
-                                                await supabase
+                                                await db
                                                     .from('ap_inbox_queue')
                                                     .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
                                                     .eq('id', item.id);
-                                                await this.logActivity(supabase, item.email_from, item.email_subject, 'DROPSHIP',
+                                                await this.logActivity(db, item.email_from, item.email_subject, 'DROPSHIP',
                                                     `Dropship notification (QuickBooks) — no PDF to forward, marked complete`, {
                                                         vendor_routing_action: "dropship",
                                                         vendor_name: (item.extracted_json as any)?.vendor_name,
                                                     });
-                                                await supabase
+                                                await db
                                                     .from('email_inbox_queue')
                                                     .update({ processed_by_ap: true })
                                                     .eq('gmail_message_id', sourceMessageId);
-                                                await this.finalizeSourceEmailIfReady(supabase, gmail, {
+                                                await this.finalizeSourceEmailIfReady(db, gmail, {
                                                     gmailMessageId: sourceMessageId,
                                                     addLabels: ["Invoice Forward"],
                                                     expectedForwardCount: (item.extracted_json as any)?.expected_forward_count,
@@ -328,7 +330,7 @@ export class APForwarderAgent {
                                             // Set ERROR_FORWARDING but do NOT restore original status
                                             // (that would create an infinite retry loop).
                                             console.warn(`   Skipping ${item.id}: missing pdf_filename or pdf_path (vendor routing record, not a real invoice)`);
-                                            await supabase
+                                            await db
                                                 .from('ap_inbox_queue')
                                                 .update({
                                                     status: 'ERROR_FORWARDING',
@@ -352,12 +354,12 @@ export class APForwarderAgent {
                                                     );
                                                     if (billcomExists) {
                                                         console.log(`   ⏭️ Already in Bill.com: vendor=${item.vendor_name} inv=${item.invoice_number} — skipping forward`);
-                                                        await supabase
+                                                        await db
                                                             .from('ap_inbox_queue')
                                                             .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
                                                             .eq('id', item.id);
                                                         await this.logActivity(
-                                                            supabase,
+                                                            db,
                                                             item.email_from,
                                                             item.email_subject,
                                                             item.intent || 'INVOICE',
@@ -392,12 +394,12 @@ export class APForwarderAgent {
 
                     if (once.status === 'already_forwarded') {
                         console.log(`   ⏭️ Single-gate suppressed: ${item.pdf_filename} (${once.reason})`);
-                        await supabase
+                        await db
                             .from('ap_inbox_queue')
                             .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
                             .eq('id', item.id);
                         await this.logActivity(
-                            supabase,
+                            db,
                             item.email_from,
                             item.email_subject,
                             item.intent || 'INVOICE',
@@ -419,20 +421,20 @@ export class APForwarderAgent {
                     // we just need to forward the PDF to Bill.com — no OCR, no PO matching.
                     if ((item.extracted_json as any)?.vendor_routing_action === "dropship") {
                         console.log(`     🚚 Dropship (skip PO match): ${item.email_subject?.slice(0, 60)}`);
-                        await supabase
+                        await db
                             .from('ap_inbox_queue')
                             .update({ status: 'FORWARDED', updated_at: new Date().toISOString() })
                             .eq('id', item.id);
-                        await this.logActivity(supabase, item.email_from, item.email_subject, 'DROPSHIP',
+                        await this.logActivity(db, item.email_from, item.email_subject, 'DROPSHIP',
                             `Dropship: forwarded to Bill.com (${item.pdf_filename}), no PO matching`, {
                                 vendor_routing_action: "dropship",
                                 billcom_sent_message_id: sentMessageId,
                             });
-                        await supabase
+                        await db
                             .from('email_inbox_queue')
                             .update({ processed_by_ap: true })
                             .eq('gmail_message_id', sourceMessageId);
-                        await this.finalizeSourceEmailIfReady(supabase, gmail, {
+                        await this.finalizeSourceEmailIfReady(db, gmail, {
                             gmailMessageId: sourceMessageId,
                             addLabels: ["Invoice Forward"],
                             expectedForwardCount: ej.expected_forward_count,
@@ -450,7 +452,7 @@ export class APForwarderAgent {
                         item.pdf_filename,
                         item.email_subject,
                         item.email_from,
-                        supabase,
+                        db,
                         false,
                         sourceMessageId,
                         item.pdf_path,
@@ -469,7 +471,7 @@ export class APForwarderAgent {
                     // Post-processing failures (OCR, PO match) are logged but don't block
                     // the primary pipeline — the invoice is already at Bill.com.
                     const finalStatus = billComSendVerified ? "FORWARDED" : "ERROR_PROCESSING";
-                    await supabase
+                    await db
                         .from('ap_inbox_queue')
                         .update({ status: finalStatus, extracted_json: extractedJson })
                         .eq('id', item.id);
@@ -478,12 +480,12 @@ export class APForwarderAgent {
                     // email as processed — the invoice made it through the critical path.
                     // Post-processing failures are secondary (logged in extracted_json).
                     if (billComSendVerified) {
-                        await supabase
+                        await db
                             .from('email_inbox_queue')
                             .update({ processed_by_ap: true })
                             .eq('gmail_message_id', sourceMessageId);
                         await this.finalizeSourceEmailIfReady(
-                            supabase,
+                            db,
                             gmail,
                             {
                                 ...item,
@@ -494,14 +496,14 @@ export class APForwarderAgent {
                             console.warn(`   ⚠️ Forwarded OK but post-processing failed: ${processingResult.error} — check /aphealth`);
                         }
                     } else {
-                        await supabase
+                        await db
                             .from('email_inbox_queue')
                             .update({ processed_by_ap: false })
                             .eq('gmail_message_id', sourceMessageId);
                     }
 
                     await this.logActivity(
-                        supabase,
+                        db,
                         item.email_from,
                         item.email_subject,
                         item.intent || 'INVOICE',
@@ -560,7 +562,7 @@ export class APForwarderAgent {
                             processing_error: err.message,
                         }
                         : undefined;
-                    await supabase
+                    await db
                         .from('ap_inbox_queue')
                         .update(
                             failureJson
@@ -569,12 +571,12 @@ export class APForwarderAgent {
                         )
                         .eq('id', item.id);
                     if (billComSendVerified) {
-                        await supabase
+                        await db
                             .from('email_inbox_queue')
                             .update({ processed_by_ap: true })
                             .eq('gmail_message_id', sourceMessageId);
                         await this.finalizeSourceEmailIfReady(
-                            supabase,
+                            db,
                             gmail,
                             {
                                 ...item,
@@ -583,7 +585,7 @@ export class APForwarderAgent {
                         );
                     }
                     await this.logActivity(
-                        supabase,
+                        db,
                         item.email_from,
                         item.email_subject,
                         item.intent || 'INVOICE',

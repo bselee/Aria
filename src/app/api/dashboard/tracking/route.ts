@@ -4,6 +4,7 @@ import {
     buildTodayShipmentSummary,
     getBestTrackingAnswerForQuery,
     getDashboardTrackingBoard,
+    getOpenPOTrackingCoverage,
 } from "@/lib/tracking/shipment-intelligence";
 
 export async function GET(req: Request) {
@@ -14,11 +15,13 @@ export async function GET(req: Request) {
         // Only call full board when needed for other data
         const boardResult = await getDashboardTrackingBoard();
         const answer = query ? await getBestTrackingAnswerForQuery(query) : null;
+        const coverage = await getOpenPOTrackingCoverage();
 
         return NextResponse.json({
             ...boardResult,
             todaySummary: buildTodayShipmentSummary(boardResult.board),
             answer,
+            coverage,
         });
     } catch (err: any) {
         console.error("Tracking dashboard API error:", err.message);

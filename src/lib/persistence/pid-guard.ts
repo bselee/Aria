@@ -27,6 +27,10 @@
  *      incoming generation and disarmed orphan detection (see that function).
  *   C) CIRCUIT BREAKER — more than MAX_REAPS_PER_WINDOW reaps inside
  *      REAP_WINDOW_MS disables reaping and logs loudly. Fails safe.
+ *   D) AGE GATE — a candidate is only reaped when it is demonstrably OLD
+ *      (>= MIN_ORPHAN_AGE_MS). A mid-restart sibling is seconds old, so it is
+ *      never killed; a genuine orphan (alive for minutes/days) always passes.
+ *      Unknown age is treated as "do not kill" (fail-safe).
  *
  * @author  Hermia
  * @created 2026-07-27
@@ -66,6 +70,9 @@ const REAP_POLL_MS = 500;
 /** Circuit-breaker thresholds. */
 const MAX_REAPS_PER_WINDOW = 3;
 const REAP_WINDOW_MS = 5 * 60 * 1000;
+
+/** A genuine orphan is OLD; a mid-restart sibling is seconds old. */
+const MIN_ORPHAN_AGE_MS = 60_000;
 
 /** Sidecar file tracking recent reap timestamps for the circuit breaker. */
 const REAP_LEDGER_PATH = join(dirname(SENTINEL_PATH), "aria-bot.reaps.json");
@@ -123,6 +130,113 @@ function getPm2SupervisedPids(): number[] | null {
       .filter((n) => Number.isFinite(n) && n > 0);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Enumerates every live aria-bot process on Windows by matching the PM2
+ * fork-wrapper command line: `node --import tsx ... ProcessContainerFork.js`.
+ * `--import tsx` is unique to aria-bot in this repo's ecosystem config (every
+ * other app runs plain `next` or a `.js` script), so this is a precise
+ * fingerprint. Returns [] on any failure — fail-safe.
+ *
+ * @returns Process IDs of all aria-bot processes, or [] when enumeration fails.
+ */
+function enumerateAriaBotPids(): number[] {
+  if (process.platform !== "win32") return [];
+  try {
+    const cmd =
+      `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ` +
+      `$_.Name -eq 'node.exe' -and $_.CommandLine -like '*--import tsx*' ` +
+      `-and $_.CommandLine -like '*ProcessContainerFork*' } | Select-Object -ExpandProperty ProcessId"`;
+    const raw = execSync(cmd, {
+      encoding: "utf-8",
+      timeout: 15_000,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return raw
+      .split(/\r?\n/)
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Age of a single process in milliseconds, or null when it cannot be
+ * determined (process already gone, or PowerShell unavailable).
+ *
+ * The age gate is the fail-safe that distinguishes a genuine orphan (old)
+ * from a mid-restart sibling (seconds old). Null is treated as "do not kill":
+ * on an uncertain signal the guard must never reap.
+ *
+ * @param pid - OS process id to age.
+ * @returns age in ms, or null when unknown.
+ */
+function getPidAgeMs(pid: number): number | null {
+  if (process.platform !== "win32" || !pid || pid <= 0) return null;
+  try {
+    const raw = execSync(
+      `powershell -NoProfile -Command "$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { $ts = (Get-Date) - $p.StartTime; [int]$ts.TotalSeconds }"`,
+      {
+        encoding: "utf-8",
+        timeout: 10_000,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    const secs = Number(raw.trim());
+    if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reaps every orphaned aria-bot process PM2 is no longer supervising.
+ *
+ * This is the BACKLOG case the single-PID sentinel cannot handle: a crash loop
+ * can orphan several generations faster than the sentinel's circuit breaker
+ * allows reaps, and once a newer boot overwrites the sentinel their PIDs are
+ * lost forever. Enumeration finds and kills them all in one pass.
+ *
+ * Fails safe: if PM2 cannot be queried (supervised === null) nothing is killed,
+ * because we cannot distinguish a live supervised process from an orphan.
+ */
+export function reapOrphanedAriaBots(): void {
+  if (process.env.ARIA_PID_GUARD_DISABLE === "true") return;
+
+  const supervised = getPm2SupervisedPids();
+  if (supervised === null) {
+    console.warn("[pid-guard] Could not query PM2 supervised PIDs — skipping orphan sweep (fail-safe).");
+    return;
+  }
+
+  const candidates = enumerateAriaBotPids();
+  for (const pid of candidates) {
+    if (pid === process.pid) continue;
+    if (supervised.includes(pid)) continue;
+    const ageMs = getPidAgeMs(pid);
+    if (ageMs === null || ageMs < MIN_ORPHAN_AGE_MS) {
+      // Too young (or unknown age) to be a genuine orphan — a mid-restart
+      // sibling, not a stale generation. Killing here is what manufactures
+      // the reaper-induced restart loop (observed 2026-09-02).
+      continue;
+    }
+    if (reapBreakerTripped()) {
+      console.warn(`[pid-guard] Skipping orphan ${pid} — circuit breaker is open.`);
+      continue;
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+      console.warn(`[pid-guard] Killed orphaned aria-bot PID ${pid} (not PM2-supervised).`);
+    } catch (err: unknown) {
+      const msg = (err as Error | undefined)?.message ?? String(err);
+      console.warn(`[pid-guard] Failed to kill orphan PID ${pid}: ${msg}`);
+    }
   }
 }
 
@@ -228,7 +342,22 @@ export function reapStaleInstanceAndClaimPid(): void {
             );
           } else {
             const supervised = getPm2SupervisedPids();
-            if (supervised && supervised.includes(stalePid)) {
+            if (supervised === null) {
+              // PM2 couldn't be queried (daemon busy, restart race, pm2 jlist
+              // timeout). We cannot positively confirm this PID is orphaned, so
+              // fail safe and DO NOT kill. Killing on "unknown" is exactly what
+              // manufactures the reaper-induced restart loop: during a PM2
+              // restart the outgoing PID is briefly untracked, and treating
+              // "unknown" as "orphan" SIGKILLs a live supervised process, which
+              // PM2 then restarts, forever. Observed live 2026-09-02 (restarts
+              // 49→55 in ~15 min). The 5-min watchdog sweep + this boot's own
+              // enumeration reaper will catch any real orphan once PM2 is
+              // queryable again.
+              console.warn(
+                `[pid-guard] Could not query PM2 supervised PIDs — PID ${stalePid} ` +
+                `outlasted the grace window but cannot be confirmed orphaned. Skipping reap (fail-safe).`,
+              );
+            } else if (supervised.includes(stalePid)) {
               console.warn(
                 `[pid-guard] PID ${stalePid} outlasted the grace window BUT PM2 reports it as a ` +
                 `supervised "${PM2_PROC_NAME}" process (pm2 pids: ${supervised.join(", ")}). ` +
@@ -237,16 +366,26 @@ export function reapStaleInstanceAndClaimPid(): void {
             } else if (reapBreakerTripped()) {
               console.warn(`[pid-guard] Skipping reap of PID ${stalePid} — circuit breaker is open.`);
             } else {
-              console.warn(
-                `[pid-guard] PID ${stalePid} is STILL alive after ${REAP_GRACE_MS}ms and is not ` +
-                `PM2-supervised — genuine orphan. Killing it to prevent duplicate cron execution.`,
-              );
-              try {
-                process.kill(stalePid, "SIGKILL");
-                console.warn(`[pid-guard] Sent SIGKILL to orphaned PID ${stalePid}.`);
-              } catch (killErr: unknown) {
-                const msg = (killErr as Error | undefined)?.message ?? String(killErr);
-                console.warn(`[pid-guard] Failed to kill PID ${stalePid}: ${msg}`);
+              const ageMs = getPidAgeMs(stalePid);
+              if (ageMs === null || ageMs < MIN_ORPHAN_AGE_MS) {
+                console.log(
+                  `[pid-guard] PID ${stalePid} outlasted the grace window but is ` +
+                  `${ageMs === null ? "of unknown age" : `only ${Math.round(ageMs / 1000)}s old`} — ` +
+                  `too young to be a genuine orphan. Skipping (age gate).`,
+                );
+              } else {
+                console.warn(
+                  `[pid-guard] PID ${stalePid} is STILL alive after ${REAP_GRACE_MS}ms, is ` +
+                  `${Math.round(ageMs / 1000)}s old, and is not PM2-supervised — genuine orphan. ` +
+                  `Killing it to prevent duplicate cron execution.`,
+                );
+                try {
+                  process.kill(stalePid, "SIGKILL");
+                  console.warn(`[pid-guard] Sent SIGKILL to orphaned PID ${stalePid}.`);
+                } catch (killErr: unknown) {
+                  const msg = (killErr as Error | undefined)?.message ?? String(killErr);
+                  console.warn(`[pid-guard] Failed to kill PID ${stalePid}: ${msg}`);
+                }
               }
             }
           }
@@ -257,6 +396,9 @@ export function reapStaleInstanceAndClaimPid(): void {
     const msg = (err as Error | undefined)?.message ?? String(err);
     console.warn(`[pid-guard] Sentinel read failed (non-fatal): ${msg}`);
   }
+
+  // Sweep any leftover orphan backlog the single-PID sentinel can't see.
+  reapOrphanedAriaBots();
 
   claimSentinel();
 }

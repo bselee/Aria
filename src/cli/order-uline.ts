@@ -331,8 +331,8 @@ export async function executeUlineFridayApproval(
 
     // Phase 2: Draft PO creation — DISABLED (2026-05-11). Auto PO creation removed.
     // Items must flow through approval before ordering.
-    let updatedManifest = manifest;
-    let finaleUrl: string | null = null;
+    const updatedManifest = manifest;
+    const finaleUrl: string | null = null;
     // try {
     //     updatedManifest = await createFinaleDraftPO(finale, manifest);
     //     ...
@@ -792,7 +792,7 @@ async function placeViaQuickOrderPaste(
         }
 
         let errorText = '';
-        let cartUrl: string | null = null;
+        const cartUrl: string | null = null;
         if (addClicked) {
             console.log('   🛒 Add to Cart clicked — loading...');
             await page.waitForTimeout(5_000);
@@ -1328,8 +1328,8 @@ export async function runAutonomousUlineOrder(): Promise<UlineOrderResult> {
 
         // Phase 2: Draft PO creation — DISABLED (2026-05-11). Auto PO creation removed.
         // Items must flow through approval before ordering.
-        let updatedManifest = manifest;
-        let finaleUrl: string | null = null;
+        const updatedManifest = manifest;
+        const finaleUrl: string | null = null;
         // try {
         //     updatedManifest = await createFinaleDraftPO(finale, manifest);
         //     ...

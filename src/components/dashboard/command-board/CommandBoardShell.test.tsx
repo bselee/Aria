@@ -11,7 +11,6 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import CommandBoardShell from "./CommandBoardShell";
-import OpsModuleDock from "./OpsModuleDock";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -35,14 +34,6 @@ const baseAgents = [
     {
         id: "ap-agent",
         label: "AP Agent",
-        reportsTo: "ops-manager",
-        process: [],
-        skills: [],
-        workflows: [],
-    },
-    {
-        id: "watchdog",
-        label: "Slack Watchdog",
         reportsTo: "ops-manager",
         process: [],
         skills: [],
@@ -238,23 +229,21 @@ describe("CommandBoardShell", () => {
         vi.stubGlobal("fetch", fetchImpl);
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
         const orderingPane = screen.getByTestId("lifecycle-pane-ordering");
         const purchasesPane = screen.getByTestId("lifecycle-pane-purchases");
         const rcvPane = screen.getByTestId("lifecycle-pane-rcv");
 
-        expect(lifecycleTab.textContent).toBe("Lifecycle");
-        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
+        // Lifecycle content is always visible (no tab button needed)
         expect(orderingPane.textContent).toContain("Ordering");
         expect(purchasesPane.textContent).toContain("Purchases");
         expect(rcvPane.textContent).toContain("Receivings");
     });
 
-    it("labels the shell Ops Board and removes redundant lifecycle drill-in tabs", async () => {
+    it("has no Ops Board header — clean header with health chips only", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        expect(await screen.findByText("Ops Board")).toBeTruthy();
+        expect(screen.queryByText("Ops Board")).toBeNull();
         expect(screen.queryByTestId("shell-tab-ordering")).toBeNull();
         expect(screen.queryByTestId("shell-tab-purchases")).toBeNull();
         expect(screen.queryByTestId("shell-tab-rcv")).toBeNull();
@@ -275,46 +264,22 @@ describe("CommandBoardShell", () => {
         });
     });
 
-    it("default tab is Lifecycle because purchasing needs ordering, active purchases, and RCV together", async () => {
+    it("lifecycle content is always visible — no tab selection needed", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
-        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
+        // Lifecycle content is the default view, always rendered
+        const orderingPane = await screen.findByTestId("lifecycle-pane-ordering");
+        expect(orderingPane).toBeTruthy();
     });
 
-    it("More menu exposes Activity and switches to it", async () => {
+    it("renders lifecycle content directly without tab bar", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        fireEvent.click(await screen.findByTestId("shell-tab-more"));
-        const activityTab = await screen.findByTestId("shell-tab-activity");
-        fireEvent.click(activityTab);
-        // option itself may not keep aria-selected after menu closes; active primary shows via More label
-        expect(await screen.findByTestId("shell-tab-more")).toBeTruthy();
-        expect(screen.getByTestId("shell-tab-more").textContent || "").toMatch(/Activity/i);
-    });
-});
-
-describe("OpsModuleDock", () => {
-    it("renders tab buttons for the existing ops modules", () => {
-        render(<OpsModuleDock />);
-
-        // Tab labels we contracted to surface.
-        const expected = [
-            "Receivings",
-            "AP / Invoices",
-            "Ordering / Purchasing",
-            "Active Purchases",
-            "Build Risk",
-            "Build Schedule",
-            "Tracking",
-            "Statement Recon",
-        ];
-        for (const label of expected) {
-            expect(
-                screen.getAllByRole("tab", { name: new RegExp(label, "i") }).length,
-            ).toBeGreaterThan(0);
-        }
+        // No More menu, no tab bar — lifecycle content is always visible
+        expect(screen.queryByTestId("shell-tab-more")).toBeNull();
+        const orderingPane = await screen.findByTestId("lifecycle-pane-ordering");
+        expect(orderingPane).toBeTruthy();
     });
 });

@@ -175,8 +175,8 @@ function analyzeVendor(
     const poCount = pos.length;
 
     // ── Signal 1: Qty-to-velocity ratio ──────────────────────────────────────
-    let qtyToVelocityRatio: number | null = null;
-    let signal1 = false;
+    const qtyToVelocityRatio: number | null = null;
+    const signal1 = false;
 
     if (velocityByProduct && velocityByProduct.size > 0) {
         const ratios: number[] = [];

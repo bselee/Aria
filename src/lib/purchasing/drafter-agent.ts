@@ -35,6 +35,11 @@ import {
 import { getVendorAutonomyLevel } from './po-sender';
 import { transitionLifecycleState } from './po-lifecycle';
 import { invalidatePurchasingCaches } from './cache';
+import { autoDraftQtyOk, isNeverAutonomous } from './ordering-row-copy';
+import { classifyLine, mayAutonomyDraft } from './input-class';
+import { bundleVendorDraftLines, capBundledLines, isAmazonVendor } from './vendor-sku-bundle';
+
+const AUTO_DRAFT_CAP_USD = Number(process.env.PO_AUTO_DRAFT_CAP) || 2500;
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -65,6 +70,29 @@ interface DrafterContext {
     vendorCooldowns?: Record<string, boolean>;
     vendorCycles?: Record<string, VendorCycleResult>;
     recentPOs?: any[];
+}
+
+/**
+ * Build a vendorPartyId → cycle-result map for a set of vendor groups from
+ * recent Finale POs. Pure — no network. Feeds Gate 4 (cycle lock) when the
+ * caller did not supply context.vendorCycles (cron drafter-scan and
+ * stockout-driver call runDrafterAgent() with no context, which previously
+ * left the gate dead).
+ */
+export function buildVendorCycleMap(
+    groups: Array<{ vendorPartyId: string; vendorName: string }>,
+    recentPOs: any[],
+): Record<string, any> {
+    const cyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+    const vendorCycles: Record<string, any> = {};
+    for (const group of groups) {
+        vendorCycles[group.vendorPartyId] = classifyVendorOrderCycle({
+            vendorPartyId: group.vendorPartyId,
+            vendorName: group.vendorName,
+            recentPOs: cyclePOs,
+        });
+    }
+    return vendorCycles;
 }
 
 // ──────────────────────────────────────────────────
@@ -113,6 +141,16 @@ export async function runDrafterAgent(context: DrafterContext = {}): Promise<Dra
         console.error('[drafter] Failed to fetch purchasing groups:', err.message);
         result.errors++;
         return result;
+    }
+
+    // ── GATE 4 FEED: vendor cycle lock needs context.vendorCycles. The cron
+    // drafter-scan and stockout-driver call runDrafterAgent() with no context,
+    // so build the map from recent Finale POs here. Caller-supplied entries win.
+    if (!context.vendorCycles || Object.keys(context.vendorCycles).length === 0) {
+        const recentPOs = await client.getRecentPurchaseOrders(45, 500).catch(() => []);
+        const vendorCycles = buildVendorCycleMap(groups, recentPOs);
+        context.vendorCycles = { ...vendorCycles, ...(context.vendorCycles ?? {}) };
+        console.log(`[drafter] Built vendor cycle map for ${Object.keys(vendorCycles).length} groups`);
     }
 
     // Assess all groups through the standard pipeline
@@ -172,6 +210,11 @@ async function processVendorGroup(
         reason: '',
     };
 
+    if (isNeverAutonomous(vendorName) || isAmazonVendor(vendorName)) {
+        baseDetail.reason = isAmazonVendor(vendorName) ? 'amazon_excluded' : 'never_autonomous';
+        return baseDetail;
+    }
+
     // ── GATE 1: Policy assessment — at least one line must be "order" ──
     const draftPolicy = buildDraftPOItemsFromAssessment(items);
     if (draftPolicy.items.length === 0) {
@@ -179,22 +222,78 @@ async function processVendorGroup(
         return baseDetail;
     }
 
-    // ── GATE 2: Commit guard — every orderable line must be "commit" ──
-    // Quinton's spec: reorder = lead time coverage + 90 days post-receipt supply
+    // ── GATE 2: 30-day supply on the order itself (no 1- and 5-each drafts) ──
     const guardBatch = assessPOCommitGuardsForLines(
         items.filter((line: any) =>
             line.assessment.decision === 'order' || line.assessment.decision === 'reduce'
         ),
-        { minimumPostLeadCoverageDays: 90 },
+        { minimumPostLeadCoverageDays: 30 },
     );
 
     const commitReadyProductIds = new Set(
         guardBatch.commitReadyLines.map((entry: any) => entry.line.item.productId),
     );
 
-    const commitReadyItems = draftPolicy.items.filter(item =>
-        commitReadyProductIds.has(item.productId),
-    );
+    // Lead time by productId — carried onto draft lines so
+    // createDraftPurchaseOrder computes dueDate from real vendor lead times
+    // instead of the 14-day fallback (src/lib/finale/purchasing.ts ~1745).
+    const leadTimeByProduct = new Map<string, number | null>();
+    for (const line of items) {
+        leadTimeByProduct.set(
+            line.item.productId,
+            line.item.leadTimeDays ?? line.item.effectiveLeadTimeDays ?? null,
+        );
+    }
+
+    const triggerItems = draftPolicy.items.filter(item => {
+        if (!commitReadyProductIds.has(item.productId)) return false;
+        const line = items.find((l: any) => l.item.productId === item.productId);
+        const dailyRate = line?.item?.dailyRate ?? line?.candidate?.directDemand ?? 0;
+        if (!autoDraftQtyOk(item.quantity, dailyRate)) return false;
+        const dollars = item.quantity * (item.unitPrice || 0);
+        const cls = classifyLine({
+            sku: item.productId,
+            lineDollars: dollars,
+            suggestedQty: item.quantity,
+            dailyRate: Number(dailyRate) || 0,
+        });
+        return mayAutonomyDraft(cls.class);
+    });
+
+    const commitReadyItems = capBundledLines(
+        bundleVendorDraftLines({
+            vendorName,
+            allItems: items.map((line: any) => ({
+                productId: line.item.productId,
+                unitPrice: line.item.unitPrice,
+                suggestedQty: line.assessment?.recommendedQty,
+                orderIncrementQty: line.item.orderIncrementQty,
+                isBulkDelivery: line.item.isBulkDelivery,
+                dailyRate: line.item.dailyRate ?? line.candidate?.directDemand,
+                runwayDays: line.item.runwayDays,
+                adjustedRunwayDays: line.item.adjustedRunwayDays,
+                leadTimeDays: line.item.leadTimeDays,
+                stockOnOrder: line.item.stockOnOrder,
+                assessment: line.assessment,
+            })),
+            selected: triggerItems.map((item) => ({
+                productId: item.productId,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                orderIncrementQty: item.orderIncrementQty,
+                isBulkDelivery: item.isBulkDelivery,
+                leadTimeDays: leadTimeByProduct.get(item.productId) ?? null,
+            })),
+        }),
+        AUTO_DRAFT_CAP_USD,
+    ).map((line) => ({
+        productId: line.productId,
+        quantity: line.quantity,
+        unitPrice: line.unitPrice,
+        orderIncrementQty: line.orderIncrementQty,
+        isBulkDelivery: line.isBulkDelivery,
+        leadTimeDays: line.leadTimeDays ?? null,
+    }));
 
     if (commitReadyItems.length === 0) {
         baseDetail.reason = 'no_commit_ready_lines';
@@ -261,6 +360,11 @@ async function processVendorGroup(
     );
     baseDetail.totalValue = totalValue;
     baseDetail.skuCount = commitReadyItems.length;
+
+    if (totalValue > AUTO_DRAFT_CAP_USD) {
+        baseDetail.reason = `over_cap_$${Math.round(totalValue)}_limit_$${AUTO_DRAFT_CAP_USD}`;
+        return baseDetail;
+    }
 
     try {
         const memo = `Auto-drafted by Aria drafter-agent at ${new Date().toISOString()}. ` +

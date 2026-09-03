@@ -61,7 +61,7 @@ pm2 restart aria-dashboard
 
 ## Testing
 ```bash
-npm test              # Jest tests
+npm test              # Vitest tests (vitest run) — NOT Jest; `npx jest` will fail
 node --env-file=.env.local src/cli/run-bot.js  # Run bot locally
 ```
 

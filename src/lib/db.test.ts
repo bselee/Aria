@@ -206,3 +206,21 @@ describe('db.ts PostgREST client — INSERT with .select() returning data', () =
         expect(decodeURIComponent(qs(calls[0]))).toContain('select=id,status');
     });
 });
+
+describe('db.ts query builder — Promise-compatible catch()/finally()', () => {
+    it('exposes catch() and finally() on QueryBuilder (thenable contract)', async () => {
+        const db = await freshClient();
+        if (!db) return; // skip when no client available
+        const qb = db.from('ap_activity_log').insert({});
+        expect(typeof qb.catch).toBe('function');
+        expect(typeof qb.finally).toBe('function');
+    });
+
+    it('exposes catch() and finally() on RpcBuilder (thenable contract)', async () => {
+        const db = await freshClient();
+        if (!db) return;
+        const rb = db.rpc('probe_fn', { arg: 1 });
+        expect(typeof rb.catch).toBe('function');
+        expect(typeof rb.finally).toBe('function');
+    });
+});

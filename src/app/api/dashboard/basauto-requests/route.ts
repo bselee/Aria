@@ -1,7 +1,8 @@
 /**
  * @file    src/app/api/dashboard/basauto-requests/route.ts
  * @purpose Serves BASAUTO purchase request data to the dashboard.
- *          Reads from the local cache written by scripts/basauto_poll.py.
+ *          Reads from the local cache written by src/cli/basauto-recon.ts
+ *          (Hermes cron `basauto-recon`, 07:00 MT daily).
  *          Lightweight endpoint — just reads JSON from disk.
  *
  * @author  Hermia
@@ -15,7 +16,7 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
-/** Cache file path (same as scripts/basauto_poll.py writes to). */
+/** Cache file path (same as src/cli/basauto-recon.ts writes to). */
 function getSnapshotPath(): string {
     return join(
         homedir(),

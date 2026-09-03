@@ -7,7 +7,7 @@
  * @deps    vitest, autonomy-engine, po-sender
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { autoProcessAutonomyDrafts } from './autonomy-engine';
 import * as poSender from './po-sender';
 
@@ -63,6 +63,12 @@ vi.mock('../gmail/auth', () => ({
     getAuthenticatedClient: vi.fn().mockResolvedValue({}),
 }));
 
+// Master switch (2026-08-19): Telegram defaults OFF unless ARIA_TELEGRAM_ENABLED=true.
+// These tests assert Telegram alerts are sent, so opt in explicitly.
+vi.mock('../intelligence/alert-gate', () => ({
+    isBusinessHours: vi.fn(() => true), // keep tests deterministic regardless of wall clock
+}));
+
 vi.mock('./po-sender', () => ({
     storePendingPOSend: vi.fn().mockResolvedValue('session-abc'),
     commitAndSendPO: vi.fn().mockResolvedValue({ orderId: 'PO-1002', sentTo: 'test@example.com' }),
@@ -76,6 +82,9 @@ describe('autoProcessAutonomyDrafts', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         process.env.TELEGRAM_CHAT_ID = '12345';
+        // Master switch (2026-08-19) defaults Telegram OFF — opt in for tests
+        // that assert Telegram alerts are sent.
+        process.env.ARIA_TELEGRAM_ENABLED = 'true';
         mockBot = {
             telegram: {
                 sendMessage: vi.fn().mockResolvedValue({ message_id: 99 }),
@@ -110,6 +119,10 @@ describe('autoProcessAutonomyDrafts', () => {
         });
     });
 
+    afterEach(() => {
+        delete process.env.ARIA_TELEGRAM_ENABLED;
+    });
+
     it('should ignore vendors at autonomy level 0', async () => {
         vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(0); // Manual
 
@@ -119,22 +132,15 @@ describe('autoProcessAutonomyDrafts', () => {
         expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled();
     });
 
-    it('should generate inline review keyboards for Level 1 autonomy vendors', async () => {
+    it('should process Level 1 autonomy vendors (telegram review disabled)', async () => {
         vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(1); // Auto-Draft review
         vi.mocked(poSender.lookupVendorOrderEmail).mockResolvedValue({ email: 'sales@rootwise.com', source: 'vendor_profiles' });
 
         const result = await autoProcessAutonomyDrafts(mockBot);
 
         expect(result.processed).toBe(2); // processed both drafts
-        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
-            '12345',
-            expect.stringContaining('Level 1'),
-            expect.objectContaining({
-                reply_markup: expect.objectContaining({
-                    inline_keyboard: expect.any(Array),
-                }),
-            })
-        );
+        // Telegram hard-disabled (2026-09-02, Bill) — nothing may send.
+        expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled();
     });
 
     it('should set Level 2 vendors to REVIEW state without auto-sending', async () => {
@@ -145,14 +151,10 @@ describe('autoProcessAutonomyDrafts', () => {
 
         expect(result.processed).toBe(2);
         expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // No auto-send
-        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
-            '12345',
-            expect.stringContaining('Level 2'),
-            expect.any(Object)
-        );
+        expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled(); // Telegram disabled (2026-09-02)
     });
 
-    it('should alert on Telegram if vendor order email is missing', async () => {
+    it('should error on missing vendor order email (no telegram ping)', async () => {
         vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(2);
         vi.mocked(poSender.lookupVendorOrderEmail).mockResolvedValue({ email: null, source: 'unknown' }); // No email
 
@@ -160,11 +162,7 @@ describe('autoProcessAutonomyDrafts', () => {
 
         expect(result.processed).toBe(0);
         expect(result.errors).toBe(2);
-        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
-            '12345',
-            expect.stringContaining('No order contact email'),
-            expect.any(Object)
-        );
+        expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled(); // Telegram disabled (2026-09-02)
     });
 
     it('should automatically mark PO as sent and skip dispatch if Gmail search proves it was already sent manually', async () => {
@@ -190,11 +188,7 @@ describe('autoProcessAutonomyDrafts', () => {
         expect(result.processed).toBe(2); // Auto-marked both
         expect(mockCommitDraftPO).toHaveBeenCalledTimes(2); // Both committed in Finale!
         expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // Safe check: didn't send again!
-        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
-            '12345',
-            expect.stringContaining('Already manually sent'),
-            expect.any(Object)
-        );
+        expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled(); // Telegram disabled (2026-09-02)
     });
 
     it('should automatically mark PO as sent and commit in Finale even for Level 0 (manual) vendors', async () => {
@@ -219,10 +213,6 @@ describe('autoProcessAutonomyDrafts', () => {
         expect(result.processed).toBe(2); // Auto-marked and status-healed both
         expect(mockCommitDraftPO).toHaveBeenCalledTimes(2); // Both committed in Finale!
         expect(poSender.commitAndSendPO).not.toHaveBeenCalled(); // No automatic sending triggered
-        expect(mockBot.telegram.sendMessage).toHaveBeenCalledWith(
-            '12345',
-            expect.stringContaining('Already manually sent'),
-            expect.any(Object)
-        );
+        expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled(); // Telegram disabled (2026-09-02)
     });
 });

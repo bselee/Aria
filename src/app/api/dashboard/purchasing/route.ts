@@ -13,6 +13,8 @@ import {
     mergeOpenPOsWithRecentCoverage,
 } from '@/lib/purchasing/ordering-po-coverage';
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
+import { readReconBadges } from '@/lib/purchasing/basauto-recon-lookup';
+import { recomputeBasautoBadge, type LiveRowAria } from '@/lib/purchasing/basauto-recon-live';
 
 // Throttle the Supabase invalidation check to protect nano-tier DB (was running on every poll)
 let lastInvalidationCheck = 0;
@@ -180,6 +182,13 @@ export async function GET(req: NextRequest) {
         groups = groups.filter(g => allowed.includes(g.urgency));
     }
 
+    // Third-opinion report read (mtime-cached): read once so both the
+    // empty-groups response and the full response can carry the missing-SKU
+    // flags. Empty map when the report is missing — rows then degrade to the
+    // previous Finale→Aria display.
+    const recon = readReconBadges();
+    const reconBadges = recon.badges;
+
     if (groups.length === 0) {
         return NextResponse.json(
             {
@@ -189,6 +198,9 @@ export async function GET(req: NextRequest) {
                 mode,
                 refreshing,
                 upcomingBuilds: [],
+                basautoReconAt: recon.crawledAt,
+                basautoReconStale: recon.stale,
+                basautoOnlyFlags: recon.missing.slice(0, 12),
             },
             { headers: { 'Cache-Control': 'no-store' } }
         );
@@ -201,12 +213,39 @@ export async function GET(req: NextRequest) {
     let recentPOs: any[] = [];
     try {
         recentPOs = await client.getRecentPurchaseOrders(180, 500);
+        (globalThis as any).__aria_recent_pos = { at: Date.now(), pos: recentPOs };
     } catch (err: any) {
         console.error('[purchasing/route] Failed to fetch recent purchase orders:', err.message);
     }
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+
+    const autoDraftIds = new Set<string>();
+    const autonomyByName = new Map<string, number>();
+    try {
+        const db = createClient();
+        if (db) {
+            const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+            const { data: autoRows } = await db
+                .from("ap_activity_log")
+                .select("metadata, created_at")
+                .eq("intent", "PO_AUTO_DRAFT")
+                .gte("created_at", since);
+            for (const row of autoRows ?? []) {
+                const id = (row as any)?.metadata?.orderId;
+                if (id) autoDraftIds.add(String(id));
+            }
+            const { data: profiles } = await db
+                .from("vendor_profiles")
+                .select("vendor_name, autonomy_level");
+            for (const p of profiles ?? []) {
+                if (p?.vendor_name) autonomyByName.set(String(p.vendor_name).toLowerCase(), Number(p.autonomy_level) || 0);
+            }
+        }
+    } catch (err: any) {
+        console.warn("[purchasing/route] autonomy/auto-draft lookup failed:", err?.message || err);
+    }
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -225,6 +264,7 @@ export async function GET(req: NextRequest) {
                     quantity: draftHit.quantity,
                     supplierName: draftHit.vendorName || group.vendorName,
                     finaleUrl: draftHit.finaleUrl,
+                    autoDrafted: autoDraftIds.has(String(draftHit.orderId)),
                 }
                 : null;
 
@@ -328,6 +368,33 @@ export async function GET(req: NextRequest) {
                 commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
                 urgency: displayUrgency,
+                // Third-opinion join, re-verdict against LIVE row state: the
+                // 07:00 crawl verdict goes stale the moment a PO is drafted or
+                // received, so rerun the same pure assessor with the basauto
+                // side from the crawl and the Aria side from this row.
+                basautoRecon: (() => {
+                    const snap = reconBadges.get(productId.toUpperCase());
+                    if (!snap) return undefined;
+                    const liveAria: LiveRowAria = {
+                        productId,
+                        urgency: displayUrgency,
+                        stockOnHand: line.item.stockOnHand ?? null,
+                        stockOnOrder: displayOnOrder,
+                        dailyRate: (line.item as any).dailyRate ?? null,
+                        dailyRateSource: (line.item as any).dailyRateSource ?? null,
+                        leadTimeDays: (line.item as any).leadTimeDays ?? null,
+                        effectiveLeadTimeDays: (line.item as any).effectiveLeadTimeDays ?? null,
+                        adjustedRunwayDays: (line.item as any).adjustedRunwayDays ?? null,
+                        runwayDays: (line.item as any).runwayDays ?? null,
+                        openPOs: mergedOpenPOs.map((po: any) => ({
+                            orderId: String(po.orderId ?? ""),
+                            quantity: Number(po.quantity) || 0,
+                            orderDate: po.orderDate ?? po.expectedDate ?? null,
+                        })),
+                        suggestedQty: displaySuggested,
+                    };
+                    return recomputeBasautoBadge(snap, liveAria, recon.crawledAt) ?? undefined;
+                })(),
             };
         });
 
@@ -347,6 +414,7 @@ export async function GET(req: NextRequest) {
             vendorPartyId: group.vendorPartyId,
             urgency: worstUrgency(),
             vendorCycle,
+            autonomyLevel: autonomyByName.get(group.vendorName.toLowerCase()) ?? 0,
             items: modifiedItems,
         };
     });
@@ -378,6 +446,14 @@ export async function GET(req: NextRequest) {
             vendorSummaries: assessment.vendorSummaries,
             mode,
             refreshing,
+            // Freshness of the basauto third-opinion join (written by the
+            // 07:00 recon cron) — lets the panel flag a stale comparison
+            // instead of silently pairing live numbers with old verdicts.
+            basautoReconAt: recon.crawledAt,
+            basautoReconStale: recon.stale,
+            // basauto-flagged SKUs with no Aria row (candidate gate / job
+            // supplies) — rendered as their own strip, high severity first.
+            basautoOnlyFlags: recon.missing.slice(0, 12),
             upcomingBuilds,
         },
         { headers: { 'Cache-Control': 'no-store' } }
@@ -386,7 +462,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
     try {
-        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp } = await req.json();
+        const { vendorPartyId, items, memo, purchaseDestination, ignoreCommitGuards, forceTopUp, skipPreflight } = await req.json();
 
         if (!vendorPartyId || !Array.isArray(items) || items.length === 0) {
             return NextResponse.json(
@@ -457,7 +533,12 @@ export async function POST(req: NextRequest) {
 
         let recentPOs: any[] = [];
         try {
-            recentPOs = await client.getRecentPurchaseOrders(45, 500);
+            const cached = (globalThis as any).__aria_recent_pos as { at: number; pos: any[] } | undefined;
+            if (cached && Date.now() - cached.at < 10 * 60 * 1000 && Array.isArray(cached.pos) && cached.pos.length > 0) {
+                recentPOs = cached.pos;
+            } else {
+                recentPOs = await client.getRecentPurchaseOrders(45, 500);
+            }
         } catch (err: any) {
             console.error('[purchasing/route] Failed to fetch recent purchase orders for vendor cycle:', err.message);
         }
@@ -521,10 +602,9 @@ export async function POST(req: NextRequest) {
             console.warn(`[purchasing/route] forceTopUp: ${dupGuard.summary}`);
         }
 
-        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination);
+        const result = await client.createDraftPurchaseOrder(vendorPartyId, items, memo, purchaseDestination, { skipPreflight: !!skipPreflight });
 
-        // Invalidate caches so the next GET shows the new PO.
-        invalidatePurchasingCaches();
+        // Coverage overlay on the next GET is enough — do not bust the 12–15 min SWR scan.
 
         return NextResponse.json({
             ...result,

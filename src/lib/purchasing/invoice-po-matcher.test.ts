@@ -49,6 +49,10 @@ vi.mock("@/lib/purchasing/po-lifecycle", () => ({
     transitionLifecycleState: vi.fn(),
 }));
 vi.mock("@/lib/purchasing/vendor-name-normalize", () => ({
+    // Mirrors the REAL implementation: punctuation is preserved (the shared
+    // normalizer strips only CRLF/dingbats/quotes). The matcher's
+    // punct-insensitive tier in scoreVendorName must handle "Concentrates,
+    // Inc" vs "Concentrates Inc." itself.
     normalizeVendorName: (s: string) => (s || "").toUpperCase().replace(/\s+/g, " ").trim(),
     resolveCanonicalVendor: () => null,
     loadVendorAliases: vi.fn().mockResolvedValue([]),
@@ -533,5 +537,132 @@ describe("findPOCandidates with Tier A auto-match", () => {
         expect(result.bestMatch!.score).toBe(100);
         const hasOcrReason = result.bestMatch!.reasons.some(r => r.includes("exact OCR PO match"));
         expect(hasOcrReason).toBe(true);
+    });
+
+    it("unions term-search POs when vendor punctuation splits the name", async () => {
+        // Bill (2026-08-27): Concentrates, Inc — direct ILIKE (%Concentrates,
+        // Inc%) only matched comma-form POs; PO 125184 ("Concentrates Inc.")
+        // never surfaced. The term search must UNION, not replace-when-empty.
+        let poCalls = 0;
+        mockFrom.mockImplementation((table: string) => {
+            if (table === "confirmed_po_matches") return createChain({ data: [{ vendor_name: "Concentrates, Inc", po_number: "124909" }], error: null });
+            if (table === "vendor_aliases") return createChain({ data: [], error: null });
+            if (table === "purchase_orders") {
+                poCalls++;
+                // 1st call = direct ILIKE on the full invoice vendor name
+                // (comma form); later calls = term ILIKE ("Concentrates").
+                return createChain({
+                    data: poCalls === 1
+                        ? [{
+                            po_number: "124909",
+                            vendor_name: "Concentrates, Inc",
+                            issue_date: "2026-06-10",
+                            total_amount: null,
+                            total: 8451.75,
+                            status: "received",
+                        }]
+                        : [
+                            {
+                                po_number: "124909",
+                                vendor_name: "Concentrates, Inc",
+                                issue_date: "2026-06-10",
+                                total_amount: null,
+                                total: 8451.75,
+                                status: "received",
+                            },
+                            {
+                                po_number: "125184",
+                                vendor_name: "Concentrates Inc.",
+                                issue_date: "2026-08-11",
+                                total_amount: null,
+                                total: 5261.68,
+                                status: "received",
+                            },
+                        ],
+                    error: null,
+                });
+            }
+            return createChain({ data: [], error: null });
+        });
+
+        const result = await findPOCandidates({
+            id: "inv-union",
+            invoiceNumber: "300419889380",
+            vendorName: "Concentrates, Inc",
+            invoiceDate: "2026-08-19",
+            subtotal: 0,
+            freight: 0,
+            tax: 0,
+            total: 916.33,
+        });
+        const ids = result.candidates.map((c) => c.orderId);
+        expect(ids).toContain("125184"); // no-comma PO surfaced via term union
+        expect(ids).toContain("124909");
+        // Date evidence ranks the recent PO above the stale confirmed one.
+        expect(result.candidates[0].orderId).toBe("125184");
+        expect(result.autoApplyReady).toBe(false); // amount 916 vs 5261 — never auto
+    });
+
+    it("confirmed PO with a large amount gap is boosted, not blinded to 95", async () => {
+        // Bill (2026-08-27): Concentrates showed 3× 95% while every candidate
+        // was 0/N SKU match and 3-9× the invoice amount. Confirmed memory must
+        // not override the amount evidence; it becomes a bounded boost.
+        stubDbForPoSearch([
+            {
+                po_number: "124909",
+                vendor_name: "Concentrates, Inc",
+                issue_date: "2026-06-10",
+                total_amount: null,
+                total: 8451.75,
+                status: "received",
+            },
+        ], [{
+            vendor_name: "Concentrates, Inc",
+            po_number: "124909",
+        }]);
+
+        const result = await findPOCandidates({
+            id: "inv-gap",
+            invoiceNumber: "300419889380",
+            vendorName: "Concentrates, Inc",
+            invoiceDate: "2026-08-19",
+            subtotal: 0,
+            freight: 0,
+            tax: 0,
+            total: 916.33,
+        });
+        const best = result.candidates[0];
+        expect(best.score).toBeLessThan(95); // no blind 95
+        expect(best.score).toBeGreaterThanOrEqual(50); // still suggested
+        expect(best.reasons.some((r) => r.includes("amount differs from PO"))).toBe(true);
+        expect(result.autoApplyReady).toBe(false);
+    });
+
+    it("confirmed PO with a close amount still reaches 95 (repeat billing)", async () => {
+        stubDbForPoSearch([
+            {
+                po_number: "124800",
+                vendor_name: "Miles Filippelli",
+                issue_date: "2026-07-10",
+                total_amount: null,
+                total: 500,
+                status: "open",
+            },
+        ], [{
+            vendor_name: "Miles Filippelli",
+            po_number: "124800",
+        }]);
+
+        const result = await findPOCandidates({
+            id: "inv-repeat",
+            invoiceNumber: "INV-REPEAT",
+            vendorName: "Miles Filippelli",
+            invoiceDate: "2026-07-20",
+            subtotal: 500,
+            freight: 25,
+            tax: 0,
+            total: 525,
+        });
+        expect(result.candidates[0].score).toBeGreaterThanOrEqual(95);
     });
 });

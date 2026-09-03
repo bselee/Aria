@@ -14,6 +14,7 @@ import {
     carrierUrl,
     parseTrackingContent,
     detectLTLCarrier,
+    pageMentionsTrackingNumber,
     isFedExNumber,
     buildFollowUpEmail,
     TRACKING_PATTERNS,
@@ -320,6 +321,37 @@ describe('extractTrackingNumbers', () => {
         expect(extractTrackingNumbers('no tracking here')).toEqual([]);
     });
 
+    // HERMIA(2026-08-20): regression for Ferticell PO 125211 — Logan Hausherr
+    // sent carrier + PRO only as an ODFL trace URL. Before urlPro the extractor
+    // returned [] and the PO sat with zero tracking despite a perfect vendor ack.
+    it('extracts an ODFL PRO from a carrier trace URL in the email body', () => {
+        const text =
+            'We shipped PO#125211 yesterday with Old Dominion. You can track your shipment here : ' +
+            'https://www.odfl.com/us/en/tools/trace-track-ltl-freight.html?proNumbers=78088240060.';
+        const results = extractTrackingNumbers(text);
+        expect(results).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ carrier: 'urlPro', trackingNumber: '78088240060' }),
+            ]),
+        );
+    });
+
+    it('extracts tracking numbers from FedEx / UPS / USPS tracking URLs', () => {
+        expect(
+            extractTrackingNumbers('https://www.fedex.com/fedextrack/?tracknumbers=794657123456')
+                .some(r => r.trackingNumber === '794657123456'),
+        ).toBe(true);
+        expect(
+            extractTrackingNumbers('https://www.ups.com/track?tracknum=1Z22YV580360436423')
+                .some(r => r.trackingNumber === '1Z22YV580360436423'),
+        ).toBe(true);
+        expect(
+            extractTrackingNumbers(
+                'https://tools.usps.com/go/TrackConfirmAction?tLabels=9434650106151053145623',
+            ).some(r => r.trackingNumber === '9434650106151053145623'),
+        ).toBe(true);
+    });
+
     it('extracts the real UPS tracking number from a Thirsty Earth ShipStation email', () => {
         const results = extractTrackingNumbers(REAL_VENDOR_EMAILS.thirstyEarthUpsShipstation);
         expect(results).toEqual(
@@ -567,5 +599,39 @@ describe('TRACKING_PATTERNS', () => {
         it('should not match TRK when part of another word', () => {
             expect(TRACKING_PATTERNS.trk.test('intrk 12345678')).toBe(false);
         });
+    });
+});
+
+// ──────────────────────────────────────────────────
+// pageMentionsTrackingNumber (LTL proof-of-shipment guard)
+// ──────────────────────────────────────────────────
+
+describe('pageMentionsTrackingNumber', () => {
+    // HERMIA(2026-08-20): ODFL renders tracking client-side. The server HTML is
+    // page chrome whose notification-preferences block literally contains the
+    // words "Out for Delivery" and "Delivered", so parseTrackingContent reported
+    // Ferticell PO 125211's in-transit LTL shipment as DELIVERED. This guard is
+    // what stops a JS shell from fabricating a delivery.
+    const odflShellChrome =
+        'Tracking Notifications Appointment Set/Confirmed Email On Off Text On Off ' +
+        'Out for Delivery Email On Off Text On Off Returned to Dock Email On Off ' +
+        'Delivered Email On Off Text On Off Email Address Required';
+
+    it('rejects a JS-shell page that never rendered the PRO', () => {
+        expect(pageMentionsTrackingNumber(odflShellChrome, '78088240060')).toBe(false);
+    });
+
+    it('accepts a page that renders the PRO verbatim', () => {
+        expect(
+            pageMentionsTrackingNumber(`PRO 78088240060 Delivered Aug 21, 2026`, '78088240060'),
+        ).toBe(true);
+    });
+
+    it('accepts a PRO formatted with separators by the carrier', () => {
+        expect(pageMentionsTrackingNumber('PRO 780-882-40060 In Transit', '78088240060')).toBe(true);
+    });
+
+    it('rejects an unusably short tracking number', () => {
+        expect(pageMentionsTrackingNumber('12345 Delivered', '12345')).toBe(false);
     });
 });

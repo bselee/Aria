@@ -59,7 +59,7 @@ export class CommsService {
       }
     } catch (err: any) {
       console.warn("[CommsService] AP morning block failed (non-fatal):", err.message);
-      blocks.push(`📬 AP: error ${err.message}`);
+      blocks.push(`AP: error ${err.message}`);
     }
 
     // Block 2: POs in flight — count by lifecycle stage.
@@ -71,7 +71,7 @@ export class CommsService {
         counts.set(stage, (counts.get(stage) ?? 0) + 1);
       }
       const total = purchases.length;
-      const lines = [`📦 *POs in flight* (${total} total)`];
+      const lines = [`*POs in flight* (${total} total)`];
       const ordered = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
       for (const [stage, count] of ordered) {
         lines.push(`  • ${stage}: ${count}`);
@@ -82,7 +82,7 @@ export class CommsService {
       blocks.push(lines.join("\n"));
     } catch (err: any) {
       console.warn("[CommsService] POs-in-flight block failed:", err.message);
-      blocks.push(`📦 POs in flight: error ${err.message}`);
+      blocks.push(`POs in flight: error ${err.message}`);
     }
 
     // Block 2.5: PO receivings in last 24h (rolls up what used to be
@@ -100,12 +100,12 @@ export class CommsService {
           .limit(100);
         const rows = (data ?? []) as Array<{ metadata: any }>;
         if (rows.length === 0) {
-          blocks.push("📦 *Received today*: none");
+          blocks.push("*Received today*: none");
         } else {
           const totalValue = rows.reduce((s, r) => s + (Number(r.metadata?.total) || 0), 0);
           const sample = rows.slice(0, 3).map(r => `  • PO #${r.metadata?.poId} — ${r.metadata?.supplier ?? "?"} ($${(Number(r.metadata?.total) || 0).toFixed(0)})`);
           const more = rows.length > 3 ? `\n  • …+${rows.length - 3} more` : "";
-          blocks.push(`📦 *Received today* (${rows.length}, $${totalValue.toFixed(0)})\n${sample.join("\n")}${more}`);
+          blocks.push(`*Received today* (${rows.length}, $${totalValue.toFixed(0)})\n${sample.join("\n")}${more}`);
         }
       }
     } catch (err: any) {
@@ -121,15 +121,15 @@ export class CommsService {
         .toLocaleDateString("en-CA", { timeZone: "America/Denver" });
       const todays = events.filter(e => e.startDate === today || e.startDate === tomorrow);
       if (todays.length === 0) {
-        blocks.push(`🏗 *Builds today*: none scheduled in the next 24h`);
+        blocks.push(`*Builds today*: none scheduled in the next 24h`);
       } else {
         const sample = todays.slice(0, 3).map(e => `  • ${e.startDate}: ${e.title || "(untitled)"}`);
         const more = todays.length > 3 ? `\n  • …+${todays.length - 3} more` : "";
-        blocks.push(`🏗 *Builds today* (${todays.length} in next 24h)\n${sample.join("\n")}${more}`);
+        blocks.push(`*Builds today* (${todays.length} in next 24h)\n${sample.join("\n")}${more}`);
       }
     } catch (err: any) {
       console.warn("[CommsService] Builds-today block failed:", err.message);
-      blocks.push(`🏗 Builds today: not available (${err.message})`);
+      blocks.push(`Builds today: not available (${err.message})`);
     }
 
     // Block 4: Tasks awaiting Will.
@@ -137,12 +137,12 @@ export class CommsService {
       const needs = await agentTask.listTasks({ status: ["NEEDS_APPROVAL"], limit: 200 });
       const failedWill = (await agentTask.listTasks({ status: ["FAILED"], owner: "will", limit: 200 })) ?? [];
       const total = needs.length + failedWill.length;
-      const lines = [`✋ *Tasks awaiting Will* (${total} total)`];
+      const lines = [`*Tasks awaiting Bill* (${total} total)`];
       if (total === 0) {
         lines.push("  • inbox clear");
       } else {
         if (needs.length > 0) lines.push(`  • needs approval: ${needs.length}`);
-        if (failedWill.length > 0) lines.push(`  • failed (Will-owned): ${failedWill.length}`);
+        if (failedWill.length > 0) lines.push(`  • failed (Bill-owned): ${failedWill.length}`);
         const top = [...needs, ...failedWill].slice(0, 3);
         for (const t of top) {
           const goal = String((t as any).goal || (t as any).type || "task").slice(0, 80);
@@ -152,7 +152,7 @@ export class CommsService {
       blocks.push(lines.join("\n"));
     } catch (err: any) {
       console.warn("[CommsService] Tasks-awaiting-Will block failed:", err.message);
-      blocks.push(`✋ Tasks awaiting Will: error ${err.message}`);
+      blocks.push(`Tasks awaiting Bill: error ${err.message}`);
     }
 
     // Assemble + cap under ~3000 chars, then send as a single Telegram message.
@@ -189,7 +189,7 @@ export class CommsService {
       if (summary.totalSamples === 0) {
         if (chatId) {
           await businessHoursAlert(this.bot, chatId,
-            "📊 *Weekly Reorder Retro*\n\nNo calibrated recommendations in the last 7 days yet — calibration loop needs received POs to score against. Check back next week.",
+            "*Weekly Reorder Retro*\n\nNo calibrated recommendations in the last 7 days yet — calibration loop needs received POs to score against. Check back next week.",
             { parse_mode: "Markdown" }
           );
         }
@@ -197,7 +197,7 @@ export class CommsService {
       }
 
       const lines: string[] = [];
-      lines.push("📊 *Weekly Reorder Retro — Model vs Finale*");
+      lines.push("*Weekly Reorder Retro — Model vs Finale*");
       lines.push(`Calibrated samples: ${summary.totalSamples} (${summary.coveredSamples} comparable to Finale)`);
       if (summary.medianAriaErrorPct != null) {
         lines.push(`Model median error: ${summary.medianAriaErrorPct >= 0 ? "+" : ""}${summary.medianAriaErrorPct.toFixed(0)}%`);

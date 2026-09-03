@@ -143,6 +143,20 @@ export class APIdentifierAgent {
         snippet: string,
         gmailMessageId?: string,
     ): Promise<string> {
+        // FIX(2026-08-12, t_3d2c50e0): Payment reminders / past-due notices are
+        // NOT invoices. QuickBooks/Bill.com reminders ("Invoice - Reminder: Your
+        // payment to X is 11 days due") previously classified as INVOICE and got
+        // archived with invoice_number="Reminder" / total=0. Catch them here
+        // BEFORE the LLM so they route to the reminder path (archive, no forward).
+        const subjectLower = subject.toLowerCase();
+        const isPaymentReminder =
+            /\breminder\b/i.test(subjectLower) &&
+            /\b(?:payment|invoice|pay|due|overdue|past\s*due|outstanding)\b/i.test(subjectLower);
+        if (isPaymentReminder) {
+            console.log(`     -> Classified REMINDER (payment/past-due subject) — not an invoice`);
+            return "STATEMENT"; // STATEMENT path archives without Bill.com forward
+        }
+
         // KAIZEN #3 (2026-05-05): Honor nightshift pre-classification before paying for Sonnet.
         // getPreClassification() already enforces conf ≥ 0.7 + valid label, but we re-check
         // here defensively so this method is safe to call from any path.
@@ -879,7 +893,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
 
                 // --- INVOICE QUEUEING (ap inbox only) ---
                 let processedAnyPDF = false;
-                let manualReviewReason: string | null = null;
+                const manualReviewReason: string | null = null;
 
                 const pdfParts: any[] = [];
                 const walkParts = (parts: any[]): void => {
@@ -1054,7 +1068,7 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                             } else if (extractedPdf) {
                                 // Non-FedEx: optional single-page pick for Bill.com OCR.
                                 // KAIZEN(2026-07-22): Removed AAA Cooper forced-page-1 override.
-                                let pageSelection = await this.selectPrimaryInvoicePageNumber(
+                                const pageSelection = await this.selectPrimaryInvoicePageNumber(
                                     buffer,
                                     extractedPdf.pages,
                                     extractedPdf.metadata?.pageCount,
@@ -1207,9 +1221,58 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
                     handled = false;
                     throw err;
                 } finally {
-                    await db.from('email_inbox_queue')
-                        .update({ processed_by_ap: handled })
-                        .eq('id', m.id);
+                    // FIX(2026-08-12, t_3d2c50e0 follow-up from t_b4894914):
+                    // All 3 queue processors must advance status, not just flip
+                    // their processed_by_* flag. Otherwise email_inbox_queue
+                    // rows sit at status='unprocessed' forever and the queue
+                    // counter inflates perpetually (the 797-backlog illusion).
+                    if (handled) {
+                        // Flag always advances (payload kept byte-identical to
+                        // the historical contract); status advances to
+                        // 'processed' ONLY when the row is still pending —
+                        // never clobber a terminal status ACK already wrote
+                        // for default-inbox rows (completed / invoice_queued /
+                        // needs_response).
+                        await db.from('email_inbox_queue')
+                            .update({ processed_by_ap: true })
+                            .eq('id', m.id);
+                        try {
+                            await db.from('email_inbox_queue')
+                                .update({
+                                    status: 'processed',
+                                    updated_at: new Date().toISOString(),
+                                })
+                                .eq('id', m.id)
+                                .in('status', ['unprocessed', 'processing']);
+                        } catch (statusErr: any) {
+                            // Non-fatal: the flag above is the real dedup lock;
+                            // status advancement is bookkeeping. Never let a
+                            // status-update failure re-queue the email.
+                            console.warn(
+                                `   [AP-Identifier] Status advance failed for ${m.id}: ${statusErr?.message || statusErr}`,
+                            );
+                        }
+                    } else {
+                        // Unhandled → leave retryable, but never downgrade a
+                        // terminal status ACK already wrote (completed,
+                        // needs_response, etc.).
+                        await db.from('email_inbox_queue')
+                            .update({ processed_by_ap: false })
+                            .eq('id', m.id);
+                        try {
+                            await db.from('email_inbox_queue')
+                                .update({
+                                    status: 'unprocessed',
+                                    updated_at: new Date().toISOString(),
+                                })
+                                .eq('id', m.id)
+                                .in('status', ['unprocessed', 'processing']);
+                        } catch (statusErr: any) {
+                            console.warn(
+                                `   [AP-Identifier] Retry status reset failed for ${m.id}: ${statusErr?.message || statusErr}`,
+                            );
+                        }
+                    }
                 }
             }
         } catch (err: any) {
@@ -1282,26 +1345,25 @@ PAID_INVOICE - Payment confirmation for an invoice that has been paid (e.g. "Inv
             }
         }
 
-        // Step 3: Log to Supabase
+        // Step 3: Log to Supabase — single write path: vendor_invoices (legacy paid_invoices is a view since 2026-08-12)
         try {
-            await db.from('paid_invoices').insert({
+            await upsertVendorInvoice({
                 vendor_name: extracted.vendorName,
                 invoice_number: extracted.invoiceNumber,
-                amount_paid: extracted.amountPaid,
-                date_paid: extracted.datePaid,
                 po_number: matchedPO?.orderId || null,
-                po_matched: !!matchedPO,
-                product_description: extracted.productDescription,
-                vendor_address: extracted.vendorAddress,
-                email_from: from,
-                email_subject: subject,
-                gmail_message_id: emailRow.gmail_message_id,
-                confidence: extracted.confidence,
+                total: extracted.amountPaid,
+                status: 'paid',
+                payment_status: 'paid',
+                paid_at: extracted.datePaid || new Date().toISOString(),
+                source: 'payment_confirm',
+                source_ref: emailRow.gmail_message_id,
+                notes: extracted.productDescription,
                 source_inbox: sourceInbox,
+                raw_data: extracted as Record<string, unknown>,
             });
         } catch (dbErr: any) {
             // Table might not exist yet — log but don't block
-            console.warn(`     ⚠️ paid_invoices insert failed (table may not exist):`, dbErr.message);
+            console.warn(`     ⚠️ paid_invoices upsert failed (table may not exist):`, dbErr.message);
         }
 
         // Step 4: If no PO match, create a draft PO for Will to review

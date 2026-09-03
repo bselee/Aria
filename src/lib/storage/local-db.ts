@@ -271,8 +271,12 @@ export function getLocalDb() {
         ["completed_at", "ALTER TABLE ap_local_forwards ADD COLUMN completed_at DATETIME"],
         ["vendor_routing_action", "ALTER TABLE ap_local_forwards ADD COLUMN vendor_routing_action TEXT"],
         ["verified", "ALTER TABLE ap_local_forwards ADD COLUMN verified INTEGER DEFAULT 0"],
+        ["billcom_processed", "ALTER TABLE ap_local_forwards ADD COLUMN billcom_processed INTEGER DEFAULT 0"],
         // Phase 3 (2026-07-09): OCR caching + real reconciliation engine output
         ["ocr_raw_text", "ALTER TABLE ap_local_forwards ADD COLUMN ocr_raw_text TEXT"],
+        ["ocr_vendor_name", "ALTER TABLE ap_local_forwards ADD COLUMN ocr_vendor_name TEXT"],
+        ["ocr_invoice_number", "ALTER TABLE ap_local_forwards ADD COLUMN ocr_invoice_number TEXT"],
+        ["ocr_total", "ALTER TABLE ap_local_forwards ADD COLUMN ocr_total TEXT"],
         ["reconciliation_verdict", "ALTER TABLE ap_local_forwards ADD COLUMN reconciliation_verdict TEXT"],
         ["reconciliation_result_json", "ALTER TABLE ap_local_forwards ADD COLUMN reconciliation_result_json TEXT"],
     ];

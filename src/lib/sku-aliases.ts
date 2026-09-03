@@ -1,14 +1,13 @@
 /**
  * @file    src/lib/sku-aliases.ts
  * @purpose Mapping of colloquial/vendor-informal SKU names to Finale SKUs.
- *          Used by slack/request-detector and other pipelines that receive
- *          human-written SKU references (Slack messages, emails, Telegram)
- *          which rarely use the exact Finale product ID.
+ *          Used by pipelines that receive human-written SKU references
+ *          (emails, Telegram) which rarely use the exact Finale product ID.
  *
  *          Why it exists: People say "0811 bags" but Finale has
- *          `SBD21410811`. Without alias resolution, the request-detector
+ *          `SBD21410811`. Without alias resolution, request handling
  *          silently drops these as unmatched — exactly what happened with
- *          Parker McMahon's Slack request (2026-06-08).
+ *          Parker McMahon's request (2026-06-08).
  *
  *          Each entry maps one or more informal names → { finaleSku, vendor, label }.
  *          Matches are case-insensitive. When the user's text is tokenized
@@ -35,7 +34,7 @@ export interface SkuAliasEntry {
  * SKU alias table. Add new entries here when users reference SKUs by
  * colloquial names that don't match the Finale product ID.
  *
- * Maintenance: When a Slack/Telegram message reveals a new alias, add it.
+ * Maintenance: When a message reveals a new alias, add it.
  * Run `npm run ship:bot` to deploy. No database migration needed.
  */
 export const SKU_ALIASES: SkuAliasEntry[] = [
@@ -59,7 +58,7 @@ export const SKU_ALIASES: SkuAliasEntry[] = [
         vendor: 'Colorful Packaging',
         aliases: ['bav5lb', 'bav5lbbag'],
     },
-    // Add more entries here as they surface in Slack/email messages
+    // Add more entries here as they surface in email/message text
 ];
 
 /**

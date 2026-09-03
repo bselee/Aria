@@ -41,6 +41,22 @@ const PROMOTIONAL_TERMS = [
     "clearance",
     "shop now",
     "unsubscribe",
+    "survey",
+    "feedback",
+    "rate your",
+    "how did we do",
+    "whitepaper",
+    "white paper",
+    "case study",
+    "industry report",
+    "market report",
+    "thought leadership",
+    "free guide",
+    "free ebook",
+    "free report",
+    "free template",
+    "register now",
+    "save your seat",
 ];
 
 const OPERATIONAL_TERMS = [

@@ -337,7 +337,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
 
                     if (routingRule.action === 'amazon_order') {
                         // DECISION(2026-03-19): Amazon emails are routed to a dedicated
-                        // parser that extracts order data and matches to Slack requests.
+                        // parser that extracts order data for spend tracking.
                         // Mark as read but do NOT archive — Will may want to reference.
                         try {
                             const { AmazonOrderParser } = await import('./workers/amazon-order-parser');
@@ -1357,25 +1357,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 gmail_message_id: messageId || null,
             }).select("id").single();
 
-            await supabase.from("invoices").upsert({
-                invoice_number: invoiceData.invoiceNumber,
-                vendor_name: invoiceData.vendorName,
-                po_number: finalePONumber,
-                invoice_date: invoiceData.invoiceDate,
-                due_date: invoiceData.dueDate || invoiceData.invoiceDate,
-                payment_terms: invoiceData.paymentTerms,
-                subtotal: invoiceData.subtotal,
-                freight: invoiceData.freight || 0,
-                tax: invoiceData.tax || 0,
-                tariff: invoiceData.tariff || 0,
-                labor: invoiceData.labor || 0,
-                tracking_numbers: invoiceData.trackingNumbers || [],
-                total: invoiceData.total,
-                amount_due: invoiceData.amountDue,
-                status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
-                document_id: docData?.id || null,
-                raw_data: invoiceData
-            }, { onConflict: "invoice_number" });
+            // Single write path: vendor_invoices only (legacy `invoices` is a read-only view since 2026-08-12)
 
             // 3a. Archive into unified vendor_invoices table (non-blocking)
             try {
@@ -1383,13 +1365,16 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                     vendor_name: invoiceData.vendorName,
                     invoice_number: invoiceData.invoiceNumber,
                     invoice_date: invoiceData.invoiceDate,
-                    due_date: invoiceData.dueDate || null,
+                    due_date: invoiceData.dueDate || invoiceData.invoiceDate,
                     po_number: finalePONumber || null,
                     subtotal: invoiceData.subtotal,
                     freight: invoiceData.freight || 0,
                     tax: invoiceData.tax || 0,
+                    tariff: invoiceData.tariff || 0,
+                    labor: invoiceData.labor || 0,
+                    tracking_numbers: invoiceData.trackingNumbers || [],
                     total: invoiceData.total,
-                    status: matched ? 'received' : 'received',
+                    status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
                     source: 'email_attachment',
                     source_ref: messageId || `email-${from}`,
                     pdf_storage_path: pdfStoragePath,
@@ -1848,7 +1833,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                                 // Both activity log and Telegram say the same plain English thing.
                                 action_taken: result.summary,
-                                notified_slack: false,
                                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                                 reconciliation_report: result.report ?? null,
                             }).eq("id", pendingLogId);
@@ -1867,7 +1851,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                     actual: fc.amount, verdict: fc.verdict, reason: fc.reason
                                 }))
                             ];
-                            await supabase.from("invoices").update({ status: newStatus, discrepancies })
+                            await supabase.from("vendor_invoices").update({ status: newStatus, discrepancies })
                                 .eq("invoice_number", result.invoiceNumber)
                                 .ilike("vendor_name", `%${result.vendorName}%`);
                         } catch {
@@ -2151,7 +2135,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 // DECISION(2026-05-20): action_taken mirrors the Telegram message exactly.
                 // Both activity log and Telegram say the same plain English thing.
                 action_taken: result.summary,
-                notified_slack: false,
                 metadata: buildAuditMetadata(result, applyResult, "auto"),
                 reconciliation_report: reconciliationReport,
             });
@@ -2180,7 +2163,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }))
             ];
 
-            await supabase.from("invoices").update({
+            await supabase.from("vendor_invoices").update({
                 status: newStatus,
                 discrepancies: discrepancies
             })
@@ -2193,7 +2176,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     /**
-     * Send reconciliation summary to Telegram (and Slack).
+     * Send reconciliation summary to Telegram.
      *
      * DECISION(2026-05-20): Phase-aware notification.
      *   Phase 1 (Surface): real-time Telegram with [✅ Noted] [⚠️ Flag] buttons when
@@ -2271,8 +2254,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         } catch (err: any) {
             console.error("Telegram reconciliation notification failed:", err.message);
         }
-
-        // Slack cross-posting disabled: AP/reconciliation review lives in Telegram and the dashboard.
     }
 
     /**
@@ -2330,8 +2311,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
         emailSubject: string,
         intent: string,
         actionTaken: string,
-        metadata?: Record<string, any>,
-        notifiedSlack: boolean = false
+        metadata?: Record<string, any>
     ) {
         if (!supabase) return;
         try {
@@ -2340,7 +2320,6 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 email_subject: emailSubject,
                 intent,
                 action_taken: actionTaken,
-                notified_slack: notifiedSlack,
                 metadata: metadata || null
             });
         } catch (err: any) {
@@ -2349,7 +2328,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
     }
 
     /**
-     * Sends a daily recap of all AP Agent actions to Telegram and Slack.
+     * Sends a daily recap of all AP Agent actions to Telegram.
      * Groups by intent category for easy scanning.
      *
      * DECISION(2026-02-26): This provides a monitoring layer so Will can

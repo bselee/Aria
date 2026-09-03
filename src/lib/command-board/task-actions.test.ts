@@ -52,7 +52,7 @@ describe('approveTask', () => {
         vi.mocked(agentTask.getById).mockResolvedValue(null);
         const r = await approveTask('t1', 'will-telegram');
         expect(r.ok).toBe(false);
-        expect(r.replyText).toBe('❓ Task not found.');
+        expect(r.replyText).toBe('Task not found.');
         expect(r.cbQueryText).toBe('Approving...');
     });
 
@@ -70,7 +70,7 @@ describe('approveTask', () => {
         });
         const r = await approveTask('t1', 'will-telegram');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('✅ Applied 3 lines');
+        expect(r.replyText).toBe('OK Applied 3 lines');
         expect(r.cbQueryText).toBe('Approving...');
         expect(approvePendingReconciliation).toHaveBeenCalledWith('src1');
     });
@@ -88,9 +88,9 @@ describe('approveTask', () => {
             message: 'Approval not found or expired.',
         });
         const r = await approveTask('t1', 'will-telegram');
-        // ok still true (call completed without throwing); content uses warn glyph
+        // ok still true (call completed without throwing); content uses WARN label
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('⚠️ Approval not found or expired.');
+        expect(r.replyText).toBe('WARN Approval not found or expired.');
     });
 
     it('generic path: returns the exact Approved string', async () => {
@@ -102,7 +102,7 @@ describe('approveTask', () => {
         vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
         const r = await approveTask('t2', 'will-telegram');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('✅ Approved.');
+        expect(r.replyText).toBe('Approved.');
         expect(r.cbQueryText).toBe('Approving...');
         expect(agentTask.decideApproval).toHaveBeenCalledWith('t2', 'approve', 'will-telegram');
     });
@@ -111,7 +111,7 @@ describe('approveTask', () => {
         vi.mocked(agentTask.getById).mockRejectedValue(new Error('boom'));
         const r = await approveTask('t3', 'will-telegram');
         expect(r.ok).toBe(false);
-        expect(r.replyText).toBe('❌ Approve failed: boom');
+        expect(r.replyText).toBe('Approve failed: boom');
         expect(r.cbQueryText).toBe('Approving...');
     });
 });
@@ -125,7 +125,7 @@ describe('rejectTask', () => {
         vi.mocked(agentTask.getById).mockResolvedValue(null);
         const r = await rejectTask('t1', 'will-telegram');
         expect(r.ok).toBe(false);
-        expect(r.replyText).toBe('❓ Task not found.');
+        expect(r.replyText).toBe('Task not found.');
         expect(r.cbQueryText).toBe('Rejecting...');
     });
 
@@ -138,7 +138,7 @@ describe('rejectTask', () => {
         vi.mocked(rejectPendingReconciliation).mockResolvedValue('Rejected approval src1');
         const r = await rejectTask('t1', 'will-telegram');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('❌ Rejected approval src1');
+        expect(r.replyText).toBe('Rejected approval src1');
         expect(r.cbQueryText).toBe('Rejecting...');
         expect(rejectPendingReconciliation).toHaveBeenCalledWith('src1');
     });
@@ -152,7 +152,7 @@ describe('rejectTask', () => {
         vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
         const r = await rejectTask('t2', 'will-telegram');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('❌ Rejected.');
+        expect(r.replyText).toBe('Rejected.');
         expect(r.cbQueryText).toBe('Rejecting...');
         expect(agentTask.decideApproval).toHaveBeenCalledWith('t2', 'reject', 'will-telegram');
     });
@@ -161,7 +161,7 @@ describe('rejectTask', () => {
         vi.mocked(agentTask.getById).mockRejectedValue(new Error('kaboom'));
         const r = await rejectTask('t3', 'will-telegram');
         expect(r.ok).toBe(false);
-        expect(r.replyText).toBe('❌ Reject failed: kaboom');
+        expect(r.replyText).toBe('Reject failed: kaboom');
         expect(r.cbQueryText).toBe('Rejecting...');
     });
 });
@@ -175,7 +175,7 @@ describe('dismissTask', () => {
         vi.mocked(agentTask.complete).mockResolvedValue(undefined);
         const r = await dismissTask('t1', 'will-telegram');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('✓ Dismissed.');
+        expect(r.replyText).toBe('Dismissed.');
         expect(r.cbQueryText).toBe('Dismissed');
 
         // assert the call shape: complete(taskId, { dismissed_by, dismissed_at: ISO })
@@ -192,7 +192,7 @@ describe('dismissTask', () => {
         vi.mocked(agentTask.complete).mockRejectedValue(new Error('nope'));
         const r = await dismissTask('t1', 'will-telegram');
         expect(r.ok).toBe(false);
-        expect(r.replyText).toBe('❌ Dismiss failed: nope');
+        expect(r.replyText).toBe('Dismiss failed: nope');
         expect(r.cbQueryText).toBe('Dismissed');
     });
 
@@ -216,6 +216,9 @@ describe('Telegram bridge', () => {
     beforeEach(() => {
         process.env.TELEGRAM_BOT_TOKEN = 'test-token';
         process.env.TELEGRAM_CHAT_ID = '12345';
+        // Master switch (2026-08-19) defaults Telegram OFF — these tests verify the
+        // bridge wiring, so opt in explicitly.
+        process.env.ARIA_TELEGRAM_ENABLED = 'true';
         // global.fetch — task-actions uses the runtime fetch, not an injected one
         (globalThis as any).fetch = vi.fn(async () =>
             new Response('{"ok":true}', { status: 200 }),
@@ -225,6 +228,7 @@ describe('Telegram bridge', () => {
     afterEach(() => {
         process.env.TELEGRAM_BOT_TOKEN = ORIGINAL_TOKEN;
         process.env.TELEGRAM_CHAT_ID = ORIGINAL_CHAT;
+        delete process.env.ARIA_TELEGRAM_ENABLED;
     });
 
     it('does NOT call telegram on will-telegram actor', async () => {
@@ -236,19 +240,13 @@ describe('Telegram bridge', () => {
         expect((globalThis as any).fetch).not.toHaveBeenCalled();
     });
 
-    it('calls telegram once on will-dashboard actor (generic approve)', async () => {
+    it('does NOT call telegram on will-dashboard actor (telegram disabled 2026-09-02)', async () => {
         vi.mocked(agentTask.getById).mockResolvedValue({
             id: 't1', source_table: null, source_id: null,
         } as any);
         vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
         await approveTask('t1', 'will-dashboard');
-        expect((globalThis as any).fetch).toHaveBeenCalledTimes(1);
-        const [url, init] = (globalThis as any).fetch.mock.calls[0];
-        expect(url).toBe('https://api.telegram.org/bottest-token/sendMessage');
-        const body = JSON.parse(init.body);
-        expect(body.chat_id).toBe('12345');
-        expect(body.text).toContain('Approved via dashboard');
-        expect(body.text).toContain('✅ Approved.');
+        expect((globalThis as any).fetch).not.toHaveBeenCalled();
     });
 
     it('does NOT call telegram when token is missing', async () => {
@@ -265,7 +263,7 @@ describe('Telegram bridge', () => {
         vi.mocked(agentTask.complete).mockResolvedValue(undefined);
         const r = await dismissTask('t9', 'will-dashboard');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('✓ Dismissed.');
+        expect(r.replyText).toBe('Dismissed.');
     });
 });
 
@@ -403,6 +401,6 @@ describe('linked-issue resolution on task action', () => {
 
         const r = await dismissTask('t-err', 'will-telegram');
         expect(r.ok).toBe(true);
-        expect(r.replyText).toBe('✓ Dismissed.');
+        expect(r.replyText).toBe('Dismissed.');
     });
 });

@@ -5,8 +5,8 @@ import { ChatPanel } from "@/components/dashboard/chat/ChatPanel";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata = {
-    title: "Agent Dashboard",
-    description: "Live monitoring of autonomous agents",
+    title: "Dashboard",
+    description: "Purchasing operations",
 };
 
 export default function DashboardLayout({

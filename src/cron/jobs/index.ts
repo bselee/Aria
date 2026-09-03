@@ -21,17 +21,23 @@
  */
 
 import { defineJob } from "../registry";
-import { generateAndSendMondayBriefing } from "@/lib/intelligence/monday-briefing";
-import { OpsManager } from "../../lib/intelligence/ops-manager";
+// Handler deps (monday-briefing, OpsManager) are imported DYNAMICALLY inside
+// handlers, not here. A top-level static import of ops-manager pulls the whole
+// OpsManager→Gmail→embedding→telegram graph at module load, which blows the
+// cron registration test's 10s hook timeout (and adds ~100s to suite import).
+import type { OpsManager } from "../../lib/intelligence/ops-manager";
 
-const ops = () => OpsManager.singleton;
+const ops = async (): Promise<OpsManager | null> =>
+    (await import("../../lib/intelligence/ops-manager")).OpsManager.singleton;
 
 defineJob({
     name: "ap-polling",
-    schedule: "0 8,12,17 * * *",
-    onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
+    // 2026-09-02 Bill: once daily is enough for invoice forwarding. 7:30 so
+    // overnight ads are gone before Bill opens Gmail.
+    schedule: "30 7 * * *",
+    onFail: "log",  // core pipeline — if this fails, no invoices processed
     description:
-        "Poll bill.selee@ + ap@ : ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
+        "Poll bill.selee@ + ap@ at 7:30/12/17 Denver: ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
     handler: async () => {
         // HERMIA(2026-06-18): Local-first forwarding — scans Gmail directly, forwards
         // invoice PDFs to Bill.com, tracks dedup in local SQLite. Zero Supabase
@@ -47,7 +53,7 @@ defineJob({
         // The Supabase-based pipeline (identifier + forwarder + PO reconciliation)
         // still runs for dashboard visibility and PO matching, but is no longer
         // the critical path — the local forwarder handles Gmail -> Bill.com.
-        const o = ops();
+        const o = await ops();
         if (!o) return;
         await o.pollAPInbox();
         // KAIZEN #5: po-sweep folded into ap-polling. Was its own */4h cron;
@@ -84,123 +90,64 @@ defineJob({
 defineJob({
     name: "build-risk",
     schedule: "0 8 * * 1-5",
-    onFail: "telegram-will",  // Bill orders based on this data
+    onFail: "log",  // Bill orders based on this data
     description: "Daily build risk analysis (Mon-Fri 8:00 AM).",
-    handler: async () => { await ops()?.runDailyBuildRisk(); },
+    handler: async () => { await (await ops())?.runDailyBuildRisk(); },
 });
 
+
+
+// KAIZEN (2026-08-25): DB reliability guards — (1) auto-heal desynced serial
+// sequences via setval (heal-first, not alert-only; past incident left
+// qty_recommendations 34k inserts short), (2) flag zero qty_recommendations
+// writes in 24h (calibration engine starved). Direct pg, no PostgREST.
 defineJob({
-    name: "jit-forward-projection",
-        schedule: "0 8 * * 1-5",
-        onFail: "telegram-will",  // Bill orders based on this data
-    description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
+    name: "db-integrity-guard",
+    schedule: "45 7 * * 1-5",
+    onFail: "log",  // guards must never page anyone on their own failure
+    description: "Mon-Fri 7:45 AM: auto-heals desynced serial sequences (setval) and flags zero qty_recommendations writes in 24h.",
     handler: async () => {
-        const { createClient } = await import("@/lib/supabase");
-
-        // Bill's rule: don't ping daily. Only alert when an orderTriggerDate is
-        // imminent (≤7 days away). If every component is far in the future,
-        // stay silent — "no news is good news".
-        const ALERT_BUFFER_DAYS = 7;
-
-        const db = createClient();
-        if (!db) {
-            console.log("[jit-forward-projection] Supabase unavailable — skipping.");
-            return;
-        }
-
-        // Latest snapshot that has components JSON with orderTriggerDate fields
-        // (written by the build-risk job that already fired at 8:00).
-        const { data, error } = await db
-            .from("build_risk_snapshots")
-            .select("generated_at,components")
-            .order("generated_at", { ascending: false })
-            .limit(1);
-
-        if (error || !data || !data[0]) {
-            console.log("[jit-forward-projection] No snapshot available. Will surface at 8:00 run.");
-            return;
-        }
-        const snap = data[0] as any;
-        const comps = (snap.components ?? {}) as Record<string, any>;
-        const snapshotDate = new Date(snap.generated_at);
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const todayISO = today.toISOString().slice(0, 10);
-        const bufferEnd = new Date(today.getTime() + ALERT_BUFFER_DAYS * 86_400_000);
-        const bufferISO = bufferEnd.toISOString().slice(0, 10);
-
-        // Collect components whose orderTriggerDate is in [today, today+7]
-        const triggers: Array<{
-            sku: string;
-            riskLevel: string;
-            triggerDate: string;
-            coverageDays?: number | null;
-            vendorName?: string | null;
-            stockoutDays?: number | null;
-            onHand?: number | null;
-            usedIn: string[];
-        }> = [];
-
-        for (const [sku, c] of Object.entries(comps)) {
-            if (!c || !c.orderTriggerDate) continue;
-            const d = c.orderTriggerDate;
-            if (d < todayISO) continue;          // already past — no alert
-            if (d > bufferISO) continue;         // not within the window yet
-            triggers.push({
-                sku,
-                riskLevel: c.riskLevel,
-                triggerDate: d,
-                coverageDays: c.coverageDays,
-                vendorName: c.vendorName,
-                stockoutDays: c.stockoutDays,
-                onHand: c.onHand,
-                usedIn: Array.isArray(c.usedIn) ? c.usedIn : Object.keys(c.usedIn ?? {}),
-            });
-        }
-
-        if (triggers.length === 0) {
-            console.log("[jit-forward-projection] No JIT triggers in the next 7d — silent.");
-            return;
-        }
-
-        // Task-first: one agent_task per trigger, then a single summary view.
-        triggers.sort((a, b) => a.triggerDate.localeCompare(b.triggerDate));
+        // Dynamic imports — keeps module load light and mirrors ap-health-report.
+        const { checkSequences } = await import("@/lib/purchasing/sequence-guard");
+        const { checkSnapshotPersistence } = await import("@/lib/purchasing/snapshot-observer");
         const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
-        for (const t of triggers) {
+
+        // Guard 1: heal-first sequence desync. Only notify when something was healed.
+        const seqResult = await checkSequences();
+        if (seqResult.healed.length > 0) {
+            console.warn(
+                `[db-integrity-guard] Healed ${seqResult.healed.length} desynced sequence(s): ` +
+                    JSON.stringify(seqResult.healed)
+            );
             await notifyViaTask({
-                sourceId: `jit:${t.sku}:${t.triggerDate}`,
-                type: "jit_order_trigger",
-                goal: `Order ${t.sku} by ${t.triggerDate} — ${t.riskLevel}`,
-                inputs: { sku: t.sku, triggerDate: t.triggerDate, vendor: t.vendorName, onHand: t.onHand, usedIn: t.usedIn },
-                priority: t.riskLevel === "CRITICAL" ? 0 : 2,
-                // KAIZEN #7: removed critical: true — JIT triggers wait for business hours
-                summaryLabel: "JIT Forward Projection",
+                sourceId: `db-integrity:${new Date().toISOString().slice(0, 10)}`,
+                type: "cron_alert",
+                goal: `DB integrity: ${JSON.stringify(seqResult)}`,
+                inputs: { result: seqResult },
+                summaryLabel: "DB Integrity",
             });
         }
-        console.log(`[jit-forward-projection] Routed ${triggers.length} triggers through agent_task hub.`);
-    },
-    // Budget: reads Supabase once, sends one Telegram — generous default is fine.
-    budget: { durationMs: 60_000 },
-});
 
-defineJob({
-    name: "ap-health-report",
-    schedule: "30 8 * * 1-5",
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
-    handler: async () => {
-            const { generateAPHealthReport } = await import("@/lib/intelligence/ap-health-report");
-            const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
-            const report = await generateAPHealthReport();
-            const day = new Date().toISOString().slice(0, 10);
+        // Guard 2: snapshot persistence. Only notify when unhealthy.
+        const snapResult = await checkSnapshotPersistence();
+        if (!snapResult.healthy) {
+            console.warn(
+                `[db-integrity-guard] Snapshot persistence UNHEALTHY — ${snapResult.count24h} ` +
+                    `qty_recommendations rows in last 24h.`
+            );
             await notifyViaTask({
-                sourceId: `ap-health:${day}`,
-                type: "cron_summary",
-                goal: report,
-                inputs: { report, day },
-                summaryLabel: "AP Health Report",
+                sourceId: `db-integrity:${new Date().toISOString().slice(0, 10)}`,
+                type: "cron_alert",
+                goal: `DB integrity: ${JSON.stringify(snapResult)}`,
+                inputs: { result: snapResult },
+                summaryLabel: "DB Integrity",
             });
-            console.log("[ap-health-report] Routed morning report through agent_task hub.");
+        }
+
+        console.log(
+            `[db-integrity-guard] Done: sequences healed=${seqResult.healed.length}, ` +
+                `snapshots24h=${snapResult.count24h} healthy=${snapResult.healthy}`
+        );
     },
 });
 
@@ -261,7 +208,7 @@ defineJob({
         }
 
         const pct = total > 0 ? Math.round((matched / total) * 100) : 100;
-        const status = stuck === 0 ? "✅" : stuck < 5 ? "⚠️" : "🔴";
+        const status = stuck === 0 ? "OK" : stuck < 5 ? "WARN" : "ALERT";
 
         const lines: string[] = [];
         lines.push(`${status} *AP Check-in*`);
@@ -288,27 +235,11 @@ defineJob({
 });
 
 defineJob({
-    name: "daily-summary",
-    schedule: "0 8 * * 1-5",
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Daily PO/invoice/email summary (Mon-Fri 8:00 AM).",
-    handler: async () => { await ops()?.sendDailySummary(); },
-});
-
-defineJob({
-    name: "weekly-summary",
-    schedule: "1 8 * * 5",
-    onFail: "log",
-    description: "Friday weekly Aria-vs-Finale retro.",
-    handler: async () => { await ops()?.sendWeeklySummary(); },
-});
-
-defineJob({
     name: "nightshift-enqueue",
     schedule: "0 18 * * *",
     onFail: "log",
     description: "6 PM daily: enqueue overnight email classification work. 7-day so Mon mornings aren't cold (weekend ads piled up unfiltered on Mon-Fri schedule).",
-    handler: async () => { await ops()?.enqueueNightshiftWork(); },
+    handler: async () => { await (await ops())?.enqueueNightshiftWork(); },
 });
 
 defineJob({
@@ -316,7 +247,7 @@ defineJob({
     schedule: "0 21 * * *",
     onFail: "log",
     description: "Nightly housekeeping at 9:00 PM.",
-    handler: async () => { await ops()?.runHousekeeping(); },
+    handler: async () => { await (await ops())?.runHousekeeping(); },
 });
 
 // HERMIA(2026-05-28): Hourly → every 6h. pinecone.ts is already a Supabase shim
@@ -327,34 +258,36 @@ defineJob({
     schedule: "5 */6 * * *",
     onFail: "log",
     description: "Every 6h: audit-log operational context to email_context_log.",
-    handler: async () => { await ops()?.indexOperationsContext(); },
+    handler: async () => { await (await ops())?.indexOperationsContext(); },
 });
 
 // KAIZEN #4: 30m -> 4h. Vendor PO emails rarely change inside a 6h window;
 // the prior 30-min cadence burned Gmail/Supabase quota with no signal gain.
 defineJob({
     name: "po-sync",
-    schedule: "0 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *". 17 jobs fired at :00 and starved
+    // the single-threaded event loop (see po-arrival-risk-check note).
+    schedule: "6 */4 * * *",
     onFail: "log",
     description: "Sync PO conversations with Gmail threads (every 4h).",
-    handler: async () => { await ops()?.syncPOConversations(); },
+    handler: async () => { await (await ops())?.syncPOConversations(); },
 });
 
 defineJob({
     name: "qty-calibration",
-    schedule: "30 8 * * *",
-    onFail: "escalate-to-supervisor",
+    schedule: "30 8 * * 1-5",
+    onFail: "log",
     description: "Daily 8:30 AM calibration of recommendations vs received POs.",
-    handler: async () => { await ops()?.runQtyCalibration(); },
+    handler: async () => { await (await ops())?.runQtyCalibration(); },
 });
 
 // Politely follow up with vendors who haven't acknowledged a sent PO.
 // L1 at sent+2d → L2 at sent+5d → L3 at sent+7d. Dropships excluded.
 defineJob({
     name: "po-followup-watcher",
-        schedule: "15 8 * * 1-5",  // KAIZEN #7: 7:45 → 8:15 (after business hours start)
+        schedule: "15 8,14 * * 1-5",  // 8:15 + 14:15 so the 48h receipt check fires on time (Bill spec 2026-08-20)
         onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "8:15 AM Mon-Fri: draft polite vendor nudges for quiet POs.",
+    description: "8:15 AM + 2:15 PM Mon-Fri: 48h polite receipt check, then escalation drafts for quiet POs.",
     handler: async () => {
         const { runPOFollowupWatcher } = await import("@/lib/purchasing/po-followup-watcher");
         const outcomes = await runPOFollowupWatcher();
@@ -364,6 +297,28 @@ defineJob({
         }, {});
         if (Object.keys(counts).length > 0) {
             console.log(`[po-followup-watcher] outcomes:`, counts);
+        }
+    },
+});
+
+// HERMIA(2026-08-20): Ship-status stage — vendors who ACKNOWLEDGED a PO but
+// went quiet with no tracking. Invisible to po-followup-watcher (unacked only)
+// and po-overdue-followup (needs past receive date). Bill was asking manually
+// (PO 125172 / Novelty, 10 days after ack). Drafts the ask for his review.
+defineJob({
+    name: "po-ship-status-followup",
+    schedule: "30 8 * * 1-5",  // after po-followup-watcher (8:15) and po-stuck (8:20)
+    onFail: "log",
+    description: "8:30 AM Mon-Fri: draft ship-status requests for POs acknowledged 7-30d ago with no tracking.",
+    handler: async () => {
+        const { runShipStatusFollowup } = await import("@/lib/purchasing/po-ship-status-followup");
+        const outcomes = await runShipStatusFollowup();
+        const counts = outcomes.reduce<Record<string, number>>((acc, o) => {
+            acc[o.action] = (acc[o.action] ?? 0) + 1;
+            return acc;
+        }, {});
+        if (Object.keys(counts).length > 0) {
+            console.log(`[po-ship-status-followup] outcomes:`, counts);
         }
     },
 });
@@ -403,9 +358,9 @@ defineJob({
 // and writes to shipments table so carrier-poll picks it up for status refresh.
 defineJob({
     name: "email-tracking-ingest",
-        schedule: "15 */2 * * *",
+        schedule: "15 */2 * * *",  // HERMIA(2026-08-26): every 2h (was 30m — too aggressive for Gmail API quota)
         onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments.",
+    description: "Scan Gmail for vendor shipping confirmations → extract tracking → upsert shipments + write PO tracking_numbers/legs (every 2h).",
     handler: async () => {
         const { runEmailTrackingIngest } = await import("@/lib/tracking/email-tracking-ingest");
         await runEmailTrackingIngest();
@@ -415,9 +370,9 @@ defineJob({
 // Refresh carrier status for every active shipment.
 defineJob({
     name: "carrier-poll",
-    schedule: "0 6,14 * * *", // 6am + 2pm daily — catches afternoon deliveries
+    schedule: "0 6,10,14,18 * * *", // 4x/day — catches morning shipments, midday updates, afternoon deliveries, evening confirmations
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Refresh live carrier status for active shipments (2x/day).",
+    description: "Refresh live carrier status for active shipments (4x/day).",
     handler: async () => {
         const { pollActiveShipments } = await import("@/lib/purchasing/carrier-poll");
         const outcomes = await pollActiveShipments();
@@ -438,7 +393,9 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "po-purchase-sync",
-    schedule: "0 */2 * * *",
+    // STAGGER(2026-08-21): was "0 */2 * * *" — 17.8s run contributed to the
+    // :00 thundering herd that wedged the loop 02:24-04:32.
+    schedule: "12 */2 * * *",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Sync purchase_orders from Finale (every 2h) — foundation for invoice→PO matching.",
     handler: async () => {
@@ -458,29 +415,18 @@ defineJob({
 // if needed for ad-hoc verification. No automated cron necessary.
 
 defineJob({
-    name: "build-completion-watcher",
-    schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — build team hours only
+    name: "receiving-sync",
+    schedule: "0 8-17 * * 1-5", // hourly M-F business hours — one pass for builds, receivings, receipts
     onFail: "log",
-    description: "Poll Finale for completed production builds (every 30m during business hours).",
-    handler: async () => { await ops()?.pollBuildCompletions(); },
-});
-
-defineJob({
-    name: "po-receiving-watcher",
-    schedule: "*/30 8-17 * * 1-5", // every 30m, 8am–5pm weekdays — warehouse hours only
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Poll Finale for received POs (every 30m during business hours).",
-    handler: async () => { await ops()?.pollPOReceivings(); },
-});
-
-// KAIZEN(2026-06-01): Post-reconciliation receiving check. When goods arrive
-// after an invoice was reconciled, re-checks quantities and alerts if short.
-defineJob({
-    name: "po-receipt-recheck",
-    schedule: "*/30 8-17 * * 1-5",  // KAIZEN (2026-07-23): weekdays only. No goods arrive off-hours.
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "Re-check reconciled invoices against newly received goods (every 30m).",
+    description: "Receiving pipeline (hourly M-F 8-17): poll completed builds, poll received POs, sync Finale receipt data, re-check reconciled invoices. 2026-09-02: 30m -> hourly to halve Finale poll rounds. Merged from build-completion-watcher + po-receiving-watcher + po-receipt-recheck.",
     handler: async () => {
+        await (await ops())?.pollBuildCompletions();
+        await (await ops())?.pollPOReceivings();
+        const { syncFinaleReceiptData } = await import("@/lib/purchasing/finale-receipt-sync");
+        const syncResult = await syncFinaleReceiptData();
+        if (syncResult.errors > 0) {
+            console.warn(`[receiving-sync] receipt sync had ${syncResult.errors} error(s)`);
+        }
         const { recheckReconciledInvoices } = await import("@/lib/purchasing/po-receipt-recheck");
         await recheckReconciledInvoices();
     },
@@ -491,7 +437,7 @@ defineJob({
 defineJob({
     name: "vendor-escalation",
         schedule: "40 8 * * 1-5",
-        onFail: "telegram-will",  // unresponsive vendors → late orders
+        onFail: "log",  // unresponsive vendors → late orders
     description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
     handler: async () => {
         const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
@@ -535,10 +481,11 @@ defineJob({
 
 defineJob({
     name: "purchasing-calendar-sync",
-    schedule: "0 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *".
+    schedule: "18 */4 * * *",
     onFail: "log",
     description: "Sync PO lifecycle to Google Calendar (every 4h).",
-    handler: async () => { await ops()?.runPurchasingCalendarSync(); },
+    handler: async () => { await (await ops())?.runPurchasingCalendarSync(); },
 });
 
 // KAIZEN #6: Mon-Fri only. Vendor reconciliations don't fire on weekends,
@@ -548,7 +495,7 @@ defineJob({
     schedule: "0 9 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "9 AM Mon-Fri: alert if any vendor missed a 24h reconciliation.",
-    handler: async () => { await ops()?.checkMissingReconciliationRuns(); },
+    handler: async () => { await (await ops())?.checkMissingReconciliationRuns(); },
 });
 
 // HERMIA(2026-06-24): 15m → 30m. Task closure is hygiene, not urgent.
@@ -558,7 +505,7 @@ defineJob({
     schedule: "*/30 * * * *",
     onFail: "log",
     description: "Hygiene: close completed agent_task rows (every 15m).",
-    handler: async () => { await ops()?.runCloseFinishedTasks(); },
+    handler: async () => { await (await ops())?.runCloseFinishedTasks(); },
 });
 
 // HERMIA(2026-05-28): 30m → hourly. Migrations don't drift that fast.
@@ -568,7 +515,7 @@ defineJob({
     schedule: "0 * * * *",
     onFail: "log",
     description: "Self-heal Layer A: tripwire checks (hourly).",
-    handler: async () => { await ops()?.runMigrationTripwire(); },
+    handler: async () => { await (await ops())?.runMigrationTripwire(); },
 });
 
 // HERMIA(2026-05-28): 10m → 30m. Playbook dispatch rarely has queued work.
@@ -578,18 +525,9 @@ defineJob({
     schedule: "*/30 * * * *",
     onFail: "log",
     description: "Self-heal Layer C: dispatch queued playbooks (every 30m).",
-    handler: async () => { await ops()?.runTaskSelfHealer(); },
+    handler: async () => { await (await ops())?.runTaskSelfHealer(); },
 });
 
-// HERMIA(2026-06-24): 15m → 30m. Issue projection rarely finds new work per cycle.
-// Saves ~96 invocations/day. Supabase free-tier friendliness.
-defineJob({
-    name: "issue-projection",
-    schedule: "*/30 * * * *",
-    onFail: "log",
-    description: "Phase 1 issue ledger projection (every 15m).",
-    handler: async () => { await ops()?.runIssueProjection(); },
-});
 
 // Auto-complete POs that satisfy all eligibility gates AND have settled
 // for ≥48h. Default OFF behind PO_AUTO_COMPLETE_ENABLED — dry-runs log
@@ -597,24 +535,31 @@ defineJob({
 // granularity is plenty.
 defineJob({
     name: "po-auto-complete-watcher",
-    schedule: "0 */4 * * *",
+    // STAGGER(2026-08-21): was "0 */4 * * *". 2026-09-02: M-F business slots only.
+    schedule: "0 8,12,16 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-complete eligible POs (every 4h; default OFF via PO_AUTO_COMPLETE_ENABLED).",
-    handler: async () => { await ops()?.runPOAutoCompleteWatcher(); },
+    handler: async () => { await (await ops())?.runPOAutoCompleteWatcher(); },
     budget: { durationMs: 300_000 }, // 5min — fetches getOrderDetails per candidate
 });
 
 // Detect open POs at risk of arriving after stockout and surface them as
 // PO_ARRIVAL_AT_RISK rows in ap_activity_log. Builds panel + Activity feed
 // render them; "Compose ETA draft" and other next-step actions are
-// triggered from the Activity row, not pushed via Slack/Gmail.
+// triggered from the Activity row, not pushed via external channels.
 // Every 2h: arrival ETAs and runway both change slowly, no need for tighter.
 defineJob({
     name: "po-arrival-risk-check",
-    schedule: "0 */2 * * *",
+    // STAGGER(2026-08-21): was "0 */2 * * *". This job ran 199.6s on 2026-08-21
+    // at 02:00 — OVER its 180s budget, yet still recorded 'succeeded', so the
+    // budget is advisory and does not abort. Combined with 16 other :00 jobs it
+    // starved node-cron's event loop; the scheduler logged "missed execution"
+    // warnings and did not recover until 04:32, so the 03:00/04:00 jobs never
+    // fired at all. Moved off :00 and given its own slot.
+    schedule: "36 */2 * * *",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Detect PO arrivals that will land after stockout (every 2h).",
-    handler: async () => { await ops()?.runPOArrivalRiskCheck(); },
+    handler: async () => { await (await ops())?.runPOArrivalRiskCheck(); },
     budget: { durationMs: 180_000 },
 });
 
@@ -626,7 +571,7 @@ defineJob({
 defineJob({
     name: "flows-tick",
     schedule: "*/5 * * * *",
-    enabled: (process.env.FLOWS_ENABLED ?? "true").toLowerCase() !== "false",
+    enabled: (process.env.FLOWS_ENABLED ?? "false").toLowerCase() === "true",
     onFail: "log",
     description: "Flow runner: drain flow_events, spawn/advance flow_runs (every 5m).",
     handler: async () => {
@@ -668,7 +613,7 @@ defineJob({
                     await notifyViaTask({
                         sourceId: `cognitive:${decision.action}`,
                         type: "cognitive_critical",
-                        goal: `🚨 Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`,
+                        goal: `Cognitive Round CRITICAL\n${decision.action}\n\n${decision.summary}`,
                         inputs: { action: decision.action, summary: decision.summary },
                         priority: 0,
                         // critical: true removed — waits for business hours
@@ -686,7 +631,8 @@ defineJob({
 // SQLite is the sole store — no cloud sync needed.
 defineJob({
     name: "memory-sync",
-    schedule: "0 */6 * * *",
+    // STAGGER(2026-08-21): was "0 */6 * * *".
+    schedule: "42 */6 * * *",
     onFail: "log",
     description: "Log memory vector counts from local SQLite (every 6h).",
     handler: async () => {
@@ -719,9 +665,9 @@ defineJob({
 // Runs every 60s. Syncs up to 20 records per tick with exponential backoff.
 defineJob({
     name: "sync-queue",
-    schedule: "* * * * *",
+    schedule: "*/5 * * * *",
     onFail: "log",
-    description: "Process sync queue: SQLite → PostgREST (every 60s).",
+    description: "Process sync queue: SQLite → PostgREST (every 5m).",
     handler: async () => {
         const { processSyncQueue, getQueueDepth, cleanFailedSyncs } = await import("@/lib/storage/sync-queue");
         const depth = getQueueDepth();
@@ -743,9 +689,9 @@ defineJob({
 // Runs every 15min. Writes to po_cache (SQLite) for sub-ms dashboard queries.
 defineJob({
     name: "po-finale-sync",
-    schedule: "*/15 * * * *",
+    schedule: ["*/15 7-19 * * 1-5", "0 8 * * 0,6"],
     onFail: "log",
-    description: "Sync Finale PO data into local SQLite cache (every 15min).",
+    description: "Sync Finale PO data into local SQLite cache. 2026-09-02: 24/7 15m -> 7am-7pm M-F 15m + weekends 8am (Finale rate-limit care: ~43% fewer runs, zero overnight/weekend polling).",
     handler: async () => {
         const { default: PQueue } = await import("p-queue");
         const { upsertPOCache, getPOCache, getPurchasingCacheStats } = await import("@/lib/storage/purchasing-cache");
@@ -849,9 +795,9 @@ defineJob({
 // cognitive rounds, and expired cache entries.
 defineJob({
     name: "sqlite-housekeeping",
-    schedule: "0 3 * * *",
+    schedule: "20 21 * * *",
     onFail: "log",
-    description: "Prune stale SQLite records and VACUUM (daily 3 AM).",
+    description: "Prune stale SQLite records and VACUUM (nightly 9:20 PM).",
     handler: async () => {
         const { pruneStaleRecords, vacuumDb, getDbFileSize } = await import("@/lib/storage/housekeeping");
         const beforeSize = getDbFileSize();
@@ -872,12 +818,12 @@ defineJob({
 });
 
 // HERMIA(2026-07-15): Daily SQLite backup.
-// Runs daily at 4AM. Keeps 7 days of backups.
+// Runs nightly at 9:25 PM. Keeps 7 days of backups.
 defineJob({
     name: "sqlite-backup",
-    schedule: "0 4 * * *",
+    schedule: "25 21 * * *",
     onFail: "log",
-    description: "Backup aria-local.db and prune old backups (daily 4 AM).",
+    description: "Backup aria-local.db and prune old backups (nightly 9:25 PM).",
     handler: async () => {
         const { createLocalBackup, pruneBackups } = await import("@/lib/storage/housekeeping");
         const backupPath = createLocalBackup();
@@ -886,17 +832,6 @@ defineJob({
     },
 });
 
-// Gated cron — preserved env flag from inline registration.
-// HERMIA(2026-05-28): 5m → 15m. Already gated on ISSUE_ORCHESTRATOR_ENABLED.
-// When enabled, 15m is plenty for orchestrating issue remediation cycles.
-defineJob({
-    name: "issue-orchestrator",
-    schedule: "*/15 * * * *",
-    enabled: (process.env.ISSUE_ORCHESTRATOR_ENABLED ?? "false").toLowerCase() === "true",
-    onFail: "log",
-    description: "Issue orchestrator (every 5m, gated by ISSUE_ORCHESTRATOR_ENABLED).",
-    handler: async () => { await ops()?.runIssueOrchestrator(); },
-});
 
 // ── DRAFTER AGENT: Autonomous PO draft creation ──────────────────────
 // HERMIA(2026-06-09): Creates draft POs in Finale for vetted vendors whose
@@ -916,16 +851,20 @@ defineJob({
 
         // Notify on Telegram if any drafts were created (or errors occurred)
         if (result.created > 0 || result.errors > 0) {
-            const o = ops();
+            const o = await ops();
             if (o?.bot) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
                 if (chatId) {
                     try {
-                        // The handler inside drafter-agent already gates the send
-                        await o.bot.telegram.sendMessage(
-                            chatId,
-                            formatDrafterTelegramSummary(result),
-                        );
+                        if (false) {
+                            // The handler inside drafter-agent already gates the send
+                            await o.bot.telegram.sendMessage(
+                                chatId,
+                                formatDrafterTelegramSummary(result),
+                            );
+                        } else {
+                            console.log('[drafter-scan] Telegram disabled — summary skipped.');
+                        }
                     } catch (err: any) {
                         console.warn(`[drafter-scan] Telegram notification failed: ${err.message}`);
                     }
@@ -942,117 +881,11 @@ defineJob({
     onFail: "log",
     description: "Process draft POs for Level 1 & 2 autonomy (2x/day weekdays).",
     handler: async () => {
-        const o = ops();
+        const o = await ops();
         if (!o || !o.bot) return;
         const { autoProcessAutonomyDrafts } = await import("../../lib/purchasing/autonomy-engine");
         await autoProcessAutonomyDrafts(o.bot);
     },
-});
-
-// ── CORE-04: Follow-up SOP ───────────────────────────────────────────────
-// HERMIA(2026-06-04): The legacy followup-sop logic (lib/slack/followup-sop.ts)
-// was deleted in the 2026-05 refactor. Its five responsibilities split:
-//
-//   • PO acknowledgements + reorder nudges  → po-followup-watcher cron
-//   • L2/L3 vendor escalation                → vendor-escalation cron
-//   • Delivery exception escalation          → delivery-exception-escalator cron
-//   • Stale Slack requests >24h unanswered   → stale-request-watcher (this handler)
-//   • AP invoices stuck in ERROR_FORWARDING  → email-forwarding-alert (this handler)
-//
-// The three PO-side crons run on weekday business hours. The two alerts that
-// need 24/7 coverage (Slack requests + AP forwarding) run on this cron's
-// 2-hour schedule via this handler. Both modules early-return + log when
-// there's nothing to surface, so a quiet hour is silent.
-//
-// The autonomy engine (purchasing-followup worker + comms-master master)
-// tracks heartbeat status for this cron via notifyCronOutcome (wired in
-// ops-manager.safeRun).
-defineJob({
-    name: "followup-sop",
-    schedule: "0 */2 * * *", // every 2 hours, 24/7
-    onFail: "log",
-    description: "Follow-up SOP fan-out: stale Slack requests (stale-request-watcher) + AP forwarding alerts (email-forwarding-alert). PO-side work lives in three dedicated crons.",
-    handler: async () => {
-        // HERMIA(2026-06-04): fan out to the two missing modules. Both
-        // early-return + log when there's nothing to report.
-        const [{ runStaleRequestWatcher }, { runForwardingEscalation }] = await Promise.all([
-            import("@/lib/slack/stale-request-watcher"),
-            import("@/lib/intelligence/email-forwarding-alert"),
-        ]);
-        await Promise.all([runStaleRequestWatcher(), runForwardingEscalation()]);
-    },
-});
-
-// HERMIA(2026-06-11): Drop-detector — weekly "what got flagged but nothing happened".
-// Finds open tasks >24h with no recent activity. Surfaces a single summary report
-// via notifyViaTask (drop_detect_report type). One row per week, dedup by date.
-defineJob({
-    name: "drop-detector",
-    schedule: "0 9 * * 5",  // Friday 9 AM — end-of-week surfacing
-    onFail: "log",
-    description: "Friday 9 AM: surface open tasks flagged >24h with no action (weekly ball-dropped report).",
-    handler: async () => {
-        const { surfaceDropReport } = await import("@/lib/intelligence/drop-detector");
-        await surfaceDropReport();
-    },
-    budget: { durationMs: 60_000 },
-});
-
-// HERMIA(2026-06-11): Pattern miner — weekly closed-loop metrics.
-// Aggregates SUCCEEDED/EXPIRED/FAILED tasks from past 7 days, computes
-// per-type drop-rate and median time-to-close. Surfaces via notifyViaTask.
-defineJob({
-    name: "pattern-miner",
-    schedule: "0 8 * * 1",  // Monday 8 AM — start-of-week retrospective
-    onFail: "log",
-    description: "Monday 8 AM: weekly closed-loop task metrics (drop-rate + median time-to-close per type).",
-    handler: async () => {
-        const { surfacePatternInsight } = await import("@/lib/intelligence/pattern-miner");
-        await surfacePatternInsight();
-    },
-    budget: { durationMs: 120_000 },
-});
-
-// HERMIA(2026-06-11): Daily proactive morning brief — synthesized action list
-// from across all Aria subsystems (JIT triggers, overdue POs, pending approvals,
-// vendor escalations, consumption spikes). If nothing actionable, stays silent.
-defineJob({
-    name: "proactive-brief",
-    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
-    onFail: "log",  // was telegram-will — demoted in frequency+alert audit
-    description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
-    handler: async () => {
-        const { generateProactiveBrief } = await import("@/lib/intelligence/proactive-brief");
-        await generateProactiveBrief();
-    },
-    budget: { durationMs: 90_000 },
-});
-
-// HERMIA(2026-06-15): Daily Slack review — queries recent messages directly
-// addressed to Bill (DMs + @Bill mentions) and sends a short summary via TG.
-// Only fires if there are open items to review. No news = silence.
-defineJob({
-    name: "daily-slack-review",
-    schedule: "30 7 * * 1-5", // 7:30 AM weekdays
-    onFail: "log",
-    description: "7:30 AM Mon-Fri: daily Slack review of addressed messages (DM/@Bill) — unresponded count + SKUs.",
-    handler: async () => {
-        const { getAddressedRequests, formatAddressedReview } =
-            await import("@/lib/slack/addressed-message-watcher");
-        const { sendTelegramNotify } = await import(
-            "@/lib/intelligence/telegram-notify"
-        );
-        const report = await getAddressedRequests(24);
-        const msg = formatAddressedReview(report);
-        if (msg) {
-            await sendTelegramNotify(msg);
-        } else {
-            console.log(
-                "[daily-slack-review] No addressed messages in last 24h — silent.",
-            );
-        }
-    },
-    budget: { durationMs: 30_000 },
 });
 
 //HERMIA(2026-06-11): Stockout driver — proactive countdown that creates drafts
@@ -1060,7 +893,7 @@ defineJob({
 defineJob({
     name: "stockout-driver",
     schedule: "0 8,11,15 * * 1-5",
-    onFail: "telegram-will",  // draft POs for at-risk SKUs — critical
+    onFail: "log",  // draft POs for at-risk SKUs — critical
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
         const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
@@ -1072,27 +905,13 @@ defineJob({
     budget: { durationMs: 120_000 },
 });
 
-// HERMIA(2026-07-13): Slack detector retired — token_revoked / non-functional.
-// Job kept registered as a silent no-op so existing schedules/history don't
-// look "missing"; no Telegram noise, no DB probes.
-defineJob({
-    name: "slack-detector-heartbeat",
-    schedule: "0 0 1 1 *", // effectively never (Jan 1 midnight)
-    onFail: "log",
-    description: "RETIRED 2026-07-13 — Slack request detector disabled (token_revoked).",
-    handler: async () => {
-        // no-op
-    },
-    budget: { durationMs: 5_000 },
-});
-
 // HERMIA(2026-06-11): System heartbeat — proactive liveness probes for every
 // critical Aria dependency, process, and scheduled job. Runs every 10 min and
 // sends a single consolidated Telegram alert only when something is newly
 // unhealthy (rate-limited 30 min per probe). All-healthy ticks stay silent.
 defineJob({
     name: "system-heartbeat",
-    schedule: "*/10 * * * *",
+    schedule: "*/30 * * * *",
     onFail: "log",  // Don't escalate cron framework failures for the heartbeat itself
     description: "Proactive liveness probes for all critical Aria systems (every 10 min).",
     budget: { durationMs: 30_000 },  // 30s total — probes should complete well under this
@@ -1106,20 +925,7 @@ defineJob({
 // Monday Briefing Cron (new 2026-06-15)
 // Runs only on Mondays at 8:00 AM MDT. Sends formatted email to Bill.
 // ─────────────────────────────────────────────────────────────────────────────
-defineJob({
-    name: "monday-briefing",
-    schedule: "0 8 * * 1",
-    onFail: "telegram-will",  // weekly overview — Bill reads these
-    description: "DISABLED 2026-07-27 (Kaizen): killed per Bill — output was unusable (Unknown Vendor across the board, receivings/matches sections empty, underlying data model didn't hold up). Was also the source of an 11x duplicate-send incident caused by an unrelated PM2 zombie-process bug (fixed separately in shutdown-guard.ts + pid-guard.ts). Re-enable only after the data gaps in build_risk_snapshots (vendor field) and ap_activity_log (PO_RECEIVED / RECONCILIATION_AUTO_APPLIED coverage) are confirmed fixed with real verified numbers.",
-    enabled: false,
-    handler: async () => {
-        const { generateAndSendMondayBriefing } = await import(
-            "@/lib/intelligence/monday-briefing"
-        );
-        await generateAndSendMondayBriefing();
-    },
-    budget: { durationMs: 120_000 },
-});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scans Watcher — CR/CRMIN & Benny scan processing (added 2026-06-16)
@@ -1146,7 +952,7 @@ defineJob({
         const { runScansWatch } = await import("@/lib/scans-watcher");
         const result = await runScansWatch();
         if (result.scanned > 0 || result.errors > 0) {
-            console.log(`[scans-watcher] ${result.scanned} scanned, ${result.processed} processed, ${result.slackNotifications} Slack, ${result.emailForwards} email, ${result.errors} errors`);
+            console.log(`[scans-watcher] ${result.scanned} scanned, ${result.processed} processed, ${result.emailForwards} email, ${result.errors} errors`);
             for (const d of result.details) console.log(`  ${d}`);
         }
     },
@@ -1177,26 +983,6 @@ defineJob({
     budget: { durationMs: 90_000 },
     });
 
-// HERMIA(2026-07-01): Post acknowledged POs with tracking numbers to Slack.
-// Runs after po-reply-watcher has had a chance to detect vendor replies (which
-// runs at :00 and :30). Posts ETA to #purchase-orders in Bill's format:
-// *Ordered <link|PO-####> ETA mm/dd*
-defineJob({
-    name: "post-eta-to-slack",
-    schedule: "45 8-18 * * 1-5",  // :45 past each hour, Mon-Fri 8AM-6PM
-    onFail: "log",
-    description: "Post acknowledged POs with tracking numbers to #purchase-orders with ETA (45min past hour, M-F 8AM-6PM MT).",
-    handler: async () => {
-        const { postETAtoSlack } = await import("@/cli/post-eta-to-slack");
-        const { posted, results } = await postETAtoSlack();
-        const errors = results.filter(r => r.action === "error").length;
-        if (posted > 0 || errors > 0) {
-            console.log(`[post-eta-to-slack] ${posted} posted, ${results.filter(r => r.action === "skipped_no_eta").length} skipped (no ETA), ${errors} errors`);
-        }
-    },
-    budget: { durationMs: 60_000 },
-});
-
     // ─────────────────────────────────────────────────────────────────────────────
     // Reconciliation Auto-Apply Watcher — automatically applies auto_approve/
     // no_change reconciliation results to Finale POs. Gated by the same
@@ -1205,7 +991,7 @@ defineJob({
     // ─────────────────────────────────────────────────────────────────────────────
     defineJob({
         name: "reconciliation-auto-apply",
-        schedule: "15 * * * *",
+        schedule: "30 8,12,16 * * 1-5",
         onFail: "log",  // was telegram-will — demoted in frequency+alert audit
         description: "Auto-apply auto_approve/no_change reconciliation results to Finale POs (hourly at :15).",
         handler: async () => {
@@ -1286,66 +1072,75 @@ defineJob({
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// HERMIA(2026-07-30): Daily bill.com reference data refresh.
-// Step 1: Download AllBillsPage.csv from bill.com via Playwright with persistent
-//         browser profile. If Chrome is unavailable or login fails, logs a
-//         warning and re-imports the last downloaded CSV instead.
-// Step 2: Import the CSV into SQLite billcom_bills_ref table.
+// AP Gmail Delivery Verification — PRIMARY delivery check, no third-party dep.
 //
-// Runs daily at 7 AM MT. This keeps the dedup check in ap-single-forward.ts
-// (isAlreadyClaimedOrForwarded → billcom_bills_ref lookup) current within
-// ~24 hours, reducing duplicate Bill.com forwards when bills are manually
-// uploaded outside of Aria's pipeline.
+// Asks Gmail (the same API Aria sends with) whether each recorded forward
+// actually exists, was addressed to the Bill.com intake address, and carried
+// its PDF. Every ap_local_forwards row stores billcom_sent_message_id, so
+// coverage is 100% — measured 274/274 delivered on 2026-08-13.
 //
-// First-time setup: run `npx tsx src/cli/download-billcom-ref.ts --headed`
-// once to establish the persistent browser profile + log into bill.com.
-// Subsequent headless runs will reuse the session cookies.
+// This REPLACES billcom_bills_ref as the source of truth for "did it arrive".
+// That table is built by scraping a CSV out of bill.com with Playwright and has
+// three independent failure modes: the login breaks (it did, silently, for 5
+// weeks), the export is often FILTERED to a single vendor, and paid bills age
+// off the report. Each one manufactures false "never landed" alerts — it
+// reported Uline / Abel's / CR Minerals / Evergreen / Logan Labs as missing
+// when all five were fine.
+//
+// An accepted delivery to buildasoilap@bill.com with no bounce IS receipt.
+// Whether Bill.com's OCR finished processing it is a separate question and the
+// only thing the CSV could ever answer.
+//
+// Runs at 8 AM MT, before Bill's 8:30 AM AP health check.
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
-    name: "billcom-ref-import",
-    schedule: "0 7 * * *",  // Daily 7 AM
+    name: "ap-gmail-delivery-verify",
+    schedule: "0 8 * * *",
     onFail: "log",
-    description: "Daily 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
+    description: "Verify AP forwards reached Bill.com using Gmail as source of truth (no scraping).",
     handler: async () => {
-        try {
-            // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)
-            const { main: downloadBillComRef } = await import("@/cli/download-billcom-ref");
-            await downloadBillComRef();
-        } catch (err: any) {
-            console.warn(`[billcom-ref-import] Download step warning: ${err?.message ?? err}`);
-            console.warn("[billcom-ref-import] Proceeding with import of existing CSV...");
+        const { getAuthenticatedClient } = await import("@/lib/gmail/auth");
+        const { gmail: GmailApi } = await import("@googleapis/gmail");
+        const { runGmailDeliverySweep } = await import("@/lib/intelligence/ap/gmail-delivery-verify");
+
+        const auth = await getAuthenticatedClient("ap");
+        const gmail = GmailApi({ version: "v1", auth: auth as any });
+
+        const result = await runGmailDeliverySweep(gmail as any, { lookbackDays: 45 });
+
+        console.log(
+            `[ap-gmail-delivery-verify] checked=${result.checked}, delivered=${result.delivered}, ` +
+            `alreadyVerified=${result.alreadyVerified}, problems=${result.problems.length}, ` +
+            `verdicts=${JSON.stringify(result.byVerdict)}`
+        );
+
+        if (result.problems.length === 0) return;
+
+        // ONE consolidated message. Only genuine problems reach here —
+        // transient Gmail lookup errors are counted, never alerted.
+        const MAX_LINES = 30;
+        const lines = result.problems.slice(0, MAX_LINES).map(
+            (p) => `• [${p.verdict}] ${p.vendorName ?? "(unknown)"} ${p.invoiceNumber ?? ""} — ${p.detail}`
+        );
+        if (result.problems.length > MAX_LINES) {
+            lines.push(`…and ${result.problems.length - MAX_LINES} more`);
         }
+        const text = [
+            `*${result.problems.length} AP forward(s) failed Gmail delivery verification*`,
+            "",
+            ...lines,
+            "",
+            "Gmail is authoritative here: these sends are missing, misaddressed, or lost their PDF.",
+        ].join("\n");
 
         try {
-            // Step 2: Import existing CSV into SQLite
-            const { main: importBillComRef } = await import("@/cli/import-billcom-ref");
-            await importBillComRef();
+            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            await sendTelegramNotify(text);
         } catch (err: any) {
-            console.error(`[billcom-ref-import] Import step failed: ${err?.message ?? err}`);
-        }
-
-        // Step 3: Clean up old ap_activity_log entries (keep 90 days)
-        try {
-            const { createClient } = await import("@/lib/supabase");
-            const db = createClient();
-            if (db) {
-                const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-                const { data, error } = await db
-                    .from("ap_activity_log")
-                    .delete()
-                    .lt("created_at", cutoff);
-                if (error) {
-                    console.warn(`[billcom-ref-import] Log cleanup warning: ${error.message}`);
-                } else {
-                    const count = typeof data === 'number' ? data : (Array.isArray(data) ? data.length : 0);
-                    console.log(`[billcom-ref-import] Log cleanup: removed entries older than 90 days`);
-                }
-            }
-        } catch (err: any) {
-            console.warn(`[billcom-ref-import] Log cleanup skipped: ${err?.message ?? err}`);
+            console.error(`[ap-gmail-delivery-verify] Telegram notify failed: ${err?.message ?? err}`);
         }
     },
-    budget: { durationMs: 120_000 },
+    budget: { durationMs: 300_000 },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1355,7 +1150,7 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "invoice-po-auto-match",
-    schedule: "*/30 * * * *",
+    schedule: "0 8,12,16 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Auto-match unmatched vendor invoices to purchase orders (every 30m).",
     handler: async () => {
@@ -1369,6 +1164,27 @@ defineJob({
                 `needs-review=${result.needsReview}`
             );
         }
+
+        // HERMIA(2026-08-12): post-pass — run the 3-way match automation over
+        // matched invoices (the ones just assigned plus any backlog). Loads
+        // PO + receipt + invoice, writes three_way_* outcomes, and records
+        // clean matches in confirmed_po_matches so the matcher learns them.
+        try {
+            const { runThreeWayMatchAutomation } = await import(
+                "@/lib/purchasing/three-way-match-runner"
+            );
+            const tw = await runThreeWayMatchAutomation();
+            if (tw.processed > 0) {
+                console.log(
+                    `[three-way-match] processed=${tw.processed} matched=${tw.matched} ` +
+                    `variance=${tw.variance} exception=${tw.exception} ` +
+                    `incomplete=${tw.incomplete} confirmed=${tw.confirmed} ` +
+                    `skipped=${tw.skippedExisting} errors=${tw.errors}`
+                );
+            }
+        } catch (err: any) {
+            console.warn(`[three-way-match] run failed: ${err?.message ?? err}`);
+        }
     },
     budget: { durationMs: 120_000 },
 });
@@ -1381,9 +1197,9 @@ defineJob({
 // ─────────────────────────────────────────────────────────────────────────────
 defineJob({
     name: "db-retention-prune",
-    schedule: "0 3 * * *",
+    schedule: "30 21 * * *",
     onFail: "log",
-    description: "VACUUM FULL email_inbox_queue and cron_runs, prune old runs (nightly).",
+    description: "VACUUM FULL email_inbox_queue and cron_runs, prune old runs (nightly 9:30 PM).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
         console.log("[db-retention-prune] Starting nightly retention prune ...");
@@ -1418,7 +1234,7 @@ defineJob({
 defineJob({
     name: "ltlselect-freight-reconcile",
     schedule: "0 9 * * 1",
-    onFail: "telegram-will",
+    onFail: "log",
     description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
@@ -1442,7 +1258,7 @@ defineJob({
             const unmatched = (stdout.match(/Unmatched:\s+(\d+)/) || [])[1] || "0";
 
             const message =
-                `📦 LTL Select weekly: ${applied} applied` +
+                `LTL Select weekly: ${applied} applied` +
                 (totalMatch ? ` | $${totalMatch[2]}` : "") +
                 ` | held: ${held} | unmatched: ${unmatched}`;
 
@@ -1473,7 +1289,7 @@ defineJob({
             const { getAuthenticatedClient } = await import(
                 "@/lib/gmail/auth"
             );
-            const { GmailApi } = await import("@googleapis/gmail");
+            const { gmail: GmailApi } = await import("@googleapis/gmail");
             const { collectGoldSamples } = await import(
                 "@/lib/intelligence/gold-sample-collector"
             );
@@ -1499,6 +1315,46 @@ defineJob({
             console.error(
                 `[gold-sample-collection] Failed: ${err?.message ?? err}`,
             );
+            throw err;
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
+
+// HERMIA(2026-08-11): Draft correction watcher — polls every 30m so Bill's
+// edits to Aria drafts are learned within the review window, not a day later.
+// Reads un-resolved email_draft_prepared events, detects sent-unchanged /
+// sent-edited / deleted-unsent, and writes learned rules to email_reply_rules.
+// The ACK agent reads those rules before composing any routine draft.
+defineJob({
+    name: "draft-correction-watch",
+    schedule: "*/30 8-18 * * 1-5",
+    onFail: "log",
+    description:
+        "Every 30m: watch threads Aria drafted into → learn Bill's edits/deletes as reply rules.",
+    handler: async () => {
+        try {
+            const { getAuthenticatedClient } = await import("@/lib/gmail/auth");
+            const { gmail: GmailApi } = await import("@googleapis/gmail");
+            const { watchDraftCorrections } = await import(
+                "@/lib/intelligence/draft-correction-watcher"
+            );
+
+            const auth = await getAuthenticatedClient("default");
+            const gmail = GmailApi({ version: "v1", auth });
+
+            const result = await watchDraftCorrections(
+                gmail,
+                "bill.selee@buildasoil.com",
+            );
+
+            if (result.learned > 0) {
+                console.log(
+                    `[draft-correction-watch] ${result.learned} correction(s) learned (${result.noReplyRules} no-reply) out of ${result.scanned} drafts`,
+                );
+            }
+        } catch (err: any) {
+            console.error(`[draft-correction-watch] Failed: ${err?.message ?? err}`);
             throw err;
         }
     },

@@ -22,6 +22,7 @@ import { FinaleClient, finaleClient } from '../finale/client';
 import { createClient } from '../db';
 import { withToolAudit } from '../agents/tool-registry';
 import { DEFAULT_LEAD_TIME_DAYS } from '../constants';
+import { resolveVendorLeadOverride, resolveVendorLeadFloor } from '../purchasing/vendor-lead-overrides';
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -40,23 +41,10 @@ export interface LeadTimeDistribution {
 }
 
 // ──────────────────────────────────────────────────
-// VENDOR MINIMUM LEAD TIME FLOORS
+// VENDOR MINIMUM LEAD TIME FLOORS & FIXED OVERRIDES
 // ──────────────────────────────────────────────────
-
-/** Vendors where Finale's product-level lead time is too optimistic.
- *  Floor ensures realistic ordering windows. Case-insensitive partial match. */
-const VENDOR_MIN_LEAD_TIME_DAYS: Record<string, number> = {
-    "sustainable village": 14,  // 2 weeks working days minimum
-};
-
-function resolveVendorLeadTimeFloor(vendorName: string): number | null {
-    if (!vendorName) return null;
-    const key = vendorName.trim().toLowerCase();
-    for (const [pattern, days] of Object.entries(VENDOR_MIN_LEAD_TIME_DAYS)) {
-        if (key.includes(pattern) || pattern.includes(key)) return days;
-    }
-    return null;
-}
+// Moved to src/lib/purchasing/vendor-lead-overrides.ts (single source of truth
+// shared with the reorder engine's resolveLeadTimeDays).
 
 // ──────────────────────────────────────────────────
 // SERVICE
@@ -157,8 +145,20 @@ export class LeadTimeService {
 
         let result: LeadTimeResult | null = null;
 
-        // 0. Policy override (highest — manual authoritative value)
-        if (this.policyCache && vendorName) {
+        // 0. Code-level vendor override (fixed authoritative — highest priority).
+        //    Covers multi-delivery inflation (CR Minerals) and long-lead imports
+        //    with no reliable Finale history (Covico).
+        const override = resolveVendorLeadOverride(vendorName);
+        if (override) {
+            result = {
+                days: override.days,
+                provenance: 'policy_override',
+                label: `${override.days}d vendor override · ${override.reason}`,
+            };
+        }
+
+        // 0b. Policy override (DB — manual authoritative value)
+        if (!result && this.policyCache && vendorName) {
             const key = vendorName.trim().toLowerCase();
             for (const [cacheKey, days] of this.policyCache.entries()) {
                 if (cacheKey === key || cacheKey.includes(key) || key.includes(cacheKey)) {
@@ -172,7 +172,7 @@ export class LeadTimeService {
             }
         }
 
-        // 0b. SKU observed send→receive
+        // 0c. SKU observed send→receive
         if (!result && sku) {
             try {
                 const { getObservedSkuLeadDays } = await import('../purchasing/sku-lead-time');
@@ -229,12 +229,13 @@ export class LeadTimeService {
         // KAIZEN(2026-08-04): Apply vendor minimum lead time floor.
         // Some vendors (e.g. Sustainable Village) have Finale product-level
         // lead times as low as 3d that don't reflect real working-day order cycles.
-        const floor = resolveVendorLeadTimeFloor(vendorName);
-        if (floor !== null && result.days < floor) {
+        // Colorful's made-to-order bags read as low as 17d from PO-after-order.
+        const floor = resolveVendorLeadFloor(vendorName);
+        if (floor && result.days < floor.days) {
             return {
-                days: floor,
+                days: floor.days,
                 provenance: 'default',
-                label: `${floor}d vendor floor (Finale said ${result.days}d)`,
+                label: `${floor.days}d vendor floor (measured ${result.days}d) · ${floor.reason}`,
             };
         }
 

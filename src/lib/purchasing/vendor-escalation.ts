@@ -8,27 +8,22 @@
  * @deps    @/lib/db, @/lib/intelligence/telegram-notify
  *
  * DESIGN:
- *   L1 (2 days): polite Gmail draft — handled by po-followup-watcher.ts
- *   L2 (5 days): firmer Gmail draft mentioning reorder risk
- *   L3 (7+ days): Telegram alert to Bill with "consider alternate vendor"
+ *   L1 (48h): polite Gmail draft — handled by po-followup-watcher.ts
+ *   L2 (5d): firmer Gmail draft requesting tracking/ship date — drafted by
+ *            po-followup-watcher.ts, which stamps lifecycle_stage
+ *            'l2_escalated'. This module only classifies + dedups L2 POs;
+ *            it never creates the L2 draft itself.
+ *   L3 (7d): Telegram alert to Bill with "consider alternate vendor"
  *
- *   Escalation tracking:
- *   - `followup_level` text column: 'l1' | 'l2' | 'l3' | null
- *   - Fallback: if column doesn't exist, use ap_activity_log dedup
- *
- *   L2 flow:
- *   1. Query POs sent 10-14 days ago, unacked, no tracking, not noncomm
- *   2. Skip if followup_level >= 'l2' or recently escalated
- *   3. Create firmer Gmail draft via VendorCommsAgent
- *   4. Update followup_level = 'l2'
- *   5. Send Telegram summary: "L2 escalated: PO #X to Vendor"
+ *   Escalation tracking (dedup):
+ *   - lifecycle_stage text column: 'l1_escalated' | 'l2_escalated' |
+ *     'l3_escalated' (repurposed field, see runVendorEscalation)
  *
  *   L3 flow:
- *   1. Query POs sent 15+ days ago, unacked, no tracking, not noncomm
- *   2. Skip if followup_level >= 'l3'
- *   4. Send Telegram alert: "PO #X from Vendor — 15+ days no response"
- *   5. Include vendor reliability grade from scorecard
- *   6. Update followup_level = 'l3'
+ *   1. Query POs sent 7-45 days ago, unacked, no tracking, not noncomm
+ *   2. Skip if lifecycle_stage contains 'l3'
+ *   3. Send Telegram alert: "PO #X from Vendor — 7+ days no response"
+ *   4. Update lifecycle_stage = 'l3_escalated'
  */
 
 import { createClient } from "@/lib/db";
@@ -77,7 +72,7 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
     const outcomes: EscalationOutcome[] = [];
     const now = Date.now();
 
-    // Query all unacked POs beyond L1 window (10+ days) that haven't been marked noncomm
+    // Query all unacked POs in the L2/L3 window (5-45 days) not marked noncomm
     const cutoffMax = new Date(now - L2_MIN_DAYS * 86_400_000).toISOString();
     const cutoffMin = new Date(now - L3_MAX_DAYS * 86_400_000).toISOString();
 
@@ -98,7 +93,9 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
         return { outcomes, l2Count: 0, l3Count: 0 };
     }
 
-    let l2Count = 0;
+    // L2 drafts now live in po-followup-watcher, so this module's L2 count is
+    // always 0 — kept for the summary + EscalationResult shape.
+    const l2Count = 0;
     let l3Count = 0;
 
     // Check lifecycle_stage for escalation tracking (repurposing existing field)
@@ -148,30 +145,13 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
         }
     }
 
-    // ── L2: Firmer Gmail draft ────────────────────────────────────────────
-    for (const po of l2Candidates.slice(0, MAX_PER_RUN)) {
-        try {
-            // Create firmer draft via direct Gmail API
-            // We don't import VendorCommsAgent here to avoid circular deps
-            // Instead, log the escalation and let the existing followup run pick it up
-            // with the followup_level context
-            await db.from("purchase_orders").update({
-                lifecycle_stage: "l2_escalated",
-                updated_at: new Date().toISOString(),
-            }).eq("po_number", po.po_number);
-
-            outcomes.push({
-                poNumber: po.po_number,
-                vendorName: po.vendor_name,
-                level: "l2",
-                action: "drafted",
-                daysSinceSent: po.daysSinceDays,
-            });
-            l2Count++;
-        } catch (e: any) {
-            console.error(`[vendor-escalation] L2 draft failed for ${po.po_number}:`, e.message);
-        }
-    }
+    // ── L2: the real draft lives in po-followup-watcher (8:15 run, before
+    // this 8:40 job) — it drafts L2 and stamps lifecycle_stage
+    // 'l2_escalated'. The classification above already emitted
+    // skipped_already_escalated outcomes for L2-stamped POs, so there is
+    // nothing left to do here. This was a stub that stamped 'l2_escalated'
+    // and reported action 'drafted' without creating any Gmail draft —
+    // removed 2026-08-20 so it can't pre-empt the watcher's real L2 draft.
 
     // ── L3: Telegram alert ────────────────────────────────────────────────
     if (l3Candidates.length > 0) {

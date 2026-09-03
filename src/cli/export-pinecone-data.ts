@@ -44,7 +44,7 @@ async function exportNamespace(
 
         // list() returns { pagination: { next: string }, vectors: string[] }
         // or in newer SDK: async iterable of ID string arrays
-        let pagination = listResponse;
+        const pagination = listResponse;
 
         // Handle both SDK versions
         if (typeof pagination[Symbol.asyncIterator] === 'function') {

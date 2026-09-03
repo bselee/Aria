@@ -1,11 +1,11 @@
 /**
  * @file    start-bot.ts
- * @purpose Standalone Telegram bot launcher for Aria. Connects the persona,
- *          Gemini (primary chat) with automatic OpenRouter fallback, and
- *          Vercel AI SDK tool calling.
- * @author  Will / Antigravity
+ * @purpose Aria process entry: pid-guard, cron runner, dashboard control plane.
+ *          Telegram is not launched (2026-09-02, Bill). Telegraf is constructed
+ *          only so OpsManager's existing constructor type still compiles.
+ * @author  Hermia
  * @created 2026-02-20
- * @updated 2026-06-12 — Business hours gate on runtime watchdogs
+ * @updated 2026-09-02 — no Telegram launch, no token required to boot
  *
  * DECISION(2026-03-18): Chat now uses a provider chain with tool support.
  * Refactored on 2026-05-26 to delegate heavy lifters to modular handlers under ./handlers/.
@@ -129,25 +129,14 @@ function buildRestoredApprovalMessage(result: ReconciliationResult, approvalId: 
 // CLIENT INITIALIZATION
 // ===========================================================================
 
-const token = process.env.TELEGRAM_BOT_TOKEN;
+const token = process.env.TELEGRAM_BOT_TOKEN || "disabled";
 const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
 const perplexityKey = process.env.PERPLEXITY_API_KEY;
 
-if (!token) {
-    console.error('❌ TELEGRAM_BOT_TOKEN is not set in .env.local');
-    process.exit(1);
-}
-
+// Telegraf object exists for OpsManager typing only — never launched.
 const bot = new Telegraf(token);
 
-// SECURITY: owner-only gate. TELEGRAM_CHAT_ID is Will's user/chat id; any update
-// whose `from.id` does not match is dropped silently to avoid leaking the bot's
-// existence. Must run before all other middleware/handlers.
-const OWNER_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
-if (!OWNER_CHAT_ID) {
-    console.error('❌ TELEGRAM_CHAT_ID is not set — refusing to start unauthenticated bot.');
-    process.exit(1);
-}
+const OWNER_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || "").trim();
 bot.use((ctx, next) => {
     const fromId = ctx.from?.id?.toString();
     if (fromId !== OWNER_CHAT_ID) {
@@ -169,7 +158,7 @@ bot.use((ctx, next) => {
 const finale = new FinaleClient();
 
 console.log('🚀 ARIA BOT BOOTING...');
-console.log(`🤖 Telegram: ✅ Connected`);
+console.log(`🤖 Telegram: ⏹️ not launched (cron + dashboard only)`);
 console.log(`🧠 Chat LLM: ✅ Gemini 2.0 Flash (free)`);
 console.log(`🧠 Background LLM: ✅ Unified chain (Gemini → OpenRouter → OpenAI → Anthropic)`);
 console.log(`🔭 Perplexity: ${perplexityKey ? '✅ Loaded' : '❌ Not Configured'}`);
@@ -392,12 +381,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn('[boot] pid-guard failed to run (non-fatal):', err.message);
     }
 
-    try {
-        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-        console.log('🔄 Cleared previous Telegram session');
-    } catch (err: any) {
-        console.log('⚠️ Webhook clear failed (non-fatal):', err.message);
-    }
+    // Telegram never launches — do not call deleteWebhook / setMyCommands.
 
     // ── Module health check ────────────────────────────────────────────
         // Verify all critical AP modules can load before launching the bot.
@@ -431,10 +415,14 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
             console.warn(`[boot] PostgREST readiness wait failed (non-fatal): ${e.message}`);
         }
 
-        bot.launch({ dropPendingUpdates: true })
-            .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+        if (false) {
+            bot.launch({ dropPendingUpdates: true })
+                .catch((err: any) => console.error('❌ Bot launch error:', err.message));
+        } else {
+            console.log('⏹️ Telegram not launched — aria-bot is cron + dashboard only (2026-09-02).');
+        }
 
-    console.log('✅ ARIA IS LIVE AND LISTENING');
+    console.log('✅ ARIA CRON RUNNER LIVE');
 
     // ── Restore chat history from prior shutdown snapshot ────────────────
     // If the previous session gracefully persisted its chatHistory to
@@ -460,22 +448,6 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn(`[boot] Chat history restore failed (non-fatal): ${err.message}`);
     }
 
-    bot.telegram.setMyCommands([
-        { command: 'issues', description: 'Open issues — blocking-me-first' },
-        { command: 'blockers', description: 'Just the blocked subset' },
-        { command: 'issue', description: 'Issue detail (paste id from /issues)' },
-        { command: 'tasks', description: 'Task hub — approvals + recent work' },
-        { command: 'crons', description: 'Cron job status' },
-        { command: 'status', description: 'Aria heartbeat / health' },
-        { command: 'memory', description: 'Recall a pattern from Pinecone' },
-        { command: 'product', description: 'Look up a Finale SKU' },
-        { command: 'consumption', description: 'BOM consumption for a SKU' },
-        { command: 'builds', description: 'Upcoming calendar builds' },
-        { command: 'buildrisk', description: 'Build risk analysis' },
-        { command: 'requests', description: 'Slack purchase-request feed' },
-        { command: 'kaizen', description: 'Recent corrections / learnings' },
-    ]).catch((err: any) => console.warn('setMyCommands failed:', err.message));
-
     try {
         const { seedMemories } = await import('../lib/intelligence/memory');
         const { seedKnownVendorPatterns } = await import('../lib/intelligence/vendor-memory');
@@ -500,14 +472,8 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         console.warn('[sandbox] Watcher failed to start (non-fatal):', err.message);
     }
 
-    // ── Slack Request Detector ────────────────────────────────────────────
-        // HERMIA(2026-07-13): Disabled. Token revoked / channel discovery broken
-        // for months; boot noise only. File kept at lib/slack/request-detector.ts
-        // for possible future revive. Heartbeat cron also retired.
-        console.log('[boot] Slack Request Detector: disabled (token_revoked / non-functional)');
-
-        // restore approvals
-        try {
+    // restore approvals
+    try {
         // KAIZEN(2026-06-04): Persist-expire stale rows FIRST so they don't
         // linger as status='pending' in Supabase (a 2026-03 Uline approval sat
         // 'pending' for 2+ months because the boot loader only skipped them
@@ -594,7 +560,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     startBotControlPlane(ops);
 
     // ── AP sparse-window catch-up (deferred, non-blocking) ──────────────
-    // ap-polling fires only at 8/12/17 Denver. A restart spanning :00 (or a
+    // ap-polling fires only at 7:30/12/17 Denver. A restart spanning :00 (or a
     // slow boot) loses the window entirely — next chance is 4-5h later. Run
     // ONE idempotent runJobOnce("ap-polling") when the current window has no
     // cron_runs row.
@@ -625,12 +591,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         })();
     }, 5_000);
 
-    console.log('📅 Cron schedules registered:');
-    console.log('   🐨 Build Risk Report:  8:00 AM MT (Weekdays)');
-    console.log('   📊 Daily PO Summary:  8:00 AM MT (Weekdays)');
-    console.log('   🗓️   Weekly Review:     8:01 AM MT (Fridays)');
-    console.log('   📦 PO Sync:           Every 4h');
-    console.log('   🧹 Ad Cleanup:        Every hour');
+    console.log('📅 Cron: ap-polling 07:30 daily; receiving-sync hourly M-F 8-17; po-finale-sync 15m 7-19 M-F.');
 
     const hcUrl = process.env.HEALTHCHECK_PING_URL;
     if (hcUrl) fetch(hcUrl).catch(() => {});
@@ -657,7 +618,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
         if (heapUsed > HEAP_THRESHOLD && Date.now() - lastMemAlertSent > COOLDOWN) {
             const mb = Math.round(heapUsed / 1024 / 1024);
             const chatId = process.env.TELEGRAM_CHAT_ID;
-            if (chatId && isBusinessHours()) {
+            if (chatId && isBusinessHours() && false) {
                 await bot.telegram.sendMessage(
                     chatId,
                     `⚠️ Memory alert: heap at ${mb}MB / 768MB threshold (1GB hard cap) — consider restarting if this persists.`
@@ -669,14 +630,13 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
     // ── GATED: Cron health watchdog only during business hours ──
     // Boot grace: skip stale_cron panics for the first 15 minutes after start.
-    // ap-polling is sparse (8/12/17 Denver) — threshold must cover multi-hour gaps.
+    // ap-polling is sparse (7:30/12/17 Denver) — threshold must cover multi-hour gaps.
     const CRON_WATCHDOG_INTERVAL = 30 * 60 * 1000;
     const CRON_WATCHDOG_BOOT_GRACE_MS = 15 * 60 * 1000;
     const CRITICAL_CRONS: { name: string; maxStaleMin: number }[] = [
-        { name: 'ap-polling', maxStaleMin: 20 * 60 }, // sparse 3x/day; match heartbeat probe
+        { name: 'ap-polling', maxStaleMin: 20 * 60 }, // 1x/day 07:30
         { name: 'po-sync', maxStaleMin: 6 * 60 },
-        { name: 'build-completion-watcher', maxStaleMin: 45 },
-        { name: 'po-receiving-watcher', maxStaleMin: 45 },
+        { name: 'receiving-sync', maxStaleMin: 90 },
     ];
     let lastCronWatchdogAlert = 0;
     setInterval(async () => {
@@ -712,7 +672,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
 
             if (stale.length > 0 && Date.now() - lastCronWatchdogAlert > 60 * 60 * 1000) {
                 const chatId = process.env.TELEGRAM_CHAT_ID;
-                if (chatId && isBusinessHours()) {
+                if (chatId && isBusinessHours() && false) {
                     const names = stale.map(s => `${s.name} (>${s.maxStaleMin}m)`).join(', ');
                     await bot.telegram.sendMessage(
                         chatId,

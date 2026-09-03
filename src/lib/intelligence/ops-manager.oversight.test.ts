@@ -59,10 +59,6 @@ vi.mock("./workers/ap-forwarder", () => ({
     },
 }));
 
-vi.mock("./tracking-agent", () => ({
-    TrackingAgent: class {},
-}));
-
 vi.mock("./acknowledgement-agent", () => ({
     AcknowledgementAgent: class {
         processUnreadEmails = vi.fn().mockResolvedValue(undefined);

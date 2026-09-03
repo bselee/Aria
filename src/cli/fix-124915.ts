@@ -20,7 +20,7 @@ async function main() {
     console.log('Current items:', (currentPO.orderItemList || []).length);
 
     // 2. Unlock if needed
-    let originalStatus = currentPO.statusId;
+    const originalStatus = currentPO.statusId;
     if (currentPO.actionUrlEdit && (currentPO.statusId === 'ORDER_LOCKED' || currentPO.statusId === 'ORDER_COMPLETED')) {
         console.log('Unlocking PO...');
         await fetch(currentPO.actionUrlEdit, { method: 'POST', headers: { Authorization: authHeader } });

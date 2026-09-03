@@ -109,13 +109,15 @@ export function resolveEmailResponsePolicy(input: ResponsePolicyInput): Response
     }
 
     if (intent === "REQUIRES_HUMAN") {
+        // No auto-draft stub. Bill writes the real answer himself — a fake
+        // "Thanks — I'll follow up shortly" is worse than nothing (he deletes it).
         return {
             action: "ESCALATE_HUMAN",
             allowAutoSend: false,
-            createDraft: true, // cautious stub only — Bill edits heavily
+            createDraft: false,
             openResponseTask: true,
             leaveInInbox: true,
-            labels: ["Needs Response", "Draft Ready"],
+            labels: ["Needs Response"],
             reason: "human_review_required",
         };
     }
@@ -143,16 +145,19 @@ export function resolveEmailResponsePolicy(input: ResponsePolicyInput): Response
         };
     }
 
-    // PO / tracking / order confirm — short draft for Bill to approve, never auto-send.
-    // These often carry ETA / qty / freight nuance and need a read before send.
+    // DECISION(2026-08-11): Routine tracking/order-confirm/PO-ack emails get
+    // NO draft by default. Bill deletes these en masse — it's more work to
+    // clean up a boilerplate "Thanks for the update" than to reply himself
+    // when he actually wants to. Drafts are reserved for vendor opportunities
+    // (pricing/samples/call offers) and learned template rules only.
     return {
-        action: "DRAFT_ROUTINE",
+        action: "SILENT",
         allowAutoSend: false,
-        createDraft: true,
-        openResponseTask: false, // Gmail Drafts + inbox visibility is the surface
+        createDraft: false,
+        openResponseTask: false,
         leaveInInbox: true,
-        labels: ["Draft Ready"],
-        reason: input.isPurchaseThread ? "po_or_tracking_review" : "routine_review",
+        labels: [],
+        reason: input.isPurchaseThread ? "routine_po_no_draft" : "routine_no_draft",
     };
 }
 

@@ -236,6 +236,7 @@ describe("recommendQty — provenance trace", () => {
             "cover_days",
             "raw_qty",
             "pack_round",
+            "cover_floor",
             "urgency",
         ]);
     });
@@ -518,7 +519,7 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 
     it("formula version reflects the current recommender version", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+        expect(QTY_FORMULA_VERSION).toBe("v2.9-freight-and-cover-2026-08-24");
     });
 });
 
@@ -622,7 +623,7 @@ describe("recommendQty — cognitive rounding integration", () => {
     });
 
     it("formula version is bumped to current", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+        expect(QTY_FORMULA_VERSION).toBe("v2.9-freight-and-cover-2026-08-24");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {
@@ -699,8 +700,9 @@ describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation c
             leadTimeDays: 14,
             coverBufferDays: 16, // total target = 5 * 30 = 150 target eaches. rawNeed = 10 eaches.
         }));
-        // v2.7 capped floor: min(150, 10*2) = 20. 10 < 20, so bumped to 20.
-        expect(result.suggestedQty).toBe(20);
+        // v2.7 capped floor: min(150, 10*2) = 20. v2.9 cover floor then raises
+        // to the full 30d supply = 150 (Bill 2026-08-24: "at least 30-45 days").
+        expect(result.suggestedQty).toBe(150);
         const packStep = result.provenance.find(p => p.step === "pack_round");
         expect(packStep?.detail).toContain("2×-capped supply floor");
     });
@@ -714,8 +716,9 @@ describe("recommendQty — v2.4 30-day minimum floor & historical PO deviation c
             orderIncrementQty: 24, // Case pack = 24
         }));
         // rawNeed = 10, cappedMin30 = 20, snapToIncrement(10, 24) = 24.
-        // 24 >= 20 → pack snap already satisfies floor.
-        expect(result.suggestedQty).toBe(24);
+        // 24 >= 20 → pack snap satisfies the capped floor; v2.9 cover floor
+        // then raises to the full 30d supply = 150 (Bill's 30-45d rule).
+        expect(result.suggestedQty).toBe(150);
     });
 
     it("adds a review flag when suggested quantity deviates by more than 50% from last order", () => {
@@ -759,7 +762,7 @@ describe("recommendQty — v2.6 historical order floor", () => {
         }));
         expect(result.historicalFloorApplied).toBe(true);
         expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
-        expect(result.provenance.some(s => s.step === "historical_floor")).toBe(true);
+        expect(result.provenance.some(s => s.step === "historical_floor" || s.step === "cover_floor")).toBe(true);
     });
 
     it("does NOT bump when history is inconsistent (no clear pattern)", () => {
@@ -791,7 +794,7 @@ describe("recommendQty — v2.6 historical order floor", () => {
         }));
         expect(result.historicalFloorApplied).toBe(true);
         expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
-        expect(result.provenance.some(s => s.step === "last_purchase_floor")).toBe(true);
+        expect(result.provenance.some(s => s.step === "last_purchase_floor" || s.step === "cover_floor")).toBe(true);
     });
 });
 

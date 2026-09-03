@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 
 # -- Configuration --
 $ProjectDir   = "C:\Users\BuildASoil\Documents\Projects\aria"
-$EcosystemCfg = Join-Path $ProjectDir "ecosystem.config.cjs"
+$EcosystemCfg = Join-Path $ProjectDir "ecosystem.config.json"
 $LogFile      = Join-Path $ProjectDir "logs\watchdog.log"
 $EnvFile      = Join-Path $ProjectDir ".env.local"
 
@@ -50,24 +50,11 @@ function Write-Log {
 # -- Helper: send Telegram alert --
 function Send-TelegramAlert {
     param([string]$Text)
-    if (-not $botToken -or -not $chatId) {
-        Write-Log "WARN: Cannot send Telegram alert - missing credentials in .env.local"
-        return
-    }
-    try {
-        $uri = "https://api.telegram.org/bot$botToken/sendMessage"
-        # Build body manually to avoid encoding issues
-        $payload = @{
-            chat_id    = $chatId
-            text       = $Text
-            parse_mode = "HTML"
-        }
-        $jsonBody = $payload | ConvertTo-Json -Depth 5
-        Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($jsonBody)) | Out-Null
-        Write-Log "Telegram alert sent."
-    } catch {
-        Write-Log "WARN: Telegram alert failed: $($_.Exception.Message)"
-    }
+    # Telegram disabled per Bill (2026-08-19) -- log-only stub.
+    $preview = ($Text -replace '
+?\n', ' ')
+    if ($preview.Length -gt 80) { $preview = $preview.Substring(0, 80) + "..." }
+    Write-Log "INFO: Telegram alert skipped (disabled per Bill 2026-08-19): $preview"
 }
 
 # -- Helper: check if aria-bot is online via pm2 pid --
@@ -107,7 +94,7 @@ function Complete-OpsControlRequest {
         Set-Location $ProjectDir
         & node --import tsx src/cli/ops-control.ts complete --id $RequestId --consumer watchdog --result $Result 2>$null | Out-Null
     } catch {
-        Write-Log "WARN: Failed to complete ops control request $RequestId: $($_.Exception.Message)"
+        Write-Log "WARN: Failed to complete ops control request ${RequestId}: $($_.Exception.Message)"
     }
 }
 
@@ -121,7 +108,7 @@ function Fail-OpsControlRequest {
         Set-Location $ProjectDir
         & node --import tsx src/cli/ops-control.ts fail --id $RequestId --consumer watchdog --error $ErrorMessage 2>$null | Out-Null
     } catch {
-        Write-Log "WARN: Failed to fail ops control request $RequestId: $($_.Exception.Message)"
+        Write-Log "WARN: Failed to fail ops control request ${RequestId}: $($_.Exception.Message)"
     }
 }
 
@@ -154,6 +141,41 @@ function Restart-AriaBot {
     Send-TelegramAlert $msg
 }
 
+# -- Helper: sweep orphaned aria-bot processes (duplicate cron schedulers) --
+# PM2 on Windows cannot guarantee SIGTERM kills the child, so a restart can
+# leave an invisible orphan still firing node-cron. Enumerate every
+# `node --import tsx` fork-wrapper and kill any PID that is NOT the
+# PM2-supervised one. See src/lib/persistence/pid-guard.ts (2026-09-02).
+function Invoke-OrphanSweep {
+    $supervisedRaw = (& pm2 pid aria-bot 2>$null | Out-String).Trim()
+    $supervisedPid = 0
+    if ($supervisedRaw -match '^\d+$') { $supervisedPid = [int]$supervisedRaw }
+    # Only sweep when we positively know the supervised PID — never when the
+    # bot is mid-boot/down, to avoid racing PM2's own restart.
+    if ($supervisedPid -le 0) { return }
+
+    try {
+        # AGE GATE (2026-09-02): never kill a process younger than 60s — during
+        # `pm2 restart` the old pid may still be listed while the NEW process is
+        # mid-boot; a young process is a sibling, not an orphan. Mirrors
+        # pid-guard.ts MIN_ORPHAN_AGE_MS = 60_000.
+        $cutoff = (Get-Date).AddSeconds(-60)
+        $zombies = Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {
+            $_.CommandLine -match '--import tsx' -and `
+            $_.CommandLine -match 'ProcessContainerFork' -and `
+            $_.ProcessId -ne $supervisedPid -and `
+            $_.CreationDate -and `
+            $_.CreationDate -lt $cutoff
+        }
+        foreach ($z in $zombies) {
+            Write-Log "CRITICAL: Killing orphaned aria-bot PID $($z.ProcessId) (duplicate cron scheduler)"
+            Stop-Process -Id $z.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Log "WARN: Orphan sweep failed: $($_.Exception.Message)"
+    }
+}
+
 # -- Main watchdog logic --
 try {
     $controlRequest = Invoke-OpsControlLease
@@ -168,6 +190,9 @@ try {
     }
 
     $isOnline = Test-AriaBotOnline
+
+    # Sweep any orphaned aria-bot processes every tick (safe no-op when none).
+    Invoke-OrphanSweep
 
     if (-not $isOnline) {
         Restart-AriaBot "Process missing or stopped in PM2"
@@ -196,11 +221,11 @@ try {
             }
         }
 
-        # 200/401/503 are healthy (503 = schema cache reload — never docker-restart)
+        # 200/401/503 are healthy (503 = schema cache reload -- never docker-restart)
         if ($pgCode -eq 200 -or $pgCode -eq 401 -or $pgCode -eq 503) {
             # ok
         } else {
-            Write-Log "WARN: PostgREST Windows path down (HTTP $pgCode) — waking WSL/Docker + proxy"
+            Write-Log "WARN: PostgREST Windows path down (HTTP $pgCode) -- waking WSL/Docker + proxy"
             & wsl.exe -d Ubuntu -u root -- bash -lc "service docker start >/dev/null 2>&1; docker start aria-db >/dev/null 2>&1; sleep 6; docker exec aria-db pg_isready -U postgres >/dev/null 2>&1; docker start aria-postgrest aria-minio >/dev/null 2>&1; true" 2>$null | Out-Null
             Start-Sleep -Seconds 8
             Set-Location $ProjectDir
@@ -221,11 +246,11 @@ try {
         }
 
         # Ensure local-stack + proxy processes exist in PM2
-        foreach ($app in @("aria-wsl-proxy", "aria-local-stack", "aria-dashboard")) {
+        foreach ($app in @("aria-postgrest", "aria-pg-health", "aria-dashboard", "aria-bot")) {
             $pidOut = & pm2 pid $app 2>$null | Out-String
             $pidOut = $pidOut.Trim()
             if (-not $pidOut -or $pidOut -eq "" -or $pidOut -eq "0") {
-                Write-Log "WARN: $app missing — starting from ecosystem.config.json"
+                Write-Log "WARN: $app missing -- starting from ecosystem.config.json"
                 $ecoJson = Join-Path $ProjectDir "ecosystem.config.json"
                 & pm2 start $ecoJson --only $app 2>&1 | Out-Null
             }

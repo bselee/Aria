@@ -20,7 +20,12 @@ import type { FinaleReorderMethod, PurchasingGroup } from "@/lib/finale/client";
 import type { ExpectedDelivery, DraftVerification, CommitVerification } from "@/lib/purchasing/po-verification";
 import { CrystalBallDetail, type CrystalBallItem } from "./CrystalBallDetail";
 import { CrystalBallSearch } from "./CrystalBallSearch";
+import { VendorOutlookBar } from "./VendorOutlookBar";
 import { FilterChip, ActionChip } from "@/components/dashboard/chips";
+import { selectForwardPoLines, applyTruckQty } from "@/lib/purchasing/forward-po-lines";
+import { bundleVendorDraftLines, isAmazonVendor } from "@/lib/purchasing/vendor-sku-bundle";
+import { decodeOutlookNotes, isHoldActive, type VendorOutlookFields } from "@/lib/purchasing/vendor-outlook";
+import { formatPoDraftLabel, isAutoDraftToday, isNeverAutonomous, orderDraftJustification, shouldListOnOrdering } from "@/lib/purchasing/ordering-row-copy";
 
 // ── types ──────────────────────────────────────────────────────────────────
 type UrgencyTier = "critical" | "warning" | "watch" | "ok";
@@ -36,9 +41,13 @@ type PurchasingItem = {
         quantity: number;
         supplierName: string;
         finaleUrl: string;
+        autoDrafted?: boolean;
     } | null;
     dailyRateSource?: "demand" | "sales" | "receipts";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
+    effectiveLeadTimeDays?: number;
+    stockAvailable?: number | null;
+    forwardDemandEntry?: { requiredQty: number; earliestBuildDate: string; feedsBuilds: string[] } | null;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     urgency: UrgencyTier;
     explanation: string; suggestedQty: number;
@@ -122,6 +131,7 @@ type VendorCycle = {
 };
 type PurchasingDisplayGroup = PurchasingGroup & {
     vendorCycle?: VendorCycle;
+    autonomyLevel?: number;
 };
 type AssessmentData = {
     groups: PurchasingDisplayGroup[];
@@ -134,12 +144,29 @@ type AssessmentData = {
     refreshing?: boolean;
     error?: string;
     upcomingBuilds?: Array<{ sku: string; earliestDate: string; componentCount: number }>;
+    /** Crawl time of the basauto third-opinion report joined onto rows. */
+    basautoReconAt?: string | null;
+    /** True when the basauto report is older than the 30h TTL (cron failure). */
+    basautoReconStale?: boolean;
+    /** basauto-flagged SKUs with no Aria row — the BAS-only strip. */
+    basautoOnlyFlags?: BasautoOnlyFlag[];
+};
+
+/** A basauto flag for a SKU that has no Ordering row at all. */
+type BasautoOnlyFlag = {
+    sku: string;
+    vendor: string | null;
+    description: string | null;
+    severity: "high" | "medium" | "low";
+    reason: string;
+    basauto: { urgency: string | null; stockDaysLeft: number | null; reorderQty: number | null; reorderDate: string | null };
 };
 type POResult = {
     orderId: string;
     finaleUrl: string;
     expectedDelivery?: ExpectedDelivery;
     verification?: DraftVerification;
+    preemptCount?: number;
 };
 type CommitReview = {
     sendId: string;
@@ -398,8 +425,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [loadingTiers, setLoadingTiers] = useState<Set<UrgencyTier>>(new Set());
     const [scanning, setScanning] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [showBasOnly, setShowBasOnly] = useState(false);
 
     const [vendorTab, setVendorTab] = useState<string>("all");
+    const [outlookByVendor, setOutlookByVendor] = useState<Record<string, VendorOutlookFields>>({});
     // Vendor dropdown combobox state (replaces horizontal tab strip)
     const [vendorDropdownOpen, setVendorDropdownOpen] = useState(false);
     const [vendorSearchQuery, setVendorSearchQuery] = useState("");
@@ -419,6 +448,8 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
+    const [preemptByVendor, setPreemptByVendor] = useState<Record<string, number>>({});
+    const [autonomyOverride, setAutonomyOverride] = useState<Record<string, number>>({});
     // Vendors that have been drafted/committed — disappear from Ordering immediately.
         // Seeded from sessionStorage so a hard refresh within 6h doesn't resurrect them
         // before the fresh recent-PO coverage overlay lands on GET.
@@ -468,6 +499,8 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     // snooze
     const [snooze, setSnooze] = useState<SnoozeMap>({});
     const [showSnoozed, setShowSnoozed] = useState(false);
+    // Always start with snoozed hidden — user can toggle to reveal
+    useEffect(() => { setShowSnoozed(false); }, []);
     const [snoozeMenu, setSnoozeMenu] = useState<string | null>(null);
     const [qtyDropdownOpen, setQtyDropdownOpen] = useState<{ pid: string; productId: string } | null>(null);
     // Default TODAY (order_now). Sorted most-needed-first inside the window.
@@ -653,6 +686,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         return "Selected items need PO handling";
     }
     function itemMatchesFocus(item: PurchasingItem): boolean {
+        const outlook = outlookByVendor[item.supplierPartyId];
+        const held = isHoldActive(outlook?.holdUntilDate ?? decodeOutlookNotes(item.vendorPolicy?.notes ?? null).holdUntilDate);
+        if (held && focusFilter === "order_now") return false;
         if (focusFilter === "order_now") {
             if (itemMatchesOrderingFocus(item, "order_now")) {
                 return true;
@@ -674,11 +710,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         return item.itemType !== "bom-component";
     }
     function itemMatchesLifecycle(item: PurchasingItem): boolean {
-        // HERMIA(2026-07-28): No STATUS UI. Silently keep only actionable buckets:
-        // need = nothing on order; topping = open PO but still short. On-order /
-        // other-holds are noise on Ordering (tracked in Active POs).
-        const bucket = lifecycleBucket(item);
-        return bucket === "need" || bucket === "topping";
+        return shouldListOnOrdering(item);
     }
     // Vendor is effectively hidden if vendor-level snoozed OR every item is individually snoozed
     function vendorSnoozed(g: PurchasingGroup): boolean {
@@ -841,7 +873,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             }
         }
 
-        useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+        useEffect(() => { load();   }, []);
 
         // RCV receipt event → bust ordering cache so need drops same day
         const prevReceiptAtRef = useRef<number>(0);
@@ -900,32 +932,41 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
 
     async function createVendorPO(group: PurchasingGroup, ignoreCommitGuards?: boolean): Promise<POResult | null> {
         const pid = group.vendorPartyId;
-        // When Quick Draft or ORDER ALL: use all eligible items, not just checked ones.
-        // Only draft items the policy engine says to order (assessment.decision === 'order').
-        const selected = group.items.filter(i =>
-                    !isSnoozed(i.productId) &&
-                    canIncludeInDraftPO(i.reorderMethod) &&
-                    !itemIsCovered(i) &&
-                    !i.draftPO &&
-                    (i as any).assessment?.decision === 'order'
-                );
-        const hasChecked = selected.some(i => checked[pid]?.[i.productId]);
-        const items = (ignoreCommitGuards || !hasChecked ? selected : selected.filter(i => checked[pid]?.[i.productId]))
-            .map(i => ({ productId: i.productId, quantity: i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false, leadTimeDays: (i as any).leadTimeDays ?? null }));
+        const anyChecked = Object.values(checked[pid] ?? {}).some(Boolean);
+        const items = bundleVendorDraftLines({
+            vendorName: group.vendorName,
+            allItems: group.items,
+            selected: applyTruckQty(
+                selectForwardPoLines({
+                    items: group.items,
+                    focus: focusFilter,
+                    qtyOverrides: qtys[pid],
+                    isSnoozed,
+                    isCovered: itemIsCovered,
+                    checked: checked[pid],
+                    requireChecked: false,
+                }),
+                outlookByVendor[pid]?.truckQty ?? null,
+            ),
+            allowPreempt: !anyChecked,
+        }).map(line => ({
+            ...line,
+            leadTimeDays: outlookByVendor[pid]?.leadTimeOverrideDays ?? line.leadTimeDays ?? null,
+        }));
+        const preemptCount = items.filter((l: any) => l.preempt).length;
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ vendorPartyId: pid, items, memo: "Purchasing Intelligence draft — review and commit in Finale", ignoreCommitGuards }),
+            body: JSON.stringify({ vendorPartyId: pid, items, memo: "Purchasing Intelligence draft — review and commit in Finale", ignoreCommitGuards, skipPreflight: true }),
         });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Failed");
-        return json as POResult;
+        return { ...(json as POResult), preemptCount };
     }
 
     async function handleCreateAllDrafts(groups: PurchasingGroup[]) {
-        // One-click: draft, commit, and send each vendor individually.
-        // No confirmation — hands off to Purchases panel.
+        // Draft only. Send from Finale — Aria email is not the path.
         for (const group of groups) {
             const pid = group.vendorPartyId;
             const sel = group.items.filter(i =>
@@ -939,17 +980,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             try {
                 const result = await createVendorPO(group, true);
                 if (result?.orderId) {
-                                    setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                    const res = await fetch('/api/dashboard/purchasing/commit', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                    });
-                                    // Draft (and usually commit) landed in Finale — leave Ordering now.
-                                    // Email failure must not keep the vendor on the board.
-                                    if (res.ok) setSentPOs(p => new Set(p).add(result.orderId!));
-                                    markVendorOrdered(pid, result.orderId);
-                                }
+                    setCreatedPOs(p => ({ ...p, [pid]: result }));
+                    setPreemptByVendor(p => ({ ...p, [pid]: result.preemptCount ?? 0 }));
+                    markVendorOrdered(pid, result.orderId);
+                }
             } catch (e: any) {
                 console.error(`[order-all] ${group.vendorName}:`, e.message);
             } finally {
@@ -975,6 +1009,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             if (result) {
                             // Draft created in Finale — leave Ordering immediately (Active POs owns it).
                             setCreatedPOs(p => ({ ...p, [pid]: result }));
+                            setPreemptByVendor(p => ({ ...p, [pid]: result.preemptCount ?? 0 }));
                             setCreatedPODetails(p => ({ ...p, [pid]: result }));
                             markVendorOrdered(pid, result.orderId);
                             const selItems = selectedItems;
@@ -986,13 +1021,36 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                 totalUnits,
                             });
                             await load(true);
-                            // DO NOT auto-transition to handleReviewAndSend — send function needs fix
                         }
-                        await load(true);
         } catch (e: any) {
             setError(`PO failed for ${group.vendorName}: ${e.message}`);
         } finally {
             setCreatingPO(p => { const n = new Set(p); n.delete(pid); return n; });
+        }
+    }
+
+    async function toggleVendorAutoDraft(vendorName: string, enabled: boolean) {
+        if (isNeverAutonomous(vendorName)) return;
+        const prev = autonomyOverride[vendorName];
+        setAutonomyOverride(p => ({ ...p, [vendorName]: enabled ? 1 : 0 }));
+        try {
+            const res = await fetch("/api/dashboard/vendor-autonomy", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ vendorName, enabled }),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || res.statusText);
+            }
+        } catch (e: any) {
+            setAutonomyOverride(p => {
+                const next = { ...p };
+                if (prev === undefined) delete next[vendorName];
+                else next[vendorName] = prev;
+                return next;
+            });
+            setError(`Auto-draft for ${vendorName}: ${e.message}`);
         }
     }
 
@@ -1361,7 +1419,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 items: hasDraftPO
                     ? []
                     : sortItemsByNeed(group.items.filter(item =>
-                        itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item)
+                        itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item) && item.suggestedQty > 0
                     )),
             };
         })
@@ -1465,7 +1523,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     // ── render ─────────────────────────────────────────────────────────────
     return (
         <div className={embedded
-            ? "h-full min-h-0 flex flex-col overflow-hidden"
+            ? "min-h-0 flex flex-col"
             : "border-b border-zinc-800 shrink-0"
         }>
             {/* PO Quantity & Case Rounding Validation Loop Modal */}
@@ -1735,20 +1793,23 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             )}
 
             {/* ── Header ── cube icon + label + search + filters, outlined in thin white */}
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md">
+            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/40">
                 <Package className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-200 uppercase tracking-widest">Ordering</span>
                 <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
                 {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
-                {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
-                {isLoading && data && (
-                    <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        {scanning ? "Refreshing…" : loadingTiers.size > 0
-                            ? `Loading ${Array.from(loadingTiers).join(", ")}…`
-                            : "Scanning…"}
+                {/* basauto third-opinion freshness — amber when the 07:00 recon cron failed and the comparison is stale */}
+                {data && !scanning && (
+                    <span
+                        title={`basauto comparison crawled ${data.basautoReconAt ? new Date(data.basautoReconAt).toLocaleString([], { timeZone: "America/Denver" }) : "?"}${data.basautoReconStale ? " — STALE (recon cron overdue)" : ""}`}
+                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${data.basautoReconStale
+                            ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
+                            : "text-violet-300 border-violet-500/25 bg-violet-500/5"}`}
+                    >
+                        BAS {data.basautoReconStale ? "stale" : "ok"}
                     </span>
                 )}
+                {/* Compact indicator removed — loading state is obvious from content */}
                 <div className="flex-1" />
 
                 {/* v2 ordering filter — Order Now / 30 / 60 / 90 / All. Cumulative. Item-counted. */}
@@ -1832,6 +1893,53 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 )}
             </div>
 
+            {/* BAS-only strip: basauto flags SKUs Ordering has no row for (candidate
+                gate / job supplies). Collapsed one-liner by default; expand for the
+                high-severity list. Reason text on hover. */}
+            {false && !effectivelyCollapsed && data && (data.basautoOnlyFlags?.length ?? 0) > 0 && (() => {
+                const flags = data.basautoOnlyFlags!;
+                const highCount = flags.filter(f => f.severity === "high").length;
+                return (
+                    <div className="border-b border-zinc-800/50 bg-zinc-950/60">
+                        <button
+                            onClick={() => setShowBasOnly(s => !s)}
+                            className="w-full px-3 py-1 flex items-center gap-2 text-[10px] font-mono hover:bg-zinc-900/40 transition-colors"
+                            title={showBasOnly ? "Collapse" : "SKUs basauto flags that have no row in Ordering"}
+                        >
+                            <span className="text-zinc-500 uppercase tracking-wider shrink-0">BAS only</span>
+                            <span className={highCount > 0 ? "text-rose-300" : "text-violet-300"}>{flags.length} flagged</span>
+                            {highCount > 0 && <span className="text-rose-300/90">{highCount} high</span>}
+                            <span className="text-zinc-600 truncate">no Ordering row</span>
+                            <ChevronDown className={`w-3 h-3 ml-auto shrink-0 transition-transform ${showBasOnly ? "" : "-rotate-90"}`} />
+                        </button>
+                        {showBasOnly && (
+                            <div className="px-3 pb-2 space-y-1 max-h-56 overflow-y-auto">
+                                {flags.map(f => (
+                                    <div
+                                        key={f.sku}
+                                        title={f.reason}
+                                        className={`flex items-center gap-2 pl-2 border-l-2 ${f.severity === "high" ? "border-rose-500/60" : "border-violet-500/40"}`}
+                                    >
+                                        <span className="font-semibold text-zinc-200">{f.sku}</span>
+                                        <span className="text-zinc-500 truncate">{f.vendor ?? "no vendor"}</span>
+                                        <span className={String(f.basauto.urgency ?? "").toUpperCase() === "OVERDUE" ? "text-rose-300" : "text-amber-300"}>
+                                            {f.basauto.urgency ?? "?"}
+                                        </span>
+                                        {f.basauto.reorderQty != null && f.basauto.reorderQty > 0 && (
+                                            <span className="text-zinc-400">reorder {f.basauto.reorderQty.toLocaleString()}</span>
+                                        )}
+                                        {f.basauto.stockDaysLeft != null && (
+                                            <span className="text-zinc-600">{f.basauto.stockDaysLeft}d left</span>
+                                        )}
+                                        {f.description && <span className="text-zinc-600 truncate">{f.description}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                );
+            })()}
+
             {/* Accounting status — Ordering (separate from Active / Receivings) */}
             {!effectivelyCollapsed && data && (
                 <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
@@ -1858,7 +1966,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             )}
 
             {!effectivelyCollapsed && (
-                <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
+                <div className={embedded ? "flex-1 min-h-0 flex flex-col" : undefined}>
                     {selectedItem ? (
                         <>
                             <div
@@ -1880,265 +1988,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                         </>
                     ) : (
                         <>
-                    {/* ── Vendor dropdown combobox ── replaces horizontal tab strip */}
-                    {focusGroups.length > 0 && (
-                        <div className="relative border-b border-zinc-800/60 bg-zinc-950/30 px-3 py-1.5" ref={vendorDropdownRef}>
-                            <div className="flex items-center gap-2">
-                                {/* Dropdown trigger button */}
-                                <button
-                                    onClick={() => setVendorDropdownOpen(!vendorDropdownOpen)}
-                                    className={`flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 rounded border transition-colors ${
-                                        vendorTab === "all"
-                                            ? "border-zinc-300/60 text-zinc-100 bg-zinc-900/50 hover:bg-zinc-800/60 hover:border-zinc-200"
-                                            : "border-zinc-300/80 text-zinc-50 bg-zinc-800/50 hover:bg-zinc-700/60 hover:border-zinc-100"
-                                    }`}
-                                >
-                                    {vendorTab === "all" ? (
-                                        <>
-                                            <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 shrink-0" />
-                                            <span>
-                                                {({
-                                                    order_now: "Order Now",
-                                                    "30": "Next 30d",
-                                                    "60": "Next 60d",
-                                                    "90": "Next 90d",
-                                                    all: "All Vendors",
-                                                } as Record<FocusFilter, string>)[focusFilter]}
-                                            </span>
-                                            <span className="text-zinc-500">{focusGroups.length}</span>
-                                        </>
-                                    ) : (
-                                        (() => {
-                                            const g = focusGroups.find(v => v.vendorPartyId === vendorTab);
-                                            const cfg = g ? URGENCY[g.urgency] : URGENCY.ok;
-                                            const hasPO = g ? !!createdPOs[g.vendorPartyId] : false;
-                                            return (
-                                                <>
-                                                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
-                                                    <span>{g ? g.vendorName : "…"}</span>
-                                                    {hasPO && <span className="text-emerald-500">✓</span>}
-                                                </>
-                                            );
-                                        })()
-                                    )}
-                                    <ChevronDown className={`w-3 h-3 text-zinc-500 transition-transform ${vendorDropdownOpen ? "rotate-180" : ""}`} />
-                                </button>
-
-                                {/* Quick summary when a specific vendor is selected */}
-                                {vendorTab !== "all" && (() => {
-                                    const g = focusGroups.find(v => v.vendorPartyId === vendorTab);
-                                    if (!g || g.items.length === 0) return null;
-                                    const earliestRunway = Math.min(...g.items.map(getEffectiveShortageDays));
-                                    const totalNeed = g.items.reduce((s, i) => s + (i.suggestedQty || 0) * (i.unitPrice || 0), 0);
-                                    const leadTime = g.items[0]?.leadTimeDays ?? 0;
-                                    const selectedCount = g.items.filter(i => checked[g.vendorPartyId]?.[i.productId]).length;
-                                    return (
-                                        <div className="flex items-center gap-3 text-[10px] font-mono text-zinc-500">
-                                            <span>{g.items.length} SKUs</span>
-                                            <span className={earliestRunway < 14 ? "text-red-400" : earliestRunway < 45 ? "text-yellow-400" : ""}>
-                                                {Number.isFinite(earliestRunway) ? `${Math.round(earliestRunway)}d runway` : "—"}
-                                            </span>
-                                            <span>lead {leadTime}d</span>
-                                            <span className="text-zinc-300">${totalNeed.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                                            {selectedCount > 0 && <span className="text-emerald-400">{selectedCount} selected</span>}
-                                        </div>
-                                    );
-                                })()}
-
-                                {/* "Show all" quick-action when filtered to a vendor */}
-                                {vendorTab !== "all" && (
-                                    <button
-                                        onClick={() => { setVendorTab("all"); setExpanded(new Set()); }}
-                                        className="text-[10px] font-mono text-zinc-600 hover:text-zinc-300 transition-colors ml-auto"
-                                    >
-                                        ← All vendors
-                                    </button>
-                                )}
-                            </div>
-
-                            {/* Dropdown panel */}
-                            {vendorDropdownOpen && (
-                                <div className="absolute left-0 right-0 z-50 mt-1 mx-2 border border-zinc-700/60 bg-zinc-950 rounded-lg shadow-2xl shadow-black/60 max-h-[420px] flex flex-col overflow-hidden">
-                                    {/* Search header */}
-                                    <div className="px-3 py-2 border-b border-zinc-800/80 flex items-center gap-2 bg-zinc-900/50 shrink-0">
-                                        <Search className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
-                                        <input
-                                            ref={vendorSearchRef}
-                                            type="text"
-                                            value={vendorSearchQuery}
-                                            onChange={e => setVendorSearchQuery(e.target.value)}
-                                            placeholder="Search vendors…"
-                                            className="flex-1 bg-transparent border-none text-xs font-mono text-zinc-100 placeholder-zinc-600 focus:outline-none"
-                                            onKeyDown={e => {
-                                                if (e.key === "Escape") {
-                                                    setVendorDropdownOpen(false);
-                                                    setVendorSearchQuery("");
-                                                }
-                                                if (e.key === "Enter") {
-                                                    const filtered = vendorDropdownItems;
-                                                    if (filtered.length === 1) {
-                                                        setVendorTab(filtered[0].vendorPartyId);
-                                                        setExpanded(prev => { const n = new Set(prev); n.add(filtered[0].vendorPartyId); return n; });
-                                                        setVendorDropdownOpen(false);
-                                                        setVendorSearchQuery("");
-                                                    }
-                                                }
-                                            }}
-                                        />
-                                        <span className="text-[9px] text-zinc-600 shrink-0">
-                                            {vendorSearchQuery ? `${vendorDropdownItems.length} match` : `${focusGroups.length} vendors`}
-                                        </span>
-                                    </div>
-
-                                    {/* Scrollable vendor list */}
-                                    <div className="overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-zinc-800 [&::-webkit-scrollbar-thumb]:rounded-full">
-                                        {/* "All Vendors" option */}
-                                        <button
-                                            onClick={() => {
-                                                setVendorTab("all");
-                                                setExpanded(new Set());
-                                                setVendorDropdownOpen(false);
-                                                setVendorSearchQuery("");
-                                            }}
-                                            className={`w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-zinc-800/40 transition-colors border-b border-zinc-900/60 ${
-                                                vendorTab === "all" ? "bg-zinc-800/30 text-zinc-100" : "text-zinc-400"
-                                            }`}
-                                        >
-                                            <span className="w-1.5 h-1.5 rounded-full bg-zinc-500 shrink-0" />
-                                            <span className="text-xs font-mono font-semibold flex-1">All Vendors</span>
-                                            <span className="text-[10px] font-mono text-zinc-600">{focusGroups.length}</span>
-                                        </button>
-
-                                        {/* Vendor rows */}
-                                        {vendorDropdownItems.map(g => {
-                                            const cfg = URGENCY[g.urgency];
-                                            const isActive = vendorTab === g.vendorPartyId;
-                                            const hasPO = !!createdPOs[g.vendorPartyId];
-                                            const vSnoozed = !hasPO && vendorSnoozed(g);
-                                            const checkedCount = g.items.filter(i => !isSnoozed(i.productId) && checked[g.vendorPartyId]?.[i.productId]).length;
-                                            const earliestRunway = g.items.length > 0
-                                                ? Math.min(...g.items.map(getEffectiveShortageDays))
-                                                : null;
-                                            const leadTime = g.items.length > 0 ? (g.items[0].leadTimeDays ?? 0) : 0;
-                                            const totalNeed = g.items.reduce((s, i) => s + (i.suggestedQty || 0) * (i.unitPrice || 0), 0);
-                                            const totalOnHand = g.items.reduce((s, i) => s + (i.stockOnHand || 0), 0);
-                                            const totalOnOrder = g.items.reduce((s, i) => s + (i.stockOnOrder || 0), 0);
-                                            const topSkus = g.items.slice(0, 3).map(i => i.productId);
-                                            const criticalItems = g.items.filter(i => i.urgency === "critical").length;
-
-                                            return (
-                                                <button
-                                                    key={g.vendorPartyId}
-                                                    onClick={() => {
-                                                        setVendorTab(g.vendorPartyId);
-                                                        setExpanded(prev => { const n = new Set(prev); n.add(g.vendorPartyId); return n; });
-                                                        setVendorDropdownOpen(false);
-                                                        setVendorSearchQuery("");
-                                                    }}
-                                                    className={`w-full text-left px-3 py-2 flex flex-col gap-1 hover:bg-zinc-800/40 transition-colors border-b border-zinc-900/40 ${
-                                                        vSnoozed ? "opacity-30" : ""
-                                                    } ${isActive ? "bg-zinc-800/30" : ""}`}
-                                                >
-                                                    {/* Row 1: vendor name + urgency + SKU count */}
-                                                    <div className="flex items-center gap-2">
-                                                        <span className={`w-2 h-2 rounded-full shrink-0 ${vSnoozed ? "bg-zinc-700" : cfg.dot}`} />
-                                                        <span className={`text-xs font-mono font-semibold flex-1 truncate ${vSnoozed ? "line-through text-zinc-700" : isActive ? "text-zinc-100" : "text-zinc-300"}`}>
-                                                            {g.vendorName}
-                                                        </span>
-                                                        {hasPO && <span className="text-[10px] text-emerald-500 font-mono">✓ PO sent</span>}
-                                                        {checkedCount > 0 && !hasPO && (
-                                                            <span className="text-[10px] font-mono bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded-full border border-zinc-700">
-                                                                {checkedCount} sel
-                                                            </span>
-                                                        )}
-                                                        {criticalItems > 0 && !hasPO && (
-                                                            <span className="text-[9px] font-mono text-red-400 bg-red-500/10 px-1 py-0.5 rounded border border-red-500/20">
-                                                                {criticalItems} CRIT
-                                                            </span>
-                                                        )}
-                                                    </div>
-
-                                                    {/* Row 2: data metrics */}
-                                                    <div className="flex items-center gap-3 text-[9px] font-mono pl-4">
-                                                        <span className="text-zinc-500">{g.items.length} SKUs</span>
-                                                        {Number.isFinite(earliestRunway ?? NaN) && (
-                                                            <span className={
-                                                                (earliestRunway ?? 999) < leadTime
-                                                                    ? "text-red-400 font-semibold"
-                                                                    : (earliestRunway ?? 999) < 30
-                                                                    ? "text-amber-400"
-                                                                    : "text-zinc-500"
-                                                            }>
-                                                                {Math.round(earliestRunway ?? 0)}d runway
-                                                            </span>
-                                                        )}
-                                                        <span className="text-zinc-600">lead {leadTime}d</span>
-                                                        <span className="text-zinc-500">
-                                                            on-hand {totalOnHand.toLocaleString()}
-                                                        </span>
-                                                        {totalOnOrder > 0 && (
-                                                            <span className="text-emerald-600">+{totalOnOrder.toLocaleString()} on order</span>
-                                                        )}
-                                                        <span className="text-zinc-400 font-semibold ml-auto">
-                                                            ${totalNeed.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                                                        </span>
-                                                    </div>
-
-                                                    {/* Row 3: affected SKUs */}
-                                                    {topSkus.length > 0 && (
-                                                        <div className="flex items-center gap-1 pl-4">
-                                                            <span className="text-[8px] font-mono text-zinc-700">affects</span>
-                                                            {topSkus.map(sku => (
-                                                                <span key={sku} className="text-[8px] font-mono text-zinc-600 bg-zinc-900 px-1 py-0.5 rounded border border-zinc-800 truncate max-w-[80px]">
-                                                                    {sku}
-                                                                </span>
-                                                            ))}
-                                                            {g.items.length > 3 && (
-                                                                <span className="text-[8px] text-zinc-700">+{g.items.length - 3} more</span>
-                                                            )}
-                                                        </div>
-                                                    )}
-                                                </button>
-                                            );
-                                        })}
-
-                                        {/* Empty state */}
-                                        {vendorDropdownItems.length === 0 && vendorSearchQuery && (
-                                            <div className="px-4 py-6 text-center text-[10px] font-mono text-zinc-600">
-                                                No vendors matching "{vendorSearchQuery}"
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    )}
-
                     {isLoading && !data && (
-                        <div className="px-4 py-10 flex items-center justify-center">
-                            <div className="flex flex-col items-center gap-3 px-6 py-6 rounded-lg border border-emerald-500/30 bg-emerald-500/5 shadow-lg max-w-md w-full">
-                                <div className="relative">
-                                    <Loader2 className="w-9 h-9 text-emerald-400 animate-spin" />
-                                    <Package className="w-4 h-4 text-emerald-300 absolute inset-0 m-auto" />
-                                </div>
-                                <div className="text-sm font-mono font-semibold text-emerald-200 tracking-wide">
-                                    {scanning ? "Re-scanning Finale…" : "Loading purchasing data…"}
-                                </div>
-                                <div className="text-[11px] font-mono text-zinc-400 text-center min-h-[14px]">
-                                    {loadingTiers.size > 0
-                                        ? `Loading ${Array.from(loadingTiers).join(", ")} items…`
-                                        : "Cold-path scans take 3–6 minutes. Hang tight."}
-                                </div>
-                                {/* Subtle skeleton hint underneath */}
-                                <div className="w-full space-y-1.5 pt-2">
-                                    {[1, 2, 3].map(i => (
-                                        <div key={i} className="flex items-center gap-2">
-                                            <div className="w-1.5 h-1.5 rounded-full skeleton-shimmer shrink-0" />
-                                            <div className="skeleton-shimmer h-2.5 rounded" style={{ width: `${45 + i * 14}%` }} />
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
+                        <div className="px-4 py-3 text-[10px] font-mono text-zinc-600">
+                            Loading…
                         </div>
                     )}
                     {error && (
@@ -2228,10 +2080,20 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                 <span className={`text-sm font-mono font-semibold ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
                                                     {group.vendorName}
                                                 </span>
-                                                {!vSnoozed && cfg.label && (
-                                                    <span className={`text-[10px] font-mono shrink-0 px-1.5 py-0.5 rounded border ${cfg.badge}`} title={cfg.label}>
-                                                        {cfg.label}
-                                                    </span>
+                                                {!vSnoozed && !isNeverAutonomous(group.vendorName) && !isAmazonVendor(group.vendorName) && (
+                                                    <label
+                                                        className="flex items-center gap-1 text-[10px] font-mono text-zinc-500 shrink-0"
+                                                        title="Overnight auto-draft. Drafts only, never sends."
+                                                        onClick={(e) => e.stopPropagation()}
+                                                    >
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={(autonomyOverride[group.vendorName] ?? group.autonomyLevel ?? 0) >= 1}
+                                                            onChange={(e) => toggleVendorAutoDraft(group.vendorName, e.target.checked)}
+                                                            className="w-3 h-3 rounded accent-emerald-500"
+                                                        />
+                                                        auto
+                                                    </label>
                                                 )}
                                                 <span className="text-[10px] font-mono text-zinc-500">
                                                     {activeItems.slice(0, 4).map((i, idx) => (
@@ -2254,49 +2116,41 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                     if (createdPOs[pid] && !completedVendors.has(pid)) {
                                                         return (
                                                             <div className="flex items-center gap-1 shrink-0">
-                                                                <span className="text-[10px] font-mono text-emerald-400 px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10">
-                                                                    ✓ PO #{createdPOs[pid].orderId}
+                                                                <span className="text-[10px] font-mono text-amber-300 px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10">
+                                                                    {formatPoDraftLabel(createdPOs[pid].orderId)}
                                                                 </span>
-                                                                <button
-                                                                    onClick={async () => {
-                                                                                                                                            const poId = createdPOs[pid].orderId;
-                                                                                                                                            if (!poId) return;
-                                                                                                                                            const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                                method: 'POST',
-                                                                                                                                                headers: { 'Content-Type': 'application/json' },
-                                                                                                                                                body: JSON.stringify({ action: 'send-direct', orderId: poId, vendorPartyId: pid }),
-                                                                                                                                            });
-                                                                                                                                            if (res.ok) {
-                                                                                                                                                setSentPOs(p => new Set(p).add(poId));
-                                                                                                                                                markVendorOrdered(pid, poId);
-                                                                                                                                            } else {
-                                                                                                                                                // Draft already exists — still leave Ordering; retry email from Purchases/Finale.
-                                                                                                                                                markVendorOrdered(pid, poId);
-                                                                                                                                                const json = await res.json().catch(() => ({}));
-                                                                                                                                                setError(`Send failed: ${(json as any).error || 'Unknown'} — PO stays in Finale`);
-                                                                                                                                            }
-                                                                                                                                        }}
-                                                                    className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-amber-500 bg-amber-600/30 hover:bg-amber-500/40 text-amber-200 transition-colors"
-                                                                >Send</button>
+                                                                <a
+                                                                    href={createdPOs[pid].finaleUrl}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                    className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-zinc-600 bg-zinc-800/40 hover:bg-zinc-700/50 text-zinc-200"
+                                                                    title="Open in Finale — send from there"
+                                                                >Finale</a>
+                                                                {preemptByVendor[pid] > 0 && (
+                                                                    <span className="text-[10px] font-mono text-zinc-500 shrink-0">+{preemptByVendor[pid]} preempt</span>
+                                                                )}
                                                             </div>
                                                         );
                                                     }
                                                     // Order button: only when something still needs ordering (not already on open/draft PO)
-                                                                                                        const orderableItems = activeItems.filter(i =>
-                                                                                                            canIncludeInDraftPO(i.reorderMethod)
-                                                                                                            && !itemIsCovered(i)
-                                                                                                            && !i.draftPO
-                                                                                                            && (i as any).assessment?.decision === "order"
-                                                                                                        );
+                                                                                                        const orderableItems = selectForwardPoLines({
+                                                                                                            items: activeItems,
+                                                                                                            focus: focusFilter,
+                                                                                                            qtyOverrides: groupQtys,
+                                                                                                            isSnoozed,
+                                                                                                            isCovered: itemIsCovered,
+                                                                                                        });
                                                                                                         const coveredOnly = activeItems.length > 0 && orderableItems.length === 0
                                                                                                             && activeItems.some(i => itemIsCovered(i) || !!i.draftPO || (i.openPOs?.length ?? 0) > 0);
                                                                                                         if (!vSnoozed && coveredOnly) {
+                                                                                                            const todayDraft = activeItems.find(i => isAutoDraftToday(i.draftPO))?.draftPO;
+                                                                                                            if (!todayDraft) return null;
                                                                                                             return (
                                                                                                                 <span
-                                                                                                                    className="text-[10px] font-mono px-2 py-1 rounded border border-cyan-700/40 bg-cyan-950/30 text-cyan-300 shrink-0"
-                                                                                                                    title="Open or draft POs already cover this vendor. Manage them in Purchases."
+                                                                                                                    className="text-[10px] font-mono px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-300 shrink-0"
+                                                                                                                    title="Auto-drafted today. Send from Finale."
                                                                                                                 >
-                                                                                                                    On PO
+                                                                                                                    {formatPoDraftLabel(todayDraft.orderId)}
                                                                                                                 </span>
                                                                                                             );
                                                                                                         }
@@ -2304,38 +2158,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                             const wasInspected = expanded.has(pid);
                                                                                                             return (
                                                                                                                 <button
-                                                                                                                    onClick={async () => {
-                                                                                                                        if (wasInspected) {
-                                                                                                                            // You reviewed — draft only for safety
-                                                                                                                            handleCreateOne(group, true);
-                                                                                                                        } else {
-                                                                                                                            // You trust it — draft + commit + send
-                                                                                                                            try {
-                                                                                                                                                                                                                                                            const result = await createVendorPO(group, true);
-                                                                                                                                                                                                                                                            if (result?.orderId) {
-                                                                                                                                                                                                                                                                setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                                                                                                                                                                                                                                                const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                                                                                                                                                    method: 'POST',
-                                                                                                                                                                                                                                                                    headers: { 'Content-Type': 'application/json' },
-                                                                                                                                                                                                                                                                    body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                                                                                                                                                                                                                                                });
-                                                                                                                                                                                                                                                                if (res.ok) {
-                                                                                                                                                                                                                                                                    setSentPOs(p => new Set(p).add(result.orderId!));
-                                                                                                                                                                                                                                                                } else {
-                                                                                                                                                                                                                                                                    setError('Draft created — send failed. PO is in Finale; email may need manual send.');
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                // PO exists in Finale — leave Ordering regardless of email path.
-                                                                                                                                                                                                                                                                markVendorOrdered(pid, result.orderId);
-                                                                                                                                                                                                                                                                await load(true);
-                                                                                                                                                                                                                                                            } else {
-                                                                                                                                                                                                                                                                setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
-                                                                                                                                                                                                                                                            }
-                                                                                                                                                                                                                                                        } catch (e: any) { setError(e.message); }
-                                                                                                                        }
-                                                                                                                    }}
+                                                                                                                    onClick={() => handleCreateOne(group, true)}
                                                                                                                     disabled={anyCreating}
                                                                                                                     className="text-[10px] font-mono px-2 py-1 rounded border bg-emerald-900/30 hover:bg-emerald-800/40 text-emerald-300 border-emerald-800 transition-colors disabled:opacity-40 shrink-0"
-                                                                                                                    title={wasInspected ? "Draft only — you reviewed this vendor" : "Draft, commit, and send"}
+                                                                                                                    title="Draft in Finale — send from Finale"
                                                                                                                 >
                                                                                                                     Order
                                                                                                                 </button>
@@ -2348,6 +2174,23 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                     ▾
                                                 </button>
                                             </div>
+                                            {false && isExpanded && (
+                                                <VendorOutlookBar
+                                                    vendorPartyId={pid}
+                                                    vendorName={group.vendorName}
+                                                    initial={outlookByVendor[pid] ?? (() => {
+                                                        const decoded = decodeOutlookNotes(activeItems[0]?.vendorPolicy?.notes ?? null);
+                                                        return {
+                                                            notes: decoded.notes,
+                                                            holdUntilDate: decoded.holdUntilDate,
+                                                            leadTimeOverrideDays: activeItems[0]?.vendorPolicy?.leadTimeOverrideDays ?? null,
+                                                            targetCoverDays: activeItems[0]?.vendorPolicy?.targetCoverDays ?? null,
+                                                            truckQty: null,
+                                                        };
+                                                    })()}
+                                                    onSaved={(next) => setOutlookByVendor(p => ({ ...p, [pid]: next }))}
+                                                />
+                                            )}
 
                                             {/* ── Item rows ── */}
                                             {isExpanded && (
@@ -2448,146 +2291,28 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                         {snoozeLabel(iKey)}
                                                                                     </span>
                                                                                 )}
-                                                                                {isBundle && (
-                                                                                    <span className="text-[9px] font-mono text-blue-500/70 border border-blue-500/20 rounded px-1 shrink-0">
-                                                                                        bundle?
-                                                                                    </span>
-                                                                                )}
-                                                                                {methodBadge && !itemSnoozed && (
-                                                                                    <span className={`text-[9px] font-mono border rounded px-1 shrink-0 ${reorderMethodTone(item.reorderMethod)}`}>
-                                                                                        {methodBadge}
-                                                                                    </span>
-                                                                                )}
-                                                                                {item.packSize && !itemSnoozed && (
-                                                                                    <span className="text-[10px] font-mono text-zinc-400 shrink-0" title={`${item.packSize.unitsPerPack} ${item.packSize.packUnit} = 1 orderable pack`}>
-                                                                                        {item.packSize.unitsPerPack}/{item.packSize.packUnit}
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.vendorPolicy?.targetCoverDays != null && item.vendorPolicy.targetCoverDays > 0 && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-emerald-300 border border-emerald-500/30 bg-emerald-500/5 rounded px-1 shrink-0"
-                                                                                        title={item.vendorPolicy.notes ?? "Vendor policy target cover window"}
+                                                                                {!itemSnoozed && isAutoDraftToday(item.draftPO) && item.draftPO && (
+                                                                                    <a
+                                                                                        href={item.draftPO.finaleUrl}
+                                                                                        target="_blank"
+                                                                                        rel="noreferrer"
+                                                                                        onClick={(e) => e.stopPropagation()}
+                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-300 border-amber-500/40 bg-amber-500/10 hover:border-amber-400"
+                                                                                        title="Auto-drafted today"
                                                                                     >
-                                                                                        {item.vendorPolicy.targetCoverDays}d cover
-                                                                                    </span>
+                                                                                        {formatPoDraftLabel(item.draftPO.orderId)}
+                                                                                    </a>
                                                                                 )}
-                                                                                {!itemSnoozed && item.vendorPolicy?.leadTimeOverrideDays != null && item.vendorPolicy.leadTimeOverrideDays > 0 && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-zinc-300 border border-zinc-600/50 bg-zinc-800/40 rounded px-1 shrink-0"
-                                                                                        title="Vendor policy lead-time override"
-                                                                                    >
-                                                                                        {item.vendorPolicy.leadTimeOverrideDays}d lead
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.moqWarning && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-amber-300 border border-amber-500/40 bg-amber-500/10 rounded px-1 shrink-0"
-                                                                                        title="Vendor MOQ not met (warn-only — qty not bumped)"
-                                                                                    >
-                                                                                        MOQ warn
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && item.reviewRequired && (
-                                                                                    <span
-                                                                                        className="text-[10px] font-mono text-red-300 border border-red-500/40 bg-red-500/10 rounded px-1 shrink-0"
-                                                                                        title="Recommendation flagged for review — see reasons below"
-                                                                                    >
-                                                                                        Review
-                                                                                    </span>
-                                                                                )}
-                                                                                {!itemSnoozed && (hasOpenPo || coveredByOpenPo || item.draftPO) && (
-                                                                                                                                                                    <span
-                                                                                                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-cyan-200 border-cyan-500/40 bg-cyan-500/10"
-                                                                                                                                                                        title={item.draftPO
-                                                                                                                                                                            ? `Draft PO #${item.draftPO.orderId} already submitted — review/commit that PO, do not re-order`
-                                                                                                                                                                            : `Already ordered on open PO${item.openPOs.length > 1 ? "s" : ""}: ${item.openPOs.map(p => `#${p.orderId} qty ${p.quantity}`).join(", ")}. Order is disabled unless coverage slips.`}
-                                                                                                                                                                    >
-                                                                                                                                                                        {item.draftPO ? "Draft submitted" : "Already on PO"}
-                                                                                                                                                                    </span>
-                                                                                                                                                                )}
-                                                                                                                                                                {!itemSnoozed && item.commitGuard && !hasOpenPo && !item.draftPO && (
-                                                                                                                                                                    <span
-                                                                                                                                                                        className={`text-[10px] font-mono border rounded px-1 shrink-0 ${
-                                                                                                                                                                            item.commitGuard.decision === "commit"
-                                                                                                                                                                                ? "text-emerald-300 border-emerald-500/35 bg-emerald-500/10"
-                                                                                                                                                                                : item.commitGuard.decision === "draft_only"
-                                                                                                                                                                                    ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
-                                                                                                                                                                                    : "text-red-300 border-red-500/40 bg-red-500/10"
-                                                                                                                                                                        }`}
-                                                                                                                                                                        title={`${item.commitGuard.summary} Target: ${item.commitGuard.targetCoverDays}d total (${item.commitGuard.leadTimeDays}d lead + ${item.commitGuard.minimumPostLeadCoverageDays}d supply).`}
-                                                                                                                                                                    >
-                                                                                                                                                                        {item.commitGuard.decision === "commit"
-                                                                                                                                                                            ? "Commit ready"
-                                                                                                                                                                            : item.commitGuard.decision === "draft_only"
-                                                                                                                                                                                ? "Draft only"
-                                                                                                                                                                                : "Blocked"}
-                                                                                                                                                                    </span>
-                                                                                                                                                                )}
-                                                                                                                                                                {!itemSnoozed && item.commitGuard && hasOpenPo && item.assessment?.decision === "order" && (
-                                                                                                                                                                    <span
-                                                                                                                                                                        className="text-[10px] font-mono border rounded px-1 shrink-0 text-amber-200 border-amber-500/40 bg-amber-500/10"
-                                                                                                                                                                        title="Open PO exists but supply still falls short of need. This is a reorder of the shortfall — confirm before ordering again."
-                                                                                                                                                                    >
-                                                                                                                                                                        Reorder?
-                                                                                                                                                                    </span>
-                                                                                                                                                                )}
 
                                                                                 <div className="flex-1" />
-
                                                                                 {!itemSnoozed && (() => {
-                                                                                    // v2: shortage label uses effective shortage, not raw runway.
-                                                                                    // Refinement A: when the lifecycle ribbon below will render
-                                                                                    // (item has open POs), drop the "→Xd adjusted" tail since the
-                                                                                    // ribbon shows the same coverage in more detail.
                                                                                     const effective = getEffectiveShortageDays(item);
-                                                                                    const ribbonBelow = (item.openPOs?.length ?? 0) > 0;
-                                                                                    const rawIsZero = item.runwayDays === 0 && item.adjustedRunwayDays > 0;
-                                                                                    if (rawIsZero && !ribbonBelow) {
-                                                                                        return (
-                                                                                            <span className={`text-xs font-mono shrink-0 ${rc}`}>
-                                                                                                on hand out · covered <span className="text-zinc-300">{Math.round(item.adjustedRunwayDays)}d</span>
-                                                                                            </span>
-                                                                                        );
-                                                                                    }
                                                                                     return (
-                                                                                        <span className={`text-xs font-mono shrink-0 ${rc}`} title="Effective shortage: finaleStockoutDays > adjustedRunwayDays > runwayDays">
-                                                                                            shortage {Number.isFinite(effective) ? `${Math.round(effective)}d` : "—"}
-                                                                                            {!ribbonBelow && item.stockOnOrder > 0 && (
-                                                                                                <span className="text-zinc-400 font-normal text-[10px]">
-                                                                                                    {" "}(raw {Math.round(item.runwayDays)}d)
-                                                                                                </span>
-                                                                                            )}
+                                                                                        <span className={`text-xs font-mono shrink-0 ${rc}`}>
+                                                                                            {Number.isFinite(effective) ? `${Math.round(effective)}d` : "—"}
                                                                                         </span>
                                                                                     );
                                                                                 })()}
-
-                                                                                {/* Per-row trigger reason badge */}
-                                                                                {!itemSnoozed && item.triggerReason && (
-                                                                                    <span
-                                                                                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${
-                                                                                            item.triggerReason === 'build-driven' ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
-                                                                                            : item.triggerReason === 'stockout-padded' ? 'bg-rose-500/15 text-rose-300 border-rose-500/40'
-                                                                                            : item.triggerReason === 'runway-short' ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
-                                                                                            : 'bg-zinc-700/40 text-zinc-400 border-zinc-700'
-                                                                                        }`}
-                                                                                        title={item.triggerDetail ?? ''}
-                                                                                    >
-                                                                                        {item.triggerReason === 'build-driven' ? '📅 build' :
-                                                                                         item.triggerReason === 'stockout-padded' ? '🔁 stockout' :
-                                                                                         item.triggerReason === 'runway-short' ? '⏱ runway' :
-                                                                                         '🗓 cadence'}
-                                                                                    </span>
-                                                                                )}
-
-                                                                                {/* 🚛 BULK badge — shown when vendor is flagged as a bulk multi-leg shipper */}
-                                                                                {!itemSnoozed && item.isBulkVendor && (
-                                                                                    <span
-                                                                                        className="text-[9px] font-mono px-1 py-0.5 rounded border border-violet-500/40 bg-violet-500/10 text-violet-300 shrink-0"
-                                                                                        title="Bulk vendor — shipments arrive in multiple legs over time"
-                                                                                    >
-                                                                                        🚛 BULK
-                                                                                    </span>
-                                                                                )}
 
                                                                                 <div className="relative shrink-0 ml-1">
                                                                                     <button
@@ -2861,18 +2586,43 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                             <span>·</span>
                                                                                             <span>{Math.round(item.stockOnHand)} on hand</span>
                                                                                         </div>
-                                                                                        {(item.finaleReorderQty ?? 0) > 0 && (
-                                                                                            <div className="flex items-center gap-2 mt-0.5">
-                                                                                                <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
-                                                                                                    Finale: {item.finaleReorderQty}
-                                                                                                </span>
-                                                                                                <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                        {((item.finaleReorderQty ?? 0) > 0 || item.basautoRecon) && (
+                                                                                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                                                                                {item.basautoRecon && item.basautoRecon.basautoQty != null && (
+                                                                                                    <>
+                                                                                                        <span
+                                                                                                            title={`${item.basautoRecon.live ? "live verdict · " : ""}basauto (${item.basautoRecon.basautoUrgency ?? 'n/a'}) wants ${item.basautoRecon.basautoQty}. ${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
+                                                                                                            className="text-[11px] font-mono italic text-violet-300"
+                                                                                                        >
+                                                                                                            basauto: {item.basautoRecon.basautoQty}
+                                                                                                        </span>
+                                                                                                        <span className="text-zinc-600 text-[10px]">·</span>
+                                                                                                    </>
+                                                                                                )}
+                                                                                                {(item.finaleReorderQty ?? 0) > 0 && (
+                                                                                                    <>
+                                                                                                        <span className={`text-[11px] font-mono italic ${item.qtyDiverged ? 'text-amber-300' : 'text-cyan-300'}`}>
+                                                                                                            Finale: {item.finaleReorderQty}
+                                                                                                        </span>
+                                                                                                        <span className="text-zinc-600 text-[10px]">→</span>
+                                                                                                    </>
+                                                                                                )}
                                                                                                 <span className={`text-[11px] font-mono font-semibold ${item.qtyDiverged ? 'text-emerald-300' : 'text-zinc-200'}`}>
                                                                                                     Aria: {item.suggestedQty}
                                                                                                 </span>
                                                                                                 {item.qtyDiverged && item.qtyDivergencePct != null && (
                                                                                                     <span className="text-[9px] font-mono text-amber-400 border border-amber-500/20 rounded px-1">
                                                                                                         ⚠ {Math.abs(item.qtyDivergencePct)}% diff
+                                                                                                    </span>
+                                                                                                )}
+                                                                                                {item.basautoRecon && (
+                                                                                                    <span
+                                                                                                        title={`${item.basautoRecon.live ? "live verdict · " : ""}${item.basautoRecon.reason}${item.basautoRecon.crawledAt ? ` · crawled ${new Date(item.basautoRecon.crawledAt).toLocaleString([], { timeZone: 'America/Denver' })}` : ''}`}
+                                                                                                        className={`text-[9px] font-mono rounded px-1 border ${item.basautoRecon.severity === 'high'
+                                                                                                            ? 'text-red-300 border-red-500/30'
+                                                                                                            : 'text-violet-300 border-violet-500/25'}`}
+                                                                                                    >
+                                                                                                        {item.basautoRecon.verdict.replace(/_/g, ' ').toLowerCase()}
                                                                                                     </span>
                                                                                                 )}
                                                                                             </div>
@@ -2951,25 +2701,37 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                 </div>
                                                                             )}
 
-                                                                            {/* Row 4: Explanation + Why drawer */}
+                                                                            {/* Row 4: one-line draft justification + Why drawer */}
                                                                             {!itemSnoozed && (
                                                                                 <div className="mt-2 space-y-1">
                                                                                     <div className="flex items-start justify-between gap-2">
-                                                                                        <div className="text-[11px] font-mono text-zinc-400 italic flex-1">
-                                                                                            {item.assessment?.explanation ?? item.explanation}
-                                                                                            {item.projectedNextOrderDate && (
-                                                                                                <span className="ml-2 text-cyan-300 not-italic">
-                                                                                                    · 🔮 Next order ~{item.projectedNextOrderDate}
-                                                                                                </span>
-                                                                                            )}
+                                                                                        <div className="text-[11px] font-mono text-zinc-400 flex-1">
+                                                                                            {orderDraftJustification({
+                                                                                                suggestedQty: item.suggestedQty,
+                                                                                                lastPurchaseQty: item.lastPurchaseQty,
+                                                                                                runwayDays: item.runwayDays,
+                                                                                                leadTimeDays: item.effectiveLeadTimeDays ?? item.leadTimeDays,
+                                                                                                dailyRate: item.dailyRate,
+                                                                                                draftPO: item.draftPO ?? null,
+                                                                                                recommendation: item.recommendation ?? null,
+                                                                                            })}
                                                                                         </div>
                                                                                         {item.recommendation && (
                                                                                             <button
                                                                                                 onClick={(e) => { e.stopPropagation(); toggleWhy(`${pid}:${item.productId}`); }}
-                                                                                                className="text-[10px] font-mono text-cyan-400 hover:text-cyan-200 underline-offset-2 hover:underline shrink-0"
+                                                                                                className="text-[10px] font-mono text-zinc-500 hover:text-zinc-300 shrink-0"
                                                                                                 title="Show full reorder math trace"
                                                                                             >
-                                                                                                {whyOpen.has(`${pid}:${item.productId}`) ? "Hide why" : `Why ${item.suggestedQty}?`}
+                                                                                                {whyOpen.has(`${pid}:${item.productId}`) ? "Hide" : "Why"}
+                                                                                            </button>
+                                                                                        )}
+                                                                                        {item.draftPO && (
+                                                                                            <button
+                                                                                                onClick={(e) => { e.stopPropagation(); handleCancelDraft(item.draftPO!.orderId); }}
+                                                                                                className="text-[10px] font-mono text-zinc-600 hover:text-rose-300 shrink-0"
+                                                                                                title="Cancel this draft in Finale"
+                                                                                            >
+                                                                                                Cancel
                                                                                             </button>
                                                                                         )}
                                                                                     </div>
@@ -2997,31 +2759,6 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                     Finale says {item.finaleReorderQty} (ignored — Aria's trace above is the source of truth)
                                                                                                 </div>
                                                                                             )}
-                                                                                        </div>
-                                                                                    )}
-                                                                                    {!itemSnoozed && item.draftPO && (
-                                                                                        <div className="mt-2.5 bg-amber-500/10 border border-amber-500/30 text-amber-300 rounded p-2.5 font-mono text-[11px] space-y-1.5 animate-fadeIn">
-                                                                                            <div className="flex items-start gap-1.5">
-                                                                                                <span className="font-bold text-amber-400 block text-xs">⚠️ Draft PO Detected</span>
-                                                                                            </div>
-                                                                                            <p className="leading-normal text-zinc-300">
-                                                                                                Draft PO #{item.draftPO.orderId} created on {item.draftPO.orderDate} by {item.draftPO.supplierName} contains {item.draftPO.quantity} units of this item. Please review and commit this PO instead of creating a duplicate.
-                                                                                            </p>
-                                                                                            <div className="flex items-center gap-2 pt-1">
-                                                                                                <button
-                                                                                                    onClick={(e) => { e.stopPropagation(); handleReviewAndSend(item.draftPO!.orderId); }}
-                                                                                                    className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-all font-semibold text-[10px]"
-                                                                                                >
-                                                                                                    Commit & Send PO
-                                                                                                </button>
-                                                                                                <button
-                                                                                                    onClick={(e) => { e.stopPropagation(); handleCancelDraft(item.draftPO!.orderId); }}
-                                                                                                    className="px-2 py-1 rounded border border-rose-500/40 hover:bg-rose-500/20 hover:text-rose-200 text-rose-300 transition-all font-semibold text-[10px]"
-                                                                                                    title="Cancel this draft PO in Finale"
-                                                                                                >
-                                                                                                    🗑 Cancel Draft
-                                                                                                </button>
-                                                                                            </div>
                                                                                         </div>
                                                                                     )}
                                                                                 </div>

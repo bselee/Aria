@@ -16,6 +16,7 @@ import {
     isFedExBillingPacketFilename,
     isFedExCarrierBillExtractedJson,
     extractFedExInvoiceNumberFromText,
+    extractFedExInvoiceTotal,
     detectFedExBillingServiceHint,
 } from "./fedex-billing-packet";
 
@@ -44,6 +45,12 @@ describe("extract + format invoice #", () => {
     it("parses Invoice Number from summary text", () => {
         const text = "Invoice Number\n9-398-79901\nAccount Number\nXXXX-X525-0\nTOTAL THIS INVOICE\nUSD\n$10,958.44";
         expect(extractFedExInvoiceNumberFromText(text)).toBe("9-398-79901");
+    });
+
+    it("extracts TOTAL THIS INVOICE amount (no-space INVOICEUSD variant)", () => {
+        expect(extractFedExInvoiceTotal("TOTAL THIS INVOICEUSD$15,287.10")).toBe(15287.1);
+        expect(extractFedExInvoiceTotal("TOTAL THIS INVOICE\nUSD\n$6,765.86")).toBe(6765.86);
+        expect(extractFedExInvoiceTotal("no total here")).toBeNull();
     });
 });
 
@@ -101,6 +108,20 @@ describe("classifyFedExBillingAttachment", () => {
         });
         expect(meta.serviceHint).toBe("Express");
         expect(meta.mayTrimPages).toBe(false);
+    });
+
+    it("derives display invoice# from filename digits when packet text is unavailable", () => {
+        // Real-world case: local forwarder's first classify runs before OCR text
+        // exists. The filename digits MUST still yield the dashed number that gets
+        // passed into forwardInvoiceOnce (ocr_invoice_number / dedup layers 4-6).
+        const meta = classifyFedExBillingAttachment({
+            from: "noreply@fedex.com",
+            subject: "Your New FedEx Billing Online invoice is attached",
+            filename: "12.99999.10033.942652443.XXXXX5250.000030.pdf",
+            pdfTextPreview: undefined,
+        });
+        expect(meta.isPacket).toBe(true);
+        expect(meta.invoiceNumberDisplay).toBe("9-426-52443");
     });
 });
 

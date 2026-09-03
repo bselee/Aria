@@ -49,6 +49,14 @@ Thumbs.db
 scratch/
 tmp/
 tmp_*
+# Assessment-discovered scratch (2026-08): temp debug scripts + sticker rabbit hole
+scratch-*.ts
+scripts/_tmp_*
+scripts/_diag-*.ts
+scripts/sticker-*.py
+scripts/compare-sticker-pricing.ts
+scripts/replay-split-rows.ts
+scripts/summarize-sticker-report.py
 test-*.ts
 test_*.ts
 probe-*.ts
@@ -127,6 +135,9 @@ tmp-next-dev-*.out.log
 # Local scraped data — regenerated each run (timestamped scrapedAt field)
 purchase-requests.json
 purchases-data.json
+data/basauto-recon.json
+data/basauto-recon-dismissed.json
+data/basauto-scrape.json
 
 # External MCP tool dir — intentionally not in this repo
 tools/excel-mcp-server/
@@ -224,3 +235,24 @@ scripts/warm-purchasing-cache.mjs
 
 # Shell warm-up capture (13-byte "EXIT CODE: 0" artifact, never useful in repo)
 _warm_output.log
+
+# ── 2026-08-13 triage (uncommitted-work-triage) ─────────────────────────────
+# One-off invoice-schema probes (root); durable equivalents live in scripts/
+.invoice-*.mjs
+# Scratch probe/receipt-sync experiments from the 3-way match work
+_probe-*.ts
+_run-receipt-sync.ts
+_validate-uom.ts
+_apply_pdf_changes.py
+# Cron warm-up shell artifact
+warm-cache.log
+# One-off DB repair scripts (already ran against live PG; promote with
+# `git add -f` only if re-run is ever needed)
+scripts/ap-gate-live-counts-pg.mjs
+scripts/ap-gate-live-counts.ts
+scripts/resolve-stuck-ap.ts
+scripts/close-phantom-prefixed-pos.ts
+scripts/fix-null-vendor-pos.ts
+# Kanban worker scratch workspaces (board owns them, not the repo)
+.hermes/kanban/
+.hermes/plans/code-review-result-temp.json

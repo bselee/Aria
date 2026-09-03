@@ -250,7 +250,7 @@ export function isSimpleVendorConfirmation(args: {
     }
 
     const confirmSignals =
-        /\b(?:sounds good|perfect|will do|will send|i('ll| will) send|as soon as we('re| are) restocked|noted|got it|thanks for (?:letting|the update)|order (?:is )?confirmed)\b/i.test(text);
+        /\b(?:sounds good|perfect|will do|will send|i('ll| will) send|as soon as we('re| are) restocked|noted|got it|received with thanks|thanks for (?:letting|the update)|order (?:is )?confirmed)\b/i.test(text);
 
     return confirmSignals;
 }
@@ -322,32 +322,55 @@ export function extractNameFromSignOff(body: string): string {
 }
 
 /**
- * Format draft. No signature block.
- * - If firstName empty and body is just thanks → "Thanks!"
- * - If firstName set → optional Hi line
+ * Format draft. No signature block, no forced greeting/sign-off wrapper.
+ *
+ * Bill's actual style for short vendor replies:
+ *   Pure ack  → "Thanks Donna"
+ *   Content   → "Lisa, I will schedule and you should receive the BOL shortly."
+ *
+ * No "Hi," newline greeting, no appended "Thanks!" when the body already
+ * conveys acknowledgment.
+ *
+ * - If firstName empty and body is pure thanks → "Thanks!"
+ * - If body is a single short line and we have a name → comma format
+ * - Longer / substantive body with name → Hi {Name}, newline, body
  */
 export function formatSignedDraft(firstName: string, bodyParagraphs: string[]): string {
     const body = bodyParagraphs.map((p) => p.trim()).filter(Boolean).join("\n\n");
-    // Already a pure thanks line
+
+    // Pure thanks line, no name → just "Thanks!" or "Thank you."
     if (/^thanks!?$|^thank you\.?$/i.test(body) && !firstName) {
         return /thank you/i.test(body) ? "Thank you." : "Thanks!";
     }
-    if (!firstName) {
-        // Ensure we end with Thanks! if not already
-        if (/\bthanks!?$|\bthank you\.?$/i.test(body)) return body;
-        return `${body}\n\nThanks!`;
+
+    // Short single-line body with a name → comma format: "Lisa, I will schedule..."
+    // Also: pure thanks with name → "Thanks Donna"
+    const singleLine = !body.includes("\n") && body.split(/\s+/).length <= 25;
+    if (firstName && singleLine) {
+        // If body already starts with thanks + name pattern, return as-is
+        if (new RegExp(`^(thanks|thank you)\\s+${firstName}`, "i").test(body)) return body;
+        // If body is a thanks variant → "Thanks Donna"
+        if (/^(thanks!?|thank you\.?)$/i.test(body)) return `Thanks ${firstName}`;
+        // Otherwise → "Lisa, I will schedule..."
+        return `${firstName}, ${body}`;
     }
-    const withClose = /\bthanks!?$|\bthank you\.?$/i.test(body) ? body : `${body}\n\nThanks!`;
-    return [`Hi ${firstName},`, "", withClose].join("\n");
+
+    // Longer body, no name → just the body (no forced Thanks! suffix)
+    if (!firstName) {
+        return body;
+    }
+
+    // Longer body with name → "Hi {Name},\n\n{body}"
+    // No forced Thanks! suffix — body carries its own close if needed
+    return [`Hi ${firstName},`, "", body].join("\n");
 }
 
-/** Pure simple ack — Bill's real style for light threads. */
+/** Pure simple ack — Bill's real style for light threads.
+ *  "Thanks Donna" not "Hi Donna,\n\nThanks!" */
 export function composeSimpleThanks(args?: { from?: string; bodyText?: string | null }): string {
-    // Even with a name, Bill often just says Thanks! on tiny confirms.
-    // Use name only when we have a solid one and want a touch more warmth.
     const name = args?.from ? extractReplyFirstName(args.from, args.bodyText) : "";
     if (name && name.length >= 3) {
-        return `Hi ${name},\n\nThanks!`;
+        return `Thanks ${name}`;
     }
     return "Thanks!";
 }

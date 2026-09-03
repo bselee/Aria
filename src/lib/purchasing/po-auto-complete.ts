@@ -42,7 +42,11 @@ export interface POForCompletion {
     completionState: string;             // "complete" expected
     completionStateSince: string | null; // ISO timestamp the state stabilized
     poFreightAmount: number;             // sum of FREIGHT adjustments on the PO
+    poTaxAmount: number;                 // sum of TAX adjustments on the PO
+    poTariffAmount: number;              // sum of TARIFF adjustments on the PO
     invoiceFreight: number;              // 0 if no invoice or invoice has no freight
+    invoiceTax: number;                  // 0 if no invoice or invoice has no tax
+    invoiceTariff: number;               // 0 if no invoice or invoice has no tariff
     hasMatchedInvoice: boolean;
 }
 
@@ -74,12 +78,28 @@ export function checkAutoCompleteEligibility(
         };
     }
 
-    // Gate 3: HARD RULE — invoice freight without matching PO freight is
-    // ALWAYS a hold, regardless of vendor pattern. Will's red flag.
+    // Gate 3: HARD RULE — any invoice fee (freight/tax/tariff) without matching
+    // PO fee is ALWAYS a hold, regardless of vendor pattern. This extends
+    // Will's red-flag rule beyond freight to tax + tariff — the safety rule
+    // "never complete until freight/tax/fees are applied".
     if (po.invoiceFreight > 0 && Math.abs(po.invoiceFreight - po.poFreightAmount) > 0.01) {
         return {
             eligible: false,
             reason: `invoice has freight $${po.invoiceFreight.toFixed(2)} but PO freight is $${po.poFreightAmount.toFixed(2)} — red flag, needs correlation`,
+            pattern: null,
+        };
+    }
+    if (po.invoiceTax > 0 && Math.abs(po.invoiceTax - po.poTaxAmount) > 0.01) {
+        return {
+            eligible: false,
+            reason: `invoice has tax $${po.invoiceTax.toFixed(2)} but PO tax is $${po.poTaxAmount.toFixed(2)} — red flag, needs correlation`,
+            pattern: null,
+        };
+    }
+    if (po.invoiceTariff > 0 && Math.abs(po.invoiceTariff - po.poTariffAmount) > 0.01) {
+        return {
+            eligible: false,
+            reason: `invoice has tariff $${po.invoiceTariff.toFixed(2)} but PO tariff is $${po.poTariffAmount.toFixed(2)} — red flag, needs correlation`,
             pattern: null,
         };
     }
@@ -218,18 +238,37 @@ export async function runPOAutoCompleteWatcher(): Promise<AutoCompleteRunStats> 
                     return url.endsWith("/productpromo/10007") || desc.includes("freight");
                 })
                 .reduce((s, adj) => s + (Number(adj.amount) || 0), 0);
+            const poTaxAmount = adjustments
+                .filter(adj => {
+                    const desc = String(adj.description || "").toLowerCase();
+                    return desc.includes("tax");
+                })
+                .reduce((s, adj) => s + (Number(adj.amount) || 0), 0);
+            const poTariffAmount = adjustments
+                .filter(adj => {
+                    const desc = String(adj.description || "").toLowerCase();
+                    return desc.includes("tariff") || desc.includes("duty");
+                })
+                .reduce((s, adj) => s + (Number(adj.amount) || 0), 0);
 
             // Pull the matched invoice (if any) for the invoice-freight value
             // and as the "hasMatchedInvoice" signal.
             const { data: invRows } = await sb
                 .from("vendor_invoices")
-                .select("invoice_number, freight, raw_payload")
+                .select("invoice_number, freight, tax, tariff, raw_data")
                 .eq("po_number", po.orderId)
                 .order("invoice_date", { ascending: false })
                 .limit(1);
             const invoice = (invRows?.[0] as any) || null;
+            const rawInv = invoice ? (invoice.raw_data || {}) : {};
             const invoiceFreight = invoice
-                ? Number(invoice.freight ?? invoice.raw_payload?.freight ?? 0) || 0
+                ? Number(invoice.freight ?? rawInv.freight ?? 0) || 0
+                : 0;
+            const invoiceTax = invoice
+                ? Number(invoice.tax ?? rawInv.tax ?? 0) || 0
+                : 0;
+            const invoiceTariff = invoice
+                ? Number(invoice.tariff ?? rawInv.tariff ?? 0) || 0
                 : 0;
             const hasMatchedInvoice = !!invoice;
 
@@ -248,7 +287,11 @@ export async function runPOAutoCompleteWatcher(): Promise<AutoCompleteRunStats> 
                     completionState: po.completionState,
                     completionStateSince,
                     poFreightAmount,
+                    poTaxAmount,
+                    poTariffAmount,
                     invoiceFreight,
+                    invoiceTax,
+                    invoiceTariff,
                     hasMatchedInvoice,
                 },
                 evidence,
@@ -306,7 +349,11 @@ export async function runPOAutoCompleteWatcher(): Promise<AutoCompleteRunStats> 
                         patternSampleSize: elig.pattern.sampleSize,
                         patternSource: elig.pattern.source,
                         poFreightAmount,
+                        poTaxAmount,
+                        poTariffAmount,
                         invoiceFreight,
+                        invoiceTax,
+                        invoiceTariff,
                         invoiceNumber: invoice?.invoice_number ?? null,
                         completionStateSince,
                     },
@@ -337,7 +384,7 @@ export async function loadVendorEvidence(vendorName: string): Promise<PatternEvi
     try {
         const { data: invoices } = await sb
             .from("vendor_invoices")
-            .select("po_number, freight, raw_payload")
+            .select("po_number, freight, tax, tariff, raw_data")
             .ilike("vendor_name", `%${vendorName}%`)
             .not("po_number", "is", null)
             .order("invoice_date", { ascending: false })
@@ -347,7 +394,7 @@ export async function loadVendorEvidence(vendorName: string): Promise<PatternEvi
         for (const row of (invoices ?? []) as any[]) {
             if (!row.po_number || seen.has(row.po_number)) continue;
             seen.add(row.po_number);
-            const invFreight = Number(row.freight ?? row.raw_payload?.freight ?? 0) || 0;
+            const invFreight = Number(row.freight ?? row.raw_data?.freight ?? 0) || 0;
             // PO freight at completion: look at the RECONCILIATION metadata
             const { data: reconRows } = await sb
                 .from("ap_activity_log")

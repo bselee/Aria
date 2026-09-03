@@ -19,6 +19,8 @@
 - [[11-Kaizen-Process|Kaizen & Continuous Improvement]]
 - [[12-Profile-Specialization|Hermes Profile Specialization]]
 - [[13-Memory-Management|Memory & SOP Database Management]]
+- [[14-SOP-Creation-Rules|SOP Creation Rules]]
+- [[15-Outbound-Review-Gate|Outbound Review Gate (Bill Voice)]]
 
 ## Quick Reference
 - **Voice Rules (Bill):** NO emojis, ≤25w, no bullets, no AI-isms, @recipient, PO→Finale link, specific #purchase-orders format.

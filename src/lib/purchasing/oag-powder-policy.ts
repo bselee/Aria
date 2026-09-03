@@ -11,6 +11,8 @@
  * @deps    none (pure data + helpers)
  */
 
+import { resolveVendorLeadOverride, resolveVendorLeadFloor } from "./vendor-lead-overrides";
+
 /** Martin / Finale 124788 powder MTO lead (calendar days). */
 export const OAG_POWDER_LEAD_DAYS = 120;
 
@@ -102,10 +104,13 @@ export function isFpfCycOnlyPo(productIds: Array<string | null | undefined> | nu
 
 /**
  * Resolve effective lead days for ordering.
- * Priority: powder MTO policy → SKU observed receipts → vendor policy → base.
+ * Priority: powder MTO policy → vendor fixed override → SKU observed receipts →
+ *           vendor policy → base → vendor minimum floor.
  */
 export function resolveLeadTimeDays(params: {
     productId: string | null | undefined;
+    /** Vendor name — enables vendor-level fixed override + minimum floor. */
+    vendorName?: string | null;
     vendorPolicyLeadDays?: number | null;
     /** Observed planning lead from Finale send→receive samples for this SKU. */
     skuObservedLeadDays?: number | null;
@@ -119,21 +124,39 @@ export function resolveLeadTimeDays(params: {
             provenance: `${skuLead}d OAG powder MTO policy (Martin/124788)`,
         };
     }
+
+    // Fixed vendor override (multi-delivery inflation / long-lead import) — absolute.
+    const vendorOverride = resolveVendorLeadOverride(params.vendorName);
+    if (vendorOverride) {
+        return {
+            days: vendorOverride.days,
+            provenance: `${vendorOverride.days}d vendor override · ${vendorOverride.reason}`,
+        };
+    }
+
+    let days: number;
+    let provenance: string;
     if (params.skuObservedLeadDays != null && params.skuObservedLeadDays > 0) {
+        days = params.skuObservedLeadDays;
+        provenance = params.skuObservedProvenance
+            ?? `${params.skuObservedLeadDays}d SKU observed`;
+    } else if (params.vendorPolicyLeadDays != null && params.vendorPolicyLeadDays > 0) {
+        days = params.vendorPolicyLeadDays;
+        provenance = `${params.vendorPolicyLeadDays}d vendor policy override`;
+    } else {
+        days = params.baseLeadDays;
+        provenance = `${params.baseLeadDays}d base`;
+    }
+
+    // Vendor minimum floor — raises over-optimistic measured leads (made-to-order
+    // vendors whose single-sample lows are PO-after-order artifacts).
+    const vendorFloor = resolveVendorLeadFloor(params.vendorName);
+    if (vendorFloor && days < vendorFloor.days) {
         return {
-            days: params.skuObservedLeadDays,
-            provenance: params.skuObservedProvenance
-                ?? `${params.skuObservedLeadDays}d SKU observed`,
+            days: vendorFloor.days,
+            provenance: `${vendorFloor.days}d vendor floor (measured ${days}d) · ${vendorFloor.reason}`,
         };
     }
-    if (params.vendorPolicyLeadDays != null && params.vendorPolicyLeadDays > 0) {
-        return {
-            days: params.vendorPolicyLeadDays,
-            provenance: `${params.vendorPolicyLeadDays}d vendor policy override`,
-        };
-    }
-    return {
-        days: params.baseLeadDays,
-        provenance: `${params.baseLeadDays}d base`,
-    };
+
+    return { days, provenance };
 }

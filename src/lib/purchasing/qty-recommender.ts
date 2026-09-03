@@ -17,6 +17,9 @@
  */
 
 import { roundToCleanQty } from "./cognitive-round";
+import { freightUnitFor } from "../../config/freight-units";
+import { sizeToFreight } from "./freight-sizing";
+import { applyCoverFloor } from "./cover-floor";
 
 // Bumped on every behavioral change so the calibration loop can bucket
 // error rates per formula. See .agents/plans/2026-05-05-canonical-recommender.md.
@@ -27,7 +30,8 @@ import { roundToCleanQty } from "./cognitive-round";
 //   v2.3-vendor-fallback-increments-2026-05-07 — vendor-specific fallback increments
 //   v2.7-capped-30d-floor-2026-06-11 — 2× cap on 30d supply floor
 //   v2.8-residual-reorder-cap-2026-07-10 — open-PO residual uses order-point window, not full target cover
-export const QTY_FORMULA_VERSION = "v2.8-residual-topup-cap-2026-07-10";
+//   v2.9-freight-and-cover-2026-08-24 — freight-aware whole-truck snaps (FTL) + 30/45d cover floor w/ history (Bill 2026-08-24)
+export const QTY_FORMULA_VERSION = "v2.9-freight-and-cover-2026-08-24";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -532,6 +536,63 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         }
     }
 
+    // ── Step 7.7 (v2.9, 2026-08-24): freight-aware sizing + 30/45d cover floor ──
+    // Bill (2026-08-24): small products carry 30-45d (60 OK) of supply and
+    // history decides when orders are small (THC101 suggested 5 but history
+    // says 50 — unacceptable); truckload SKUs snap to whole trucks of
+    // 21 totes x 2,000 lb = 42,000 lb, never a fractional truck. Big
+    // production inputs stay human-reviewed (a later task, not here).
+    // Freight SKUs go through sizeToFreight (whole-truck snap with cover
+    // validation gates); everything else through applyCoverFloor (gap floor
+    // + history/MOQ floors). Only `suggestedQty` mutates — `rawNeededEaches`
+    // stays the arithmetic truth for overbuy review and calibration.
+    const freightUnit = freightUnitFor(input.sku);
+    // Hoisted: Step 7.7 may apply a history floor via applyCoverFloor, and the
+    // flag must be visible to Step 8.7's skip logic below.
+    let historicalFloorApplied = false;
+    if (suggestedQty > 0) {
+        if (freightUnit) {
+            const fz = sizeToFreight({
+                sku: input.sku,
+                rawNeedQty: suggestedQty,
+                dailyRate,
+                leadTimeDays: leadTimeUsed,
+                stockOnHand: effectiveStock,
+                stockOnOrder,
+                targetCoverDaysOverride: input.targetCoverDays ?? null,
+            });
+            suggestedQty = fz.qty;
+            trace.push({ step: "freight_sizing", detail: fz.reason, value: fz.qty });
+        } else {
+            const preFloor = suggestedQty;
+            const cf = applyCoverFloor({
+                sku: input.sku,
+                rawNeedQty: suggestedQty,
+                dailyRate,
+                stockOnHand: effectiveStock,
+                stockOnOrder,
+                skuPurchaseHistory: input.skuPurchaseHistory ?? null,
+                lastPurchaseQty: input.lastPurchaseQty ?? null,
+                // Step 8 owns MOQ tri-state semantics (enforce/warn/ignore,
+                // pack snap, dollar MOQ) — do not double-enforce here.
+                minimumOrderEaches: null,
+                unitPrice: input.unitPrice ?? null,
+                targetCoverDaysOverride: input.targetCoverDays ?? null,
+            });
+            if (cf.qty !== suggestedQty) {
+                suggestedQty = cf.qty;
+            }
+            if (cf.qty > preFloor && (cf.historyFloor != null || cf.lastOrderFloor != null)) {
+                historicalFloorApplied = true;
+            }
+            trace.push({
+                step: "cover_floor",
+                detail: cf.reason + (cf.flags.length ? ` [${cf.flags.join(", ")}]` : ""),
+                value: cf.qty,
+            });
+        }
+    }
+
     // ── Step 8: vendor MOQ — tri-state mode ───────────────────────────────
     // v2.1 — moqMode: 'enforce' (default — bump qty), 'warn' (sets moqWarning,
     // no bump), 'ignore' (no bump, no warn). Mode comes from vendor_reorder_policies.
@@ -610,8 +671,11 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         const pctThreshold = input.overbuyReviewPct ?? 50;
         const dollarsThreshold = input.overbuyReviewDollars ?? 1000;
         if (overbuyPct >= pctThreshold || overbuyDollars >= dollarsThreshold) {
-            const reason = `MOQ overbuy: +${Math.round(overbuyQty)} extra units` +
-                (overbuyDollars > 0 ? ` (+$${overbuyDollars.toFixed(0)})` : "");
+            const reason = moqApplied
+                ? `MOQ overbuy: +${Math.round(overbuyQty)} extra units` +
+                    (overbuyDollars > 0 ? ` (+$${overbuyDollars.toFixed(0)})` : "")
+                : `Cover/history floor overbuy: +${Math.round(overbuyQty)} extra units` +
+                    (overbuyDollars > 0 ? ` (+$${overbuyDollars.toFixed(0)})` : "");
             reviewReasons.push(reason);
             trace.push({
                 step: "review",
@@ -626,8 +690,10 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     // (set reviewRequired flag). Now: when a vendor has a consistent
     // order pattern (3+ POs, same qty or within 20%), use the mode as
     // a HARD ordering floor. A PO for 5 units never goes to a vendor
-    // that always ships 20.
-    let historicalFloorApplied = false;
+    // that always ships 20. NOTE: `historicalFloorApplied` is declared at
+    // Step 7.7 (cover-floor may set it first); this block only re-affirms
+    // legacy floors the cover-floor does not own (standard_order_qty,
+    // lastPurchaseQty fallback).
 
     // v2.6a: explicit standard_order_qty override (takes priority)
     const standardOrderQty = input.standardOrderQty ?? null;
@@ -667,6 +733,10 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     }
 
     // v2.6c: lastPurchaseQty single-point floor (fallback when no multi-PO history)
+    // NOTE (v2.9): superseded by cover-floor Rule 4b, which applies the same
+    // >=50% deviation threshold against the floored base and adds a 90d cap.
+    // Left in place for byte-compatibility; cover-floor raises qty first so
+    // this block is effectively a no-op for every reachable state.
     if (!historicalFloorApplied && suggestedQty > 0) {
         const lastQty = input.lastPurchaseQty ?? null;
         const history = input.skuPurchaseHistory ?? [];

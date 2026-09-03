@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
     buildTodayShipmentSummary,
     buildBestTrackingAnswer,
+    canonicalizeTrackingNumbers,
     classifyShipmentEvidence,
     getShipmentBoardBuckets,
     getShipmentsDueForRefresh,
@@ -63,6 +64,148 @@ describe("normalizeTrackingIdentity", () => {
             carrierName: "Old Dominion",
             trackingKind: "ltl_pro",
         });
+    });
+
+    it("classifies parcel carriers tagged via Carrier:::Number as parcel, not ltl_pro", () => {
+        expect(normalizeTrackingIdentity("FedEx:::383269682926")).toMatchObject({
+            trackingKind: "parcel",
+            carrierKey: "fedex",
+        });
+    });
+
+    it("classifies UPS encoded tracking as parcel", () => {
+        expect(normalizeTrackingIdentity("UPS:::1Z22YV580360436423")).toMatchObject({
+            trackingKind: "parcel",
+            carrierKey: "ups",
+        });
+    });
+
+    it("classifies USPS encoded tracking as parcel", () => {
+        expect(normalizeTrackingIdentity("USPS:::9405511899223456789012")).toMatchObject({
+            trackingKind: "parcel",
+            carrierKey: "usps",
+        });
+    });
+
+    it("keeps LTL freight (FedEx Freight) tagged as ltl_pro", () => {
+        expect(normalizeTrackingIdentity("FedEx Freight:::300050638069")).toMatchObject({
+            trackingKind: "ltl_pro",
+        });
+    });
+
+    it("keeps AAA Cooper tagged as ltl_pro (LTL carrier)", () => {
+        expect(normalizeTrackingIdentity("AAA Cooper:::723259594")).toMatchObject({
+            trackingKind: "ltl_pro",
+            carrierName: "AAA Cooper",
+        });
+    });
+
+    it("preserves AAA Cooper casing in the carrier name (no title-case munging)", () => {
+        const result = normalizeTrackingIdentity("AAA Cooper:::723259594");
+        expect(result.carrierName).toBe("AAA Cooper");
+        expect(result.trackingNumber).toBe("AAA Cooper:::723259594");
+    });
+
+    it("throws on empty string", () => {
+        expect(() => normalizeTrackingIdentity("")).toThrow("Tracking number is required");
+    });
+
+    it("throws on whitespace-only string", () => {
+        expect(() => normalizeTrackingIdentity("   ")).toThrow("Tracking number is required");
+    });
+
+    it("generates a tracking URL for encoded LTL tracking", () => {
+        const result = normalizeTrackingIdentity("Oak Harbor Freight Lines:::56177295394");
+        expect(result.publicTrackingUrl).toBeTruthy();
+        expect(result.publicTrackingUrl).toContain("oakh");
+    });
+
+    it("generates a tracking URL for parcel tracking", () => {
+        const result = normalizeTrackingIdentity("123456789012");
+        expect(result.publicTrackingUrl).toBeTruthy();
+    });
+
+    it("normalizes bare tracking number to uppercase", () => {
+        expect(normalizeTrackingIdentity("123456789012")).toMatchObject({
+            trackingNumber: "123456789012",
+            normalizedTrackingNumber: "123456789012",
+        });
+    });
+
+    it("returns carrierKey null for unknown bare number format", () => {
+        // A number that doesn't match any known carrier pattern
+        const result = normalizeTrackingIdentity("XYZ123ABC");
+        expect(result.carrierKey).toBeNull();
+        expect(result.trackingKind).toBe("unknown");
+    });
+});
+
+describe("canonicalizeTrackingNumbers", () => {
+    it("collapses bare + carrier-prefixed duplicates, preferring the prefixed form", () => {
+        expect(
+            canonicalizeTrackingNumbers(["FedEx:::383269682926", "383269682926"]),
+        ).toEqual(["FedEx:::383269682926"]);
+    });
+
+    it("keeps distinct tracking numbers", () => {
+        expect(
+            canonicalizeTrackingNumbers(["FedEx:::111111111111", "UPS:::1Z9999999999999999"]),
+        ).toEqual(["FedEx:::111111111111", "UPS:::1Z9999999999999999"]);
+    });
+
+    it("preserves LTL carrier casing (no title-case munging)", () => {
+        expect(
+            canonicalizeTrackingNumbers(["AAA Cooper:::723259594"]),
+        ).toEqual(["AAA Cooper:::723259594"]);
+    });
+
+    it("returns empty for empty/blank input", () => {
+        expect(canonicalizeTrackingNumbers([])).toEqual([]);
+        expect(canonicalizeTrackingNumbers(["", "  "])).toEqual([]);
+    });
+
+    it("handles mixed bare + prefixed (3+ entries) correctly", () => {
+        const result = canonicalizeTrackingNumbers([
+            "383269682926",
+            "FedEx:::383269682926",
+            "UPS:::1Z999",
+            "1Z999",
+        ]);
+        // Each unique suffix deduped; preferred form is the prefixed one.
+        expect(result).toEqual(["FedEx:::383269682926", "UPS:::1Z999"]);
+    });
+
+    it("preserves order of first appearance", () => {
+        const result = canonicalizeTrackingNumbers([
+            "UPS:::1ZAAA",
+            "FedEx:::123456",
+            "383269682926",
+            "FedEx:::383269682926",
+        ]);
+        // First appearance of each suffix determines order.
+        // "ups 1zaaa" → "UPS:::1ZAAA", "fedex 123456" → "FedEx:::123456",
+        // "383269682926" → "FedEx:::383269682926" (prefixed replaces bare)
+        expect(result).toEqual(["UPS:::1ZAAA", "FedEx:::123456", "FedEx:::383269682926"]);
+    });
+
+    it("handles case-insensitive dedup (same number, different case)", () => {
+        // "FedEx:::ABC123" and "FEDEX:::abc123" normalize to the same suffix.
+        const result = canonicalizeTrackingNumbers(["FedEx:::ABC123", "FEDEX:::abc123"]);
+        // Both have ::: so the first one wins (existing already has ::: → preferThis is false for the second).
+        expect(result).toEqual(["FedEx:::ABC123"]);
+    });
+
+    it("keeps bare-only entries when no prefixed version exists", () => {
+        expect(canonicalizeTrackingNumbers(["123456789", "987654321"])).toEqual([
+            "123456789",
+            "987654321",
+        ]);
+    });
+
+    it("filters out null-ish and whitespace entries", () => {
+        expect(canonicalizeTrackingNumbers([null as any, "  ", "FedEx:::123"])).toEqual([
+            "FedEx:::123",
+        ]);
     });
 });
 
