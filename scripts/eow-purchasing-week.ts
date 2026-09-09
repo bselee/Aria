@@ -28,6 +28,9 @@ import {
   mondayOf,
   money,
   needByIso,
+  priceVendorName,
+  researchHit,
+  shortPriceNote,
   withinDays,
 } from "../src/lib/purchasing/eow-report";
 
@@ -41,7 +44,13 @@ function denverToday(): string {
 }
 
 function iso(d: unknown): string {
-  return d ? String(d).slice(0, 10) : "";
+  if (!d) return "";
+  if (d instanceof Date && !Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  const s = String(d);
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const parsed = new Date(s);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  return "";
 }
 
 function esc(s: unknown): string {
@@ -248,7 +257,7 @@ async function gmailDigest(
   const research: Row[] = [];
   const seen = new Set<string>();
   const q =
-    `after:${afterQ} -subject:"Purchasing week" (quote OR quoted OR "price increase" OR "new price" OR "2026 pricing" OR sample OR tote OR "cover crop")`;
+    `after:${afterQ} -subject:"Purchasing week" (quote OR quoted OR "price increase" OR "new price" OR "2026 pricing" OR sample OR tote OR "cover crop" OR frass OR soybean OR grove OR "lind marine")`;
   const list = await gmail.users.messages.list({ userId: "me", q, maxResults: 25 });
   for (const m of list.data.messages || []) {
     const d = await gmail.users.messages.get({
@@ -260,14 +269,28 @@ async function gmailDigest(
     const from = hdr(d.data.payload?.headers, "From");
     const sub = hdr(d.data.payload?.headers, "Subject");
     if (NEWSLETTER.test(from + sub)) continue;
-    const vendor = from.replace(/.*<|>.*/g, "").replace(/@.*/, "").slice(0, 40) || from.slice(0, 40);
+    if (/bill\.selee|buildasoil/i.test(from)) continue;
+    const vendor = priceVendorName(from, sub);
     const key = `${vendor}|${sub}`.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     const snippet = (d.data.snippet || "").replace(/\s+/g, " ").slice(0, 140);
-    const row: Row = { po: "", vendor, amount: 0, note: snippet, sku: "" };
-    if (/price increase|new price|2026 pricing|raised/i.test(sub + snippet)) price.push(row);
-    else research.push(row);
+    const priceNote = shortPriceNote(vendor, sub, snippet);
+    const isPrice = /price increase|new price|2026 pricing|raised|FM104 raised|WDG101 2026|Processed frass/i.test(
+      sub + snippet + priceNote
+    );
+    if (isPrice) {
+      if (seen.has(`note:${priceNote}`)) continue;
+      seen.add(`note:${priceNote}`);
+      const sku = /^(FM104|WDG101|CFR101)/.test(priceNote) ? priceNote.slice(0, 6).trim() : "";
+      price.push({ po: "", vendor, amount: 0, note: priceNote, sku });
+    } else {
+      const hit = researchHit(from, sub, snippet);
+      if (!hit) continue;
+      if (seen.has(`research:${hit.vendor}`)) continue;
+      seen.add(`research:${hit.vendor}`);
+      research.push({ po: "", vendor: hit.vendor, amount: 0, note: hit.note, sku: hit.sku });
+    }
     if (price.length >= 4 && research.length >= 6) break;
   }
   return { priceUpdates: price.slice(0, 4), research: research.slice(0, 6) };
@@ -414,28 +437,32 @@ async function main() {
 
   const delayedQ = await pool.query(`
     SELECT po_number, vendor_name, COALESCE(total_amount,total,0)::float AS amount,
-           required_date, receive_date, status, lifecycle_stage, line_items
+           required_date, receive_date, status, lifecycle_stage, line_items, vendor_stated_eta
     FROM purchase_orders
-    WHERE required_date IS NOT NULL
-      AND required_date::date < CURRENT_DATE
-      AND (receive_date IS NULL OR receive_date::date > CURRENT_DATE)
-      AND COALESCE(status,'') NOT ILIKE '%cancel%'
-      AND COALESCE(status,'') NOT IN ('closed','received')
+    WHERE po_number ~ '^[0-9]+$'
+      AND COALESCE(status,'') = 'open'
+      AND COALESCE(vendor_name,'') !~* 'amazon|autopot|printful|dropship|evergreen'
       AND COALESCE(lifecycle_stage,'') NOT ILIKE '%cancel%'
-      AND COALESCE(lifecycle_stage,'') NOT IN ('RECEIVED','COMPLETED')
-      AND po_number ~ '^[0-9]+$'
-      AND COALESCE(vendor_name,'') !~* 'amazon|autopot|printful|dropship'
-      AND (vendor_acknowledged_at IS NULL OR vendor_acknowledged_at::date <> '2026-07-22')
-    ORDER BY required_date ASC
+      AND COALESCE(lifecycle_stage,'') NOT IN ('COMPLETED','INVOICED')
+      AND (
+        (receive_date IS NULL AND required_date IS NOT NULL AND required_date::date < CURRENT_DATE)
+        OR (vendor_stated_eta IS NOT NULL AND vendor_stated_eta::date < CURRENT_DATE)
+      )
+    ORDER BY COALESCE(vendor_stated_eta, required_date) ASC
     LIMIT 20
   `);
-  const delayed: Row[] = delayedQ.rows.map((r) => ({
-    po: r.po_number,
-    vendor: r.vendor_name || "",
-    sku: skuList(r.line_items),
-    amount: Number(r.amount) || 0,
-    note: "No update from vendor",
-  }));
+  const delayed: Row[] = delayedQ.rows
+    .filter((r) => !receivedPo.has(String(r.po_number)))
+    .map((r) => {
+      const eta = iso(r.vendor_stated_eta);
+      return {
+        po: r.po_number,
+        vendor: r.vendor_name || "",
+        sku: skuList(r.line_items),
+        amount: Number(r.amount) || 0,
+        note: eta ? `Vendor ETA ${mdFromIso(eta)}` : "No update from vendor",
+      };
+    });
 
   // Invoice issues intentionally empty this week; section header stays.
   const issues: Row[] = [];

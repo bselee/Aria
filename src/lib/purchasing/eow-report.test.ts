@@ -17,6 +17,9 @@ import {
   mondayOf,
   money,
   needByIso,
+  priceVendorName,
+  researchHit,
+  shortPriceNote,
   withinDays,
 } from "./eow-report";
 
@@ -64,5 +67,42 @@ describe("eow-report", () => {
     expect(withinDays("2026-10-03", "2026-09-03", 30)).toBe(true);
     expect(withinDays("2026-10-06", "2026-09-03", 30)).toBe(false);
     expect(money(27433.19)).toBe("$27,433");
+  });
+
+  it("shortens price-update notes and names Concentrates", () => {
+    expect(
+      shortPriceNote(
+        "Kayla",
+        "RE: PO 125257",
+        "Hi Bill! Unfortunately, the shortage on fish meal has created a huge inflation on the material. The new price on a pallet is $84.39."
+      )
+    ).toBe("FM104 raised. Cut to 1 pallet.");
+    expect(priceVendorName("Kayla Hale <Kayla@concentratesnw.com>", "ack")).toBe("Concentrates");
+  });
+
+  it("researchHit returns company and product, not email snippets", () => {
+    expect(
+      researchHit("Lauren Taranow <lauren@symtonbsf.com>", "Re: Frass by the tote", "price per tote is $250")
+    ).toEqual({
+      sku: "",
+      vendor: "Symton",
+      note: "Frass tote. Freight on us. 2/mo. Testing pending.",
+    });
+    expect(
+      researchHit(
+        "Green Cover Seed <support@greencoverseed.zohodesk.com>",
+        "[## 31853 ##] Cover crop",
+        "mix and shipping"
+      )?.vendor
+    ).toBe("Green Cover");
+    expect(
+      researchHit(
+        "Green Cover Seed <support@greencoverseed.zohodesk.com>",
+        "[## 31853 ##] Cover crop",
+        "mix and shipping"
+      )?.note
+    ).toContain("$1.74/lb");
+    expect(researchHit("HVH <info@hvhindustrial.com>", "vacuum pumps", "DVP distributor")).toBeNull();
+    expect(researchHit("Landon <landon@drivensol.com>", "soil bags quote", "MOQ bags")).toBeNull();
   });
 });
