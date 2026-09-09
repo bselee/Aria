@@ -33,10 +33,8 @@ import { sendTelegramNotify } from "../intelligence/telegram-notify";
  */
 const CRITICAL_MODULES: Array<{ name: string; path: string }> = [
     { name: "ap-local-forwarder", path: "@/lib/intelligence/workers/ap-local-forwarder" },
-    { name: "ap-forwarder", path: "@/lib/intelligence/workers/ap-forwarder" },
     { name: "ap-dedup", path: "@/lib/intelligence/ap-dedup" },
     { name: "ap-single-forward", path: "@/lib/intelligence/ap-single-forward" },
-    { name: "ap-identifier", path: "@/lib/intelligence/workers/ap-identifier" },
     { name: "vendor-router", path: "@/lib/intelligence/ap/vendor-router" },
     { name: "local-db", path: "@/lib/storage/local-db" },
     { name: "gmail-auth", path: "@/lib/gmail/auth" },

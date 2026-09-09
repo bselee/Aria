@@ -37,12 +37,6 @@ export interface EmailPollingCycleDeps {
     emailIngestionAP: {
         run: () => Promise<void>;
     };
-    apIdentifier: {
-        identifyAndQueue: () => Promise<void>;
-    };
-    apForwarder: {
-        processPendingForwards: () => Promise<void>;
-    };
     onStageSuccess?: (stage: string) => Promise<void> | void;
 }
 
@@ -67,6 +61,4 @@ export async function runEmailPollingCycle(deps: EmailPollingCycleDeps): Promise
     await runEmailStage("default-email-pipeline", () => deps.emailIngestionDefault.run(), deps.onStageSuccess);
     await runEmailStage("default-acknowledgement", () => deps.acknowledgementAgent.processUnreadEmails(), deps.onStageSuccess);
     await runEmailStage("ap-email-pipeline", () => deps.emailIngestionAP.run(), deps.onStageSuccess);
-    await runEmailStage("ap-identifier", () => deps.apIdentifier.identifyAndQueue(), deps.onStageSuccess);
-    await runEmailStage("ap-forwarder", () => deps.apForwarder.processPendingForwards(), deps.onStageSuccess);
 }

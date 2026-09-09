@@ -12,9 +12,7 @@ import { SupervisorAgent } from "./supervisor-agent";
 import { CommsService } from "./services/comms-service";
 import { POService } from "./services/po-service";
 import { APService } from "./services/ap-service";
-import { APIdentifierAgent } from "./workers/ap-identifier";
 import { EmailIngestionWorker } from "./workers/email-ingestion";
-import { APForwarderAgent } from "./workers/ap-forwarder";
 import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import * as agentTask from "./agent-task";
@@ -96,10 +94,8 @@ export class OpsManager {
 
     public bot: Telegraf;
     private scheduledTasks: ScheduledTask[] = [];
-    private apIdentifier: APIdentifierAgent;
     private emailIngestionDefault: EmailIngestionWorker;
     private emailIngestionAP: EmailIngestionWorker;
-    private apForwarder: APForwarderAgent;
     private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
     private supervisor: SupervisorAgent;
@@ -134,10 +130,8 @@ export class OpsManager {
         // hard-require a decommissioned integration.
 
         // Initialize dedicated AP agents
-        this.apIdentifier = new APIdentifierAgent(bot);
         this.emailIngestionDefault = new EmailIngestionWorker("default");
         this.emailIngestionAP = new EmailIngestionWorker("ap");
-        this.apForwarder = new APForwarderAgent(bot);
         this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
@@ -149,10 +143,8 @@ export class OpsManager {
         this.commsService = new CommsService(bot);
         this.poService = new POService(bot);
         this.apService = new APService(
-            this.apIdentifier,
             this.emailIngestionDefault,
             this.emailIngestionAP,
-            this.apForwarder,
             this.ackAgent,
             this.oversightAgent,
         );
