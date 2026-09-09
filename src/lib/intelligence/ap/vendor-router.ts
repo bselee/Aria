@@ -86,6 +86,11 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { subjectContains: 'your order has shipped' }, action: 'skip', label: 'Ship Confirm (Not Invoice)' },
     { match: { subjectContains: 'order acknowledgement' }, action: 'skip', label: 'Order Ack (Not Invoice)' },
     { match: { subjectContains: 'order acknowledgment' }, action: 'skip', label: 'Order Ack (Not Invoice)' },
+    // BFG Supply sends "Acknowledgment for OrderNumber: NNN" with an
+    // Acknowledgment_*.pdf — an order ack, never a bill (2026-09-08: two were
+    // forwarded; zero became bills, both correctly absent from Bill.com).
+    { match: { filenameContains: 'acknowledgment_' }, action: 'skip', label: 'Order Ack PDF (Not Invoice)' },
+    { match: { filenameContains: '_acknowledgment' }, action: 'skip', label: 'Order Ack PDF (Not Invoice)' },
     { match: { subjectContains: 'monthly statement' }, action: 'skip', label: 'Vendor Monthly Statement' },
     { match: { subjectContains: 'account statement' }, action: 'skip', label: 'Account Statement (Not Invoice)' },
     { match: { subjectContains: 'statement of account' }, action: 'skip', label: 'Statement of Account (Not Invoice)' },
@@ -105,6 +110,28 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { senderContains: 'beltpower', filenameContains: 'statement' }, action: 'skip', label: 'Belt Power Statement PDF' },
     { match: { filenameContains: '_statement' }, action: 'skip', label: 'Statement Attachment (Not Invoice)' },
     { match: { filenameContains: 'statement.pdf' }, action: 'skip', label: 'Statement PDF (Not Invoice)' },
+
+    // ── Skip: account statements & correspondence (2026-09-08 audit) ────
+    // Evidence: Berger Horticultural STATEMENT/RELEVÉ DE COMPTE (BUIAS1.pdf,
+    // $42,539) + account-update images forwarded to Bill.com, never became bills.
+    // ⚠️ Berger ALSO sends real invoices in batches of 10–14 per delivery
+    //    (no deliveries recently, so none observed). Real invoices arrive as
+    //    QuickBooks "New payment request" or invoice-subject emails — those
+    //    MUST keep forwarding (null rule). Skip ONLY explicit statement /
+    //    correspondence signals; never a bare sender or 'compte' match
+    //    (French invoices can legitimately reference "compte").
+    { match: { senderContains: 'berger', subjectContains: 'statement' }, action: 'skip', label: 'Berger Statement (Not Invoice)' },
+    { match: { senderContains: 'berger', subjectContains: 'relev' }, action: 'skip', label: 'Berger Statement FR (Relevé de Compte)' },
+    { match: { senderContains: 'berger', subjectContains: 'update required' }, action: 'skip', label: 'Berger Account Correspondence' },
+    // Wagner Equipment "Invoice and CC Receipt" (F1973685.PDF) — paid by credit
+    // card at pickup; the PDF is a CC receipt, not a payable.
+    { match: { senderContains: 'wagner equipment', subjectContains: 'cc receipt' }, action: 'skip', label: 'Wagner CC Receipt (Paid)' },
+    // Marion Ag payment receipts (Payment Receipt_Customer_*.pdf) prove a payment
+    // already made — the payable invoice was forwarded separately (Invoice_*.pdf).
+    { match: { senderContains: 'marionag', filenameContains: 'payment receipt' }, action: 'skip', label: 'Marion Ag Payment Receipt (Paid)' },
+    // Grassroots reminder threads carry a photo/PDF of an invoice already sent via
+    // QuickBooks ("Grassroots Invoice NNNNN"). Reminder = duplicate content.
+    { match: { senderContains: 'grassroots', subjectContains: 'reminder' }, action: 'skip', label: 'Grassroots Invoice Reminder (Duplicate)' },
 
     // ── Amazon: route to order parser ──────────────────────────────────
     { match: { senderContains: 'auto-confirm@amazon' }, action: 'amazon_order', label: 'Amazon Order Confirmation' },

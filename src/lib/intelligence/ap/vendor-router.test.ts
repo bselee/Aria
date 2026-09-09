@@ -9,10 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { matchVendorRouting } from "./vendor-router";
 
-// ─── Convenience: typical name from address pattern ─────────────────────────
-function nameFromEmail(email: string): string {
-    return email.split("@")[0].replace(/\./g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
+// ─── Convenience helpers ─────────────────────────────────────────────────────
 
 describe("vendor-router domain match", () => {
     it("matches wwex.com → skip", () => {
@@ -219,6 +216,135 @@ describe("vendor-router Toyota CF + Belt Power (2026-07-17)", () => {
             "Belt Power, LLC",
             "Belt Power, LLC - Invoice# 3198860 Belt Power Invoice",
             "Inv3198860.pdf",
+        );
+        expect(r).toBeNull();
+    });
+});
+
+describe("vendor-router Berger/Wagner/Marion/Grassroots skip (2026-09-08 audit)", () => {
+    it("Berger STATEMENT/RELEVÉ DE COMPTE → skip (statement, not invoice)", () => {
+        const r = matchVendorRouting(
+            "comptabilite@berger.ca",
+            "BERGER HORTICULTURAL PRODUCTS LTD.",
+            "STATEMENT/RELEVÉ DE COMPTE",
+            "BUIAS1.pdf",
+        );
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toMatch(/Berger/i);
+    });
+
+    it("Berger RE: BUIAS1 - ACCOUNT UPDATE REQUIRED → skip (correspondence)", () => {
+        const r = matchVendorRouting(
+            "comptabilite@berger.ca",
+            "Berger Horticultural",
+            "RE: BUIAS1 - ACCOUNT UPDATE REQUIRED",
+            "image002.pdf",
+        );
+        expect(r?.action).toBe("skip");
+    });
+
+    it("Berger real QuickBooks payment request invoice → forward (null)", () => {
+        const r = matchVendorRouting(
+            "quickbooks@notification.intuit.com",
+            "BERGER HORTICULTURAL PRODUCTS LTD.",
+            "New payment request from Berger Horticultural - invoice 44122",
+            "Invoice_44122_from_Berger.pdf",
+        );
+        expect(r).toBeNull();
+    });
+
+    it("Berger real delivery invoice batch email → forward (null)", () => {
+        // Berger delivers periodically with 10-14 real invoices — never block by sender alone
+        const r = matchVendorRouting(
+            "comptabilite@berger.ca",
+            "BERGER HORTICULTURAL PRODUCTS LTD.",
+            "BUIAS1 - Invoice 44521",
+            "Invoice_44521.pdf",
+        );
+        expect(r).toBeNull();
+    });
+
+    it("Berger subject mentioning compte but with invoice number → forward (null)", () => {
+        // 'compte' alone must never skip — French invoices reference the account
+        const r = matchVendorRouting(
+            "comptabilite@berger.ca",
+            "BERGER HORTICULTURAL PRODUCTS LTD.",
+            "FACTURE 44522 SUR VOTRE COMPTE",
+            "FACTURE_44522.pdf",
+        );
+        expect(r).toBeNull();
+    });
+
+    it("BFG Supply Acknowledgment_*.pdf → skip (order ack, never a bill)", () => {
+        const r = matchVendorRouting(
+            "customerrelations@bfgsupply.com",
+            "BFG Supply Customer Relations",
+            "Acknowledgment for OrderNumber: 3259787-00 has been created.",
+            "Acknowledgment_3259787-00.pdf",
+        );
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toMatch(/Ack/i);
+    });
+
+    it("BFG Supply real invoice PDF → forward (null)", () => {
+        const r = matchVendorRouting(
+            "customerrelations@bfgsupply.com",
+            "BFG Supply Customer Relations",
+            "Invoice 3290156 from BFG Supply",
+            "Invoice_3290156.pdf",
+        );
+        expect(r).toBeNull();
+    });
+
+    it("Wagner 'Invoice and CC Receipt' → skip (paid by card)", () => {
+        const r = matchVendorRouting(
+            "wagnerequipment.com@notification.com",
+            "Wagner Equipment Company",
+            "Wagner Invoice and CC Receipt",
+            "F1973685.PDF",
+        );
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toMatch(/Wagner/i);
+    });
+
+    it("Marion Ag payment receipt filename → skip (already paid)", () => {
+        const r = matchVendorRouting(
+            "ar@marionag.com",
+            "Marion Ag Service",
+            "Company: Marion Ag Service - Transaction # 105416",
+            "Payment Receipt_Customer_BuildA_Date_08-31-2026_Time_132750.pdf",
+        );
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toMatch(/Marion/i);
+    });
+
+    it("Marion Ag real invoice filename → forward (null)", () => {
+        const r = matchVendorRouting(
+            "ar@marionag.com",
+            "Marion Ag Service",
+            "Company: Marion Ag Service - Transaction #89402",
+            "Invoice_89402_Customer_BuildA_Date_09022026_Time_152633.pdf",
+        );
+        expect(r).toBeNull();
+    });
+
+    it("Grassroots reminder thread → skip (duplicate of QuickBooks invoice)", () => {
+        const r = matchVendorRouting(
+            "info@grassrootsfabricpots.com",
+            "Grassroots Fabric Pots",
+            "Re: Invoice - Reminder: Your payment to Grassroots Fabric Pots Inc. is 7 days due",
+            "Image.pdf",
+        );
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toMatch(/Grassroots/i);
+    });
+
+    it("Grassroots real invoice → forward (null)", () => {
+        const r = matchVendorRouting(
+            "quickbooks@notification.intuit.com",
+            "GRASSROOTS FABRIC POTS INC.",
+            "New payment request from GRASSROOTS FABRIC POTS INC - invoice 34573",
+            "Invoice_34573_from_Grassroots_Fabric_Pots_Inc.pdf",
         );
         expect(r).toBeNull();
     });

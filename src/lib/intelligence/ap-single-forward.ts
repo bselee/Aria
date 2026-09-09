@@ -492,6 +492,39 @@ export async function forwardInvoiceOnce(
     console.log(
       `[ap-single-forward] OK ${safeFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
     );
+
+    // ── Immediate verify-in-Sent: fetch the sent message back and confirm it
+    // carries the PDF, then set verified=1 so the log answers "did it send?"
+    // at forward time rather than leaving the flag 0 forever. Best-effort —
+    // a lookup failure must not turn a successful forward into an ERROR row.
+    try {
+      const sent = await gmail.users.messages.get({
+        userId: "me",
+        id: sentId,
+        format: "full",
+      });
+      const hasPdf = (function walkPdf(part: any): boolean {
+        if (!part) return false;
+        if ((part.mimeType || "").toLowerCase() === "application/pdf") return true;
+        if ((part.filename || "").toLowerCase().endsWith(".pdf")) return true;
+        return Array.isArray(part.parts) && part.parts.some(walkPdf);
+      })(sent.data?.payload);
+      if (hasPdf) {
+        getLocalDb()
+          .prepare("UPDATE ap_local_forwards SET verified = 1 WHERE billcom_sent_message_id = ?")
+          .run(sentId);
+        console.log(`[ap-single-forward] ✅ Verified in Sent: ${safeFilename}`);
+      } else {
+        console.warn(
+          `[ap-single-forward] ⚠️ Sent message ${sentId} has no PDF attachment — investigate`,
+        );
+      }
+    } catch (verifyErr: any) {
+      console.warn(
+        `[ap-single-forward] Verify-in-Sent skipped: ${verifyErr?.message || verifyErr}`,
+      );
+    }
+
     return {
       status: "forwarded",
       billcomSentMessageId: sentId,

@@ -34,6 +34,7 @@ interface ColumnMap {
   invoiceAmount: string[];
   invoiceDate: string[];
   dueDate: string[];
+  createdDate: string[];
   poNumber: string[];
   chartOfAccount: string[];
   billType: string[];
@@ -42,15 +43,16 @@ interface ColumnMap {
 }
 
 const COLUMN_MAP: ColumnMap = {
-  invoiceNumber: ["invoice #", "invoice number", "inv #", "invoice#", "number", "inv num"],
-  vendorName: ["vendor", "vendor name", "supplier", "payee", "from"],
-  invoiceAmount: ["amount", "total", "invoice amount", "bill amount", "total amount", "amt"],
-  invoiceDate: ["invoice date", "date", "inv date", "bill date", "issued"],
-  dueDate: ["due date", "due", "payment due", "pay by"],
-  poNumber: ["po #", "po number", "purchase order", "po#", "reference"],
-  chartOfAccount: ["chart of account", "category", "account", "gl account", "coa"],
-  billType: ["bill type", "type", "entry type", "source", "origin"],
-  paymentStatus: ["payment status", "status", "pay status", "state"],
+  invoiceNumber: ["invoice no", "invoice number", "inv no", "inv #", "invoice#", "invoice num"],
+  vendorName: ["vendor name", "vendor", "supplier", "payee"],
+  invoiceAmount: ["invoice amount", "bill amount", "total amount", "amount", "total", "amt"],
+  invoiceDate: ["invoice date", "inv date", "bill date", "issue date", "issued"],
+  dueDate: ["due date", "payment due", "due by", "due"],
+  createdDate: ["created date", "date created", "date added", "entered date", "added date"],
+  poNumber: ["po number", "po no", "po #", "po#", "purchase order number", "purchase order"],
+  chartOfAccount: ["chart of account", "gl account", "gl category", "category", "account"],
+  billType: ["bill type", "entry type", "bill type", "type"],
+  paymentStatus: ["payment status", "pay status", "status", "state"],
   currency: ["currency", "curr"],
 };
 
@@ -62,6 +64,7 @@ interface ParsedRow {
   invoice_amount: number | null;
   invoice_date: string | null;
   due_date: string | null;
+  created_date: string | null;
   po_number: string | null;
   chart_of_account: string | null;
   bill_type: string | null;
@@ -69,16 +72,44 @@ interface ParsedRow {
   currency: string | null;
 }
 
+export type { ParsedRow };
+
 /**
  * Find a column index by matching header text against known names.
+ *
+ * Resolution is deliberate to avoid cross-column poison:
+ *   pass 1 — exact normalized equality (e.g. "Invoice no." vs "invoice no")
+ *   pass 2 — header CONTAINS a label name, but only names ≥ 6 chars, so a
+ *            generic short name like "date" can never grab "Created date"
+ *            before the real "Invoice date" column.
+ *   pass 3 — short generics (≤5 chars: type, due, amt, …) exact-or-startswith,
+ *            used only when no longer label matched.
  */
+function normalizeHeader(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 function findColumn(headers: string[], names: string[]): number {
-  const lowerNames = names.map((n) => n.toLowerCase().trim());
+  const normalized = names.map(normalizeHeader).filter((n) => n.length > 0);
+
+  // Pass 1: exact normalized match
   for (let i = 0; i < headers.length; i++) {
-    const h = (headers[i] || "").toLowerCase().trim();
-    if (lowerNames.some((n) => h === n || h.startsWith(n) || h.includes(n))) {
-      return i;
-    }
+    const h = normalizeHeader(headers[i] || "");
+    if (h && normalized.includes(h)) return i;
+  }
+
+  // Pass 2: header contains a meaningful label (long names only)
+  for (let i = 0; i < headers.length; i++) {
+    const h = normalizeHeader(headers[i] || "");
+    if (!h) continue;
+    if (normalized.some((n) => n.length >= 6 && h.includes(n))) return i;
+  }
+
+  // Pass 3: short generic (≤5 chars) exact or starts-with
+  for (let i = 0; i < headers.length; i++) {
+    const h = normalizeHeader(headers[i] || "");
+    if (!h) continue;
+    if (normalized.some((n) => n.length < 6 && (h === n || h.startsWith(n)))) return i;
   }
   return -1;
 }
@@ -165,8 +196,10 @@ function parseDate(raw: string): string | null {
 
 /**
  * Parse the entire CSV file into structured rows.
+ * Exported for reconcile-billcom.ts (duplicate-bill scan on RAW rows, before the
+ * UNIQUE(vendor, invoice#) UPSERT collapses exact-dup entries).
  */
-function parseCSV(filePath: string): ParsedRow[] {
+export function parseCSV(filePath: string): ParsedRow[] {
   const raw = fs.readFileSync(filePath, "utf-8");
   const lines = raw.split(/\r?\n/).filter((l) => l.trim());
 
@@ -221,6 +254,7 @@ function parseCSV(filePath: string): ParsedRow[] {
       invoice_amount: parseAmount(fields[colIdx.invoiceAmount] || ""),
       invoice_date: parseDate(fields[colIdx.invoiceDate] || ""),
       due_date: parseDate(fields[colIdx.dueDate] || ""),
+      created_date: parseDate(fields[colIdx.createdDate] || ""),
       po_number: (fields[colIdx.poNumber] || "").trim() || null,
       chart_of_account: (fields[colIdx.chartOfAccount] || "").trim() || null,
       bill_type: (fields[colIdx.billType] || "").trim() || null,
@@ -241,7 +275,7 @@ function parseCSV(filePath: string): ParsedRow[] {
 function importRows(rows: ParsedRow[]): { inserted: number; updated: number; errors: number } {
   const db = getLocalDb();
   let inserted = 0;
-  let updated = 0;
+  const updated = 0; // SQLite changes() counts inserts+updates together; kept for API shape
   let errors = 0;
 
   const upsert = db.prepare(`
@@ -281,9 +315,9 @@ function importRows(rows: ParsedRow[]): { inserted: number; updated: number; err
         if (result.changes > 0) inserted++;
         // We can't easily distinguish insert vs update without last_insert_rowid
         // tracking, but the total changes tell us rows were written
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.warn(
-          `[billcom-import] Failed to upsert ${row.vendor_name} #${row.invoice_number}: ${err.message}`,
+          `[billcom-import] Failed to upsert ${row.vendor_name} #${row.invoice_number}: ${err instanceof Error ? err.message : String(err)}`,
         );
         errors++;
       }
@@ -296,11 +330,11 @@ function importRows(rows: ParsedRow[]): { inserted: number; updated: number; err
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-export async function main(): Promise<void> {
-  // Allow custom CSV path via --csv= argument
-  const csvArg = process.argv.find((a) => a.startsWith("--csv="));
-  const csvPath = csvArg ? csvArg.split("=")[1] : DEFAULT_CSV;
-
+/**
+ * Import a Bill.com All Bills CSV into billcom_bills_ref (UPSERT).
+ * Exported for reuse by reconcile-billcom.ts so one run = import + sweep.
+ */
+export async function importCsvFile(csvPath: string): Promise<{ inserted: number; updated: number; errors: number; rows: number }> {
   console.log(`[billcom-import] Importing Bill.com reference data...`);
   console.log(`[billcom-import] CSV: ${csvPath}`);
 
@@ -308,7 +342,7 @@ export async function main(): Promise<void> {
     console.error(`[billcom-import] CSV not found at ${csvPath}`);
     console.error("[billcom-import] Run download-billcom-ref.ts first, or provide --csv=path/to/file.csv");
     process.exitCode = 1;
-    return;
+    return { inserted: 0, updated: 0, errors: 0, rows: 0 };
   }
 
   const stats = fs.statSync(csvPath);
@@ -317,17 +351,17 @@ export async function main(): Promise<void> {
   let rows: ParsedRow[];
   try {
     rows = parseCSV(csvPath);
-  } catch (err: any) {
-    console.error(`[billcom-import] Parse error: ${err.message}`);
+  } catch (err: unknown) {
+    console.error(`[billcom-import] Parse error: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 1;
-    return;
+    return { inserted: 0, updated: 0, errors: 0, rows: 0 };
   }
 
   console.log(`[billcom-import] Parsed ${rows.length} rows`);
 
   if (rows.length === 0) {
     console.warn("[billcom-import] No rows to import — CSV may be empty or malformed.");
-    return;
+    return { inserted: 0, updated: 0, errors: 0, rows: 0 };
   }
 
   const result = importRows(rows);
@@ -340,6 +374,14 @@ export async function main(): Promise<void> {
     `[billcom-import] ✓ Imported: ${result.inserted + result.updated} rows written ` +
     `(${result.errors} errors). Table total: ${total} rows.`,
   );
+  return { ...result, rows: rows.length };
+}
+
+export async function main(): Promise<void> {
+  // Allow custom CSV path via --csv= argument
+  const csvArg = process.argv.find((a) => a.startsWith("--csv="));
+  const csvPath = csvArg ? csvArg.split("=")[1] : DEFAULT_CSV;
+  await importCsvFile(csvPath);
 }
 
 // CLI entry point

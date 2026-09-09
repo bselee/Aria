@@ -55,7 +55,6 @@ import {
     isInvoiceImagePart,
 } from "@/lib/pdf/image-to-pdf";
 import * as crypto from "crypto";
-// @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
 const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 const MAX_EMAILS_PER_CYCLE = 20;
@@ -131,11 +130,86 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     ) {
         return true;
     }
-    // AAA Cooper Transportation — individual Pro# invoices left for manual review
-    // Subject pattern: "Invoice Stmt - Cust 0001159492 Pro#: 64471684"
-    if (subjectLower.includes("invoice stmt - cust 0001159492 pro#")) {
-        return true;
+    // AAA Cooper Transportation (2026-08-13): forward INDIVIDUAL invoices only.
+    // Their correspondence bundles ("Account 1159492 - BUILDASOIL"), statements,
+    // and reply threads ("RE: Need remittance") bundle the SAME invoices that are
+    // also sent individually — forwarding them creates "Multiple Copies" in
+    // Bill.com. Individual invoices are the "Invoice Stmt - ... Pro#: N" emails
+    // or bare-Pro# subjects. Those stay forwarded; everything else is skipped.
+    if (fromLower.includes("aaacooper")) {
+        const isIndividualInvoice =
+            subjectLower.includes("invoice stmt") ||
+            /^\s*\d{5,10}\s*$/.test(subject.trim());
+        if (!isIndividualInvoice) return true;
     }
+    return false;
+}
+
+/**
+ * One-stop junk classifier for the local forwarder's pre-send gate.
+ *
+ * Exported so the policy is unit-testable (ap-local-forwarder-junk.test.ts)
+ * and reusable by any other AP surface. Superset of the historical
+ * isNonInvoiceSender gate: everything that helper skipped is still skipped,
+ * plus the generic junk classes measured in ap_local_forwards on 2026-08-13
+ * (37 of 106 FORWARDED rows were not invoices):
+ *
+ *   - FedEx Billing Online statement packets — "Your New FedEx Billing Online
+ *     invoice is attached" from noreply@fedex.com. Multi-invoice billing
+ *     packets, NOT a single invoice; must never reach Bill.com.
+ *   - Vendor order acknowledgments — "Acknowledgment for OrderNumber:
+ *     3259787-00 has been created." from BFG Supply (an order ack, not an
+ *     invoice; the existing 'order acknowledgement' classes miss this shape).
+ *   - Due notices — "Notice of Invoice Due ID: 16" from Uline AR (the notice,
+ *     not the invoice PDF; real "Uline Invoice <digits> ID# 16" emails are
+ *     unaffected).
+ *   - Credit memos — "Credit Memo 149505 from Evergreen Growers Supply"
+ *     (negative-value documents are not bills; SKIP new credit-memo forwards).
+ *   - Account-management correspondence — "BUISA1 - URGENT UPDATE REQUIRED"
+ *     from Berger (account mail, not an invoice).
+ *
+ * RE: threads are skipped ONLY via the per-vendor individual-invoice policy
+ * (AAA Cooper: only "Invoice Stmt ..." / bare-Pro# subjects forward). There is
+ * deliberately NO blanket "RE:" rule — an invoice-numbered reply thread
+ * ("RE: Uline Invoice 211897049 ID# 16") still forwards.
+ *
+ * @param args.from    raw Gmail From header ("Name <email@domain.com>")
+ * @param args.subject raw Gmail Subject header
+ * @returns true when the email must NOT be forwarded (skip before send)
+ */
+export function isNonInvoiceEmail(args: { from: string; subject: string }): boolean {
+    const { from, subject } = args;
+    const fromLower = (from || "").toLowerCase();
+    const subjectLower = (subject || "").toLowerCase();
+
+    // Historical gate stays intact — every class it skipped is still skipped.
+    if (isNonInvoiceSender(from, subject)) return true;
+
+    // FedEx Billing Online past-due NOTICES — "FedEx Billing Online -
+    // Invoice(s) Past Due" from BillingOnline@fedex.com. These carry NO
+    // invoice PDF (the notice, not the bill) — skip. The invoice-attached
+    // emails ("Your New FedEx Billing Online invoice is attached" from
+    // noreply@fedex.com) MUST forward: they are the FedEx carrier bills
+    // (full packet, pay-path only via fedex-billing-packet.ts).
+    // REVERSED (2026-08-18, Bill): the 08-13 gate that skipped the whole
+    // channel was wrong — "fedex can not be skipped!". The packet channel
+    // forwards as carrier_bill; only past-due notices stay skipped.
+    if (subjectLower.includes("fedex billing online") && subjectLower.includes("past due")) return true;
+
+    // BFG Supply order acknowledgments: "Acknowledgment for OrderNumber:
+    // 3259787-00 has been created." (also covers British spelling).
+    if (/acknowledgment\s+for\s+order/i.test(subjectLower)) return true;
+
+    // Uline AR due notice (NOT the invoice PDF):
+    // "Notice of Invoice Due ID: 16 C# (9897269)".
+    if (subjectLower.includes("notice of invoice due")) return true;
+
+    // Credit memos — negative-value documents, never forwarded as bills.
+    if (subjectLower.includes("credit memo")) return true;
+
+    // Account-management correspondence: "BUISA1 - URGENT UPDATE REQUIRED".
+    if (subjectLower.includes("urgent update required")) return true;
+
     return false;
 }
 
