@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { runEmailPollingCycle } from "./email-polling-cycle";
 
 describe("runEmailPollingCycle", () => {
-    it("runs the default inbox cleanup before the AP forwarding pipeline", async () => {
+    it("runs default ingestion, acknowledgement, and AP ingestion in order", async () => {
         const calls: string[] = [];
 
         await runEmailPollingCycle({
@@ -22,28 +22,12 @@ describe("runEmailPollingCycle", () => {
                     calls.push("ap-ingest");
                 }),
             },
-            apIdentifier: {
-                identifyAndQueue: vi.fn(async () => {
-                    calls.push("ap-identify");
-                }),
-            },
-            apForwarder: {
-                processPendingForwards: vi.fn(async () => {
-                    calls.push("ap-forward");
-                }),
-            },
         });
 
-        expect(calls).toEqual([
-            "default-ingest",
-            "default-ack",
-            "ap-ingest",
-            "ap-identify",
-            "ap-forward",
-        ]);
+        expect(calls).toEqual(["default-ingest", "default-ack", "ap-ingest"]);
     });
 
-    it("continues into the AP pipeline when the default inbox path throws", async () => {
+    it("continues into AP ingestion when the default inbox path throws", async () => {
         const calls: string[] = [];
         const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
@@ -64,25 +48,9 @@ describe("runEmailPollingCycle", () => {
                     calls.push("ap-ingest");
                 }),
             },
-            apIdentifier: {
-                identifyAndQueue: vi.fn(async () => {
-                    calls.push("ap-identify");
-                }),
-            },
-            apForwarder: {
-                processPendingForwards: vi.fn(async () => {
-                    calls.push("ap-forward");
-                }),
-            },
         });
 
-        expect(calls).toEqual([
-            "default-ingest",
-            "default-ack",
-            "ap-ingest",
-            "ap-identify",
-            "ap-forward",
-        ]);
+        expect(calls).toEqual(["default-ingest", "default-ack", "ap-ingest"]);
         expect(errorSpy).toHaveBeenCalled();
         errorSpy.mockRestore();
     });
@@ -100,12 +68,6 @@ describe("runEmailPollingCycle", () => {
             emailIngestionAP: {
                 run: vi.fn(async () => undefined),
             },
-            apIdentifier: {
-                identifyAndQueue: vi.fn(async () => undefined),
-            },
-            apForwarder: {
-                processPendingForwards: vi.fn(async () => undefined),
-            },
             onStageSuccess: vi.fn((stage: string) => {
                 stages.push(stage);
             }),
@@ -115,8 +77,6 @@ describe("runEmailPollingCycle", () => {
             "default-email-pipeline",
             "default-acknowledgement",
             "ap-email-pipeline",
-            "ap-identifier",
-            "ap-forwarder",
         ]);
     });
 });
