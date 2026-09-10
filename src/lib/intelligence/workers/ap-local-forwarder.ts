@@ -226,6 +226,66 @@ function isStatementAttachment(filename: string, from: string, subject: string):
     return false;
 }
 
+/** Extract the plain-text body of a Gmail message (walks the MIME tree). */
+function extractMessageBody(payload: any): string {
+    const parts: string[] = [];
+    function walk(part: any) {
+        if (!part) return;
+        if (part.mimeType === "text/plain" && part.body?.data) {
+            parts.push(Buffer.from(part.body.data, "base64url").toString("utf8"));
+        } else if (part.mimeType === "text/html" && part.body?.data) {
+            parts.push(
+                Buffer.from(part.body.data, "base64url")
+                    .toString("utf8")
+                    .replace(/<[^>]+>/g, " ")
+                    .replace(/&amp;/g, "&")
+                    .replace(/&#39;/g, "'")
+                    .replace(/\s+/g, " "),
+            );
+        }
+        if (part.parts) for (const sub of part.parts) walk(sub);
+    }
+    walk(payload);
+    return parts.join(" ");
+}
+
+/**
+ * Vendor payment/remittance correspondence — NOT an invoice, but NOT junk.
+ * A vendor writing "we got a check for invoices already paid" or "what do I
+ * do with this check?" is a financial exception a human must act on. Silently
+ * archiving it hides a money leak. Returns true when the subject or body
+ * carries a payment-exception signal, so the caller leaves it visible.
+ */
+export function looksLikePaymentCorrespondence(subject: string, body: string): boolean {
+    const text = `${subject || ""}\n${body || ""}`.toLowerCase();
+    const signals = [
+        "check #",
+        "check no",
+        "check number",
+        "already paid",
+        "was already paid",
+        "duplicate check",
+        "duplicate payment",
+        "overpaid",
+        "over payment",
+        "what do you want me to do",
+        "what should i do",
+        "do you want me to",
+        "shred this",
+        "shred these",
+        "payment error",
+        "payment was declined",
+        "unable to process",
+        "returned check",
+        "stop payment",
+        "voided",
+        "received a check",
+        "received another check",
+    ];
+    const monthPattern = /\bpaid\s+in\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b/;
+    return signals.some((s) => text.includes(s)) || monthPattern.test(text);
+}
+
 // ── Paid Invoice Detection (ported from ap-identifier.ts) ──────────────────
 // DECISION(2026-06-18, Bill Selee): OCR text from PDFs before forwarding
 // to detect already-paid invoices. These should never reach Bill.com.
@@ -1251,7 +1311,26 @@ export async function runLocalApForward(): Promise<{
             }
 
             if (invoiceAttachments.length === 0) {
-                // No invoice attachment — not an invoice. Mark read, archive, skip.
+                // No invoice attachment — not an invoice. But before skipping,
+                // check for payment/remittance correspondence: a vendor asking
+                // "what do I do with this check?" or flagging duplicate/already-paid
+                // payments is a financial exception a human must act on. Those
+                // stay UNREAD + INBOX; true junk still gets marked read + archived.
+                const body = extractMessageBody(msgRes.data.payload);
+                if (looksLikePaymentCorrespondence(subject, body)) {
+                    console.log(`   [AP-Local] ⚠️ Payment correspondence — leaving UNREAD for review: ${subject.slice(0, 60)}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: "(no-attachment)",
+                        reason: "vendor payment correspondence (left unread for review)",
+                        vendorRoutingAction: "review",
+                    });
+                    summary.skipped++;
+                    // Deliberately NOT markEmailProcessed — keep INBOX + UNREAD so it surfaces.
+                    continue;
+                }
                 console.log(`   [AP-Local] No PDF/image invoice — skipping: ${subject.slice(0, 50)}`);
                 recordSkippedForward({
                     gmailMessageId,
