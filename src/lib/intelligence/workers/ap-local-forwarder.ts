@@ -48,6 +48,7 @@ import {
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
+import { isStatementSubject, isStatementAttachment } from "@/lib/intelligence/ap-statement-gate";
 import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
 import {
     imageBufferToPdf,
@@ -84,29 +85,8 @@ function checkVendorRouting(from: string, subject: string, filename: string = ""
     return matchVendorRouting(email, name, subject, filename);
 }
 
-/**
- * Statement-signal detection on the SUBJECT (not the attachment filename).
- *
- * A vendor statement ("Statement from LOGAN LABS LLC", "STATEMENT/RELEVÉ DE
- * COMPTE") is a summary of open invoices, NOT a bill. Forwarding it creates a
- * bogus Bill.com bill (e.g. bill 3457 $1,737, a Logan Labs statement that
- * re-saved as "Auto-saved"). The filename-only gate (isStatementAttachment)
- * misses statements whose attachment is opaque ("BUIAS1.pdf").
- *
- * Word-boundary "statement" matches "Statement from …", "Monthly Statement",
- * "Statement of Account", etc. The French "relevé de compte" is Berger's
- * statement subject.
- *
- * Deliberately does NOT match "Invoice Stmt" / "Invoice Statement" — those are
- * AAA Cooper's per-Pro# INVOICES and must keep forwarding (see isNonInvoiceSender's
- * aaacooper block).
- */
-export function isStatementSubject(subject: string): boolean {
-    const s = (subject || "").toLowerCase();
-    if (s.includes("relevé de compte") || s.includes("releve de compte")) return true;
-    const isInvoiceStatement = /\binvoice\s+st(atement|mt)\b/.test(s);
-    return /\bstatement\b/.test(s) && !isInvoiceStatement;
-}
+/** Re-export from the shared statement gate (single source of truth). */
+export { isStatementSubject };
 
 
 /**
@@ -238,19 +218,6 @@ export function isNonInvoiceEmail(args: { from: string; subject: string }): bool
     // Account-management correspondence: "BUISA1 - URGENT UPDATE REQUIRED".
     if (subjectLower.includes("urgent update required")) return true;
 
-    return false;
-}
-
-/** Statement / collections attachments that must never hit Bill.com. */
-function isStatementAttachment(filename: string, from: string, subject: string): boolean {
-    const f = (filename || "").toLowerCase();
-    const fromLower = (from || "").toLowerCase();
-    const subjectLower = (subject || "").toLowerCase();
-    if (!f) return false;
-    if (f.includes("statement") || f.includes("aging") || f.includes("account_summary")) return true;
-    // Belt Power remitto invoices are Inv######.pdf — statements are BuildASoil_LLC_Statement.pdf
-    if (fromLower.includes("beltpower") && f.includes("statement")) return true;
-    if (fromLower.includes("beltpower") && subjectLower.includes("reminder") && !f.startsWith("inv")) return true;
     return false;
 }
 

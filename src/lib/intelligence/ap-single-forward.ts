@@ -446,6 +446,19 @@ export async function forwardInvoiceOnce(
     };
   }
 
+  // Statement choke-point: no forward path may send a vendor statement to
+  // Bill.com. The local forwarder also gates this up front, but /apretry,
+  // ap-autonomous-poll, sandbox/aria-review watchers, and scans-watcher all
+  // call forwardInvoiceOnce directly — this is the single guarantee.
+  const { isStatementDocument } = await import("./ap-statement-gate");
+  if (isStatementDocument(req.emailSubject, req.pdfFilename, req.emailFrom)) {
+    return {
+      status: "blocked",
+      reason: `statement/non-invoice document (subject="${req.emailSubject}", file="${req.pdfFilename}")`,
+      pdfContentHash: sha256Pdf(req.pdfBuffer),
+    };
+  }
+
   const pdfHash = sha256Pdf(req.pdfBuffer);
   const safeFilename = sanitizeForwardFilename(req.pdfFilename || "invoice.pdf");
 
