@@ -85,6 +85,31 @@ function checkVendorRouting(from: string, subject: string, filename: string = ""
 }
 
 /**
+ * Statement-signal detection on the SUBJECT (not the attachment filename).
+ *
+ * A vendor statement ("Statement from LOGAN LABS LLC", "STATEMENT/RELEVÉ DE
+ * COMPTE") is a summary of open invoices, NOT a bill. Forwarding it creates a
+ * bogus Bill.com bill (e.g. bill 3457 $1,737, a Logan Labs statement that
+ * re-saved as "Auto-saved"). The filename-only gate (isStatementAttachment)
+ * misses statements whose attachment is opaque ("BUIAS1.pdf").
+ *
+ * Word-boundary "statement" matches "Statement from …", "Monthly Statement",
+ * "Statement of Account", etc. The French "relevé de compte" is Berger's
+ * statement subject.
+ *
+ * Deliberately does NOT match "Invoice Stmt" / "Invoice Statement" — those are
+ * AAA Cooper's per-Pro# INVOICES and must keep forwarding (see isNonInvoiceSender's
+ * aaacooper block).
+ */
+export function isStatementSubject(subject: string): boolean {
+    const s = (subject || "").toLowerCase();
+    if (s.includes("relevé de compte") || s.includes("releve de compte")) return true;
+    const isInvoiceStatement = /\binvoice\s+st(atement|mt)\b/.test(s);
+    return /\bstatement\b/.test(s) && !isInvoiceStatement;
+}
+
+
+/**
  * Check if an email is likely from a non-invoice sender (tracking, marketing).
  * Also catches UPS tracking notifications that slip through vendor-router.
  * HERMIA(2026-07-10): Expanded after Belt Power shipment notices + statements
@@ -97,6 +122,9 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     if (fromLower.includes("mcinfo@ups.com") && !subjectLower.includes("invoice")) {
         return true;
     }
+    // Statement subjects — "Statement from …", "STATEMENT/RELEVÉ DE COMPTE" —
+    // are vendor statements, NOT invoices. Skip before anything forwards.
+    if (isStatementSubject(subject)) return true;
     // Non-invoice subject classes (belt-and-suspenders with vendor-router skip rules)
     const nonInvoiceSubjects = [
         "shipment notification",
