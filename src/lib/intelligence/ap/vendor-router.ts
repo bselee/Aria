@@ -62,6 +62,8 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { senderContains: 'google cloud' }, action: 'skip', label: 'Google Cloud (Prepaid)' },
     { match: { senderContains: 'culligan' }, action: 'skip', label: 'Culligan Water (Prepaid)' },
     { match: { senderContains: 'terminix' }, action: 'skip', label: 'Terminix (Prepaid)' },
+    { match: { senderContains: 'blackburn propane' }, action: 'skip', label: 'Blackburn Propane (Autopay)' },
+    { match: { domain: 'blackburnspropane.com' }, action: 'skip', label: 'Blackburn Propane (Autopay)' },
     // Toyota Industries Commercial Finance — paid online (BillTrust portal)
     { match: { senderContains: 'toyota commercial finance' }, action: 'skip', label: 'Toyota Commercial Finance (Paid Online)' },
     { match: { senderContains: 'ticf' }, action: 'skip', label: 'TICF (Paid Online)' },

@@ -88,6 +88,23 @@ function checkVendorRouting(from: string, subject: string, filename: string = ""
 /** Re-export from the shared statement gate (single source of truth). */
 export { isStatementSubject };
 
+/**
+ * Extract the AAA Cooper Pro# (the real invoice number) from the email subject.
+ * Subject shape: "Invoice Stmt - Cust 0001159492 Pro#: 64058450" or bare "64058450".
+ * Returns null when no Pro# is present.
+ */
+export function extractAaaProNumber(subject: string): string | null {
+    const m = (subject || "").match(/pro\s*#?\s*:?\s*(\d{6,10})/i);
+    if (m) return m[1];
+    const bare = (subject || "").trim().match(/^\s*(\d{6,10})\s*$/);
+    return bare ? bare[1] : null;
+}
+
+/** Build a clear AAA Cooper invoice filename so Bill.com keys the bill to the Pro#. */
+export function buildAaaCooperFilename(proNumber: string): string {
+    return `${proNumber}_AAA_Cooper_Transportation.pdf`;
+}
+
 
 /**
  * Check if an email is likely from a non-invoice sender (tracking, marketing).
@@ -1248,6 +1265,13 @@ export async function runLocalApForward(): Promise<{
             const from = headers.find((h: any) => h.name === "From")?.value || "unknown";
             const gmailMessageId = msg.id;
 
+            // AAA Cooper: the Pro# (real invoice #) lives in the subject, not the
+            // scanned PDF body. Bill.com OCR reads the account/customer/tracking #
+            // instead, keying the bill wrong. Rename the attachment to the Pro# and
+            // leave the email UNREAD so Bill can manually fix the bill number.
+            const isAaaCooper = from.toLowerCase().includes("aaacooper");
+            const aaaProNumber = isAaaCooper ? extractAaaProNumber(subject) : null;
+
             // Skip known non-invoice senders (tracking notifications, etc.)
             if (isNonInvoiceSender(from, subject)) {
                 console.log(`   [AP-Local] Skipping non-invoice: ${subject.slice(0, 50)} (${from.slice(0, 25)})`);
@@ -1359,6 +1383,12 @@ export async function runLocalApForward(): Promise<{
 
                 let pdfBuffer = att.buffer;
                 let pdfFilename = att.filename;
+
+                // AAA Cooper: label the attachment with the subject Pro# so Bill.com
+                // keys the bill to the real invoice number (not the account/customer #).
+                if (aaaProNumber) {
+                    pdfFilename = buildAaaCooperFilename(aaaProNumber);
+                }
 
                 // Fetch attachment content if not inline
                 if (att.attachmentId && pdfBuffer.length === 0) {
@@ -1543,9 +1573,18 @@ export async function runLocalApForward(): Promise<{
                 }
             }
 
-            // Mark email as processed only if all PDFs were forwarded
+            // Mark email as processed only if all PDFs were forwarded.
+            // AAA Cooper invoices stay UNREAD: Bill.com OCR reads the account #
+            // from the scan instead of the Pro#, so Bill must manually key the
+            // bill number. Leaving it unread flags it for manual correction.
             if (allPdfsForwarded) {
-                await markEmailProcessed(gmail, gmailMessageId);
+                if (isAaaCooper && aaaProNumber) {
+                    console.log(
+                        `   [AP-Local] 👁️ AAA Cooper ${aaaProNumber} forwarded — left UNREAD for manual invoice# fix`,
+                    );
+                } else {
+                    await markEmailProcessed(gmail, gmailMessageId);
+                }
             }
         } catch (e: any) {
             console.error(`   [AP-Local] Error processing email ${msg.id}:`, e.message);

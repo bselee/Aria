@@ -37,6 +37,17 @@ describe("vendor-router senderContains match", () => {
         expect(r?.action).toBe("skip");
     });
 
+    it("matches blackburn propane → skip (autopay)", () => {
+        const r = matchVendorRouting("delta@blackburnspropane.com", "Blackburn Propane", "Invoice");
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toContain("Blackburn");
+    });
+
+    it("matches blackburn propane via BPI Delta CO sender name", () => {
+        const r = matchVendorRouting("delta@blackburnspropane.com", "BPI Delta CO", "Invoice");
+        expect(r?.action).toBe("skip");
+    });
+
     it("matches gorgias via sender name", () => {
         const r = matchVendorRouting("noreply@some-cdn.com", "Gorgias Support", "Ticket");
         expect(r?.action).toBe("skip");
