@@ -199,6 +199,13 @@ function deriveInvoice(fwd: ForwardRow): string {
   const proSubj = (fwd.email_subject || "").match(/\bPro#?:?\s*(\d{6,10})\b/i);
   if (proSubj) return proSubj[1];
 
+  // 0.5 Subject explicit "Invoice# N" — authoritative when the subject states the
+  //    invoice number ("Concentrates, Inc - Invoice# 3084520") but OCR grabs a
+  //    different number (1081435, the PO#). Mirrors the Pro# rule above; subject
+  //    wins over OCR.
+  const subjInv = (fwd.email_subject || "").match(/\b(?:invoice|inv|facture)\s*[#:._-]*\s*(\d[A-Za-z0-9-]{2,})/i);
+  if (subjInv) return subjInv[1];
+
   // 1. OCR invoice number second (comma-form ok)
   const ocr = (fwd.ocr_invoice_number || "").trim().replace(/,/g, "");
   if (ocr && /[A-Za-z0-9]{4,}/.test(ocr) && !/^unknown$/i.test(ocr)) return ocr;
