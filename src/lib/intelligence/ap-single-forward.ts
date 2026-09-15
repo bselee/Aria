@@ -519,6 +519,45 @@ export async function forwardInvoiceOnce(
       }
     }
 
+    // ── Pre-send OCR gate: render page 1 of the FINAL prepared bytes and
+    //    assert (1) an invoice number is present and (2) the AAA Cooper
+    //    customer number is absent. Deterministic confidence layer — runs on
+    //    exactly what Bill.com receives. NON-BLOCKING: the send always
+    //    proceeds; a non-pass verdict is logged loudly and persisted so the
+    //    weekly reconcile surfaces it. No Bill.com dependency, no WAF.
+    try {
+      const { verifyInvoiceForBillCom } = await import("./ap/invoice-ocr-gate");
+      const gate = await verifyInvoiceForBillCom(sendBuffer);
+      if (gate.verdict === "pass") {
+        console.log(`[OCR-GATE] ✓ pass — ${gate.reason}`);
+      } else if (gate.verdict === "skipped") {
+        console.warn(`[OCR-GATE] ⚠ skipped — ${gate.reason} (sent unverified)`);
+      } else {
+        console.warn(
+          `[OCR-GATE] ⚠ ${gate.verdict.toUpperCase()} — ${gate.reason} (sent anyway)`,
+        );
+      }
+      try {
+        getLocalDb()
+          .prepare(
+            `UPDATE ap_local_forwards
+             SET reconciliation_notes = COALESCE(
+                   reconciliation_notes || ' | ',
+                   ''
+                 ) || 'ocr-gate:' || ? || ':' || ?
+             WHERE id = ?`,
+          )
+          .run(gate.verdict, gate.reason.slice(0, 300), claimId);
+      } catch {
+        /* notes update is best-effort */
+      }
+    } catch (gateErr: any) {
+      // The gate must NEVER break the forward path.
+      console.warn(
+        `[OCR-GATE] ⚠ gate error (sent unverified): ${gateErr?.message || gateErr}`,
+      );
+    }
+
     const sentId = await sendMime(
       gmail,
       req.emailSubject,
