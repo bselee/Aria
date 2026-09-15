@@ -61,6 +61,7 @@ interface ForwardRow {
   verified: number;
   billcom_processed: number;
   vendor_routing_action: string | null;
+  reconciliation_notes: string | null;
 }
 
 interface Verdict {
@@ -306,6 +307,19 @@ function vendorTermMedian(refRows: RefRow[]): Map<string, number> {
 }
 
 /**
+ * Parse the pre-send OCR-gate verdict out of a forward's reconciliation_notes.
+ * The gate writes `ocr-gate:<verdict>:<reason>` (see ap-single-forward.ts); the
+ * weekly sweep surfaces any non-pass verdict here so a no_invoice_number or
+ * customer_number flag never stays buried in a note column.
+ */
+function parseGateVerdict(notes: string | null): { verdict: string; reason: string } | null {
+  if (!notes) return null;
+  const m = notes.match(/ocr-gate:([a-z_]+):(.*?)(?=\s*(?:ocr-gate:|\||$))/i);
+  if (!m) return null;
+  return { verdict: m[1], reason: m[2].trim() };
+}
+
+/**
  * True when any forward for this vendor+invoice# is a credit memo (filename or
  * subject says Cr_Memo / Credit Memo / credit). Credit memos carry net-0 due
  * dates by nature — a terms-outlier flag on one is noise.
@@ -418,7 +432,7 @@ async function main(): Promise<void> {
     .prepare(
       `SELECT id, forwarded_at, email_from, email_subject, pdf_filename,
               ocr_vendor_name, ocr_invoice_number, ocr_total, ocr_raw_text, verified, billcom_processed,
-              vendor_routing_action
+              vendor_routing_action, reconciliation_notes
        FROM ap_local_forwards
        WHERE status='FORWARDED' AND forwarded_at >= ?
        ORDER BY forwarded_at DESC`,
@@ -429,6 +443,7 @@ async function main(): Promise<void> {
 
   const verdicts: Verdict[] = [];
   const billIssues: BillIssue[] = [];
+  const gateFlags: Array<{ date: string; vendor: string; invoice: string; verdict: string; reason: string }> = [];
   let matched = 0;
   let paidOnlineCount = 0;
   const terms = vendorTermMedian(ref);
@@ -437,6 +452,18 @@ async function main(): Promise<void> {
     const hay = vendorHaystack(f);
     const invoice = deriveInvoice(f);
     const displayVendor = parseSender(f.email_from).display || f.ocr_vendor_name || f.email_from || "";
+
+    // Surface any non-pass pre-send OCR-gate verdict on this forward.
+    const gate = parseGateVerdict(f.reconciliation_notes);
+    if (gate && gate.verdict !== "pass" && gate.verdict !== "skipped") {
+      gateFlags.push({
+        date: (f.forwarded_at || "").slice(0, 10),
+        vendor: displayVendor,
+        invoice: invoice || f.pdf_filename || "?",
+        verdict: gate.verdict,
+        reason: gate.reason,
+      });
+    }
 
     const base = {
       forwarded_at: (f.forwarded_at || "").slice(0, 10),
@@ -687,6 +714,14 @@ async function main(): Promise<void> {
     for (const x of billIssues) {
       console.log(`[${x.kind}] ${x.vendor} | #${x.invoice} | ${x.amount ?? "$?"}`);
       console.log(`        ${x.detail}`);
+    }
+  }
+
+  if (gateFlags.length > 0) {
+    console.log("\n=== OCR-GATE FLAGS (pre-send — may have landed with wrong/none invoice#) ===");
+    for (const g of gateFlags) {
+      console.log(`[${g.verdict.toUpperCase()}] ${g.date} | ${g.vendor} | #${g.invoice}`);
+      console.log(`        ${g.reason}`);
     }
   }
 
