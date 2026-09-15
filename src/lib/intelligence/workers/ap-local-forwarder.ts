@@ -1515,9 +1515,12 @@ export async function runLocalApForward(): Promise<{
                               : undefined,
                         vendorName: isFedExCarrierBill
                             ? "FedEx"
-                            : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
-                              ? "Down to Earth Worms"
-                              : undefined,
+                            : aaaProNumber
+                              ? "AAA Cooper Transportation"
+                              : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
+                                ? "Down to Earth Worms"
+                                : undefined,
+                        invoiceNumber: aaaProNumber || undefined,
                     });
                     if (once.status === "already_forwarded") {
                         console.log(`   [AP-Local] ⏭️ Already forwarded: ${pdfFilename} (${once.reason})`);

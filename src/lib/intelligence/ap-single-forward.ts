@@ -20,6 +20,11 @@ import { createHash, randomBytes } from "crypto";
 import { getLocalDb } from "@/lib/storage/local-db";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
+import {
+    buildStampedFilename,
+    shouldStampInvoice,
+    stampInvoicePdf,
+} from "@/lib/pdf/invoice-overlay";
 
 const BILL_COM_EMAIL =
   process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
@@ -350,16 +355,17 @@ function claimForward(
   }
 }
 
-function markClaimForwarded(claimId: number, billcomSentMessageId: string): void {
+function markClaimForwarded(claimId: number, billcomSentMessageId: string, sentFilename?: string): void {
   const db = getLocalDb();
   db.prepare(
     `UPDATE ap_local_forwards
      SET status = 'FORWARDED',
+         pdf_filename = COALESCE(?, pdf_filename),
          billcom_sent_message_id = ?,
          forwarded_at = datetime('now'),
          error_message = NULL
      WHERE id = ?`,
-  ).run(billcomSentMessageId, claimId);
+  ).run(sentFilename || null, billcomSentMessageId, claimId);
 }
 
 function markClaimError(claimId: number, message: string): void {
@@ -485,12 +491,40 @@ export async function forwardInvoiceOnce(
       gmail = GmailApi({ version: "v1", auth });
     }
 
+    // ── Invoice# stamp: vendors whose PDFs mis-OCR (AAA Cooper reads the
+    //    CUSTOMER/account number instead of the Pro#) get the reliable
+    //    subject-derived invoice number stamped onto page 1 BEFORE the send,
+    //    so Bill.com's own extraction keys the bill on the right number.
+    //    Never blocks the forward — on stamp failure we send the original.
+    let sendBuffer = req.pdfBuffer;
+    let sendFilename = safeFilename;
+    if (shouldStampInvoice(req.emailFrom, req.invoiceNumber)) {
+      try {
+        sendBuffer = await stampInvoicePdf(
+          req.pdfBuffer,
+          {
+            invoiceNumber: req.invoiceNumber!,
+            vendorName: req.vendorName,
+          },
+          req.emailFrom,
+        );
+        sendFilename = buildStampedFilename(req.invoiceNumber!, req.vendorName);
+        console.log(
+          `[ap-single-forward] 📌 Stamped invoice# ${req.invoiceNumber} → ${sendFilename}`,
+        );
+      } catch (stampErr: any) {
+        console.warn(
+          `[ap-single-forward] Stamp failed (sending original): ${stampErr?.message || stampErr}`,
+        );
+      }
+    }
+
     const sentId = await sendMime(
       gmail,
       req.emailSubject,
       req.emailFrom,
-      safeFilename,
-      req.pdfBuffer,
+      sendFilename,
+      sendBuffer,
     );
     if (!sentId) {
       markClaimError(claimId, "Gmail send returned no message id");
@@ -501,9 +535,9 @@ export async function forwardInvoiceOnce(
       };
     }
 
-    markClaimForwarded(claimId, sentId);
+    markClaimForwarded(claimId, sentId, sendFilename);
     console.log(
-      `[ap-single-forward] OK ${safeFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
+      `[ap-single-forward] OK ${sendFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
     );
 
     // ── Immediate verify-in-Sent: fetch the sent message back and confirm it
