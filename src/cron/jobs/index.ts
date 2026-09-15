@@ -1305,7 +1305,14 @@ defineJob({
     name: "billcom-ref-import",
     schedule: "0 7 * * *",  // Daily 7 AM
     onFail: "log",
-    description: "Daily 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
+    enabled: false, // DISABLED 2026-09-15: headless Playwright hits Bill.com's
+    // Cloudflare CAPTCHA every run (no CSV ever downloads), the import step
+    // then re-imports a stale data/AllBillsPage.csv, and the Supabase cleanup
+    // step is dead code (Supabase removed). The working path is Bill's manual
+    // AllBillsPage CSV + `reconcile-billcom.ts --csv=`, which imports AND
+    // sweeps in one read-only run. Leave disabled; do not re-enable until the
+    // download uses the computer_use live-session path instead of headless.
+    description: "DISABLED — was: daily 7 AM download Bill.com CSV + import. Headless Playwright is Cloudflare-walled; manual CSV + reconcile-billcom is the live path.",
     handler: async () => {
         try {
             // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)

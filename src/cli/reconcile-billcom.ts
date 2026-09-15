@@ -81,7 +81,7 @@ interface BillIssue {
   vendor: string;
   invoice: string;
   amount: string | null;
-  kind: "AMOUNT_MISMATCH" | "DUP_INVOICE_NUMBER" | "NONUNIQUE_INVOICE_NUMBER" | "DATE_ISSUE" | "TERMS_OUTLIER";
+  kind: "AMOUNT_MISMATCH" | "AMOUNT_OUTLIER" | "AMOUNT_LOW_CONFIDENCE" | "DUP_INVOICE_NUMBER" | "NONUNIQUE_INVOICE_NUMBER" | "DATE_ISSUE" | "TERMS_OUTLIER";
   detail: string;
 }
 
@@ -307,7 +307,33 @@ function vendorTermMedian(refRows: RefRow[]): Map<string, number> {
 }
 
 /**
- * Parse the pre-send OCR-gate verdict out of a forward's reconciliation_notes.
+ * Vendor typical invoice amount (median) from clean ref history. Feeds the
+ * "strange or large amount" outlier check: a forward whose total is a large
+ * multiple of the vendor's own median (or an absolute large bill) gets
+ * flagged for a human to verify the entered amount.
+ */
+function vendorAmountMedian(refRows: RefRow[]): Map<string, number> {
+  const amounts = new Map<string, number[]>();
+  for (const r of refRows) {
+    const a = r.invoice_amount;
+    if (a === null || a === undefined || a <= 0 || a > 1_000_000) continue;
+    const key = normVendor(r.vendor_name);
+    if (!key) continue;
+    const arr = amounts.get(key) || [];
+    arr.push(a);
+    amounts.set(key, arr);
+  }
+  const out = new Map<string, number>();
+  for (const [k, arr] of amounts) {
+    if (arr.length < 3) continue; // too little history to trust
+    arr.sort((x, y) => x - y);
+    const mid = Math.floor(arr.length / 2);
+    out.set(k, arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2);
+  }
+  return out;
+}
+
+/**
  * The gate writes `ocr-gate:<verdict>:<reason>` (see ap-single-forward.ts); the
  * weekly sweep surfaces any non-pass verdict here so a no_invoice_number or
  * customer_number flag never stays buried in a note column.
@@ -447,6 +473,7 @@ async function main(): Promise<void> {
   let matched = 0;
   let paidOnlineCount = 0;
   const terms = vendorTermMedian(ref);
+  const amountMedians = vendorAmountMedian(ref);
 
   for (const f of fwds) {
     const hay = vendorHaystack(f);
@@ -489,9 +516,13 @@ async function main(): Promise<void> {
       if (exactInv) {
         const fwdAmt = parseDollars(f.ocr_total);
         const rederived = rederiveFinalTotal(f.ocr_raw_text);
+        const billAmt = hitRow.invoice_amount;
+        const med = amountMedians.get(normVendor(hitRow.vendor_name || ""));
+
+        // Tier 1 — confident + confirmed: double-extraction agreement AND the
+        // entered amount disagrees → a real amount mismatch, flag it.
         if (fwdAmt !== null && rederived !== null) {
           const agree = Math.abs(fwdAmt - rederived) <= Math.max(0.05, fwdAmt * 0.005);
-          const billAmt = hitRow.invoice_amount;
           if (agree && billAmt != null && Math.abs(fwdAmt - billAmt) > 0.02) {
             billIssues.push({
               vendor: displayVendor,
@@ -499,6 +530,43 @@ async function main(): Promise<void> {
               amount: f.ocr_total,
               kind: "AMOUNT_MISMATCH",
               detail: `confirmed total $${fwdAmt.toFixed(2)} ≠ Bill.com amount $${billAmt.toFixed(2)} (bill #${hitRow.invoice_number}) — verify which is right`,
+            });
+          }
+        }
+
+        // Tier 2 — large/strange amount vs this vendor's own history. Fires
+        // regardless of match: a bill that is 5× the vendor's median (or over
+        // an absolute $25k) is worth a human glance before it gets paid.
+        const confidentAmt = fwdAmt ?? rederived ?? billAmt ?? null;
+        if (confidentAmt !== null && med !== undefined) {
+          const rel = confidentAmt > med * 5;
+          const abs = confidentAmt > 25_000;
+          if (rel || abs) {
+            billIssues.push({
+              vendor: displayVendor,
+              invoice,
+              amount: confidentAmt.toFixed(2),
+              kind: "AMOUNT_OUTLIER",
+              detail: `$${confidentAmt.toFixed(2)} is ${abs ? ">$25k" : `${Math.round((confidentAmt / med) * 10) / 10}× vendor median $${med.toFixed(2)}`} — verify entered amount is not a miskey`,
+            });
+          }
+        }
+
+        // Tier 3 — low confidence: a single extraction exists (no re-derivation
+        // to confirm it) and it is a large bill. OCR total on a big bill without
+        // corroboration is the "verify entered" case Bill flagged.
+        if (
+          (fwdAmt !== null && rederived === null) ||
+          (fwdAmt === null && rederived !== null)
+        ) {
+          const single = (fwdAmt ?? rederived) as number;
+          if (single > 10_000) {
+            billIssues.push({
+              vendor: displayVendor,
+              invoice,
+              amount: single.toFixed(2),
+              kind: "AMOUNT_LOW_CONFIDENCE",
+              detail: `$${single.toFixed(2)} from a single OCR pass (no corroborating total) — verify the entered amount`,
             });
           }
         }
