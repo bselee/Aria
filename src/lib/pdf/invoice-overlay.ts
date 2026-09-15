@@ -46,6 +46,24 @@ interface StampPlacement {
 }
 
 /**
+ * A white-out region on page 1 (top-left origin). Used to redact the
+ * CUSTOMER NUMBER (account/customer id) that Bill.com's OCR otherwise reads
+ * as the invoice number. Bill.com keys on the labeled "CUSTOMER NUMBER" field
+ * — even after the invoice# stamp is added — so the contaminant number must be
+ * physically removed. Each box is drawn as a solid white rectangle.
+ */
+interface RedactionBox {
+    /** Left edge, points from the page left edge. */
+    x1: number;
+    /** Top edge, points measured DOWN from the page top edge. */
+    yTop1: number;
+    /** Right edge, points from the page left edge. */
+    x2: number;
+    /** Bottom edge, points measured DOWN from the page top edge. */
+    yTop2: number;
+}
+
+/**
  * Per-sender template placements. Measured deterministically at 600 DPI on the
  * real AAA Cooper header (614.39 x 781.2 pt page): the "INVOICE" title ink
  * band runs x≈398.9-467.4, y≈0.2-13.1 from top (baseline ≈13-14.5). The
@@ -61,6 +79,44 @@ const STAMP_PLACEMENTS: Array<{ match: RegExp; placement: StampPlacement }> = [
 
 /** Fallback: top-right corner of page 1 — safe, out of any header content. */
 const DEFAULT_PLACEMENT: StampPlacement = { x: 0, yFromTop: 30, size: 12, prefix: "INVOICE # " };
+
+/**
+ * Per-sender white-out boxes (top-left origin, points) for the CUSTOMER
+ * NUMBER / account id that Bill.com's OCR mis-reads as the invoice number.
+ * Measured deterministically via tesseract at 600 DPI on the real AAA Cooper
+ * header (614.39 x 781.2 pt page). The customer number "1159492" appears in
+ * FOUR places — the header "CUSTOMER NUMBER" cell, the "BILL TO" block, the
+ * footer "Stmt Id:DLO…01159492" line, and the bottom tracking code. All four
+ * must be whited out so Bill.com keys on the stamped invoice# instead.
+ *
+ * Never touch the Pro# "64058449" — it appears in the INVOICE # stamp
+ * (x≈485-546, yTop≈4-15), the PRO NUMBER cell (x≈490-529, yTop≈35-42), and
+ * the footer PRO NUMBER (x≈440-479, yTop≈746-753); the boxes below are clear
+ * of all three.
+ */
+const REDACTION_BOXES: Array<{ match: RegExp; boxes: RedactionBox[] }> = [
+    {
+        match: /aaacooper/i,
+        boxes: [
+            // Header "CUSTOMER NUMBER" value 1159492
+            { x1: 356, yTop1: 31, x2: 400, yTop2: 45 },
+            // "BILL TO" customer number 1159492 (left of the merged "1159492DATE")
+            { x1: 492, yTop1: 54, x2: 538, yTop2: 68 },
+            // Footer "Stmt Id:DLO…01159492" numeric tail
+            { x1: 247, yTop1: 765, x2: 342, yTop2: 777 },
+            // Bottom tracking code "0001159492" tail ("159492" segment)
+            { x1: 53, yTop1: 773, x2: 73, yTop2: 782 },
+        ],
+    },
+];
+
+function redactionBoxesForSender(from: string | null | undefined): RedactionBox[] {
+    const f = String(from || "").toLowerCase();
+    for (const entry of REDACTION_BOXES) {
+        if (entry.match.test(f)) return entry.boxes;
+    }
+    return [];
+}
 
 function placementForSender(from: string | null | undefined): StampPlacement {
     const f = String(from || "").toLowerCase();
@@ -141,6 +197,20 @@ export async function stampInvoicePdf(
     // DEFAULT_PLACEMENT.x === 0 → right-align in the top-right corner.
     const x = placement.x > 0 ? placement.x : Math.max(10, width - textWidth - 12);
     const y = height - placement.yFromTop;
+
+    // Redact the customer/account number first so Bill.com's OCR can't read it
+    // as the invoice number. White boxes are drawn before the stamp text.
+    for (const box of redactionBoxesForSender(from)) {
+        page.drawRectangle({
+            x: box.x1,
+            y: height - box.yTop2,
+            width: box.x2 - box.x1,
+            height: box.yTop2 - box.yTop1,
+            color: rgb(1, 1, 1),
+            borderColor: rgb(1, 1, 1),
+            borderWidth: 0,
+        });
+    }
 
     page.drawText(text, {
         x,
