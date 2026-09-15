@@ -1574,17 +1574,11 @@ export async function runLocalApForward(): Promise<{
             }
 
             // Mark email as processed only if all PDFs were forwarded.
-            // AAA Cooper invoices stay UNREAD: Bill.com OCR reads the account #
-            // from the scan instead of the Pro#, so Bill must manually key the
-            // bill number. Leaving it unread flags it for manual correction.
+            // (AAA Cooper is marked read like everything else — the Pro# filename
+            //  labeling already handles the invoice# fix; no reason to leave it
+            //  unread and pile up in the inbox.)
             if (allPdfsForwarded) {
-                if (isAaaCooper && aaaProNumber) {
-                    console.log(
-                        `   [AP-Local] 👁️ AAA Cooper ${aaaProNumber} forwarded — left UNREAD for manual invoice# fix`,
-                    );
-                } else {
-                    await markEmailProcessed(gmail, gmailMessageId);
-                }
+                await markEmailProcessed(gmail, gmailMessageId);
             }
         } catch (e: any) {
             console.error(`   [AP-Local] Error processing email ${msg.id}:`, e.message);
