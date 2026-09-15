@@ -45,6 +45,7 @@ import {
     FEDEX_CARRIER_BILL_ACTION,
     buildFedExBillComFilename,
     classifyFedExBillingAttachment,
+    trimToFirstPage,
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
@@ -1435,8 +1436,17 @@ export async function runLocalApForward(): Promise<{
                 const isFedExCarrierBill = fedexPacket.isPacket;
                 if (isFedExCarrierBill) {
                     pdfFilename = buildFedExBillComFilename(fedexPacket, pdfFilename);
+                    // First-page-only forward (2026-09-15): page 1 = summary +
+                    // invoice number + total. Trimming defeats Bill.com's OCR
+                    // mis-read of the dashed invoice # across 100–150 pages.
+                    if (fedexPacket.mayTrimPages) {
+                        const trimmed = await trimToFirstPage(pdfBuffer);
+                        if (trimmed !== pdfBuffer) {
+                            pdfBuffer = trimmed;
+                        }
+                    }
                     console.log(
-                        `   [AP-Local] 📦 FedEx carrier bill FULL packet → ${pdfFilename} (no trim, skip PO match)`,
+                        `   [AP-Local] 📦 FedEx carrier bill → ${pdfFilename} (page 1 of ${fedexPacket.mayTrimPages ? "multi" : "1"}, skip PO match)`,
                     );
                 }
 
