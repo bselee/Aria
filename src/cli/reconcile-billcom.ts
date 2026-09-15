@@ -34,6 +34,7 @@
 
 import { getLocalDb } from "@/lib/storage/local-db";
 import { importCsvFile, parseCSV, type ParsedRow } from "./import-billcom-ref";
+import { isStatementDocument } from "@/lib/intelligence/ap-statement-gate";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -514,6 +515,14 @@ async function main(): Promise<void> {
       // on parser noise, only on a stable two-parse figure vs the entered bill.
       const exactInv = !!invoice && normInvoice(invoice) === normInvoice(hitRow.invoice_number || "");
       if (exactInv) {
+        // A statement is not an invoice — the statement gate blocks these at
+        // forward time now, but pre-gate FORWARDED rows (Berger BUIAS1.pdf,
+        // "$42k statement") still surface here. Skip all amount checks on a
+        // statement row: its "amount" is an account balance, not a bill.
+        const isStmt = isStatementDocument(f.email_subject || "", f.pdf_filename || "", f.email_from || "");
+        if (isStmt) {
+          continue;
+        }
         const fwdAmt = parseDollars(f.ocr_total);
         const rederived = rederiveFinalTotal(f.ocr_raw_text);
         const billAmt = hitRow.invoice_amount;

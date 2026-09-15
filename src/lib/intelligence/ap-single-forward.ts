@@ -522,12 +522,36 @@ export async function forwardInvoiceOnce(
     // ── Pre-send OCR gate: render page 1 of the FINAL prepared bytes and
     //    assert (1) an invoice number is present and (2) the AAA Cooper
     //    customer number is absent. Deterministic confidence layer — runs on
-    //    exactly what Bill.com receives. NON-BLOCKING: the send always
-    //    proceeds; a non-pass verdict is logged loudly and persisted so the
-    //    weekly reconcile surfaces it. No Bill.com dependency, no WAF.
+    //    exactly what Bill.com receives. No Bill.com dependency, no WAF.
+    //
+    //    BLOCKING case: a WEIGHT TICKET / BOL (ticket label present, no
+    //    invoice number) is NOT a bill — Bill.com would mint a phantom bill
+    //    off the ticket# (the CR Minerals $23.56 class). It blocks, same as a
+    //    statement. The remaining cases stay non-blocking so a genuine invoice
+    //    is never withheld on an OCR doubt: customer_number (redaction failed)
+    //    and no_invoice_number WITHOUT a ticket label (could be a real invoice
+    //    that OCR read poorly) are logged + flagged, not blocked.
     try {
       const { verifyInvoiceForBillCom } = await import("./ap/invoice-ocr-gate");
       const gate = await verifyInvoiceForBillCom(sendBuffer);
+
+      // Weight ticket / BOL / non-invoice → hard block (mirrors statement gate).
+      if (gate.verdict === "no_invoice_number" && gate.ticketDetected) {
+        getLocalDb()
+          .prepare(
+            `UPDATE ap_local_forwards
+             SET status = 'BLOCKED',
+                 error_message = ?,
+                 reconciliation_notes = COALESCE(reconciliation_notes || ' | ', '') || 'ocr-gate:blocked:' || ?
+             WHERE id = ?`,
+          )
+          .run(`weight ticket / BOL (${gate.reason.slice(0, 200)})`, gate.reason.slice(0, 300), claimId);
+        console.warn(
+          `[OCR-GATE] ⛔ BLOCKED weight ticket / BOL — ${gate.reason} (claim=${claimId})`,
+        );
+        return { status: "blocked", reason: `weight ticket / BOL: ${gate.reason}`, pdfContentHash: pdfHash };
+      }
+
       if (gate.verdict === "pass") {
         console.log(`[OCR-GATE] ✓ pass — ${gate.reason}`);
       } else if (gate.verdict === "skipped") {
