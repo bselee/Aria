@@ -9,6 +9,7 @@ import {
     extractNameFromSignOff,
     extractReplyFirstName,
     gradeVendorReplyDraft,
+    isNoResponseNeededFyi,
     isSimpleVendorConfirmation,
     templateWarmVendorReply,
 } from "./email-draft-voice";
@@ -59,6 +60,19 @@ describe("extractReplyFirstName", () => {
         expect(extractReplyFirstName(CARI_FROM)).not.toBe("Cs");
         expect(extractReplyFirstName(CARI_FROM).toLowerCase()).not.toBe("cs");
     });
+
+    it("Noah.Julin@ is Noah, never last-name Julin", () => {
+        const from = "Noah.Julin@destinationtrans.com";
+        expect(extractReplyFirstName(from)).toBe("Noah");
+        expect(extractReplyFirstName(from)).not.toBe("Julin");
+        expect(extractReplyFirstName("Noah Julin <Noah.Julin@destinationtrans.com>")).toBe("Noah");
+        expect(
+            extractReplyFirstName(
+                from,
+                "Hey Bill,\n\nGot this secured at $2,250 today.\n\nThanks,\n\nNoah Julin\nNational Account Executive",
+            ),
+        ).toBe("Noah");
+    });
 });
 
 describe("isSimpleVendorConfirmation", () => {
@@ -76,6 +90,27 @@ describe("isSimpleVendorConfirmation", () => {
             isSimpleVendorConfirmation({
                 subject: MEGAN_SUBJECT,
                 bodyText: MEGAN_BODY,
+            }),
+        ).toBe(false);
+    });
+});
+
+describe("isNoResponseNeededFyi", () => {
+    it("flags broker FYI rate-secured with no question", () => {
+        expect(
+            isNoResponseNeededFyi({
+                subject: "Re: Load",
+                bodyText:
+                    "Hey Bill,\n\nGot this secured at $2,250 today.\n\nThanks,\n\nNoah Julin\nNational Account Executive",
+            }),
+        ).toBe(true);
+    });
+
+    it("does not flag a real ask", () => {
+        expect(
+            isNoResponseNeededFyi({
+                subject: "Re: Load",
+                bodyText: "Hey Bill, can you confirm the delivery hours for tomorrow?",
             }),
         ).toBe(false);
     });

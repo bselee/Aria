@@ -29,6 +29,7 @@ dotenv.config({ path: '.env.local' });
 
 import { chromium, type Page } from 'playwright';
 import { FinaleClient } from '../lib/finale/client';
+import { freightAdjustmentForPo } from '../lib/finale/freight-adjustment';
 import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { BrowserManager } from '../lib/scraping/browser-manager';
 import { ReconciliationRun } from '../lib/reconciliation/run-tracker';
@@ -522,8 +523,10 @@ async function reconcilePO(
             .reduce((s: number, a: any) => s + a.amount, 0);
 
         if (totalFreight > 0 && Math.abs(existingFreight - totalFreight) > 0.01) {
-            const label = `Freight - ULINE Inv ${invNums.join('+')}`;
-            const alreadyLabeled = existingAdj.some((a: any) => a.description?.includes('ULINE Inv'));
+            const label = "Freight";
+            const alreadyLabeled = existingAdj.some((a: any) =>
+                (a.productPromoUrl === FREIGHT_PROMO) && Number(a.amount) > 0,
+            );
             if (!alreadyLabeled) {
                 console.log(`     + Freight: $${totalFreight} (${label})`);
 
@@ -672,11 +675,13 @@ async function main() {
                         const freightInfo = poFreightMap[poId];
                         if (freightInfo) {
                             const existingAdj = unlocked.orderAdjustmentList || [];
-                            existingAdj.push({
-                                amount: freightInfo.totalFreight,
-                                description: `Freight - ULINE Inv ${freightInfo.invNums.join('+')}`,
-                                productPromoUrl: FREIGHT_PROMO,
-                            });
+                            existingAdj.push(freightAdjustmentForPo(
+                                freightInfo.totalFreight,
+                                (unlocked.orderItemList || []).map((item: { quantity?: number; weight?: number }) => ({
+                                    quantity: Number(item.quantity) || 0,
+                                    weight: Number(item.weight) || undefined,
+                                })),
+                            ));
                             unlocked.orderAdjustmentList = existingAdj;
                             run.recordFreight(Math.round(freightInfo.totalFreight * 100));
                         }

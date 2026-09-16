@@ -463,16 +463,11 @@ export function pickPoForEntry(
 }
 
 /**
- * Finale FREIGHT adjustment description — keep simple (Bill 2026-08-05):
- * amount is the field; notes = "Freight" + BOL (or PRO if no BOL).
- * No LTL Select / origin / date prose on the PO.
- *
- * @example "Freight BOL 17165341"
- * @example "Freight PRO 300183121811"
+ * Finale FREIGHT adjustment description — always the promo name "Freight".
+ * BOL/PRO belong in activity logs, not the line. Extra text skips ADJ_BY_WEIGHT
+ * landed-cost allocation (Diamond K RAWGYPSUM, 2026-09).
  */
-export function buildFreightLabel(entry: CollectEntry): string {
-    if (entry.bolNumber) return `Freight BOL ${entry.bolNumber}`;
-    if (entry.proNumber) return `Freight PRO ${entry.proNumber}`;
+export function buildFreightLabel(_entry: CollectEntry): string {
     return "Freight";
 }
 

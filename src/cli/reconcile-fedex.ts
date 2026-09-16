@@ -33,6 +33,7 @@ import * as dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import { FinaleClient } from '../lib/finale/client';
+import { freightAdjustmentForPo } from '../lib/finale/freight-adjustment';
 import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
@@ -168,9 +169,7 @@ function poHasRealCarrierFreight(
 }
 
 /** Simple Finale note — amount is the $ field. No product/system branding. */
-function buildFedExFreightLabel(fedex: FedExEntry): string {
-    const inv = (fedex.invoiceNumber || '').trim();
-    if (inv) return `Freight ${inv}`;
+function buildFedExFreightLabel(_fedex: FedExEntry): string {
     return 'Freight';
 }
 
@@ -767,11 +766,13 @@ async function main() {
 
                     const adjustments = [...(po.orderAdjustmentList || [])];
                     for (const item of freightItems) {
-                        adjustments.push({
-                            amount: item.fedex.amtDue,
-                            description: item.label,
-                            productPromoUrl: FREIGHT_PROMO,
-                        });
+                        adjustments.push(freightAdjustmentForPo(
+                            item.fedex.amtDue,
+                            (po.orderItemList || []).map((line: { quantity?: number; weight?: number }) => ({
+                                quantity: Number(line.quantity) || 0,
+                                weight: Number(line.weight) || undefined,
+                            })),
+                        ));
                         run.recordFreight(Math.round(item.fedex.amtDue * 100));
                     }
 

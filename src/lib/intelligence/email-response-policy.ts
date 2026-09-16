@@ -5,16 +5,15 @@
  *          Drafts are prepared for Bill to read/edit/send. Auto-send caused the
  *          BioChar miss ("Received, thank you!" on a pricing + call offer).
  *
- * Policy matrix:
+ * Policy matrix (DECISION 2026-08-11):
  *   ARCHIVE          — promo / system / marketplace noise. No reply.
- *   SILENT           — already replied in-thread, noreply, active conversation.
- *                      Leave visible or mark read; no draft.
- *   DRAFT_ROUTINE    — PO ack / tracking / order confirm. Short professional draft.
- *                      Bill reviews before send. Leave in inbox.
+ *   SILENT           — routine PO/tracking/FYI, already-replied, noreply.
+ *                      Leave visible; no draft (Bill deletes boilerplate).
+ *   DRAFT_ROUTINE    — unused. Routine no longer drafts.
  *   DRAFT_OPPORTUNITY— Pricing, TDS, inquiry response, call offer. Business draft
  *                      + Needs Response + email_needs_response task.
  *   ESCALATE_HUMAN   — Questions / problems / conversation needing Bill.
- *                      Needs Response + task; optional cautious draft stub.
+ *                      Needs Response + task. NO draft stub.
  *   INVOICE          — Paid CC invoice → nightshift. No vendor reply.
  *
  * @author  Hermia
@@ -112,10 +111,10 @@ export function resolveEmailResponsePolicy(input: ResponsePolicyInput): Response
         return {
             action: "ESCALATE_HUMAN",
             allowAutoSend: false,
-            createDraft: true, // cautious stub only — Bill edits heavily
+            createDraft: false, // stub "I'll follow up shortly" is worse than nothing
             openResponseTask: true,
             leaveInInbox: true,
-            labels: ["Needs Response", "Draft Ready"],
+            labels: ["Needs Response"],
             reason: "human_review_required",
         };
     }
@@ -143,16 +142,16 @@ export function resolveEmailResponsePolicy(input: ResponsePolicyInput): Response
         };
     }
 
-    // PO / tracking / order confirm — short draft for Bill to approve, never auto-send.
-    // These often carry ETA / qty / freight nuance and need a read before send.
+    // PO / tracking / FYI — silent. Drafting "Thanks for the update" made more
+    // work (delete drafts) than Bill replying himself.
     return {
-        action: "DRAFT_ROUTINE",
+        action: "SILENT",
         allowAutoSend: false,
-        createDraft: true,
-        openResponseTask: false, // Gmail Drafts + inbox visibility is the surface
+        createDraft: false,
+        openResponseTask: false,
         leaveInInbox: true,
-        labels: ["Draft Ready"],
-        reason: input.isPurchaseThread ? "po_or_tracking_review" : "routine_review",
+        labels: [],
+        reason: input.isPurchaseThread ? "po_or_tracking_silent" : "routine_silent",
     };
 }
 
