@@ -447,6 +447,8 @@ async function enrichInvoiceForPoMatch(args: {
     pdfBuffer: Buffer;
     ocrHint?: string;
     vendorHint?: string;
+    /** Authoritative invoice number already known at forward time (AAA Cooper Pro#). */
+    invoiceNumberHint?: string;
 }): Promise<void> {
     const { extractPDF } = await import("@/lib/pdf/extractor");
     const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
@@ -485,6 +487,13 @@ async function enrichInvoiceForPoMatch(args: {
     }
 
     const norm = normalizeInvoiceForDb(parsed, rawText, { vendorHint });
+    // AAA Cooper: the real invoice # is the subject Pro#, never the scanned-body
+    // shipper/account number the OCR picks up. The forward already stamped and
+    // keyed Bill.com on the Pro# — persist that same value here so ap_local_forwards
+    // and vendor_invoices don't diverge from the bill Bill.com actually created.
+    if (args.invoiceNumberHint) {
+        norm.invoiceNumber = args.invoiceNumberHint;
+    }
     // Subject-line PO fallback
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
@@ -1568,6 +1577,7 @@ export async function runLocalApForward(): Promise<{
                                 vendorHint: /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
                                     ? "Down to Earth Worms"
                                     : undefined,
+                                invoiceNumberHint: aaaProNumber || undefined,
                             });
                         } catch (enrichErr: any) {
                             console.warn(
