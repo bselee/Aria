@@ -27,6 +27,19 @@ import { OpsManager } from "../../lib/intelligence/ops-manager";
 const ops = () => OpsManager.singleton;
 
 defineJob({
+    name: "ap-forward",
+    schedule: "*/15 * * * *",
+    onFail: "telegram-will",  // self-healing critical path — a dropped tick must surface
+    description:
+        "Self-healing Gmail→Bill.com forward (every 15 min). Decoupled from the Finale-heavy ap-polling so a blocked event loop can never strand invoices for 4+ hours. Idempotent via dedup; skips PO reconciliation (Finale matching stays on ap-polling 3×/day).",
+    handler: async () => {
+        const { runLocalApForward } = await import("@/lib/intelligence/workers/ap-local-forwarder");
+        await runLocalApForward({ skipReconciliation: true });
+    },
+    budget: { durationMs: 180_000 },
+});
+
+defineJob({
     name: "ap-polling",
     schedule: "0 8,12,17 * * *",
     onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
@@ -91,7 +104,7 @@ defineJob({
 
 defineJob({
     name: "jit-forward-projection",
-        schedule: "0 8 * * 1-5",
+        schedule: "5 8 * * 1-5",
         onFail: "telegram-will",  // Bill orders based on this data
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
@@ -289,7 +302,7 @@ defineJob({
 
 defineJob({
     name: "daily-summary",
-    schedule: "0 8 * * 1-5",
+    schedule: "15 8 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Daily PO/invoice/email summary (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.sendDailySummary(); },
@@ -907,7 +920,7 @@ defineJob({
 // vendor_profiles (human-vetted). Drafts only — never auto-sends.
 defineJob({
     name: "drafter-scan",
-    schedule: "0 8 * * 1-5", // KAIZEN #7: 7 AM → 8 AM (business hours start)
+    schedule: "10 8 * * 1-5", // KAIZEN #7: 7 AM → 8 AM (business hours start)
     onFail: "log",
     description: "Morning PO draft creation for vetted vendors. Runs once daily before arrival to present actionable drafts for review.",
     handler: async () => {
@@ -1018,7 +1031,7 @@ defineJob({
 // vendor escalations, consumption spikes). If nothing actionable, stays silent.
 defineJob({
     name: "proactive-brief",
-    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
+    schedule: "20 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
     handler: async () => {
@@ -1059,7 +1072,7 @@ defineJob({
 // and presents one-tap-send. Runs 3x/day during business hours.
 defineJob({
     name: "stockout-driver",
-    schedule: "0 8,11,15 * * 1-5",
+    schedule: "25 8,11,15 * * 1-5",
     onFail: "telegram-will",  // draft POs for at-risk SKUs — critical
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
@@ -1471,7 +1484,7 @@ defineJob({
 // draft-review window so yesterday's drafts have settled.
 defineJob({
     name: "gold-sample-collection",
-    schedule: "0 8 * * 1-5",
+    schedule: "30 8 * * 1-5",
     onFail: "log",
     description:
         "Daily: check threads Aria drafted into → find Bill's sent reply → log gold voice samples.",

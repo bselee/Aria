@@ -1221,7 +1221,10 @@ async function markEmailProcessed(gmail: any, messageId: string): Promise<void> 
  *
  * @returns Summary of actions taken this cycle
  */
-export async function runLocalApForward(): Promise<{
+export async function runLocalApForward(opts?: {
+    /** Skip the Finale PO reconciliation handoff (used by the frequent self-healing forward job). */
+    skipReconciliation?: boolean;
+}): Promise<{
     scanned: number;
     forwarded: number;
     skipped: number;
@@ -1616,7 +1619,13 @@ export async function runLocalApForward(): Promise<{
     // ── Reconciliation handoff: match forwarded invoices to Finale POs ──
     // Runs every cycle. Dropship invoices auto-complete.
     // Invoices with PO# in subject get matched to Finale POs.
-    await runReconciliationHandoff();
+    // Skipped by the frequent ap-forward job (skipReconciliation) so a blocked
+    // event loop can't strand invoices: the Gmail→Bill.com forward is the
+    // critical path and must be self-healing; Finale matching stays on the
+    // 3×/day ap-polling tick.
+    if (!opts?.skipReconciliation) {
+        await runReconciliationHandoff();
+    }
 
     return summary;
 }

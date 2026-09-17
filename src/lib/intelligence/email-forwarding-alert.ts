@@ -154,13 +154,14 @@ export async function runForwardingEscalation(): Promise<void> {
                 await sendTelegramNotify(formatted);
                 // Log each new alert for future dedup
                 for (const a of newAlerts) {
-                    await db.from("ap_activity_log").insert({
+                    const { error } = await db.from("ap_activity_log").insert({
                         email_from: a.from,
                         email_subject: a.messageId,
                         intent: "FORWARDING_ESCALATED",
                         action_taken: `Escalated: invoice stuck in ${a.status} for ${a.ageHours}h — ${a.from}`,
                         metadata: { message_id: a.messageId, status: a.status, age_hours: a.ageHours },
-                    }).catch(() => {});
+                    });
+                    if (error) console.warn(`[forwarding-alert] dedup log failed: ${error.message}`);
                 }
                 console.log(`[forwarding-alert] Alerted Bill: ${newAlerts.length} AP invoice(s) stuck in ERROR_FORWARDING/ERROR_PROCESSING.`);
                 return;
@@ -174,13 +175,14 @@ export async function runForwardingEscalation(): Promise<void> {
     // Log each alert for future dedup
     if (db) {
         for (const a of alerts) {
-            await db.from("ap_activity_log").insert({
+            const { error } = await db.from("ap_activity_log").insert({
                 email_from: a.from,
                 email_subject: a.messageId,
                 intent: "FORWARDING_ESCALATED",
                 action_taken: `Escalated: invoice stuck in ${a.status} for ${a.ageHours}h — ${a.from}`,
                 metadata: { message_id: a.messageId, status: a.status, age_hours: a.ageHours },
-            }).catch(() => {});
+            });
+            if (error) console.warn(`[forwarding-alert] dedup log failed: ${error.message}`);
         }
     }
 
