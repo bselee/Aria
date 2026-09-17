@@ -267,14 +267,31 @@ async function getReconciliationIssues(db: any): Promise<{ count: number; lines:
  *          Zeroed/empty result if the local ledger is unavailable.
  */
 export async function getLocalForwardStats24h(): Promise<{
+    /** False when the local ledger could not be read — callers MUST NOT render this as "clean". */
+    available: boolean;
     forwarded: number;
     nullInv: number;
+    /** Total non-pass gate flags in 24h (unaffected by the display LIMIT). */
+    gateFlagCount: number;
+    /** Total suspect-flagged forwards in 24h (unaffected by the display LIMIT). */
+    suspectCount: number;
     gateFlags: Array<{ email_subject: string; note: string }>;
     suspects: Array<{ email_subject: string; note: string }>;
 }> {
-    const empty = { forwarded: 0, nullInv: 0, gateFlags: [], suspects: [] } as {
+    const unavailable = {
+        available: false,
+        forwarded: 0,
+        nullInv: 0,
+        gateFlagCount: 0,
+        suspectCount: 0,
+        gateFlags: [],
+        suspects: [],
+    } as {
+        available: boolean;
         forwarded: number;
         nullInv: number;
+        gateFlagCount: number;
+        suspectCount: number;
         gateFlags: Array<{ email_subject: string; note: string }>;
         suspects: Array<{ email_subject: string; note: string }>;
     };
@@ -302,15 +319,31 @@ export async function getLocalForwardStats24h(): Promise<{
                AND forwarded_at >= datetime('now', '-1 day')
              ORDER BY id DESC LIMIT 5`,
         ).all() as Array<{ email_subject: string; note: string }>;
+        // True totals — the arrays above are a DISPLAY sample capped at 5, so
+        // reporting their length understated the real count (9 flags showed as 5).
+        const gateTotal = ldb.prepare(
+            `SELECT COUNT(*) AS n FROM ap_local_forwards
+             WHERE reconciliation_notes LIKE '%ocr-gate:%'
+               AND reconciliation_notes NOT LIKE '%ocr-gate:pass%'
+               AND forwarded_at >= datetime('now', '-1 day')`,
+        ).get() as { n: number } | undefined;
+        const suspectTotal = ldb.prepare(
+            `SELECT COUNT(*) AS n FROM ap_local_forwards
+             WHERE reconciliation_notes LIKE '%suspect:%'
+               AND forwarded_at >= datetime('now', '-1 day')`,
+        ).get() as { n: number } | undefined;
 
         return {
+            available: true,
             forwarded: Number(fw?.forwarded ?? 0),
             nullInv: Number(fw?.nullInv ?? 0),
+            gateFlagCount: Number(gateTotal?.n ?? gateFlags?.length ?? 0),
+            suspectCount: Number(suspectTotal?.n ?? suspects?.length ?? 0),
             gateFlags: gateFlags ?? [],
             suspects: suspects ?? [],
         };
     } catch {
-        return empty;
+        return unavailable;
     }
 }
 
@@ -429,32 +462,40 @@ export async function generateAPHealthReport(): Promise<string> {
     // Reads the LOCAL SQLite ap_local_forwards: what actually forwarded, gate
     // verdicts that were not clean, suspect subjects, and missing invoice#s.
     try {
-        const { forwarded, nullInv, gateFlags, suspects } = await getLocalForwardStats24h();
+        const { available, forwarded, nullInv, gateFlagCount, suspectCount, gateFlags, suspects } =
+            await getLocalForwardStats24h();
 
         lines.push(`\n*📤 Forwarded to Bill.com (24h)*`);
-        lines.push(`Total: **${forwarded}**`);
-        if (forwarded === 0) {
-            lines.push("_No forwards in the last 24 hours._");
-        }
-        if ((nullInv || 0) > 0) {
-            lines.push(`🔢 Missing invoice# in ledger: **${nullInv}**`);
+        // A read failure is NOT a clean bill of health — say so explicitly.
+        if (!available) {
+            lines.push("_⚠️ Local ledger unavailable — forwarded count is UNKNOWN, not zero._");
             needsAttention = true;
-        }
-        if (gateFlags.length > 0) {
-            lines.push(`🚧 OCR-gate flags: **${gateFlags.length}**`);
-            for (const g of gateFlags) lines.push(`   ${g.email_subject.slice(0, 55)} — ${g.note}`);
-            needsAttention = true;
-        }
-        if (suspects.length > 0) {
-            lines.push(`🚩 Suspect subjects (forwarded+flagged): **${suspects.length}**`);
-            for (const s of suspects) lines.push(`   ${s.email_subject.slice(0, 55)} — ${s.note}`);
-            actionRequired = true;
-        }
-        if (forwarded === 0 && gateFlags.length === 0 && suspects.length === 0 && (nullInv || 0) === 0) {
-            lines.push("✅ Clean.");
+        } else {
+            lines.push(`Total: **${forwarded}**`);
+            if (forwarded === 0) {
+                lines.push("_No forwards in the last 24 hours._");
+            }
+            if ((nullInv || 0) > 0) {
+                lines.push(`🔢 Missing invoice# in ledger: **${nullInv}**`);
+                needsAttention = true;
+            }
+            if (gateFlagCount > 0) {
+                lines.push(`🚧 OCR-gate flags: **${gateFlagCount}**${gateFlags.length < gateFlagCount ? ` (showing ${gateFlags.length})` : ""}`);
+                for (const g of gateFlags) lines.push(`   ${g.email_subject.slice(0, 55)} — ${g.note}`);
+                needsAttention = true;
+            }
+            if (suspectCount > 0) {
+                lines.push(`🚩 Suspect subjects (forwarded+flagged): **${suspectCount}**${suspects.length < suspectCount ? ` (showing ${suspects.length})` : ""}`);
+                for (const s of suspects) lines.push(`   ${s.email_subject.slice(0, 55)} — ${s.note}`);
+                actionRequired = true;
+            }
+            if (forwarded === 0 && gateFlagCount === 0 && suspectCount === 0 && (nullInv || 0) === 0) {
+                lines.push("✅ Clean.");
+            }
         }
     } catch {
-        lines.push(`\n*📤 Forwarded to Bill.com (24h)*\n_local ledger unavailable._`);
+        lines.push(`\n*📤 Forwarded to Bill.com (24h)*\n_⚠️ Local ledger unavailable._`);
+        needsAttention = true;
     }
 
     // ── 6. Overall Status ───────────────────────────────────────────────

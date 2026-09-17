@@ -50,7 +50,11 @@ beforeEach(() => {
 describe("getLocalForwardStats24h", () => {
     it("returns zeroes when nothing forwarded in 24h", async () => {
         const stats = await getLocalForwardStats24h();
-        expect(stats).toEqual({ forwarded: 0, nullInv: 0, gateFlags: [], suspects: [] });
+        expect(stats.available).toBe(true);
+        expect(stats.forwarded).toBe(0);
+        expect(stats.nullInv).toBe(0);
+        expect(stats.gateFlags).toEqual([]);
+        expect(stats.suspects).toEqual([]);
     });
 
     it("returns forwarded count and missing-invoice count", async () => {
@@ -69,7 +73,7 @@ describe("getLocalForwardStats24h", () => {
 
     it("scopes every query to the last 24h", async () => {
         await getLocalForwardStats24h();
-        expect(localDbState.lastSql).toHaveLength(3);
+        expect(localDbState.lastSql).toHaveLength(5);
         for (const sql of localDbState.lastSql) {
             expect(sql).toContain("datetime('now', '-1 day')");
             expect(sql).toContain("ap_local_forwards");
@@ -97,9 +101,25 @@ describe("getLocalForwardStats24h", () => {
         expect(stats.suspects[0].note).toContain("dispute-letter");
     });
 
-    it("degrades to zeros if the local ledger is unavailable (never throws)", async () => {
+    it("reports totals, not the display sample length", async () => {
+        // Regression: the arrays are LIMIT 5, so reporting their length showed
+        // 5 flags when the real 24h count was 9.
+        localDbState.counts = { forwarded: 12, nullInv: 1, n: 9 } as Record<string, number>;
+        localDbState.gateFlags = [{ email_subject: "one", note: "ocr-gate:no_invoice_number" }];
+        const stats = await getLocalForwardStats24h();
+        expect(stats.gateFlags).toHaveLength(1);      // sample
+        expect(stats.gateFlagCount).toBe(9);          // true total
+        expect(stats.suspectCount).toBe(9);
+    });
+
+    it("marks the result unavailable if the local ledger is unavailable (never throws)", async () => {
         localDbState.throws = true;
         const stats = await getLocalForwardStats24h();
-        expect(stats).toEqual({ forwarded: 0, nullInv: 0, gateFlags: [], suspects: [] });
+        // A read failure must be DISTINCT from a genuinely empty ledger, or the
+        // morning report renders "Clean" on an unknown state.
+        expect(stats.available).toBe(false);
+        expect(stats.forwarded).toBe(0);
+        expect(stats.gateFlags).toEqual([]);
+        expect(stats.suspects).toEqual([]);
     });
 });

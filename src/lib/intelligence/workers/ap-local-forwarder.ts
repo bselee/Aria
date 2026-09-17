@@ -473,6 +473,15 @@ async function enrichInvoiceForPoMatch(args: {
     vendorHint?: string;
     /** Authoritative invoice number already known at forward time (AAA Cooper Pro#). */
     invoiceNumberHint?: string;
+    /**
+     * Row id of the exact ap_local_forwards claim for THIS attachment.
+     * Authoritative key — gmail_message_id alone is NOT unique when one email
+     * carries several PDFs, and keying on it made every sibling attachment
+     * overwrite the others' OCR fields (Century Equipment quote packet:
+     * 8 PDFs, 8 hashes, all collapsed onto one number/total). Pass the claim
+     * id from forwardInvoiceOnce; falls back to the message id if absent.
+     */
+    rowId?: number;
 }): Promise<void> {
     const { extractPDF } = await import("@/lib/pdf/extractor");
     const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
@@ -563,7 +572,7 @@ async function enrichInvoiceForPoMatch(args: {
                    ELSE reconciliation_status
                  END,
                  reconciliation_notes = COALESCE(reconciliation_notes, ?)
-             WHERE gmail_message_id = ?`,
+             WHERE ${args.rowId ? "id = ?" : "gmail_message_id = ?"}`,
         ).run(
             rawText || null,
             norm.vendorName,
@@ -577,7 +586,7 @@ async function enrichInvoiceForPoMatch(args: {
             norm.poNumber
                 ? `OCR logged; PO candidate ${norm.poNumber}`
                 : "OCR logged; no PO# found — needs match",
-            args.gmailMessageId,
+            args.rowId ?? args.gmailMessageId,
         );
     } catch (e: any) {
         console.warn(`   [AP-Local] SQLite OCR field update failed: ${e?.message || e}`);
@@ -1545,23 +1554,31 @@ export async function runLocalApForward(opts?: {
                     // WITH an attachment) are flagged, never blocked.
                     try {
                         const fills: string[] = [];
+                        // Key on the CLAIM ID returned by the gate, not the raw
+                        // filename: the row stores the sanitized/stamped name, so a
+                        // filename-keyed UPDATE silently matched 0 rows whenever the
+                        // original contained '#', '&' or exceeded 180 chars.
+                        const rowId = once.claimId;
                         const subjInv = deriveInvoiceNumberFromSubject(subject, pdfFilename);
-                        if (subjInv) {
-                            getLocalDb().prepare(
+                        if (subjInv && rowId) {
+                            const res = getLocalDb().prepare(
                                 `UPDATE ap_local_forwards
                                  SET ocr_invoice_number = ?
-                                 WHERE gmail_message_id = ? AND pdf_filename = ?
+                                 WHERE id = ?
                                    AND (ocr_invoice_number IS NULL OR ocr_invoice_number = '')`,
-                            ).run(subjInv, gmailMessageId, pdfFilename);
+                            ).run(subjInv, rowId);
+                            if (res.changes === 0) {
+                                console.warn(`   [AP-Local] ledger fill matched 0 rows for id=${rowId} — check key/filename`);
+                            }
                             fills.push(`inv#${subjInv}`);
                         }
                         const suspect = suspectSubjectReason(subject);
-                        if (suspect) {
+                        if (suspect && rowId) {
                             getLocalDb().prepare(
                                 `UPDATE ap_local_forwards
                                  SET reconciliation_notes = COALESCE(reconciliation_notes || ' | ', '') || ?
-                                 WHERE gmail_message_id = ? AND pdf_filename = ?`,
-                            ).run(`suspect:${suspect}`, gmailMessageId, pdfFilename);
+                                 WHERE id = ?`,
+                            ).run(`suspect:${suspect}`, rowId);
                             console.warn(`   [AP-Local] 🚩 Suspect subject forwarded+flagged (${suspect}): ${subject.slice(0, 70)}`);
                             fills.push(`suspect:${suspect}`);
                         }
@@ -1587,6 +1604,9 @@ export async function runLocalApForward(opts?: {
                                     ? "Down to Earth Worms"
                                     : undefined,
                                 invoiceNumberHint: aaaProNumber || undefined,
+                                // Authoritative row key — never gmail_message_id
+                                // alone (multi-attachment emails overwrite each other).
+                                rowId: once.claimId,
                             });
                         } catch (enrichErr: any) {
                             console.warn(

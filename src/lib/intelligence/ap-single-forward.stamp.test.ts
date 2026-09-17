@@ -1,6 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import Database from "better-sqlite3";
 
+// These tests run the REAL stamp path, which OCR-locates the customer-number
+// boxes via tesseract (~3s alone, longer under parallel suite load). The default
+// 5s timeout made them flake under load — raise it explicitly rather than
+// skip/weaken the assertions.
+vi.setConfig({ testTimeout: 30_000 });
+
 const mem = new Database(":memory:");
 mem.exec(`
   CREATE TABLE ap_local_forwards (
