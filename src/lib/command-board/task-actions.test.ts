@@ -236,23 +236,18 @@ describe('Telegram bridge', () => {
         expect((globalThis as any).fetch).not.toHaveBeenCalled();
     });
 
-    it('calls telegram once on will-dashboard actor (generic approve)', async () => {
+    it('makes NO outbound send on will-dashboard actor (Telegram removed)', async () => {
+        // 2026-09-17: the dashboard-actor notice used to POST to
+        // api.telegram.org. Telegram is gone, so approving must send nothing.
         vi.mocked(agentTask.getById).mockResolvedValue({
             id: 't1', source_table: null, source_id: null,
         } as any);
         vi.mocked(agentTask.decideApproval).mockResolvedValue(undefined);
         await approveTask('t1', 'will-dashboard');
-        expect((globalThis as any).fetch).toHaveBeenCalledTimes(1);
-        const [url, init] = (globalThis as any).fetch.mock.calls[0];
-        expect(url).toBe('https://api.telegram.org/bottest-token/sendMessage');
-        const body = JSON.parse(init.body);
-        expect(body.chat_id).toBe('12345');
-        expect(body.text).toContain('Approved via dashboard');
-        expect(body.text).toContain('✅ Approved.');
+        expect((globalThis as any).fetch).not.toHaveBeenCalled();
     });
 
-    it('does NOT call telegram when token is missing', async () => {
-        delete process.env.TELEGRAM_BOT_TOKEN;
+    it('does NOT send anything when dismissing (Telegram removed)', async () => {
         vi.mocked(agentTask.complete).mockResolvedValue(undefined);
         await dismissTask('t9', 'will-dashboard');
         expect((globalThis as any).fetch).not.toHaveBeenCalled();

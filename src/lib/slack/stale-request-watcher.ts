@@ -14,7 +14,7 @@
  */
 
 import { createClient } from "../db";
-import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { notify } from "../intelligence/notify";
 import { isBusinessHours } from "../intelligence/alert-gate";
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ export async function runStaleRequestWatcher(): Promise<void> {
 
     // Actually notify Bill — not just log to console
     if (formatted) {
-        await sendTelegramNotify(formatted).catch(() => {});
+        await notify(formatted).catch(() => {});
     }
 
     console.log(`[stale-request-watcher] Nudged Bill about ${stale.length} stale Slack request(s).`);

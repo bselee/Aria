@@ -262,17 +262,6 @@ async function routeFailure(jobName: string, mode: string, result: RunResult): P
         }
         return;
     }
-    if (mode === "telegram-will") {
-        try {
-            const { sendTelegramNotify } = await import("../lib/intelligence/telegram-notify");
-            await sendTelegramNotify(
-                `⚠️ Cron *${jobName}* failed: ${result.failureReason}\n${result.failureMessage}`,
-            );
-        } catch (err: any) {
-            console.warn(`[cron:${jobName}] telegram-will failed: ${err.message}`);
-        }
-        return;
-    }
 }
 
 let _started = false;

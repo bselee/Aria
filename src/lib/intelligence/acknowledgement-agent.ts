@@ -914,7 +914,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                 const isBusinessHours = hour >= 6 && hour <= 22; // 6am - 10pm MT
 
                 try {
-                    const { sendTelegramNotify } = await import('./telegram-notify');
+                    const { notify } = await import('./notify');
                     const lines: string[] = [];
 
                     if (requiresHumanBatch.length === 1) {
@@ -942,7 +942,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                         lines.push(`\n🌙 _Off-hours: holding notification for morning digest._`);
                         // Queue for morning digest instead of sending now
                         try {
-                            const { sendTelegramNotify: sendNow } = await import("@/lib/intelligence/telegram-notify");
+                            const { notify: sendNow } = await import("@/lib/intelligence/notify");
                             if (db) {
                                 // Write to agent_task for morning pickup
                                 const { upsertTask } = await import("@/lib/command-board/task-actions");
@@ -960,7 +960,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                         } catch { /* fall through to immediate notify */ }
                     }
 
-                    await sendTelegramNotify(lines.join("\n"));
+                    await notify(lines.join("\n"));
                     console.log(`📨 [Acknowledgement-Agent] Notified Bill: ${requiresHumanBatch.length} email(s) need response.`);
                 } catch (notifyErr: any) {
                     console.warn(`⚠️ [Acknowledgement-Agent] Failed to send REQUIRES_HUMAN batch notification: ${notifyErr.message}`);

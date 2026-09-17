@@ -1,5 +1,5 @@
 // carrier-poll → carrierPoll (alias)
-import { sendTelegramNotify } from "../lib/intelligence/telegram-notify";
+import { notify } from "../lib/intelligence/notify";
 import carrierPoller from "../lib/tracking/carrier-poller";
 import { classifyShipmentEvidence } from "../lib/tracking/shipment-intelligence";
 
@@ -9,7 +9,7 @@ async function runCarrierPoll() {
     console.log("poll executed");
   } catch (error) {
     console.warn(`[carrier-poll] ${error.message}`);
-    await sendTelegramNotify(`⚠️ Error in carrier poll: ${error.message}`);
+    await notify(`⚠️ Error in carrier poll: ${error.message}`);
   }
 }
 

@@ -76,8 +76,8 @@ vi.mock("@/lib/storage/local-db", () => ({
     }),
 }));
 
-vi.mock("./telegram-notify", () => ({
-    sendTelegramNotify: sendTelegramNotifyMock,
+vi.mock("./notify", () => ({
+    notify: sendTelegramNotifyMock,
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -33,7 +33,7 @@ import {
 import * as shipmentIntelligence from '@/lib/tracking/shipment-intelligence';
 import { extractBolText } from "./bol-ocr";
 import { createClient } from "@/lib/db";
-import { sendTelegramNotify } from "@/lib/intelligence/telegram-notify";
+import { notify } from "@/lib/intelligence/notify";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -800,5 +800,5 @@ async function sendTgSummary(results: IngestResult[]): Promise<void> {
         lines.push(`… +${upsertedItems.length - 8} more`);
     }
 
-    await sendTelegramNotify(lines.join("\n"));
+    await notify(lines.join("\n"));
 }

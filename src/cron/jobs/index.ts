@@ -29,7 +29,7 @@ const ops = () => OpsManager.singleton;
 defineJob({
     name: "ap-forward",
     schedule: "*/15 * * * *",
-    onFail: "telegram-will",  // self-healing critical path — a dropped tick must surface
+    onFail: "log",  // self-healing critical path — a dropped tick must surface
     description:
         "Self-healing Gmail→Bill.com forward (every 15 min). Decoupled from the Finale-heavy ap-polling so a blocked event loop can never strand invoices for 4+ hours. Idempotent via dedup; skips PO reconciliation (Finale matching stays on ap-polling 3×/day).",
     handler: async () => {
@@ -42,7 +42,7 @@ defineJob({
 defineJob({
     name: "ap-polling",
     schedule: "0 8,12,17 * * *",
-    onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
+    onFail: "log",  // core pipeline — if this fails, no invoices processed
     description:
         "Poll bill.selee@ + ap@ : ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
     handler: async () => {
@@ -97,7 +97,7 @@ defineJob({
 defineJob({
     name: "build-risk",
     schedule: "0 8 * * 1-5",
-    onFail: "telegram-will",  // Bill orders based on this data
+    onFail: "log",  // Bill orders based on this data
     description: "Daily build risk analysis (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.runDailyBuildRisk(); },
 });
@@ -105,7 +105,7 @@ defineJob({
 defineJob({
     name: "jit-forward-projection",
         schedule: "5 8 * * 1-5",
-        onFail: "telegram-will",  // Bill orders based on this data
+        onFail: "log",  // Bill orders based on this data
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
@@ -509,7 +509,7 @@ defineJob({
 defineJob({
     name: "vendor-escalation",
         schedule: "40 8 * * 1-5",
-        onFail: "telegram-will",  // unresponsive vendors → late orders
+        onFail: "log",  // unresponsive vendors → late orders
     description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
     handler: async () => {
         const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
@@ -1057,15 +1057,12 @@ defineJob({
     onFail: "log",
     description: "7:30 AM Mon-Fri: daily Slack review of addressed messages (DM/@Bill) — unresponded count + SKUs.",
     handler: async () => {
-        const { getAddressedRequests, formatAddressedReview } =
-            await import("@/lib/slack/addressed-message-watcher");
-        const { sendTelegramNotify } = await import(
-            "@/lib/intelligence/telegram-notify"
-        );
+        const { getAddressedRequests, formatAddressedReview } = await import("@/lib/slack/addressed-message-watcher");
+        const { notify } = await import("@/lib/intelligence/notify");
         const report = await getAddressedRequests(24);
         const msg = formatAddressedReview(report);
         if (msg) {
-            await sendTelegramNotify(msg);
+            await notify(msg);
         } else {
             console.log(
                 "[daily-slack-review] No addressed messages in last 24h — silent.",
@@ -1080,7 +1077,7 @@ defineJob({
 defineJob({
     name: "stockout-driver",
     schedule: "25 8,11,15 * * 1-5",
-    onFail: "telegram-will",  // draft POs for at-risk SKUs — critical
+    onFail: "log",  // draft POs for at-risk SKUs — critical
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
         const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
@@ -1129,7 +1126,7 @@ defineJob({
 defineJob({
     name: "monday-briefing",
     schedule: "0 8 * * 1",
-    onFail: "telegram-will",  // weekly overview — Bill reads these
+    onFail: "log",  // weekly overview — Bill reads these
     description: "DISABLED 2026-07-27 (Kaizen): killed per Bill — output was unusable (Unknown Vendor across the board, receivings/matches sections empty, underlying data model didn't hold up). Was also the source of an 11x duplicate-send incident caused by an unrelated PM2 zombie-process bug (fixed separately in shutdown-guard.ts + pid-guard.ts). Re-enable only after the data gaps in build_risk_snapshots (vendor field) and ap_activity_log (PO_RECEIVED / RECONCILIATION_AUTO_APPLIED coverage) are confirmed fixed with real verified numbers.",
     enabled: false,
     handler: async () => {
@@ -1445,7 +1442,7 @@ defineJob({
 defineJob({
     name: "ltlselect-freight-reconcile",
     schedule: "0 9 * * 1",
-    onFail: "telegram-will",
+    onFail: "log",
     description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
@@ -1473,8 +1470,8 @@ defineJob({
                 (totalMatch ? ` | $${totalMatch[2]}` : "") +
                 ` | held: ${held} | unmatched: ${unmatched}`;
 
-            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-            await sendTelegramNotify(message).catch(() => {});
+            const { notify } = await import("@/lib/intelligence/notify");
+            await notify(message).catch(() => {});
         } catch (err: any) {
             console.error(`[ltlselect-freight] Failed: ${err?.message ?? err}`);
             if (err?.stdout) console.error(err.stdout);

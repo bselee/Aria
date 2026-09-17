@@ -30,7 +30,7 @@
  */
 
 import { createClient } from "../db";
-import { sendTelegramNotify } from "./telegram-notify";
+import { notify } from "./notify";
 
 export interface StuckForwardAlert {
     messageId: string;
@@ -155,7 +155,7 @@ export async function runForwardingEscalation(): Promise<void> {
                 console.log(`[forwarding-alert] ${newAlerts.length} new stuck invoice(s), ${alerts.length - newAlerts.length} already alerted — sending for new only.`);
                 // Send only for the new ones
                 const formatted = formatForwardingAlerts(newAlerts);
-                await sendTelegramNotify(formatted);
+                await notify(formatted);
                 // Log each new alert for future dedup
                 for (const a of newAlerts) {
                     const { error } = await db.from("ap_activity_log").insert({
@@ -174,7 +174,7 @@ export async function runForwardingEscalation(): Promise<void> {
     }
 
     const formatted = formatForwardingAlerts(alerts);
-    await sendTelegramNotify(formatted);
+    await notify(formatted);
 
     // Log each alert for future dedup
     if (db) {

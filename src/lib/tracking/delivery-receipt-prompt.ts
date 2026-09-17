@@ -17,7 +17,7 @@
  */
 
 import { createClient } from "@/lib/db";
-import { sendTelegramNotify } from "@/lib/intelligence/telegram-notify";
+import { notify } from "@/lib/intelligence/notify";
 import {
     DELIVERED_ESCALATE_HOURS,
     DELIVERED_FLAG_HOURS,
@@ -188,7 +188,7 @@ export async function promptDeliveredReceipts(): Promise<ReceiptPromptResult> {
         lines.push(`—`);
         lines.push(`Aria does not receive in Finale — flag for receiving team.`);
 
-        await sendTelegramNotify(lines.join("\n"));
+        await notify(lines.join("\n"));
 
         for (const c of toPrompt) {
             promptedThisSession.add(c.poNumber);

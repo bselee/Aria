@@ -1,7 +1,5 @@
 import { ReconciliationRun } from './run-tracker';
 
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID ?? '';
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 
 function formatCents(cents: number): string {
     return `$${(cents / 100).toFixed(2)}`;
@@ -17,14 +15,7 @@ function duration(startedAt: Date, endedAt: Date): string {
 
 export async function sendReconciliationSummary(run: ReconciliationRun): Promise<void> {
     const r = run.getRecord();
-    const token = TELEGRAM_BOT_TOKEN;
-    const chatId = TELEGRAM_CHAT_ID;
-
-    if (!token || !chatId) {
-        console.warn('[ReconciliationNotifier] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
-        return;
-    }
-
+    // 2026-09-17: no transport credential needed — notifications go to the task hub.
     let message: string;
 
     if (r.status === 'failed') {
@@ -50,13 +41,12 @@ export async function sendReconciliationSummary(run: ReconciliationRun): Promise
         ].filter(Boolean).join('\n');
     }
 
+    // 2026-09-17: was a direct api.telegram.org send. Telegram removed — the
+    // summary now goes to the agent_task hub (dashboard /dashboard/tasks).
     try {
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'Markdown' }),
-        });
+        const { notify } = await import("@/lib/intelligence/notify");
+        await notify(message, undefined, { title: "Reconciliation run" });
     } catch (err) {
-        console.error('[ReconciliationNotifier] Failed to send Telegram message:', err);
+        console.error('[ReconciliationNotifier] Failed to record notification:', err);
     }
 }
