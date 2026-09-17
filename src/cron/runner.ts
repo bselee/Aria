@@ -18,6 +18,9 @@
 import cron from "node-cron";
 import Bottleneck from "bottleneck";
 
+/** Jobs currently executing — lets the drift monitor name the blocker. */
+const _inFlight = new Set<string>();
+
 import { getJob, listJobs } from "./registry";
 import { recordStart, recordEnd, lastRun, isSuccessStatus, type CronRunStatus } from "./history";
 
@@ -107,13 +110,20 @@ export async function runJobOnce(
                 job.budget.durationMs,
             );
         }
+        _inFlight.add(jobName);
         await limiter.schedule(() => job.handler({
             invokedBy,
             correlationId,
             log: (msg) => console.log(`[cron:${jobName}] ${msg}`),
             signal: ac.signal,
         }));
+        _inFlight.delete(jobName);
         result = { status: "succeeded", durationMs: Date.now() - startMs };
+        // Slow-handler instrumentation (2026-09-17 plan 3.1): name any handler
+        // that runs >30s so the overnight/8am event-loop blockage has a face.
+        if (result.durationMs > 30_000) {
+            console.warn(`[cron-slow] ${jobName} ran ${Math.round(result.durationMs / 1000)}s — candidate event-loop blocker`);
+        }
             // Reset consecutive failure counter on success
             try {
                 const { recordCronSuccess } = await import("../lib/ops/module-health-check");
@@ -130,6 +140,10 @@ export async function runJobOnce(
             failureReason: aborted ? "duration-exceeded" : "handler-threw",
             failureMessage: err?.message ?? String(err),
         };
+        _inFlight.delete(jobName);
+        if (result.durationMs > 30_000) {
+            console.warn(`[cron-slow] ${jobName} FAILED after ${Math.round(result.durationMs / 1000)}s — ${result.failureReason}`);
+        }
         await runObservabilityHooks(jobName, "failure", result, startedAtIso, err);
         await routeFailure(jobName, job.onFail ?? "log", result);
     } finally {
@@ -248,20 +262,37 @@ async function routeFailure(jobName: string, mode: string, result: RunResult): P
         }
         return;
     }
-    if (mode === "telegram-will") {
-        try {
-            const { sendTelegramNotify } = await import("../lib/intelligence/telegram-notify");
-            await sendTelegramNotify(
-                `⚠️ Cron *${jobName}* failed: ${result.failureReason}\n${result.failureMessage}`,
-            );
-        } catch (err: any) {
-            console.warn(`[cron:${jobName}] telegram-will failed: ${err.message}`);
-        }
-        return;
-    }
 }
 
 let _started = false;
+
+/**
+ * Event-loop drift monitor (2026-09-17 plan 3.1). node-cron silently DROPS a
+ * tick when the loop is blocked at the scheduled instant (207 "missed
+ * execution" warnings on 2026-09-17, concentrated 02:00-04:15 and 08:00).
+ * A 5s interval that measures its own scheduling drift names the blockage in
+ * the log the moment it happens — the data needed to move the heavy work off
+ * the bot process (plan 3.3) instead of guessing.
+ */
+function startEventLoopDriftMonitor(): void {
+    const INTERVAL_MS = 5000;
+    const ALERT_MS = 10_000; // >2 missed intervals
+    let last = Date.now();
+    const timer = setInterval(() => {
+        const now = Date.now();
+        const drift = now - last - INTERVAL_MS;
+        last = now;
+        if (drift > ALERT_MS) {
+            // Name the jobs that were in flight when the loop stalled — an
+            // overnight blockage is only fixable if we know what was running.
+            const inFlight = [..._inFlight].join(", ") || "none in flight (external: OS/AV/backup)";
+            console.warn(
+                `[event-loop] blocked ~${(drift / 1000).toFixed(1)}s — async work starved node-cron (dropped-tick risk). in-flight: ${inFlight}`,
+            );
+        }
+    }, INTERVAL_MS);
+    timer.unref?.();
+}
 
 /** Schedule every enabled registered job via node-cron. Idempotent. */
 export function startCronRunner(): void {
@@ -270,6 +301,7 @@ export function startCronRunner(): void {
         return;
     }
     _started = true;
+    startEventLoopDriftMonitor();
     for (const job of listJobs()) {
         if (!job.enabled) {
             console.log(`[cron-runner] ${job.name}: disabled, skipping schedule`);

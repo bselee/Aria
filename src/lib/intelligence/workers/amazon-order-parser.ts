@@ -342,13 +342,13 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
             message += `\nTracking: ${order.trackingNumber} (${order.carrier || 'Unknown'})`;
         }
 
+        // 2026-09-17: was a direct api.telegram.org send. Telegram removed —
+        // routed to the agent_task hub instead.
         try {
-            await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-                chat_id: chatId,
-                text: message,
-            });
+            const { notify } = await import("@/lib/intelligence/notify");
+            await notify(message, undefined, { title: "Amazon order parsed" });
         } catch (err: any) {
-            console.error(`[AmazonOrderParser] Telegram notification failed:`, err.message);
+            console.error(`[AmazonOrderParser] notification failed:`, err.message);
         }
     }
 
@@ -376,12 +376,10 @@ For estimated delivery, return the date as written (e.g., "Thursday, March 27").
         }
 
         try {
-            await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-                chat_id: chatId,
-                text: message,
-            });
+            const { notify } = await import("@/lib/intelligence/notify");
+            await notify(message, undefined, { title: "Amazon order shipped" });
         } catch (err: any) {
-            console.error(`[AmazonOrderParser] Telegram shipping notification failed:`, err.message);
+            console.error(`[AmazonOrderParser] shipping notification failed:`, err.message);
         }
     }
 

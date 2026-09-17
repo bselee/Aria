@@ -17,7 +17,9 @@ import {
     isFedExCarrierBillExtractedJson,
     extractFedExInvoiceNumberFromText,
     detectFedExBillingServiceHint,
+    trimToFirstPage,
 } from "./fedex-billing-packet";
+import { PDFDocument } from "pdf-lib";
 
 const EXPRESS_NAME = "12.99999.10033.939879901.XXXXX5250.000030.pdf";
 const GROUND_NAME = "12.99999.10033.939879902.XXXXX5250.000002.pdf";
@@ -78,7 +80,7 @@ describe("isFedExBillingOnlineEmail", () => {
 });
 
 describe("classifyFedExBillingAttachment", () => {
-    it("marks packet, forbids trim, skips product PO match", () => {
+    it("marks packet, trims to first page, skips product PO match", () => {
         const meta = classifyFedExBillingAttachment({
             from: "noreply@fedex.com",
             subject: "Your New FedEx Billing Online invoice is attached",
@@ -86,7 +88,7 @@ describe("classifyFedExBillingAttachment", () => {
             pdfTextPreview: "FedEx Ground Services\nTOTAL THIS INVOICE\nUSD\n$13,499.43",
         });
         expect(meta.isPacket).toBe(true);
-        expect(meta.mayTrimPages).toBe(false);
+        expect(meta.mayTrimPages).toBe(true);
         expect(meta.skipProductPoMatch).toBe(true);
         expect(meta.invoiceNumberDisplay).toBe("9-398-79902");
         expect(meta.serviceHint).toBe("Ground");
@@ -100,7 +102,7 @@ describe("classifyFedExBillingAttachment", () => {
             pdfTextPreview: "FedEx Express Services\nFedEx 2Day",
         });
         expect(meta.serviceHint).toBe("Express");
-        expect(meta.mayTrimPages).toBe(false);
+        expect(meta.mayTrimPages).toBe(true);
     });
 });
 
@@ -113,7 +115,7 @@ describe("Bill.com filename + queue fields", () => {
         expect(name).toBe("FedEx_Ground_9-398-79902.pdf");
     });
 
-    it("queue fields force carrier_bill + no trim", () => {
+    it("queue fields force carrier_bill + first-page trim", () => {
         const meta = classifyFedExBillingAttachment({
             filename: EXPRESS_NAME,
             from: "noreply@fedex.com",
@@ -121,10 +123,30 @@ describe("Bill.com filename + queue fields", () => {
         });
         const fields = buildFedExCarrierBillQueueFields(meta);
         expect(fields.vendor_routing_action).toBe(FEDEX_CARRIER_BILL_ACTION);
-        expect(fields.fedex_may_trim_pages).toBe(false);
+        expect(fields.fedex_may_trim_pages).toBe(true);
         expect(fields.skip_product_po_match).toBe(true);
         expect(fields.skip_uline_bas_freight).toBe(true);
         expect(isFedExCarrierBillExtractedJson(fields)).toBe(true);
+    });
+
+    it("trims a multi-page PDF to page 1", async () => {
+        const src = await PDFDocument.create();
+        src.addPage([612, 792]);
+        src.addPage([612, 792]);
+        src.addPage([612, 792]);
+        const full = Buffer.from(await src.save());
+
+        const trimmed = await trimToFirstPage(full);
+        const reloaded = await PDFDocument.load(trimmed);
+        expect(reloaded.getPageCount()).toBe(1);
+    });
+
+    it("returns the original buffer when already single-page", async () => {
+        const src = await PDFDocument.create();
+        src.addPage([612, 792]);
+        const one = Buffer.from(await src.save());
+        const out = await trimToFirstPage(one);
+        expect(out).toBe(one);
     });
 });
 

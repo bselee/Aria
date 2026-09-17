@@ -43,7 +43,7 @@ import { sendReconciliationSummary } from '../lib/reconciliation/notifier';
 import { assertPriceReasonable, assertSubtotalMatch, InvariantViolationError } from '@/lib/reconciliation/invariants';
 import {
     FINALE_FREIGHT_PROMO_URL,
-    buildFinaleFreightAdjustment,
+    freightAdjustmentForPo,
     mergeInvoiceCorrelationNote,
 } from '../lib/finale/freight-adjustment';
 import * as fs from 'fs';
@@ -1405,7 +1405,13 @@ async function main() {
                         const existingAdj = unlocked.orderAdjustmentList || [];
                         unlocked.orderAdjustmentList = [
                             ...existingAdj.filter((adj: any) => adj.productPromoUrl !== FREIGHT_PROMO),
-                            buildFinaleFreightAdjustment(freightInfo.totalFreight),
+                            freightAdjustmentForPo(
+                                freightInfo.totalFreight,
+                                (unlocked.orderItemList || []).map((item: { quantity?: number; weight?: number }) => ({
+                                    quantity: Number(item.quantity) || 0,
+                                    weight: Number(item.weight) || undefined,
+                                })),
+                            ),
                         ];
                         run.recordFreight(Math.round(freightInfo.totalFreight * 100));
                     }
@@ -1532,7 +1538,14 @@ async function main() {
                                 const adjs = (poDetail.orderAdjustmentList || []).filter(
                                     (adj: any) => adj.productPromoUrl !== FREIGHT_PROMO
                                 );
-                                adjs.push(buildFinaleFreightAdjustment(inv.shipping));
+                                adjs.push(freightAdjustmentForPo(
+                                    inv.shipping,
+                                    (poDetail.orderItemList || []).map((item: { quantity?: number; weight?: number }) => ({
+                                        quantity: Number(item.quantity) || 0,
+                                        weight: Number(item.weight) || undefined,
+                                    })),
+                                ));
+                                poDetail.orderAdjustmentList = adjs;
                                 poDetail.privateNotes = mergeInvoiceCorrelationNote(poDetail.privateNotes, [inv.invoiceNumber]);
                                 await post(`/buildasoilorganics/api/order/${encodeURIComponent(result.orderId)}`, poDetail);
                                 console.log(`      + Freight: $${inv.shipping.toFixed(2)}`);

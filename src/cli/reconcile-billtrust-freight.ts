@@ -24,7 +24,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { FinaleClient } from "../lib/finale/client";
-import { FINALE_FREIGHT_PROMO_URL } from "../lib/finale/freight-adjustment";
+import { freightAdjustmentForPo } from "../lib/finale/freight-adjustment";
 import { upsertVendorInvoice } from "../lib/storage/vendor-invoices";
 import {
     isMultiDeliveryVendor,
@@ -53,7 +53,9 @@ interface PoDoc {
         amount?: number;
         description?: string;
         productPromoUrl?: string;
+        orderAdjustmentAllocationList?: number[];
     }>;
+    orderItemList?: Array<{ quantity?: number; weight?: number }>;
     [key: string]: unknown;
 }
 
@@ -82,7 +84,15 @@ async function applyFreightToPo(
     const zeroFreightIdx = adjustments.findIndex(
         (a) => (a.productPromoUrl ?? "").includes("/10007") && Number(a.amount) === 0,
     );
-    const replacement = { amount, description: label, productPromoUrl: FINALE_FREIGHT_PROMO_URL };
+    const items = (po.orderItemList ?? []).map((item) => ({
+        quantity: Number(item.quantity) || 0,
+        weight: Number(item.weight) || undefined,
+    }));
+    const existingFreight = adjustments.filter((a) => (a.productPromoUrl ?? "").includes("/10007"));
+    const existingAlloc = !isMultiDelivery && existingFreight.length === 1
+        ? existingFreight[0].orderAdjustmentAllocationList
+        : undefined;
+    const replacement = freightAdjustmentForPo(amount, items, existingAlloc);
 
     if (zeroFreightIdx >= 0 && adjustments.length === 1) {
         adjustments[zeroFreightIdx] = replacement;

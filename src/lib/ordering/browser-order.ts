@@ -25,7 +25,7 @@
  */
 
 import { createClient } from "@/lib/db";
-import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
+import { notify } from "@/lib/intelligence/notify";
 import { BrowserManager } from "@/lib/scraping/browser-manager";
 import { fillUlineCart } from "./uline-cart";
 import { fillAxiomCart } from "./axiom-cart";
@@ -60,7 +60,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
         .single();
 
     if (poError || !po) {
-        await sendTelegramNotifyWithButtons(
+        await notify(
             `❌ *Order Failed*\nPO ${poNumber} not found in database.`,
             []
         );
@@ -71,7 +71,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
     const platform = detectVendorPlatform(vendorName);
 
     if (!platform) {
-        await sendTelegramNotifyWithButtons(
+        await notify(
             `❌ *Unsupported Vendor*\n${vendorName} — no browser ordering flow configured.\n\nSupported: Uline, Axiom`,
             []
         );
@@ -81,7 +81,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
     // 2. Parse line items
     const lineItems: POLineItem[] = Array.isArray(po.line_items) ? po.line_items : [];
     if (lineItems.length === 0) {
-        await sendTelegramNotifyWithButtons(
+        await notify(
             `⚠️ *PO ${poNumber} has no line items.*\n\nNothing to add to ${vendorName} cart.`,
             []
         );
@@ -89,7 +89,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
     }
 
     // 3. Notify Bill we're starting
-    await sendTelegramNotifyWithButtons(
+    await notify(
         `🛒 *Starting ${vendorName} order*\nPO ${poNumber} — ${lineItems.length} item(s)\n\nOpening browser...`,
         []
     );
@@ -108,7 +108,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
             browserbaseTaskType: `cart-filling-${platform}`, // Session reuse within vendor
         });
     } catch (err: any) {
-        await sendTelegramNotifyWithButtons(
+        await notify(
             `❌ *Browser launch failed*\n${err.message}\n\nMake sure Chrome is running with --remote-debugging-port=9222`,
             []
         );
@@ -179,7 +179,7 @@ export async function executeBrowserOrder(poNumber: string): Promise<CartFillRes
         ],
     ] : [];
 
-    await sendTelegramNotifyWithButtons(lines.join("\n"), buttons);
+    await notify(lines.join("\n"), buttons);
 
     // 7. Log to ap_activity_log
     try {

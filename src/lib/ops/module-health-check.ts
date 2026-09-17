@@ -22,7 +22,7 @@
  */
 
 import { getLocalDb } from "../storage/local-db";
-import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { notify } from "../intelligence/notify";
 
 // ─── Module list ─────────────────────────────────────────────────────────
 
@@ -33,10 +33,8 @@ import { sendTelegramNotify } from "../intelligence/telegram-notify";
  */
 const CRITICAL_MODULES: Array<{ name: string; path: string }> = [
     { name: "ap-local-forwarder", path: "@/lib/intelligence/workers/ap-local-forwarder" },
-    { name: "ap-forwarder", path: "@/lib/intelligence/workers/ap-forwarder" },
     { name: "ap-dedup", path: "@/lib/intelligence/ap-dedup" },
     { name: "ap-single-forward", path: "@/lib/intelligence/ap-single-forward" },
-    { name: "ap-identifier", path: "@/lib/intelligence/workers/ap-identifier" },
     { name: "vendor-router", path: "@/lib/intelligence/ap/vendor-router" },
     { name: "local-db", path: "@/lib/storage/local-db" },
     { name: "gmail-auth", path: "@/lib/gmail/auth" },
@@ -84,7 +82,7 @@ export async function verifyCriticalModules(): Promise<HealthCheckResult> {
         const failedList = failures.map(f => `${f.name}: ${f.error.slice(0, 80)}`).join("\n");
         const alertMsg = `🚨 BOOT HEALTH CHECK FAILED\n\n${failures.length} critical module(s) failed to load:\n\n${failedList}\n\nAP pipeline dedup is likely broken. Check for syntax errors in recently edited files.`;
         try {
-            await sendTelegramNotify(alertMsg);
+            await notify(alertMsg);
         } catch {
             console.error("[health] Failed to send Telegram alert for boot health check failure");
         }
@@ -164,7 +162,7 @@ export async function recordCronFailure(jobName: string, reason: string): Promis
             if (shouldAlert) {
                 const alertMsg = `CRON FAILURE STREAK\n\n${jobName} has failed ${newCount} consecutive times.\n\nLast error: ${reason.slice(0, 150)}\n\nCheck pm2 logs or run: pm2 logs aria-bot --lines 50`;
                 try {
-                    await sendTelegramNotify(alertMsg);
+                    await notify(alertMsg);
                 } catch {
                     console.error(`[health] Failed to send Telegram alert for ${jobName} failure streak`);
                 }

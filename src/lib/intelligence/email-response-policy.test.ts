@@ -9,15 +9,16 @@ import {
 } from "./email-response-policy";
 
 describe("resolveEmailResponsePolicy", () => {
-    it("never allows auto-send on routine PO/tracking", () => {
+    it("routine PO/tracking is silent — no draft for Bill to delete", () => {
         const p = resolveEmailResponsePolicy({
             intent: "ROUTINE_INFO",
             isPurchaseThread: true,
         });
         expect(p.allowAutoSend).toBe(false);
-        expect(p.createDraft).toBe(true);
-        expect(p.action).toBe("DRAFT_ROUTINE");
-        expect(p.labels).toContain("Draft Ready");
+        expect(p.createDraft).toBe(false);
+        expect(p.action).toBe("SILENT");
+        expect(p.leaveInInbox).toBe(true);
+        expect(p.labels).not.toContain("Draft Ready");
     });
 
     it("archives promo with no draft", () => {
@@ -35,12 +36,14 @@ describe("resolveEmailResponsePolicy", () => {
         expect(p.openResponseTask).toBe(true);
     });
 
-    it("human escalate = draft stub + task, never send", () => {
+    it("human escalate = task only, no draft stub", () => {
         const p = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
         expect(p.action).toBe("ESCALATE_HUMAN");
         expect(p.allowAutoSend).toBe(false);
-        expect(p.createDraft).toBe(true);
+        expect(p.createDraft).toBe(false);
         expect(p.openResponseTask).toBe(true);
+        expect(p.labels).toContain("Needs Response");
+        expect(p.labels).not.toContain("Draft Ready");
     });
 
     it("silent when already in conversation", () => {

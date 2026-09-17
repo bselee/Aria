@@ -12,6 +12,7 @@ dotenv.config({ path: '.env.local' });
 import { gmail as GmailApi } from '@googleapis/gmail';
 import { getAuthenticatedClient } from '../lib/gmail/auth';
 import { FinaleClient, PurchaseOrder } from '../lib/finale/client';
+import { freightAdjustmentForPo } from '../lib/finale/freight-adjustment';
 import { upsertVendorInvoice, lookupVendorInvoices } from '../lib/storage/vendor-invoices';
 import { ReconciliationRun } from '@/lib/reconciliation/run-tracker';
 import { sendReconciliationSummary } from '@/lib/reconciliation/notifier';
@@ -359,8 +360,10 @@ async function reconcileInvoice(
             .reduce((s: number, a: any) => s + a.amount, 0);
 
         if (invoice.shipping > 0 && Math.abs(existingFreight - invoice.shipping) > 0.01) {
-            const label = `Freight - TeraGanix Inv ${invoice.orderNumber}`;
-            const alreadyLabeled = existingAdj.some((a: any) => a.description?.includes('TeraGanix Inv'));
+            const label = "Freight";
+            const alreadyLabeled = existingAdj.some((a: any) =>
+                (a.productPromoUrl === FREIGHT_PROMO) && Number(a.amount) > 0,
+            );
             if (!alreadyLabeled) {
                 console.log(`   + Adding Freight: $${invoice.shipping} (${label})`);
 
@@ -584,11 +587,13 @@ async function main() {
                     if (freightItems.length > 0) {
                         const existingAdj = unlocked.orderAdjustmentList || [];
                         for (const fi of freightItems) {
-                            existingAdj.push({
-                                amount: fi.amount,
-                                description: fi.label,
-                                productPromoUrl: FREIGHT_PROMO,
-                            });
+                            existingAdj.push(freightAdjustmentForPo(
+                                fi.amount,
+                                (unlocked.orderItemList || []).map((item: { quantity?: number; weight?: number }) => ({
+                                    quantity: Number(item.quantity) || 0,
+                                    weight: Number(item.weight) || undefined,
+                                })),
+                            ));
                             run.recordFreight(Math.round(fi.amount * 100));
                         }
                         unlocked.orderAdjustmentList = existingAdj;

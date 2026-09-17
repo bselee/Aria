@@ -4,30 +4,27 @@
  * @created 2026-05-29
  * @author  Bill Selee
  * @extracted-from ops-manager.ts (Phase 3/3 OpsManager split)
- * @deps    email-polling-cycle, workers/ap-identifier, workers/email-ingestion,
- *          workers/ap-forwarder, acknowledgement-agent, oversight-agent
+ * @deps    email-polling-cycle, workers/email-ingestion, acknowledgement-agent,
+ *          oversight-agent
  */
 
-import { APIdentifierAgent } from "../workers/ap-identifier";
 import { EmailIngestionWorker } from "../workers/email-ingestion";
-import { APForwarderAgent } from "../workers/ap-forwarder";
 import { AcknowledgementAgent } from "../acknowledgement-agent";
 import { OversightAgent } from "../oversight-agent";
 import { runEmailPollingCycle } from "../email-polling-cycle";
 
 export class APService {
     constructor(
-        private apIdentifier: APIdentifierAgent,
         private emailIngestionDefault: EmailIngestionWorker,
         private emailIngestionAP: EmailIngestionWorker,
-        private apForwarder: APForwarderAgent,
         private ackAgent: AcknowledgementAgent,
         private oversightAgent: OversightAgent,
     ) {}
 
     /**
      * Periodically poll AP inbox for new invoices.
-     * Orchestrates the full email polling cycle: ingestion → identification → forwarding.
+     * Ingestion → acknowledgement → ingestion(ap). Forwarding is handled by the
+     * local-first forwarder (ap-local-forwarder.ts), not this cycle.
      */
     async pollAPInbox() {
         console.log("\u{1F4E1} Polling AP Inbox...");
@@ -36,8 +33,6 @@ export class APService {
                 emailIngestionDefault: this.emailIngestionDefault,
                 acknowledgementAgent: this.ackAgent,
                 emailIngestionAP: this.emailIngestionAP,
-                apIdentifier: this.apIdentifier,
-                apForwarder: this.apForwarder,
                 onStageSuccess: (stage: string) => this.oversightAgent.registerHeartbeat(stage, stage, { source: "email-polling-cycle" }),
             });
         } catch (err: any) {

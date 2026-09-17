@@ -1,8 +1,9 @@
 /**
  * @file    fedex-billing-packet.ts
  * @purpose Detect FedEx Billing Online multi-page invoice packets and define
- *          AP handling rules: forward FULL PDF (never trim), pay-path only
- *          (Bill.com), never product-PO freight apply / Uline bas_freight.
+ *          AP handling rules: forward FIRST PAGE ONLY (page 1 = summary with
+ *          the invoice number + total), pay-path only (Bill.com), never
+ *          product-PO freight apply / Uline bas_freight.
  *
  * Format (verified 2026-08-05):
  *   Email: noreply@fedex.com → ap@
@@ -14,8 +15,10 @@
  *
  * @author  Hermia
  * @created 2026-08-05
- * @deps    none
+ * @deps    pdf-lib (trimToFirstPage)
  */
+
+import { PDFDocument } from "pdf-lib";
 
 /** Opaque FBO attachment name FedEx emails to AP. */
 export const FEDEX_BILLING_PACKET_FILENAME_RE =
@@ -34,8 +37,8 @@ export interface FedExBillingPacketMeta {
     /** Display invoice # preferred for Bill.com subject/filename. */
     invoiceNumberDisplay: string | null;
     serviceHint: FedExBillingServiceHint;
-    /** Always false — full multi-page PDF must be forwarded. */
-    mayTrimPages: false;
+    /** First-page-only forward — page 1 = summary + invoice number (2026-09-15). */
+    mayTrimPages: boolean;
     /** Never run product-PO / Uline bas_freight apply on these. */
     skipProductPoMatch: true;
     reason: string;
@@ -142,7 +145,7 @@ export function isFedExBillingOnlineEmail(
 
 /**
  * Attachment-level decision for AP queue/forward.
- * mayTrimPages is always false — never single-page-trim FBO packets.
+ * mayTrimPages is true for packets — forward page 1 only (summary + invoice #).
  */
 export function classifyFedExBillingAttachment(args: {
     from?: string | null;
@@ -185,7 +188,7 @@ export function classifyFedExBillingAttachment(args: {
         invoiceDigitsFromFilename: digits,
         invoiceNumberDisplay: display,
         serviceHint: detectFedExBillingServiceHint(args.pdfTextPreview, args.subject),
-        mayTrimPages: false,
+        mayTrimPages: true,
         skipProductPoMatch: true,
         reason: isName
             ? "fedex_billing_packet_filename"
@@ -210,13 +213,40 @@ export function buildFedExBillComFilename(
 }
 
 /**
+ * Trim a multi-page PDF down to page 1 (the summary page carrying the
+ * "Invoice Number: 9-XXX-XXXXX" field). FedEx Billing Online packets are
+ * 100–150 pages of itemized tracking detail; Bill.com OCR chokes on the volume
+ * and misreads the invoice number, flagging the bill as a duplicate. Page 1
+ * holds the invoice number + total, which is all Bill.com needs.
+ *
+ * Never blocks: on any load/save failure returns the original buffer so the
+ * full packet still reaches Bill.com.
+ *
+ * @param buffer  full FedEx packet PDF bytes
+ * @returns       single-page PDF (page 1 only), or the original on failure
+ */
+export async function trimToFirstPage(buffer: Buffer): Promise<Buffer> {
+    try {
+        const src = await PDFDocument.load(buffer);
+        if (src.getPageCount() <= 1) return buffer;
+        const out = await PDFDocument.create();
+        const [page0] = await out.copyPages(src, [0]);
+        out.addPage(page0);
+        return Buffer.from(await out.save());
+    } catch (err) {
+        console.warn(`[fedex-billing-packet] trimToFirstPage failed (sending full packet): ${(err as Error)?.message || err}`);
+        return buffer;
+    }
+}
+
+/**
  * Queue extracted_json fields for identifier / forwarder.
  */
 export function buildFedExCarrierBillQueueFields(meta: FedExBillingPacketMeta): Record<string, unknown> {
     return {
         vendor_routing_action: FEDEX_CARRIER_BILL_ACTION,
         fedex_billing_packet: true,
-        fedex_may_trim_pages: false,
+        fedex_may_trim_pages: meta.mayTrimPages,
         skip_product_po_match: true,
         skip_uline_bas_freight: true,
         invoice_number: meta.invoiceNumberDisplay,
@@ -235,7 +265,7 @@ export function isFedExCarrierBillExtractedJson(
     if (!extracted || typeof extracted !== "object") return false;
     if (extracted.vendor_routing_action === FEDEX_CARRIER_BILL_ACTION) return true;
     if (extracted.fedex_billing_packet === true) return true;
-    if (extracted.skip_product_po_match === true && extracted.fedex_may_trim_pages === false) {
+    if (extracted.skip_product_po_match === true) {
         return true;
     }
     return false;

@@ -584,7 +584,7 @@ export async function processDefaultInboxInvoice(
             try {
                 await finale.addOrderAdjustment(
                     poSummary.orderId, "FREIGHT", freight,
-                    `Freight - ${vendorName} ${invoiceNumber}`,
+                    "Freight",
                 );
             } catch { /* non-fatal */ }
         }

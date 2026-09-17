@@ -19,7 +19,7 @@
 import { FinaleClient } from "../finale/client";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
-import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { notify } from "../intelligence/notify";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -608,5 +608,5 @@ async function sendTgSummary(
     const counts = `Drafted: ${drafted.length} | Vendor replied: ${emailFound.length} | Need manual: ${noEmail.length + skipped.length}`;
     lines.push(counts);
 
-    await sendTelegramNotify(lines.join("\n")).catch(() => {});
+    await notify(lines.join("\n")).catch(() => {});
 }

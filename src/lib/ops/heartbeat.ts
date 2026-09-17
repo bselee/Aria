@@ -98,11 +98,11 @@ export async function runSystemHeartbeat(): Promise<void> {
         const message = formatAlert(newFailures);
         const anyCritical = newFailures.some((f) => f.spec.critical);
         try {
-            const { sendTelegramNotify, sendCriticalTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
+            const { notify, notifyCritical } = await import("@/lib/intelligence/notify");
             if (anyCritical) {
-                await sendCriticalTelegramNotify(message);
+                await notifyCritical(message);
             } else {
-                await sendTelegramNotify(message);
+                await notify(message);
             }
             // Only mark as alerted once the send succeeds, so a transient send
             // failure doesn't suppress the next tick's retry.

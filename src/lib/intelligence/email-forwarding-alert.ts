@@ -30,7 +30,7 @@
  */
 
 import { createClient } from "../db";
-import { sendTelegramNotify } from "./telegram-notify";
+import { notify } from "./notify";
 
 export interface StuckForwardAlert {
     messageId: string;
@@ -42,44 +42,48 @@ export interface StuckForwardAlert {
 }
 
 /**
- * Check for AP invoices stuck in ERROR_FORWARDING (never reached Bill.com).
+ * Check for AP forwards stuck in a non-terminal local state (ERROR / CLAIMED /
+ * PENDING_SEND) for >4h — i.e. they never reached Bill.com and no later cycle
+ * rescued them. Reads the LOCAL SQLite ledger (ap_local_forwards), which is the
+ * source of truth since the Supabase ap_inbox_queue pipeline was retired
+ * (2026-09-17 plan item 1.3 — the old queue kept reporting months-old zombie
+ * rows as "6 AP invoices stuck" every cycle).
+ *
  * Returns alerts — caller decides whether to send Telegram.
  */
 export async function getStuckForwardingAlerts(): Promise<StuckForwardAlert[]> {
-    const db = createClient();
-    if (!db) return [];
+    let rows: Array<{
+        id: number;
+        email_from: string | null;
+        email_subject: string | null;
+        status: string;
+        error_message: string | null;
+        forwarded_at: string | null;
+    }>;
+    try {
+        const { getLocalDb } = await import("@/lib/storage/local-db");
+        const db = getLocalDb();
+        rows = db.prepare(
+            `SELECT id, email_from, email_subject, status, error_message, forwarded_at
+             FROM ap_local_forwards
+             WHERE status IN ('ERROR', 'CLAIMED', 'PENDING_SEND')
+               AND forwarded_at IS NOT NULL
+               AND forwarded_at <= datetime('now', '-4 hours')
+             ORDER BY forwarded_at DESC
+             LIMIT 10`,
+        ).all();
+    } catch {
+        return [];
+    }
 
-    const twoHoursAgo = new Date(Date.now() - 2 * 3600000).toISOString();
-    const { data, error } = await db
-        .from("ap_inbox_queue")
-        .select("message_id, extracted_json, status, created_at, updated_at")
-        .in("status", ["ERROR_FORWARDING", "ERROR_PROCESSING"])
-        .lt("updated_at", twoHoursAgo)
-        .order("created_at", { ascending: false })
-        .limit(10);
-
-    if (error || !data) return [];
-
-    // Filter out zombie records — old pipeline debris with empty extracted_json
-    // that has no from/vendor_name/subject. These are months-old ERROR_PROCESSING
-    // records that should not be reported as "stuck".
-    const meaningful = (data as any[]).filter(row => {
-        const ej = row.extracted_json;
-        if (!ej || typeof ej !== 'object') return false;
-        return ej.from || ej.vendor_name || ej.subject;
-    });
-
-    return meaningful.map(row => {
-        const ej = row.extracted_json || {};
-        return {
-            messageId: row.message_id || "unknown",
-            from: ej.from || ej.vendor_name || "unknown sender",
-            subject: ej.subject || "no subject",
-            status: row.status,
-            ageHours: Math.round((Date.now() - new Date(row.created_at).getTime()) / 3600000),
-            lastError: ej.last_error || ej.error_message || row.status,
-        };
-    });
+    return rows.map((row) => ({
+        messageId: String(row.id),
+        from: row.email_from || "unknown sender",
+        subject: row.email_subject || "no subject",
+        status: row.status,
+        ageHours: Math.round((Date.now() - new Date(row.forwarded_at + "Z").getTime()) / 3600000),
+        lastError: row.error_message || row.status,
+    }));
 }
 
 /**
@@ -151,16 +155,17 @@ export async function runForwardingEscalation(): Promise<void> {
                 console.log(`[forwarding-alert] ${newAlerts.length} new stuck invoice(s), ${alerts.length - newAlerts.length} already alerted — sending for new only.`);
                 // Send only for the new ones
                 const formatted = formatForwardingAlerts(newAlerts);
-                await sendTelegramNotify(formatted);
+                await notify(formatted);
                 // Log each new alert for future dedup
                 for (const a of newAlerts) {
-                    await db.from("ap_activity_log").insert({
+                    const { error } = await db.from("ap_activity_log").insert({
                         email_from: a.from,
                         email_subject: a.messageId,
                         intent: "FORWARDING_ESCALATED",
                         action_taken: `Escalated: invoice stuck in ${a.status} for ${a.ageHours}h — ${a.from}`,
                         metadata: { message_id: a.messageId, status: a.status, age_hours: a.ageHours },
-                    }).catch(() => {});
+                    });
+                    if (error) console.warn(`[forwarding-alert] dedup log failed: ${error.message}`);
                 }
                 console.log(`[forwarding-alert] Alerted Bill: ${newAlerts.length} AP invoice(s) stuck in ERROR_FORWARDING/ERROR_PROCESSING.`);
                 return;
@@ -169,18 +174,19 @@ export async function runForwardingEscalation(): Promise<void> {
     }
 
     const formatted = formatForwardingAlerts(alerts);
-    await sendTelegramNotify(formatted);
+    await notify(formatted);
 
     // Log each alert for future dedup
     if (db) {
         for (const a of alerts) {
-            await db.from("ap_activity_log").insert({
+            const { error } = await db.from("ap_activity_log").insert({
                 email_from: a.from,
                 email_subject: a.messageId,
                 intent: "FORWARDING_ESCALATED",
                 action_taken: `Escalated: invoice stuck in ${a.status} for ${a.ageHours}h — ${a.from}`,
                 metadata: { message_id: a.messageId, status: a.status, age_hours: a.ageHours },
-            }).catch(() => {});
+            });
+            if (error) console.warn(`[forwarding-alert] dedup log failed: ${error.message}`);
         }
     }
 

@@ -2,13 +2,12 @@
  * @file    src/lib/intelligence/notify-via-task.ts
  * @purpose Task-first notification pattern. Replaces fire-and-forget Telegram
  *          sends: every alert creates/dedups an `agent_task` row FIRST, then
- *          Telegram becomes a VIEW of all open tasks of that type — one summary
- *          message, not one ping per alert. The task is the source of truth;
- *          Telegram is downstream.
+ *          (2026-09-17: the Telegram view is gone — Bill does not use it.)
+ *          The task is the source of truth and the dashboard is the view.
  */
 
 import { incrementOrCreate, listTasks, type IncrementOrCreateArgs, type AgentTask } from "./agent-task";
-import { sendCriticalTelegramNotify, sendTelegramNotify } from "./telegram-notify";
+import { notifyCritical, notify } from "./notify";
 
 /** Fixed spoke table for all task-first cron notifications. */
 const SOURCE_TABLE = "cron_notify";
@@ -79,9 +78,9 @@ export async function notifyViaTask(args: NotifyViaTaskArgs): Promise<string | n
 
     // 4. Send — critical bypasses biz-hours gate, otherwise gated.
     if (args.critical) {
-        await sendCriticalTelegramNotify(message);
+        await notifyCritical(message);
     } else {
-        await sendTelegramNotify(message);
+        await notify(message);
     }
 
     // 5. Return the task id.

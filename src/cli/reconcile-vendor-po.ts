@@ -25,7 +25,7 @@ import {
     applyReconciliation,
     ReconciliationResult,
 } from '../lib/finale/reconciler';
-import { sendCriticalTelegramNotify } from '../lib/intelligence/telegram-notify';
+import { notifyCritical } from '../lib/intelligence/notify';
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -88,11 +88,11 @@ async function main() {
     // Notify
     const summary = `PO ${poNumber} Thirsty Earth: shipping $6.17 applied from invoice D1885. Line item matched.`;
     console.log(summary);
-    await sendCriticalTelegramNotify(summary);
+    await notifyCritical(summary);
 
   } catch (err: any) {
     console.error(`[reconcile-vendor-po] Error:`, err.message);
-    await sendCriticalTelegramNotify(`PO ${poNumber} reconcile failed: ${err.message}`);
+    await notifyCritical(`PO ${poNumber} reconcile failed: ${err.message}`);
     process.exit(1);
   }
 }

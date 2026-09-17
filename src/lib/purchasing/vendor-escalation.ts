@@ -32,7 +32,7 @@
  */
 
 import { createClient } from "@/lib/db";
-import { sendTelegramNotify, sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
+import { notify } from "@/lib/intelligence/notify";
 
 /** Escalation windows (days since PO sent) */
 // L1 (2d) → L2 (5d) → L3 (7d) — tightens vendor response cycle
@@ -213,14 +213,14 @@ export async function runVendorEscalation(): Promise<EscalationResult> {
             },
         ]);
 
-        await sendTelegramNotifyWithButtons(alertLines.join("\n"), buttons);
+        await notify(alertLines.join("\n"), buttons);
     }
 
     if (l2Count > 0 || l3Count > 0) {
         const summary = `📨 Vendor escalation: L2=${l2Count}, L3=${l3Count}`;
         console.log(`[vendor-escalation] ${summary}`);
         if (l2Count > 0 && l3Count === 0) {
-            await sendTelegramNotify(summary);
+            await notify(summary);
         }
     }
 

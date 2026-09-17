@@ -18,7 +18,7 @@
 
 import { createClient } from '../db';
 import { finaleClient } from '../finale/client';
-import { sendTelegramNotify } from '../intelligence/telegram-notify';
+import { notify } from '../intelligence/notify';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -475,7 +475,7 @@ export async function runLeadTimeTracker(
     const report = formatTelegramReport(result);
     if (report) {
         try {
-            await sendTelegramNotify(report);
+            await notify(report);
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             result.errors.push(`TG report send failed: ${msg}`);
