@@ -254,6 +254,66 @@ async function getReconciliationIssues(db: any): Promise<{ count: number; lines:
  *   5. Reconciliation issues
  *   6. Overall status emoji + message
  */
+/**
+ * Read the last 24h of the LOCAL ap_local_forwards ledger for the morning
+ * health report: how many forwarded, how many are missing an invoice#, OCR-gate
+ * flags that were not a clean pass, and suspect (dispute/dunning/remittance)
+ * subjects that were forwarded with a flag.
+ *
+ * Exported separately from generateAPHealthReport() so it can be unit-tested
+ * against a mocked local DB — 2026-09-17 plan 4.2.
+ *
+ * @returns {{forwarded: number, nullInv: number, gateFlags: Array<{email_subject: string, note: string}>, suspects: Array<{email_subject: string, note: string}>}}
+ *          Zeroed/empty result if the local ledger is unavailable.
+ */
+export async function getLocalForwardStats24h(): Promise<{
+    forwarded: number;
+    nullInv: number;
+    gateFlags: Array<{ email_subject: string; note: string }>;
+    suspects: Array<{ email_subject: string; note: string }>;
+}> {
+    const empty = { forwarded: 0, nullInv: 0, gateFlags: [], suspects: [] } as {
+        forwarded: number;
+        nullInv: number;
+        gateFlags: Array<{ email_subject: string; note: string }>;
+        suspects: Array<{ email_subject: string; note: string }>;
+    };
+    try {
+        const { getLocalDb } = await import("@/lib/storage/local-db");
+        const ldb = getLocalDb();
+        const fw = ldb.prepare(
+            `SELECT COUNT(*) AS forwarded,
+                    SUM(CASE WHEN ocr_invoice_number IS NULL OR ocr_invoice_number = '' THEN 1 ELSE 0 END) AS nullInv
+             FROM ap_local_forwards
+             WHERE status = 'FORWARDED' AND forwarded_at >= datetime('now', '-1 day')`,
+        ).get() as { forwarded: number; nullInv: number | null } | undefined;
+        const gateFlags = ldb.prepare(
+            `SELECT email_subject, substr(reconciliation_notes, 1, 80) AS note
+             FROM ap_local_forwards
+             WHERE reconciliation_notes LIKE '%ocr-gate:%'
+               AND reconciliation_notes NOT LIKE '%ocr-gate:pass%'
+               AND forwarded_at >= datetime('now', '-1 day')
+             ORDER BY id DESC LIMIT 5`,
+        ).all() as Array<{ email_subject: string; note: string }>;
+        const suspects = ldb.prepare(
+            `SELECT email_subject, substr(reconciliation_notes, 1, 60) AS note
+             FROM ap_local_forwards
+             WHERE reconciliation_notes LIKE '%suspect:%'
+               AND forwarded_at >= datetime('now', '-1 day')
+             ORDER BY id DESC LIMIT 5`,
+        ).all() as Array<{ email_subject: string; note: string }>;
+
+        return {
+            forwarded: Number(fw?.forwarded ?? 0),
+            nullInv: Number(fw?.nullInv ?? 0),
+            gateFlags: gateFlags ?? [],
+            suspects: suspects ?? [],
+        };
+    } catch {
+        return empty;
+    }
+}
+
 export async function generateAPHealthReport(): Promise<string> {
     const db = createClient();
     if (!db) {
@@ -369,37 +429,15 @@ export async function generateAPHealthReport(): Promise<string> {
     // Reads the LOCAL SQLite ap_local_forwards: what actually forwarded, gate
     // verdicts that were not clean, suspect subjects, and missing invoice#s.
     try {
-        const { getLocalDb } = await import("@/lib/storage/local-db");
-        const ldb = getLocalDb();
-        const fw = ldb.prepare(
-            `SELECT COUNT(*) AS forwarded,
-                    SUM(CASE WHEN ocr_invoice_number IS NULL OR ocr_invoice_number = '' THEN 1 ELSE 0 END) AS nullInv
-             FROM ap_local_forwards
-             WHERE status = 'FORWARDED' AND forwarded_at >= datetime('now', '-1 day')`,
-        ).get() as { forwarded: number; nullInv: number | null };
-        const gateFlags = ldb.prepare(
-            `SELECT email_subject, substr(reconciliation_notes, 1, 80) AS note
-             FROM ap_local_forwards
-             WHERE reconciliation_notes LIKE '%ocr-gate:%'
-               AND reconciliation_notes NOT LIKE '%ocr-gate:pass%'
-               AND forwarded_at >= datetime('now', '-1 day')
-             ORDER BY id DESC LIMIT 5`,
-        ).all() as Array<{ email_subject: string; note: string }>;
-        const suspects = ldb.prepare(
-            `SELECT email_subject, substr(reconciliation_notes, 1, 60) AS note
-             FROM ap_local_forwards
-             WHERE reconciliation_notes LIKE '%suspect:%'
-               AND forwarded_at >= datetime('now', '-1 day')
-             ORDER BY id DESC LIMIT 5`,
-        ).all() as Array<{ email_subject: string; note: string }>;
+        const { forwarded, nullInv, gateFlags, suspects } = await getLocalForwardStats24h();
 
         lines.push(`\n*📤 Forwarded to Bill.com (24h)*`);
-        lines.push(`Total: **${fw.forwarded}**`);
-        if (fw.forwarded === 0) {
+        lines.push(`Total: **${forwarded}**`);
+        if (forwarded === 0) {
             lines.push("_No forwards in the last 24 hours._");
         }
-        if ((fw.nullInv || 0) > 0) {
-            lines.push(`🔢 Missing invoice# in ledger: **${fw.nullInv}**`);
+        if ((nullInv || 0) > 0) {
+            lines.push(`🔢 Missing invoice# in ledger: **${nullInv}**`);
             needsAttention = true;
         }
         if (gateFlags.length > 0) {
@@ -412,7 +450,7 @@ export async function generateAPHealthReport(): Promise<string> {
             for (const s of suspects) lines.push(`   ${s.email_subject.slice(0, 55)} — ${s.note}`);
             actionRequired = true;
         }
-        if (fw.forwarded === 0 && gateFlags.length === 0 && suspects.length === 0 && (fw.nullInv || 0) === 0) {
+        if (forwarded === 0 && gateFlags.length === 0 && suspects.length === 0 && (nullInv || 0) === 0) {
             lines.push("✅ Clean.");
         }
     } catch {

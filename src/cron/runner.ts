@@ -18,6 +18,9 @@
 import cron from "node-cron";
 import Bottleneck from "bottleneck";
 
+/** Jobs currently executing — lets the drift monitor name the blocker. */
+const _inFlight = new Set<string>();
+
 import { getJob, listJobs } from "./registry";
 import { recordStart, recordEnd, lastRun, isSuccessStatus, type CronRunStatus } from "./history";
 
@@ -107,12 +110,14 @@ export async function runJobOnce(
                 job.budget.durationMs,
             );
         }
+        _inFlight.add(jobName);
         await limiter.schedule(() => job.handler({
             invokedBy,
             correlationId,
             log: (msg) => console.log(`[cron:${jobName}] ${msg}`),
             signal: ac.signal,
         }));
+        _inFlight.delete(jobName);
         result = { status: "succeeded", durationMs: Date.now() - startMs };
         // Slow-handler instrumentation (2026-09-17 plan 3.1): name any handler
         // that runs >30s so the overnight/8am event-loop blockage has a face.
@@ -135,6 +140,7 @@ export async function runJobOnce(
             failureReason: aborted ? "duration-exceeded" : "handler-threw",
             failureMessage: err?.message ?? String(err),
         };
+        _inFlight.delete(jobName);
         if (result.durationMs > 30_000) {
             console.warn(`[cron-slow] ${jobName} FAILED after ${Math.round(result.durationMs / 1000)}s — ${result.failureReason}`);
         }
@@ -288,8 +294,11 @@ function startEventLoopDriftMonitor(): void {
         const drift = now - last - INTERVAL_MS;
         last = now;
         if (drift > ALERT_MS) {
+            // Name the jobs that were in flight when the loop stalled — an
+            // overnight blockage is only fixable if we know what was running.
+            const inFlight = [..._inFlight].join(", ") || "none in flight (external: OS/AV/backup)";
             console.warn(
-                `[event-loop] blocked ~${(drift / 1000).toFixed(1)}s — async work starved node-cron (dropped-tick risk)`,
+                `[event-loop] blocked ~${(drift / 1000).toFixed(1)}s — async work starved node-cron (dropped-tick risk). in-flight: ${inFlight}`,
             );
         }
     }, INTERVAL_MS);

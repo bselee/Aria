@@ -198,7 +198,11 @@ defineJob({
 
 defineJob({
     name: "ap-health-report",
-    schedule: "30 8 * * 1-5",
+    // KAIZEN(2026-09-17): 8:30 -> 8:50. At 8:30 this job fired inside a
+    // 14-job herd (4 daily + every periodic :30 job) that was blocking the
+    // node event loop and dropping cron ticks. Running LAST also means it
+    // reports on the jobs that ran at 8:35-8:45 instead of racing them.
+    schedule: "50 8 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
     handler: async () => {
@@ -355,7 +359,8 @@ defineJob({
 
 defineJob({
     name: "qty-calibration",
-    schedule: "30 8 * * *",
+    // KAIZEN(2026-09-17): 8:30 -> 8:35, out of the :00/:30 periodic pile-up.
+    schedule: "35 8 * * *",
     onFail: "escalate-to-supervisor",
     description: "Daily 8:30 AM calibration of recommendations vs received POs.",
     handler: async () => { await ops()?.runQtyCalibration(); },
@@ -951,7 +956,9 @@ defineJob({
 
 defineJob({
     name: "autonomy-scan",
-    schedule: "30 8,13 * * 1-5", // KAIZEN #7: 7:30am → 8:30am + 1:30pm weekdays
+    // KAIZEN #7: 7:30am → 8:30am + 1:30pm weekdays
+    // KAIZEN(2026-09-17): 8:30 -> 8:40, out of the :30 periodic pile-up.
+    schedule: "40 8,13 * * 1-5",
     onFail: "log",
     description: "Process draft POs for Level 1 & 2 autonomy (2x/day weekdays).",
     handler: async () => {
@@ -1484,7 +1491,8 @@ defineJob({
 // draft-review window so yesterday's drafts have settled.
 defineJob({
     name: "gold-sample-collection",
-    schedule: "30 8 * * 1-5",
+    // KAIZEN(2026-09-17): 8:30 -> 8:45, out of the :30 periodic pile-up.
+    schedule: "45 8 * * 1-5",
     onFail: "log",
     description:
         "Daily: check threads Aria drafted into → find Bill's sent reply → log gold voice samples.",
