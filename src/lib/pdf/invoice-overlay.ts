@@ -63,6 +63,8 @@ interface RedactionBox {
     yTop2: number;
 }
 
+export type { RedactionBox };
+
 /**
  * Per-sender template placements. Measured deterministically at 600 DPI on the
  * real AAA Cooper header (614.39 x 781.2 pt page): the "INVOICE" title ink
@@ -183,6 +185,10 @@ export async function stampInvoicePdf(
     buffer: Buffer,
     stamp: InvoiceStamp,
     from?: string | null,
+    opts?: {
+        /** OCR-located contaminant boxes (plan 4.3) — merged with the static template boxes. */
+        extraRedactionBoxes?: RedactionBox[];
+    },
 ): Promise<Buffer> {
     const pdf = await PDFDocument.load(buffer);
     const font = await pdf.embedFont(StandardFonts.HelveticaBold);
@@ -200,7 +206,12 @@ export async function stampInvoicePdf(
 
     // Redact the customer/account number first so Bill.com's OCR can't read it
     // as the invoice number. White boxes are drawn before the stamp text.
-    for (const box of redactionBoxesForSender(from)) {
+    // OCR-located boxes (anchor-relative, plan 4.3) are drawn alongside the
+    // static template boxes — belt and suspenders: a template shift that moves
+    // the contaminant out from under the static boxes is still covered by the
+    // OCR hit, and a missed OCR hit is still covered by the static template.
+    const dynamicBoxes = opts?.extraRedactionBoxes ?? [];
+    for (const box of [...dynamicBoxes, ...redactionBoxesForSender(from)]) {
         page.drawRectangle({
             x: box.x1,
             y: height - box.yTop2,

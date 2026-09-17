@@ -365,6 +365,60 @@ export async function generateAPHealthReport(): Promise<string> {
         needsAttention = true;
     }
 
+    // ── 5.5 Local forwards (24h) — the Gmail→Bill.com ledger (2026-09-17 plan 4.2).
+    // Reads the LOCAL SQLite ap_local_forwards: what actually forwarded, gate
+    // verdicts that were not clean, suspect subjects, and missing invoice#s.
+    try {
+        const { getLocalDb } = await import("@/lib/storage/local-db");
+        const ldb = getLocalDb();
+        const fw = ldb.prepare(
+            `SELECT COUNT(*) AS forwarded,
+                    SUM(CASE WHEN ocr_invoice_number IS NULL OR ocr_invoice_number = '' THEN 1 ELSE 0 END) AS nullInv
+             FROM ap_local_forwards
+             WHERE status = 'FORWARDED' AND forwarded_at >= datetime('now', '-1 day')`,
+        ).get() as { forwarded: number; nullInv: number | null };
+        const gateFlags = ldb.prepare(
+            `SELECT email_subject, substr(reconciliation_notes, 1, 80) AS note
+             FROM ap_local_forwards
+             WHERE reconciliation_notes LIKE '%ocr-gate:%'
+               AND reconciliation_notes NOT LIKE '%ocr-gate:pass%'
+               AND forwarded_at >= datetime('now', '-1 day')
+             ORDER BY id DESC LIMIT 5`,
+        ).all() as Array<{ email_subject: string; note: string }>;
+        const suspects = ldb.prepare(
+            `SELECT email_subject, substr(reconciliation_notes, 1, 60) AS note
+             FROM ap_local_forwards
+             WHERE reconciliation_notes LIKE '%suspect:%'
+               AND forwarded_at >= datetime('now', '-1 day')
+             ORDER BY id DESC LIMIT 5`,
+        ).all() as Array<{ email_subject: string; note: string }>;
+
+        lines.push(`\n*📤 Forwarded to Bill.com (24h)*`);
+        lines.push(`Total: **${fw.forwarded}**`);
+        if (fw.forwarded === 0) {
+            lines.push("_No forwards in the last 24 hours._");
+        }
+        if ((fw.nullInv || 0) > 0) {
+            lines.push(`🔢 Missing invoice# in ledger: **${fw.nullInv}**`);
+            needsAttention = true;
+        }
+        if (gateFlags.length > 0) {
+            lines.push(`🚧 OCR-gate flags: **${gateFlags.length}**`);
+            for (const g of gateFlags) lines.push(`   ${g.email_subject.slice(0, 55)} — ${g.note}`);
+            needsAttention = true;
+        }
+        if (suspects.length > 0) {
+            lines.push(`🚩 Suspect subjects (forwarded+flagged): **${suspects.length}**`);
+            for (const s of suspects) lines.push(`   ${s.email_subject.slice(0, 55)} — ${s.note}`);
+            actionRequired = true;
+        }
+        if (fw.forwarded === 0 && gateFlags.length === 0 && suspects.length === 0 && (fw.nullInv || 0) === 0) {
+            lines.push("✅ Clean.");
+        }
+    } catch {
+        lines.push(`\n*📤 Forwarded to Bill.com (24h)*\n_local ledger unavailable._`);
+    }
+
     // ── 6. Overall Status ───────────────────────────────────────────────
     lines.push("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     if (actionRequired) {

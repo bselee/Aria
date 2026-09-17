@@ -281,3 +281,101 @@ export async function verifyInvoiceForBillCom(pdfBuffer: Buffer): Promise<OcrGat
 
     return classifyGateOutput(out);
 }
+
+// ── Anchor-relative redaction locator (2026-09-17 plan 4.3) ─────────────────
+
+/** A white-out region on page 1 in PDF points, top-left origin. */
+export interface CustomerBox {
+    x1: number;
+    yTop1: number;
+    x2: number;
+    yTop2: number;
+}
+
+/** Raw JSON contract of `invoice-ocr-gate.py --locate-customer`. */
+interface LocatePyOutput {
+    ok: boolean;
+    boxes?: CustomerBox[];
+    customerNumberHits?: string[];
+    error?: string | null;
+}
+
+/**
+ * Locate the customer-number contaminant on page 1 by OCR (tesseract TSV word
+ * boxes) and return white-out boxes in PDF points. Used BEFORE stamping so the
+ * redaction follows the actual text position instead of hardcoded template
+ * coordinates — one template shift no longer silently un-redacts the number.
+ *
+ * NEVER throws. Returns null when tooling is unavailable or nothing matched —
+ * the caller then falls back to the static template boxes.
+ *
+ * @param pdfBuffer  ORIGINAL (pre-redaction) PDF bytes
+ */
+export async function locateCustomerNumberBoxes(
+    pdfBuffer: Buffer,
+): Promise<{ boxes: CustomerBox[]; hits: string[] } | null> {
+    if (!pdfBuffer || pdfBuffer.length === 0) return null;
+
+    return new Promise((resolveP) => {
+        let tmpDir: string | null = null;
+        let pdfPath: string;
+        try {
+            tmpDir = mkdtempSync(join(tmpdir(), "ocr-locate-"));
+            pdfPath = join(tmpDir, "invoice.pdf");
+            writeFileSync(pdfPath, pdfBuffer);
+        } catch {
+            resolveP(null);
+            return;
+        }
+
+        let stdout = "";
+        let settled = false;
+        const finish = (out: { boxes: CustomerBox[]; hits: string[] } | null) => {
+            if (settled) return;
+            settled = true;
+            if (tmpDir) {
+                try {
+                    rmSync(tmpDir, { recursive: true, force: true });
+                } catch {
+                    /* ignore */
+                }
+            }
+            resolveP(out);
+        };
+
+        const child = spawn(
+            pythonCommand().cmd,
+            [...pythonCommand().args, gateScriptPath(), "--locate-customer", pdfPath],
+            { stdio: ["ignore", "pipe", "pipe"] },
+        );
+        const timer = setTimeout(() => {
+            child.kill();
+            finish(null);
+        }, GATE_TIMEOUT_MS);
+
+        child.stdout.on("data", (d: Buffer) => {
+            stdout += d.toString("utf-8");
+        });
+        child.on("error", () => {
+            clearTimeout(timer);
+            finish(null);
+        });
+        child.on("close", (code) => {
+            clearTimeout(timer);
+            if (code !== 0) {
+                finish(null);
+                return;
+            }
+            try {
+                const parsed = JSON.parse(stdout.trim()) as LocatePyOutput;
+                if (!parsed.ok || !parsed.boxes?.length) {
+                    finish(null);
+                    return;
+                }
+                finish({ boxes: parsed.boxes, hits: parsed.customerNumberHits || [] });
+            } catch {
+                finish(null);
+            }
+        });
+    });
+}

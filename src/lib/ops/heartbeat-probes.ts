@@ -377,6 +377,10 @@ export const HEARTBEAT_PROBES: ProbeSpec[] = [
     { name: "bot-alive", category: "process", critical: true, probe: probeBotAlive },
     { name: "slack-poller-alive", category: "process", critical: false, probe: probeSlackPollerAlive },
     // Cron freshness (informational)
+    // ap-forward is the SELF-HEALING critical path (every 15 min, 2026-09-17) —
+    // probe it tightly (1h). ap-polling keeps a loose 20h probe for the
+    // Finale-heavy 3×/day tick it remains responsible for.
+    { name: "ap-forward-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("ap-forward-fresh", "ap-forward", 1) },
     { name: "ap-polling-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("ap-polling-fresh", "ap-polling", 20) },
     { name: "build-risk-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("build-risk-fresh", "build-risk", 26, { weekdaysOnly: true }) },
     { name: "email-tracking-ingest-fresh", category: "cron", critical: false, probe: cronFreshnessProbe("email-tracking-ingest-fresh", "email-tracking-ingest", 4) },

@@ -500,6 +500,25 @@ export async function forwardInvoiceOnce(
     let sendFilename = safeFilename;
     if (shouldStampInvoice(req.emailFrom, req.invoiceNumber)) {
       try {
+        // Anchor-relative redaction (2026-09-17 plan 4.3): for template-matched
+        // senders, OCR-locate the customer-number contaminant on the ORIGINAL
+        // page and pass the boxes to the stamper alongside the static template
+        // boxes. Best-effort — on any failure the static boxes still apply.
+        let extraRedactionBoxes;
+        if (/aaacooper/i.test(req.emailFrom || "")) {
+          try {
+            const { locateCustomerNumberBoxes } = await import("./ap/invoice-ocr-gate");
+            const located = await locateCustomerNumberBoxes(req.pdfBuffer);
+            if (located?.boxes?.length) {
+              extraRedactionBoxes = located.boxes;
+              console.log(
+                `[ap-single-forward] 🎯 OCR-located ${located.boxes.length} customer# box(es) for redaction (${located.hits.join(", ")})`,
+              );
+            }
+          } catch (locErr: any) {
+            console.warn(`[ap-single-forward] redaction locate failed (static boxes apply): ${locErr?.message || locErr}`);
+          }
+        }
         sendBuffer = await stampInvoicePdf(
           req.pdfBuffer,
           {
@@ -507,6 +526,7 @@ export async function forwardInvoiceOnce(
             vendorName: req.vendorName,
           },
           req.emailFrom,
+          { extraRedactionBoxes },
         );
         sendFilename = buildStampedFilename(req.invoiceNumber!, req.vendorName);
         console.log(
@@ -623,7 +643,7 @@ export async function forwardInvoiceOnce(
         getLocalDb()
           .prepare("UPDATE ap_local_forwards SET verified = 1 WHERE billcom_sent_message_id = ?")
           .run(sentId);
-        console.log(`[ap-single-forward] ✅ Verified in Sent: ${safeFilename}`);
+        console.log(`[ap-single-forward] ✅ Verified in Sent: ${sendFilename}`);
       } else {
         console.warn(
           `[ap-single-forward] ⚠️ Sent message ${sentId} has no PDF attachment — investigate`,

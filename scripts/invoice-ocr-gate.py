@@ -77,6 +77,128 @@ def ocr_png(png_path):
         return f"{e}", False
 
 
+def ocr_png_tsv(png_path):
+    """
+    Run tesseract in TSV mode via the output-file method — the `tsv` positional
+    config is unreliable on Windows installs (silently falls back to plain
+    text). Writes <base>.tsv and returns its contents. Returns (tsv_text, ok).
+    """
+    base = None
+    try:
+        fd, base = tempfile.mkstemp(suffix="_ocr")
+        os.close(fd)
+        out = subprocess.run(
+            ["tesseract", png_path, base, "--psm", "6", "-c", "tessedit_create_tsv=1"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        tsv_path = base + ".tsv"
+        if not os.path.exists(tsv_path):
+            return "", False
+        with open(tsv_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(), True
+    except FileNotFoundError:
+        return "", False
+    except Exception:  # noqa: BLE001
+        return "", False
+    finally:
+        if base:
+            for suffix in ("", ".tsv", ".txt"):
+                p = base + suffix
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+
+def locate_customer_boxes(pdf_path, dpi=300):
+    """
+    Anchor-relative redaction locator (2026-09-17 plan 4.3): render page 1,
+    OCR it in TSV mode, and return the bounding box of EVERY occurrence of the
+    customer-number contaminant (0*1159492), converted to PDF points
+    (top-left origin) so the TypeScript stamper can white them out without
+    relying on hardcoded template coordinates.
+
+    Returns (boxes, hits, ok):
+        boxes = [{"x1","yTop1","x2","yTop2"}] in PDF points
+        hits  = the matched contaminant strings
+        ok    = False when rendering/tesseract unavailable
+    """
+    import tempfile
+
+    ok, err = None, None
+    try:
+        import pymupdf  # noqa: F401
+    except ImportError:
+        try:
+            import fitz as pymupdf  # older installs
+        except ImportError:
+            return [], [], False
+
+    tmp = None
+    try:
+        doc = pymupdf.open(pdf_path)
+        if doc.page_count == 0:
+            return [], [], False
+        page = doc[0]
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        pix = page.get_pixmap(dpi=dpi)
+        pix.save(tmp)
+        doc.close()
+    except Exception:  # noqa: BLE001
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return [], [], False
+
+    try:
+        tsv, tsv_ok = ocr_png_tsv(tmp)
+        if not tsv_ok or not tsv:
+            return [], [], False
+
+        pt_per_px = 72.0 / dpi
+        # Contaminant word tokens: the full number ("1159492", "01159492",
+        # "0001159492") and the OCR-split tail ("001 159492" → word "159492").
+        pattern = re.compile(r"0*1?59492\b")
+        boxes, hits = [], []
+        for line in tsv.splitlines():
+            parts = line.split("\t")
+            # TSV: level, page, block, par, line, word, left, top, width, height, conf, text
+            if len(parts) < 12 or parts[0] != "5":
+                continue
+            word = parts[11].strip()
+            m = pattern.search(word)
+            if not m:
+                continue
+            try:
+                left = float(parts[6])
+                top = float(parts[7])
+                width = float(parts[8])
+                height = float(parts[9])
+            except ValueError:
+                continue
+            pad = 2.0
+            boxes.append({
+                "x1": max(0.0, left * pt_per_px - pad),
+                "yTop1": max(0.0, top * pt_per_px - pad),
+                "x2": (left + width) * pt_per_px + pad,
+                "yTop2": (top + height) * pt_per_px + pad,
+            })
+            hits.append(m.group(0))
+        return boxes, hits, True
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 _INVOICE_PATTERNS = [
     re.compile(r"INVOICE\s*#\s*([A-Z0-9][A-Z0-9\-. ]{2,})", re.IGNORECASE),
     re.compile(r"INVOICE\s*(?:NO\.?|NUMBER)\s*[:#]?\s*([A-Z0-9][A-Z0-9\-. ]{2,})", re.IGNORECASE),
@@ -122,6 +244,22 @@ def extract(text):
 
 
 def main():
+    # --locate-customer mode: print bounding boxes of the customer-number
+    # contaminant for anchor-relative redaction (plan 4.3), then exit.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--locate-customer":
+        pdf_path = sys.argv[2]
+        if not os.path.exists(pdf_path):
+            print(json.dumps({"ok": False, "error": "pdf not found"}))
+            return 1
+        boxes, hits, ok = locate_customer_boxes(pdf_path)
+        print(json.dumps({
+            "ok": ok,
+            "boxes": boxes,
+            "customerNumberHits": hits,
+            "error": None if ok else "render/ocr unavailable",
+        }))
+        return 0 if ok else 1
+
     if len(sys.argv) < 2:
         print(json.dumps({"ok": False, "error": "usage: invoice-ocr-gate.py <pdf> [<png>]"}))
         return 1
