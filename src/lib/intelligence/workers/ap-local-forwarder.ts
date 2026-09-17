@@ -48,6 +48,7 @@ import {
     trimToFirstPage,
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
+import { deriveInvoiceNumberFromSubject } from "@/lib/intelligence/ap/invoice-number";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 import { isStatementSubject, isStatementAttachment } from "@/lib/intelligence/ap-statement-gate";
 import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
@@ -104,6 +105,29 @@ export function extractAaaProNumber(subject: string): string | null {
 /** Build a clear AAA Cooper invoice filename so Bill.com keys the bill to the Pro#. */
 export function buildAaaCooperFilename(proNumber: string): string {
     return `${proNumber}_AAA_Cooper_Transportation.pdf`;
+}
+
+/**
+ * Flag-only suspicion check for non-payable letter subjects that arrive WITH
+ * an attachment (so the no-attachment payment-correspondence gate never sees
+ * them): dispute/collection letters ("FedEx Freight vs Buildasoil LLC File#…"),
+ * dunning notices ("Notice of Invoice Due"), remittance advices, past-due
+ * statements. FORWARD + FLAG, never block (2026-09-17 plan item 4.1) — the
+ * flag lands in reconciliation_notes as `suspect:<reason>` and surfaces in
+ * the morning AP health report and the weekly reconcile.
+ *
+ * @returns short machine-readable reason tag, or null when the subject looks ordinary
+ */
+export function suspectSubjectReason(subject: string | null | undefined): string | null {
+    const s = String(subject || "");
+    if (/\bvs\.?\s/i.test(s)) return "dispute-letter";
+    if (/notice of invoice due/i.test(s)) return "dunning-notice";
+    if (/payment\s+(information|confirmation|receipt)/i.test(s)) return "payment-doc";
+    if (/remittance/i.test(s)) return "remittance";
+    if (/past\s+due/i.test(s)) return "past-due";
+    if (/collections?\s+letter|final\s+notice/i.test(s)) return "collection-letter";
+    if (/statement of account/i.test(s)) return "statement-of-account";
+    return null;
 }
 
 
@@ -818,58 +842,6 @@ async function syncToSupabase(
 }
 
 /**
- * Verify that a sent forward message exists in Gmail Sent and contains
- * the expected PDF attachment. Returns true if verified, false otherwise.
- *
- * @param gmail - Authenticated Gmail API client
- * @param sentMessageId - Gmail message ID of the sent forward
- * @param expectedFilename - PDF filename that should be attached
- * @returns true if the sent message exists and has the PDF attachment
- */
-async function verifySentForward(gmail: any, sentMessageId: string, expectedFilename: string): Promise<boolean> {
-    try {
-        const sentMsg = await gmail.users.messages.get({
-            userId: "me",
-            id: sentMessageId,
-            format: "full",
-        });
-
-        // Check the message has parts (multipart)
-        const payload = sentMsg.data.payload;
-        if (!payload) return false;
-
-        // Walk the MIME tree looking for the PDF attachment
-        function findAttachment(part: any): boolean {
-            if (!part) return false;
-            const filename = part.filename || "";
-            const mimeType = part.mimeType || "";
-            if (filename === expectedFilename && mimeType === "application/pdf") {
-                return true;
-            }
-            if (part.parts) {
-                return part.parts.some((p: any) => findAttachment(p));
-            }
-            return false;
-        }
-
-        const hasAttachment = findAttachment(payload);
-        if (hasAttachment) {
-            // Mark as verified in local DB
-            try {
-                const db = getLocalDb();
-                db.prepare(
-                    `UPDATE ap_local_forwards SET verified = 1 WHERE billcom_sent_message_id = ?`
-                ).run(sentMessageId);
-            } catch { /* non-critical */ }
-        }
-        return hasAttachment;
-    } catch (e: any) {
-        console.warn(`   [AP-Local] Verify sent failed: ${e.message}`);
-        return false;
-    }
-}
-
-/**
  * Check for bounce/notification emails from mailer-daemon or postmaster
  * that reference recent Bill.com forwards. Scans last 24h of inbox.
  * Flags any bounced forwards in the local DB.
@@ -1563,6 +1535,40 @@ export async function runLocalApForward(opts?: {
                     await syncToSupabase(from, subject, pdfFilename, once.billcomSentMessageId);
                     summary.forwarded++;
                     console.log(`   [AP-Local] ✅ Forwarded ${pdfFilename} from ${from.slice(0, 25)} (single-gate)`);
+
+                    // Ledger accuracy (2026-09-17): populate ocr_invoice_number from
+                    // the subject/filename even when the PO-match enrich path is
+                    // skipped (dropship, FedEx carrier bills) or OCR is thin, so
+                    // ap_local_forwards carries the same invoice# the weekly
+                    // reconcile derives. Fill-only — never overwrites a real OCR
+                    // value. Suspect subjects (dispute/dunning/remittance letters
+                    // WITH an attachment) are flagged, never blocked.
+                    try {
+                        const fills: string[] = [];
+                        const subjInv = deriveInvoiceNumberFromSubject(subject, pdfFilename);
+                        if (subjInv) {
+                            getLocalDb().prepare(
+                                `UPDATE ap_local_forwards
+                                 SET ocr_invoice_number = ?
+                                 WHERE gmail_message_id = ? AND pdf_filename = ?
+                                   AND (ocr_invoice_number IS NULL OR ocr_invoice_number = '')`,
+                            ).run(subjInv, gmailMessageId, pdfFilename);
+                            fills.push(`inv#${subjInv}`);
+                        }
+                        const suspect = suspectSubjectReason(subject);
+                        if (suspect) {
+                            getLocalDb().prepare(
+                                `UPDATE ap_local_forwards
+                                 SET reconciliation_notes = COALESCE(reconciliation_notes || ' | ', '') || ?
+                                 WHERE gmail_message_id = ? AND pdf_filename = ?`,
+                            ).run(`suspect:${suspect}`, gmailMessageId, pdfFilename);
+                            console.warn(`   [AP-Local] 🚩 Suspect subject forwarded+flagged (${suspect}): ${subject.slice(0, 70)}`);
+                            fills.push(`suspect:${suspect}`);
+                        }
+                        if (fills.length) console.log(`   [AP-Local] 📝 ledger fill: ${fills.join(", ")}`);
+                    } catch (fillErr: any) {
+                        console.warn(`   [AP-Local] ledger fill failed: ${fillErr?.message || fillErr}`);
+                    }
 
                     // Vision/OCR + vendor_invoices so Receivings can PO-match.
                     // Photo invoices need LLM OCR (pdf-parse returns ~0 text).
