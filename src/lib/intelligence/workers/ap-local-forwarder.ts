@@ -52,6 +52,7 @@ import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/int
 import { deriveInvoiceNumberFromSubject } from "@/lib/intelligence/ap/invoice-number";
 import { forwardInvoiceOnce } from "@/lib/intelligence/ap-single-forward";
 import { isStatementSubject, isStatementAttachment } from "@/lib/intelligence/ap-statement-gate";
+import { isQuoteOrSpecName, isQuoteOrSpecText } from "@/lib/intelligence/ap/quote-spec-gate";
 import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
 import {
     imageBufferToPdf,
@@ -1382,6 +1383,23 @@ export async function runLocalApForward(opts?: {
                     continue;
                 }
 
+                // Quote / spec-sheet PDFs — log, never Bill.com. Century
+                // Equipment forwarded 8 quotes+specs on 2026-09-16; they can
+                // never become bills, only permanent reconcile noise.
+                if (isQuoteOrSpecName({ subject, filename: att.filename })) {
+                    console.log(`   [AP-Local] Quote/spec attachment — log only: ${att.filename}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: att.filename,
+                        reason: `quote/spec document - not an invoice: ${att.filename}`,
+                        vendorRoutingAction: "skip",
+                    });
+                    summary.skipped++;
+                    continue;
+                }
+
                 let pdfBuffer = att.buffer;
                 let pdfFilename = att.filename;
 
@@ -1493,6 +1511,23 @@ export async function runLocalApForward(opts?: {
                 }
 
                 // Re-classify with OCR text for service hint / invoice # when available.
+                // Quote/spec sheet with ambiguous name (e.g. "Nick Schwab 2025 Open
+                // Rops CX37C.pdf"): text says quote/spec and carries no payable
+                // signal — log only, never Bill.com.
+                if (isQuoteOrSpecText({ pdfText: paidCheck.rawText })) {
+                    console.log(`   [AP-Local] Quote/spec text — log only: ${att.filename}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: att.filename,
+                        reason: `quote/spec document (text) - not an invoice: ${att.filename}`,
+                        vendorRoutingAction: "skip",
+                    });
+                    summary.skipped++;
+                    continue;
+                }
+
                 const fedexMeta = isFedExCarrierBill
                     ? classifyFedExBillingAttachment({
                         from,

@@ -36,6 +36,7 @@ import { getLocalDb } from "@/lib/storage/local-db";
 import { importCsvFile, parseCSV, type ParsedRow } from "./import-billcom-ref";
 import { isStatementDocument } from "@/lib/intelligence/ap-statement-gate";
 import { isFedExFreightOnlineBill } from "@/lib/intelligence/ap/fedex-billing-packet";
+import { isQuoteOrSpecDocument } from "@/lib/intelligence/ap/quote-spec-gate";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -74,7 +75,7 @@ interface Verdict {
   vendor: string;
   invoice: string;
   amount: string | null;
-  kind: "MISSING" | "NEEDS_REVIEW" | "NO_IDENTITY" | "OCR_SUSPECT";
+  kind: "MISSING" | "NEEDS_REVIEW" | "NO_IDENTITY" | "OCR_SUSPECT" | "DIRECT_PAY";
   detail: string;
 }
 
@@ -83,7 +84,7 @@ interface BillIssue {
   vendor: string;
   invoice: string;
   amount: string | null;
-  kind: "AMOUNT_MISMATCH" | "AMOUNT_OUTLIER" | "AMOUNT_LOW_CONFIDENCE" | "DUP_INVOICE_NUMBER" | "NONUNIQUE_INVOICE_NUMBER" | "DATE_ISSUE" | "TERMS_OUTLIER";
+  kind: "AMOUNT_MISMATCH" | "AMOUNT_OUTLIER" | "AMOUNT_LOW_CONFIDENCE" | "DUP_INVOICE_NUMBER" | "NEAR_DUP_INVOICE_NUMBER" | "NONUNIQUE_INVOICE_NUMBER" | "DATE_ISSUE" | "TERMS_OUTLIER";
   detail: string;
 }
 
@@ -104,6 +105,23 @@ function normVendor(s: string | null | undefined): string {
 function normInvoice(s: string | null | undefined): string {
   return (s || "").replace(/\D/g, "").replace(/^0+/, "");
 }
+
+/**
+ * Industry-generic words that must never alone prove two vendors are the same.
+ * "Century Equipment Company" and "Welch Equipment" share "equipment" but are
+ * unrelated vendors; treating a shared generic token as a match made the
+ * Century Equipment invoice (GJ17176-1) report "vendor matches ref" when no
+ * Century bill has ever existed in 1300+ Bill.com rows. Only the token-overlap
+ * branch of vendorsMatch is filtered — containment and the alias map are not.
+ */
+const GENERIC_VENDOR_TOKENS = new Set([
+  "equipment", "supply", "supplies", "company", "inc", "llc", "ltd", "corp",
+  "services", "service", "group", "logistics", "transport", "transportation",
+  "trucking", "packaging", "products", "industries", "solutions", "systems",
+  "distributors", "distribution", "wholesale", "farms", "farm", "ranch",
+  "trading", "enterprises", "holdings", "partners", "manufacturing",
+  "organics", "organic", "soils", "soil", "america", "usa", "national",
+]);
 
 /** Loose vendor compare: containment OR shared meaningful token OR alias map. */
 const VENDOR_ALIASES: Array<string[]> = [
@@ -141,8 +159,8 @@ function vendorsMatch(a: string, b: string): boolean {
   const nb = normVendor(b);
   if (!na || !nb) return false;
   if (na.includes(nb) || nb.includes(na)) return true;
-  const ta = new Set(na.split(" ").filter((t) => t.length >= 4));
-  const tb = new Set(nb.split(" ").filter((t) => t.length >= 4));
+  const ta = new Set(na.split(" ").filter((t) => t.length >= 4 && !GENERIC_VENDOR_TOKENS.has(t)));
+  const tb = new Set(nb.split(" ").filter((t) => t.length >= 4 && !GENERIC_VENDOR_TOKENS.has(t)));
   if ([...ta].some((t) => tb.has(t))) return true;
   for (const group of VENDOR_ALIASES) {
     if (group.some((g) => na.includes(g)) && group.some((g) => nb.includes(g))) return true;
@@ -470,6 +488,8 @@ async function main(): Promise<void> {
   const refRows = ref; // full loose match over rows (prefix/suffix invoice compare)
 
   const verdicts: Verdict[] = [];
+  /** Real payables that never become Bill.com bills (vendor collects payment). */
+  const directPay: Verdict[] = [];
   const billIssues: BillIssue[] = [];
   const gateFlags: Array<{ date: string; vendor: string; invoice: string; verdict: string; reason: string }> = [];
   let matched = 0;
@@ -620,7 +640,15 @@ async function main(): Promise<void> {
       filename,
       invoiceNumber: invoice,
     });
+    // Quote / spec-sheet documents (Century Equipment, 2026-09-16) are not
+    // bills — they can never be entered. Router skips them at forward now.
+    const quoteSpecDoc = isQuoteOrSpecDocument({
+      subject: f.email_subject,
+      filename,
+      pdfText: f.ocr_raw_text,
+    });
     const noBillClass = fedexFreightOnline
+      || quoteSpecDoc
       || /acknowledgment_/i.test(filename)
       || /us payment information/i.test(filename)
       || /correspondence_/i.test(filename)
@@ -628,6 +656,24 @@ async function main(): Promise<void> {
       || (/berger/i.test(`${displayVendor} ${hay}`) && /image00/i.test(filename));
     if (paidOnline || wagnerCc || noBillClass) {
       paidOnlineCount++;
+      continue;
+    }
+
+    // Century Equipment (peter.capone@centuryeq.com): the vendor collects
+    // payment directly — "I can come pick up a physical Check or I can take
+    // payment over the phone" (2026-09-11 email), and the 2026-09-17 invoice
+    // GJ17176-1 ($9,638.89, bucket extension + counterweights) ships only after
+    // "a signed copy and payment". Zero Century bills in 1300+ Bill.com rows.
+    // It is a real payable, just not a Bill.com bill — report once, never as
+    // a missing Bill.com entry.
+    const directPayVendor = /century\s*equipment/i.test(`${displayVendor} ${hay}`)
+      || /centuryeq\.com/i.test(f.email_from || "");
+    if (directPayVendor) {
+      directPay.push({
+        ...base,
+        kind: "DIRECT_PAY",
+        detail: `vendor collects payment directly (check pickup / phone) — not a Bill.com bill; confirm it got paid outside Bill.com`,
+      });
       continue;
     }
 
@@ -760,6 +806,41 @@ async function main(): Promise<void> {
         });
       }
     }
+    // d) Near-duplicate invoice# across exports: same vendor + amount + date,
+    //    one number a prefix of the other. Real case: FedEx 9-444-759 vs
+    //    9-444-75902 ($15,202.99, 2026-09-01) — the short number was a mistyped
+    //    copy of the Ground bill and Bill renamed it on 2026-09-08. Because the
+    //    rename completed before the next export, no single export ever held
+    //    both, so (b)/(c) can never see this class. Compare fresh rows against
+    //    the accumulated ref and say whether the twin is live or stale.
+    const freshKeys = new Set(
+      freshRows.map((r) => `${normVendor(r.vendor_name)}|${normInvoice(r.invoice_number)}`),
+    );
+    for (const row of freshRows) {
+      const v = normVendor(row.vendor_name);
+      const rd0 = normInvoice(row.invoice_number);
+      if (!v || row.invoice_amount == null || !row.invoice_date || rd0.length < 6) continue;
+      for (const cand of ref) {
+        if (normVendor(cand.vendor_name) !== v) continue;
+        if (cand.invoice_amount !== row.invoice_amount) continue;
+        if ((cand.invoice_date || "") !== row.invoice_date) continue;
+        const rd1 = normInvoice(cand.invoice_number);
+        if (rd1 === rd0 || rd1.length < 6) continue;
+        const [short, long] = rd0.length <= rd1.length ? [rd0, rd1] : [rd1, rd0];
+        if (!long.startsWith(short)) continue;
+        const twinLive = freshKeys.has(`${v}|${rd1}`);
+        if (billIssues.some((x) => x.kind === "NEAR_DUP_INVOICE_NUMBER" && x.vendor === (row.vendor_name || "") && (x.invoice === (row.invoice_number || "") || x.invoice === (cand.invoice_number || "")))) continue;
+        billIssues.push({
+          vendor: row.vendor_name || "?",
+          invoice: row.invoice_number || "?",
+          amount: row.invoice_amount != null ? `$${row.invoice_amount.toFixed(2)}` : null,
+          kind: "NEAR_DUP_INVOICE_NUMBER",
+          detail: twinLive
+            ? `invoice# ${row.invoice_number} and ${cand.invoice_number} are BOTH in this export with the same amount/date — live duplicate entry; void one before payment`
+            : `invoice# ${row.invoice_number} has an older twin ${cand.invoice_number} (same amount/date, not in this export) — looks already renamed/voided in Bill.com; confirm it is gone`,
+        });
+      }
+    }
   }
 
   const kinds = verdicts.reduce<Record<string, number>>((acc, v) => {
@@ -773,6 +854,9 @@ async function main(): Promise<void> {
   if (paidOnlineCount > 0) {
     console.log(`[reconcile-billcom] Paid online / CC (no bill expected): ${paidOnlineCount}`);
   }
+  if (directPay.length > 0) {
+    console.log(`[reconcile-billcom] Direct pay (not a Bill.com bill): ${directPay.length}`);
+  }
   console.log(`[reconcile-billcom] Action needed: ${verdicts.length} (${Object.entries(kinds).map(([k, v]) => `${v} ${k}`).join(", ") || "none"})`);
   if (billIssues.length > 0) {
     const ikinds = billIssues.reduce<Record<string, number>>((acc, x) => {
@@ -782,9 +866,19 @@ async function main(): Promise<void> {
     console.log(`[reconcile-billcom] Bill-data issues: ${billIssues.length} (${Object.entries(ikinds).map(([k, v]) => `${v} ${k}`).join(", ")})`);
   }
 
-  if (verdicts.length === 0 && billIssues.length === 0) {
+  if (verdicts.length === 0 && billIssues.length === 0 && directPay.length === 0) {
     console.log("\n✓ Nothing missing, needing review, or miskeyed.");
     process.exit(0);
+  }
+
+  if (directPay.length > 0) {
+    console.log("\n=== DIRECT PAY — real payable, paid outside Bill.com ===");
+    for (const v of directPay) {
+      console.log(
+        `[DIRECT_PAY] ${v.forwarded_at} | ${v.vendor} | #${v.invoice} | $${v.amount ?? "?"} | ${v.pdf_filename}`,
+      );
+      console.log(`        ${v.detail}`);
+    }
   }
 
   if (verdicts.length > 0) {
