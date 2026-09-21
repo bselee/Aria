@@ -239,6 +239,58 @@ export async function trimToFirstPage(buffer: Buffer): Promise<Buffer> {
     }
 }
 
+/** FedEx Freight LTL account — billed/paid online (Billtrust), never Bill.com. */
+export const FEDEX_FREIGHT_ACCOUNT = "646135168";
+
+/** FedEx Freight invoice numbers are 10+ digits starting 3004 (300408064402). */
+const FEDEX_FREIGHT_INVOICE_RE = /^300\d{7,}$/;
+
+/**
+ * True when a message/attachment is a FedEx **Freight** (LTL) bill.
+ *
+ * FedEx Freight is a separate lane from FedEx Billing Online (FBO) parcel
+ * bills: it is presented and paid online (Billtrust-style "Acct No. …
+ * Your Bill from FedEx Freight is Available Online"), and Bill does not enter
+ * it in Bill.com (confirmed 2026-09-21 for 300408064402 / 300408264007).
+ * Forwarding these to Bill.com only creates unmatched-bill noise, so the
+ * forwarder skips them and reconcile-billcom treats them as "no bill expected".
+ *
+ * FBO parcel packets (noreply@fedex.com, "Your New FedEx Billing Online
+ * invoice is attached", invoice # 9-XXX-XXXXX) MUST still forward.
+ *
+ * @param args.from          Gmail From header
+ * @param args.subject       Gmail Subject header
+ * @param args.filename      attachment filename (optional)
+ * @param args.invoiceNumber OCR/invoice number when known (optional)
+ * @returns true when this is a FedEx Freight online bill
+ */
+export function isFedExFreightOnlineBill(args: {
+    from?: string | null;
+    subject?: string | null;
+    filename?: string | null;
+    invoiceNumber?: string | null;
+}): boolean {
+    const subject = String(args.subject || "");
+    const filename = String(args.filename || "");
+    const from = String(args.from || "");
+    const blob = `${subject}\n${filename}\n${from}`;
+    if (!/fedex/i.test(blob)) return false;
+
+    // Billtrust-style presentment notice: "Acct No. 646135168: Your Bill from
+    // FedEx Freight is Available Online - No Action Required"
+    if (/fedex\s*freight/i.test(blob) && (/available\s*online/i.test(subject) || /acct\s*no/i.test(subject))) {
+        return true;
+    }
+    // Account number present anywhere with FedEx context (subject or filename)
+    if (blob.includes(FEDEX_FREIGHT_ACCOUNT)) return true;
+    // Generated FedEx Freight statement filename: fedex_646135168_<date>_*.pdf
+    if (/^fedex_646135168_/i.test(filename.trim().split(/[/\\]/).pop() || "")) return true;
+    // Freight invoice-number shape (10+ digits, 3004…) with FedEx context
+    const inv = String(args.invoiceNumber || "").replace(/\D/g, "");
+    if (inv && FEDEX_FREIGHT_INVOICE_RE.test(inv)) return true;
+    return false;
+}
+
 /**
  * Queue extracted_json fields for identifier / forwarder.
  */

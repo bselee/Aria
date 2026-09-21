@@ -35,6 +35,7 @@
 import { getLocalDb } from "@/lib/storage/local-db";
 import { importCsvFile, parseCSV, type ParsedRow } from "./import-billcom-ref";
 import { isStatementDocument } from "@/lib/intelligence/ap-statement-gate";
+import { isFedExFreightOnlineBill } from "@/lib/intelligence/ap/fedex-billing-packet";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -610,7 +611,17 @@ async function main(): Promise<void> {
     // BFG order acks, Uline payment-information docs, AAA Cooper collection
     // correspondence. Router rules prevent these from forwarding today.
     const filename = f.pdf_filename || "";
-    const noBillClass = /acknowledgment_/i.test(filename)
+    // FedEx Freight LTL (acct 646135168, invoice 3004…) is presented and paid
+    // online — Bill never enters it in Bill.com (confirmed 2026-09-21 for
+    // 300408064402 / 300408264007). Never a missing bill.
+    const fedexFreightOnline = isFedExFreightOnlineBill({
+      from: f.email_from,
+      subject: f.email_subject,
+      filename,
+      invoiceNumber: invoice,
+    });
+    const noBillClass = fedexFreightOnline
+      || /acknowledgment_/i.test(filename)
       || /us payment information/i.test(filename)
       || /correspondence_/i.test(filename)
       || /collectiontoolbox/i.test(`${displayVendor} ${hay}`)

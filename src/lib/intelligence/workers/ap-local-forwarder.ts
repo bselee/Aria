@@ -45,6 +45,7 @@ import {
     FEDEX_CARRIER_BILL_ACTION,
     buildFedExBillComFilename,
     classifyFedExBillingAttachment,
+    isFedExFreightOnlineBill,
     trimToFirstPage,
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
@@ -180,6 +181,12 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     ) {
         return true;
     }
+    // FedEx Freight LTL (acct 646135168) — billed and paid online (Billtrust
+    // presentment), never entered in Bill.com (Bill, 2026-09-21). Forwarding
+    // them creates unmatched-bill noise in reconcile-billcom forever. FBO
+    // parcel packets (noreply@fedex.com) are a different lane and still forward.
+    if (isFedExFreightOnlineBill({ from, subject })) return true;
+
     // AAA Cooper Transportation (2026-08-13): forward INDIVIDUAL invoices only.
     // Their correspondence bundles ("Account 1159492 - BUILDASOIL"), statements,
     // and reply threads ("RE: Need remittance") bundle the SAME invoices that are
@@ -1067,8 +1074,8 @@ export async function runReconciliationHandoff(): Promise<{
                 ).run(inv.id);
                 if (shouldNotifyPoUnmatched(inv.forwarded_at)) {
                     try {
-                        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-                        await sendTelegramNotify(
+                        const { notify } = await import("@/lib/intelligence/notify");
+                        await notify(
                             `AP: invoice not matched to PO\n` +
                             `From: ${(inv.email_from || "").slice(0, 60)}\n` +
                             `Subj: ${(inv.email_subject || "").slice(0, 80)}\n` +
@@ -1094,8 +1101,8 @@ export async function runReconciliationHandoff(): Promise<{
                 ).run(inv.id);
                 if (shouldNotifyPoUnmatched(inv.forwarded_at)) {
                     try {
-                        const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-                        await sendTelegramNotify(
+                        const { notify } = await import("@/lib/intelligence/notify");
+                        await notify(
                             `AP: invoice not matched to PO\n` +
                             `From: ${(inv.email_from || "").slice(0, 60)}\n` +
                             `Subj: ${(inv.email_subject || "").slice(0, 80)}\n` +
@@ -1140,8 +1147,8 @@ export async function runReconciliationHandoff(): Promise<{
                 } else {
                     if (shouldNotifyPoUnmatched(inv.forwarded_at)) {
                         try {
-                            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-                            await sendTelegramNotify(
+                            const { notify } = await import("@/lib/intelligence/notify");
+                            await notify(
                                 `AP: invoice needs PO review\n` +
                                 `PO: ${poNumber}\n` +
                                 `From: ${(inv.email_from || "").slice(0, 60)}\n` +

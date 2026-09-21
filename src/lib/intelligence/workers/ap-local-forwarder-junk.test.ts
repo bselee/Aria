@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { isFedExFreightOnlineBill } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isNonInvoiceEmail } from "./ap-local-forwarder";
 
 describe("isNonInvoiceEmail — junk pre-send gate", () => {
@@ -60,6 +61,42 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
                 subject: "FedEx Billing Online - Invoice(s) Past Due",
             }),
         ).toBe(true);
+    });
+
+    // ── FedEx Freight LTL (billed online, never entered in Bill.com) ──────
+    // Bill, 2026-09-21: acct 646135168 bills are paid online. Real rows from
+    // ap_local_forwards (ids 782, 783) forwarded 2026-09-21.
+    it("skips FedEx Freight online bill notice (acct 646135168)", () => {
+        expect(
+            isNonInvoiceEmail({
+                from: "BuildASoil Support <support@buildasoil.com>",
+                subject:
+                    "Fwd: Acct No. 646135168: Your Bill from FedEx Freight is Available Online - No Action Required",
+            }),
+        ).toBe(true);
+    });
+
+    it("skips FedEx Freight statement attachment by filename", () => {
+        expect(
+            isFedExFreightOnlineBill({
+                from: "BuildASoil Support <support@buildasoil.com>",
+                subject: "Fwd: FedEx Freight bill",
+                filename: "fedex_646135168_20260921_10340598_4926466165.pdf",
+                invoiceNumber: "300408064402",
+            }),
+        ).toBe(true);
+    });
+
+    // FBO parcel carrier bills must keep forwarding — different lane.
+    it("ALLOWS FedEx Billing Online parcel invoice (9-XXX-XXXXX)", () => {
+        expect(
+            isFedExFreightOnlineBill({
+                from: "FedEx Billing Online <noreply@fedex.com>",
+                subject: "Your New FedEx Billing Online invoice is attached",
+                filename: "FedEx_Ground_9-462-62548.pdf",
+                invoiceNumber: "9-462-62548",
+            }),
+        ).toBe(false);
     });
 
     // ── Vendor order acknowledgments (must skip) ──────────────────────────
