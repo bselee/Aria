@@ -3,10 +3,8 @@
 import React from "react";
 import {
     cleanup,
-    fireEvent,
     render,
     screen,
-    waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -238,61 +236,30 @@ describe("CommandBoardShell", () => {
         vi.stubGlobal("fetch", fetchImpl);
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
-        const orderingPane = screen.getByTestId("lifecycle-pane-ordering");
+        const orderingPane = await screen.findByTestId("lifecycle-pane-ordering");
         const purchasesPane = screen.getByTestId("lifecycle-pane-purchases");
         const rcvPane = screen.getByTestId("lifecycle-pane-rcv");
 
-        expect(lifecycleTab.textContent).toBe("Lifecycle");
-        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
         expect(orderingPane.textContent).toContain("Ordering");
         expect(purchasesPane.textContent).toContain("Purchases");
-        expect(rcvPane.textContent).toContain("Receivings");
+        expect(rcvPane.textContent).toContain("Invoices");
     });
 
-    it("labels the shell Ops Board and removes redundant lifecycle drill-in tabs", async () => {
+    it("does not render Ops Board header chrome or module tabs", async () => {
         const fetchImpl = makeFetch();
         render(<CommandBoardShell fetchImpl={fetchImpl} />);
 
-        expect(await screen.findByText("Ops Board")).toBeTruthy();
+        await screen.findByTestId("purchasing-lifecycle-panel");
+        expect(screen.queryByText("Ops Board")).toBeNull();
+        expect(screen.queryByText(/needs you/i)).toBeNull();
+        expect(screen.queryByText(/^Refresh$/i)).toBeNull();
+        expect(screen.queryByTestId("shell-tab-lifecycle")).toBeNull();
         expect(screen.queryByTestId("shell-tab-ordering")).toBeNull();
         expect(screen.queryByTestId("shell-tab-purchases")).toBeNull();
         expect(screen.queryByTestId("shell-tab-rcv")).toBeNull();
-    });
-
-    it("fetches agents endpoint at boot (data is hydrated even though right rail is gone)", async () => {
-        const fetchImpl = makeFetch();
-        render(<CommandBoardShell fetchImpl={fetchImpl} />);
-
-        // Right rail (agent tree + cron) was removed in 31de1c5 — agents
-        // labels no longer render by default. But the shell STILL fetches
-        // /api/command-board/agents on boot because the response carries
-        // health-chip counts (X/Y healthy) shown in the header.
-        await waitFor(() => {
-            const calls = (fetchImpl as unknown as { mock: { calls: any[][] } }).mock.calls;
-            const urls = calls.map(c => String(c[0]));
-            expect(urls.some(u => u.startsWith("/api/command-board/agents"))).toBe(true);
-        });
-    });
-
-    it("default tab is Lifecycle because purchasing needs ordering, active purchases, and RCV together", async () => {
-        const fetchImpl = makeFetch();
-        render(<CommandBoardShell fetchImpl={fetchImpl} />);
-
-        const lifecycleTab = await screen.findByTestId("shell-tab-lifecycle");
-        expect(lifecycleTab.getAttribute("aria-selected")).toBe("true");
-    });
-
-    it("More menu exposes Activity and switches to it", async () => {
-        const fetchImpl = makeFetch();
-        render(<CommandBoardShell fetchImpl={fetchImpl} />);
-
-        fireEvent.click(await screen.findByTestId("shell-tab-more"));
-        const activityTab = await screen.findByTestId("shell-tab-activity");
-        fireEvent.click(activityTab);
-        // option itself may not keep aria-selected after menu closes; active primary shows via More label
-        expect(await screen.findByTestId("shell-tab-more")).toBeTruthy();
-        expect(screen.getByTestId("shell-tab-more").textContent || "").toMatch(/Activity/i);
+        expect(screen.queryByTestId("shell-tab-more")).toBeNull();
+        expect(screen.queryByTestId("shell-tab-activity")).toBeNull();
+        expect(screen.queryByText(/AI Operations Assistant/i)).toBeNull();
     });
 });
 
