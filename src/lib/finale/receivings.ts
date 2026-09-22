@@ -1063,7 +1063,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
 
     protected mergeDraftOrderItems(
         existingItems: any[],
-        incomingItems: Array<{ productId: string; quantity: number; unitPrice: number }>,
+        incomingItems: Array<{ productId: string; quantity: number; unitPrice: number; productName?: string | null }>,
     ): any[] {
         const merged = [...(existingItems || [])];
 
@@ -1071,12 +1071,20 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             const index = merged.findIndex((item) => this.normalizeOrderLineProductId(item) === incoming.productId);
             if (index >= 0) {
                 const current = merged[index];
+                const existingDesc = String(current.itemDescription || '').trim();
+                const descIsSku = !existingDesc
+                    || existingDesc.toLowerCase() === String(incoming.productId).toLowerCase();
                 merged[index] = {
                     ...current,
                     productId: this.normalizeOrderLineProductId(current) || incoming.productId,
                     productUrl: current.productUrl || `/${this.accountPath}/api/product/${encodeURIComponent(incoming.productId)}`,
                     quantity: Math.max(Number(current.quantity || 0), incoming.quantity),
                     unitPrice: incoming.unitPrice > 0 ? incoming.unitPrice : current.unitPrice,
+                    // HERMIA(2026-09-21): stamp a real product description when
+                    // Finale auto-filled the line with the bare SKU.
+                    ...(descIsSku && incoming.productName
+                        ? { itemDescription: incoming.productName }
+                        : {}),
                 };
                 continue;
             }
@@ -1086,6 +1094,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(incoming.productId)}`,
                 quantity: incoming.quantity,
                 unitPrice: incoming.unitPrice,
+                ...(incoming.productName ? { itemDescription: incoming.productName } : {}),
             });
         }
 

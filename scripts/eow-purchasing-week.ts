@@ -22,7 +22,6 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import {
   addDays,
   excludeManualVendor,
-  invoiceAmountLabel,
   isStatement,
   mdFromIso,
   mondayOf,
@@ -112,20 +111,8 @@ function table(headers: string[], rows: string[][], total?: string[]): string {
 </table>`;
 }
 
-function billGrid(rows: Row[]): string {
-  const body = rows
-    .map(
-      (r) =>
-        `<tr><td>${esc(r.vendor)}</td><td>${esc(r.note || "")}</td><td class="amt">${invoiceAmountLabel(r.vendor, r.amount)}</td></tr>`
-    )
-    .join("\n");
-  return `<table class="bill">
-  <col class="vendor"><col class="note"><col class="amt">
-  <thead><tr><th>Vendor</th><th>Invoice</th><th class="amt">Amount</th></tr></thead>
-  <tbody>
-  ${body}
-  </tbody>
-</table>`;
+function invoicesSentSummary(n: number): string {
+  return `<p class="summary">(${n}) invoices sent</p>`;
 }
 
 function renderHtml(p: {
@@ -199,7 +186,7 @@ ${table(["PO", "Vendor", "SKU", "Amount", "Vendor Response"], toPoCells(p.delaye
 </div>
 <div class="keep">
 <h2>Invoices to Bill.com</h2>
-${billGrid(p.billVerified)}
+${invoicesSentSummary(p.billVerified.length)}
 </div>
 <div class="keep">
 <h2>Invoice Issues</h2>
@@ -316,10 +303,11 @@ function chromePdf(htmlPath: string, pdfPath: string) {
 
 async function main() {
   const send = process.argv.includes("--send");
+  const weekArg = process.argv.find((a) => a.startsWith("--week="))?.slice(7);
   const today = denverToday();
-  const start = mondayOf(today);
+  const start = mondayOf(weekArg || today);
   const friday = addDays(start, 4);
-  const end = today < friday ? today : friday;
+  const end = weekArg ? friday : today < friday ? today : friday;
   const receiptEnd = addDays(end, 1);
 
   const finale = new FinaleClient();

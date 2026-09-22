@@ -10,6 +10,7 @@
 
 import type { FinaleClient, FullPO } from "../finale/client";
 import { createClient, probePostgrest } from "../db";
+import { CACHE_ACTIVE_STATUS_VALUES } from "./active-po-status";
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
@@ -99,16 +100,21 @@ function maxPastShipmentReceiveDate(
     return past.sort().at(-1) || null;
 }
 
-async function readCachedPos(): Promise<FullPO[]> {
+export async function readCachedPos(daysBack = 60): Promise<FullPO[]> {
     const db = createClient();
     if (!db) return [];
 
     try {
+        const cutoff = new Date();
+        cutoff.setUTCDate(cutoff.getUTCDate() - daysBack);
+        const cutoffStr = cutoff.toISOString().split("T")[0];
+
         const { data, error } = await db
             .from("purchase_orders")
             .select("*")
-            .order("updated_at", { ascending: false })
-            .limit(500);
+            .in("status", [...CACHE_ACTIVE_STATUS_VALUES])
+            .gte("issue_date", cutoffStr)
+            .order("issue_date", { ascending: false });
 
         if (error || !data || data.length === 0) return [];
 
@@ -183,7 +189,7 @@ export async function getCachedOrFresh(
             try {
                 const lastSync = await getCacheAge();
                 if (lastSync && isCacheFresh(lastSync)) {
-                    const cached = await readCachedPos();
+                    const cached = await readCachedPos(daysBack);
                     if (cached.length > 0) {
                         console.log(`[po-cache] HIT — ${cached.length} POs (synced ${timeAgo(lastSync)})`);
                         return { pos: cached, fromCache: true };

@@ -13,9 +13,11 @@ try {
     }
 
     $anyRestarted = $false
+    $ariaFound = 0
     foreach ($line in $pm2Output) {
         if ($line -match '\|\s+\d+\s+\|\s+(aria-[\w-]+)\s+\|') {
             $name = $Matches[1]
+            $ariaFound++
             $parts = $line -split '\|'
             $status = ($parts[6] -replace '\s','').Trim()
             if ($status -ne 'online') {
@@ -24,6 +26,15 @@ try {
                 $anyRestarted = $true
             }
         }
+    }
+
+    if ($ariaFound -eq 0) {
+        # Empty pm2 list used to print "All online" and exit 0 -- that is
+        # how the stack stayed down all morning after a daemon wipe.
+        $eco = "C:\Users\BuildASoil\Documents\Projects\aria\ecosystem.config.json"
+        Write-Warning "No aria-* processes in pm2 list -- starting $eco"
+        pm2 start $eco
+        $anyRestarted = $true
     }
 
     if (-not $anyRestarted) {

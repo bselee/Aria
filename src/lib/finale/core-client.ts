@@ -229,10 +229,11 @@ export interface DraftPOReview {
     orderDate: string;
     total: number;
     items: Array<{ productId: string; productName: string; quantity: number; unitPrice: number; lineTotal: number; supplierSku?: string; packing?: string }>;
+    /** Supplier postal address lines (street, city/state/zip) — Finale prints it. */
+    vendorAddress?: string[];
     finaleUrl: string;
     canCommit: boolean;   // true only if statusId === 'ORDER_CREATED'
 }
-
 export interface SendPurchaseOrderEmailInput {
     toEmail: string;
     subject: string;
