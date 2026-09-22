@@ -465,7 +465,7 @@ export async function correlatePOsWithInvoices(
 
     // Fetch all invoices from the last 90 days
     const { data: invoices } = await supabase
-        .from("invoices")
+        .from("vendor_invoices")
         .select("invoice_number, po_number, vendor_name, total, created_at")
         .gte("created_at", new Date(Date.now() - 90 * 86_400_000).toISOString());
 

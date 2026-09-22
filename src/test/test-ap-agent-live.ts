@@ -152,7 +152,7 @@ async function main() {
     }
     try {
         const { data: cols, error: colErr } = await supabase
-            .from("invoices")
+            .from("vendor_invoices")
             .select("tariff, labor, tracking_numbers")
             .limit(1);
         if (colErr) throw colErr;

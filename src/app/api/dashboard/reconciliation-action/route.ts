@@ -528,7 +528,7 @@ export async function POST(req: Request) {
                 // Step 4: Also update the invoices table so the queue filter catches them
                 if (invoiceNumbers.length > 0) {
                     await db
-                        .from("invoices")
+                        .from("vendor_invoices")
                         .update({
                             no_po_required: true,
                             no_po_reason: reason,
@@ -801,7 +801,7 @@ export async function POST(req: Request) {
             // Also update the invoices table so the queue picks up the change
             if (invoice.invoice_number) {
                 await db
-                    .from("invoices")
+                    .from("vendor_invoices")
                     .update({
                         po_number: poNumber,
                         updated_at: now,

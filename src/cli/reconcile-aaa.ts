@@ -26,6 +26,7 @@ import { getAuthenticatedClient } from "../lib/gmail/auth";
 // This CLI script is archived. If you need it, restore aaa-cooper-splitter.ts first.
 // import { splitAAACooperStatementAttachments } from "../lib/intelligence/aaa-cooper-splitter";
 import { upsertVendorInvoice, lookupVendorInvoices } from "../lib/storage/vendor-invoices";
+import { forwardInvoiceOnce } from "../lib/intelligence/ap-single-forward";
 import { ReconciliationRun } from "@/lib/reconciliation/run-tracker";
 import { sendReconciliationSummary } from "@/lib/reconciliation/notifier";
 import { InvariantViolationError } from "@/lib/reconciliation/invariants";
@@ -47,10 +48,11 @@ interface ChangeSetItem {
     filename: string;
     pdfBuffer: Buffer;
     date: string | null;
+    sourceMessageId: string;
 }
 type ChangeSet = ChangeSetItem[];
 
-const BILL_COM_EMAIL = "buildasoilap@bill.com";
+const AAA_FROM = "invoices@aaacooper.com";
 
 interface ExtractedInvoice {
     pageNumber: number;
@@ -110,39 +112,26 @@ async function buildInvoicesFromSplitResult(
 async function sendToBillCom(
     gmail: any,
     invoice: ExtractedInvoice,
+    sourceMessageId: string,
 ): Promise<void> {
-    const rawBase64 = invoice.pdfBuffer.toString("base64");
-    const chunked = rawBase64.match(/.{1,76}/g)?.join("\r\n") || rawBase64;
-    const boundary = `b_aaa_${Date.now()}_${Math.random().toString(36).substring(2)}`;
-
-    const subject = invoice.invoiceNumber
-        ? `Triple A Cooper ${invoice.invoiceNumber}${invoice.date ? ` ${invoice.date}` : ""}`
-        : `Triple A Cooper Invoice ${invoice.pageNumber}`;
-
-    const mime = [
-        `To: ${BILL_COM_EMAIL}`,
-        `Subject: ${subject}`,
-        "MIME-Version: 1.0",
-        `Content-Type: multipart/mixed; boundary="${boundary}"`,
-        "",
-        `--${boundary}`,
-        "Content-Type: text/plain; charset=\"UTF-8\"",
-        "",
-        "AAA Cooper freight invoice forwarded for payment.",
-        "",
-        `--${boundary}`,
-        `Content-Type: application/pdf; name="${invoice.filename}"`,
-        "Content-Transfer-Encoding: base64",
-        `Content-Disposition: attachment; filename="${invoice.filename}"`,
-        "",
-        chunked,
-        `--${boundary}--`,
-    ].join("\r\n");
-
-    await gmail.users.messages.send({
-        userId: "me",
-        requestBody: { raw: Buffer.from(mime).toString("base64url") },
+    // The single-forward gate claims the PDF hash before it sends, so a
+    // re-run of this splitter cannot deliver the same page twice.
+    const result = await forwardInvoiceOnce({
+        gmailMessageId: sourceMessageId,
+        emailFrom: AAA_FROM,
+        emailSubject: invoice.invoiceNumber
+            ? `Triple A Cooper ${invoice.invoiceNumber}${invoice.date ? ` ${invoice.date}` : ""}`
+            : `Triple A Cooper Invoice ${invoice.pageNumber}`,
+        pdfFilename: invoice.filename,
+        pdfBuffer: invoice.pdfBuffer,
+        vendorName: "AAA COOPER",
+        invoiceNumber: invoice.invoiceNumber || undefined,
+        source: "aaa-split",
+        gmail,
     });
+    if (result.status === "error") {
+        throw new Error(`forward failed: ${result.reason}`);
+    }
 }
 
 async function archiveInvoice(
@@ -255,6 +244,7 @@ async function main() {
                         filename: invoice.filename,
                         pdfBuffer: invoice.pdfBuffer,
                         date: invoice.date,
+                        sourceMessageId: stmt.messageId,
                     });
                     console.log("       Would send to Bill.com (dry-run or collected for Phase 2)");
                 } else {
@@ -286,7 +276,7 @@ async function main() {
                             filename: change.filename,
                         };
 
-                        await sendToBillCom(gmail, extInvoice);
+                        await sendToBillCom(gmail, extInvoice, change.sourceMessageId);
                         await archiveInvoice(client, extInvoice, '', '');
                         run.recordInvoiceProcessed();
                         console.log(`   ✅ Forwarded: ${change.filename}`);

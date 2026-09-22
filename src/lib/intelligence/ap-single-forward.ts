@@ -43,6 +43,8 @@ export type SingleForwardSource =
   | "ap-agent"
   | "dashboard"
   | "scans-watcher"
+  | "aaa-split"
+  | "telegram"
   | "manual";
 
 export interface SingleForwardRequest {

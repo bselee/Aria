@@ -18,6 +18,7 @@ import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate, isHighConfide
 import { derivePOSentVerification, type POSentVerification } from "./po-sent-verification";
 import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-profile";
 import { normalizeLifecycleStage } from "./po-lifecycle";
+import { isActivePoStatus } from "./active-po-status";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
@@ -203,7 +204,7 @@ export async function loadActivePurchases(
                             for (let i = 0; i < poNumbers.length; i += 100) {
                                 const chunk = poNumbers.slice(i, i + 100);
                                 const { data: invData } = await db
-                                    .from("invoices")
+                                    .from("vendor_invoices")
                                     .select("po_number, status, id, discrepancies, total")
                                     .in("po_number", chunk);
                                 for (const inv of invData || []) {
@@ -358,7 +359,7 @@ export async function loadActivePurchases(
         if (po.orderId.toLowerCase().includes("dropship")) continue;
 
         const status = (po.status || "").toLowerCase();
-        if (!["committed", "completed"].includes(status)) continue;
+        if (!isActivePoStatus(status)) continue;
 
         const shipments = (shipmentMap.get(po.orderId) || []).map((shipment) => {
             const classification = classifyShipmentEvidence(shipment);

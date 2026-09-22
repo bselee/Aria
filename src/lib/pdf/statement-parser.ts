@@ -61,7 +61,7 @@ export async function reconcileStatement(statement: StatementData) {
             if (line.documentType === "invoice") {
                 // Find matching invoice in our DB
                 const { data: ourInvoice } = await supabase
-                    .from("invoices")
+                    .from("vendor_invoices")
                     .select("*")
                     .eq("invoice_number", line.referenceNumber)
                     .single();

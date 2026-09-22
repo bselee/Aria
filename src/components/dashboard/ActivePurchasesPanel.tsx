@@ -867,9 +867,9 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
             }
             ref={containerRef}
         >
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
+            <div className="px-3 h-11 min-h-11 shrink-0 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md overflow-hidden">
                 <ListChecks className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Active Purchases</span>
+                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest whitespace-nowrap truncate">Active Purchases</span>
                 {cachedAt && !refreshing && <span className="text-[10px] text-[var(--dash-ts)] font-mono">{timeAgo(cachedAt)}</span>}
                 {refreshing && <span className="text-xs text-zinc-600 font-mono">refreshing…</span>}
                 <div className="flex-1" />
@@ -1234,6 +1234,13 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                                     ${po.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                                                 </span>
                                             )}
+                                            {!po.isReceived && (() => {
+                                                const due = po.etaProfile?.expectedDate || po.expectedDate;
+                                                const days = due ? dayDiff(due, new Date().toISOString().slice(0, 10)) : null;
+                                                const label = days == null ? "no ETA" : days < 0 ? `${-days}d overdue` : days === 0 ? "due today" : `due in ${days}d`;
+                                                const tone = days == null ? "text-zinc-500" : days < 0 ? "text-rose-300" : days <= 7 ? "text-amber-300" : "text-zinc-400";
+                                                return <span className={`text-[10px] font-mono shrink-0 ${tone}`}>{label}</span>;
+                                            })()}
                                             <ChevronDown className={`w-3 h-3 text-zinc-600 transition-transform shrink-0 ${expandedPOs.has(po.orderId) ? 'rotate-180' : ''}`} />
                                         </div>
 
@@ -1252,7 +1259,7 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                             </a>
                                             <span className="text-zinc-700">·</span>
 
-                                            {isReceived && po.receiveDate ? (
+                                            {po.isReceived && po.receiveDate ? (
                                                 <span>
                                                     Rcvd {fmtDate(po.receiveDate)}
                                                     {receivedDiff != null && (

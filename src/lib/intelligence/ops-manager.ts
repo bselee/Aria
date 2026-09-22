@@ -185,14 +185,9 @@ export class OpsManager {
             retry: runEmailRecovery,
             controlCommand: "run_ap_poll_now",
         });
-        this.oversightAgent.registerRecovery("ap-identifier", {
-            retry: runEmailRecovery,
-            controlCommand: "run_ap_poll_now",
-        });
-        this.oversightAgent.registerRecovery("ap-forwarder", {
-            retry: runEmailRecovery,
-            controlCommand: "run_ap_poll_now",
-        });
+        // ap-identifier and ap-forwarder were removed. Their recovery handlers
+        // pointed a retry at code that no longer exists, which is how a stuck
+        // row kept getting re-run. One handler, on the stage that exists.
         this.oversightAgent.registerRecovery("nightshift-agent", {
             retry: async () => {
                 await enqueueEmailClassification();

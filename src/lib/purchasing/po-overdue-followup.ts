@@ -69,7 +69,7 @@ async function invoiceExists(orderId: string): Promise<boolean> {
         const db = createClient();
         if (!db) return false;
         const { data } = await db
-            .from("invoices")
+            .from("vendor_invoices")
             .select("id")
             .eq("po_number", orderId)
             .limit(1);

@@ -70,7 +70,7 @@ export async function loadUnmatchedInvoicesForAutoMatch(
     // Fetch invoices where po_number is missing or empty, and
     // no_po_required is not explicitly true.
     const { data: invoices, error } = await db
-        .from("invoices")
+        .from("vendor_invoices")
         .select("id, invoice_number, vendor_name, total, subtotal, freight, tax, invoice_date, created_at, po_number, no_po_required, status")
         .or("po_number.is.null,po_number.eq.,status.eq.unmatched")
         .or("no_po_required.is.null,no_po_required.eq.false")
@@ -198,7 +198,7 @@ export async function runAutoMatchUnmatched(
 
             // IDEMPOTENCY: double-check po_number hasn't been set since load
             const { data: fresh } = await db
-                .from("invoices")
+                .from("vendor_invoices")
                 .select("po_number")
                 .eq("id", invoice.id)
                 .single();
@@ -253,7 +253,7 @@ export async function runAutoMatchUnmatched(
             // ── Apply the match ───────────────────────────────────────────
             // Always assign po_number to invoices table
             await db
-                .from("invoices")
+                .from("vendor_invoices")
                 .update({
                     po_number: poToAssign,
                     status: "matched_unreconciled",
@@ -361,7 +361,7 @@ export async function applyPOCandidate(
 
     // Fetch the invoice
     const { data: invoice, error: fetchError } = await db
-        .from("invoices")
+        .from("vendor_invoices")
         .select("id, invoice_number, vendor_name, po_number, status")
         .eq("id", invoiceId)
         .single();
@@ -389,7 +389,7 @@ export async function applyPOCandidate(
 
     // Update invoices table
     await db
-        .from("invoices")
+        .from("vendor_invoices")
         .update({
             po_number: poNumber.trim(),
             status: "matched_unreconciled",
@@ -466,7 +466,7 @@ export async function approveCloseMatchUnreconciled(): Promise<{
     if (!db) return { approved: 0, errors: 0 };
 
     const { data: matchedUnreconciled, error } = await db
-        .from("invoices")
+        .from("vendor_invoices")
         .select("id, invoice_number, vendor_name, total, po_number")
         .eq("status", "matched_unreconciled")
         .not("po_number", "is", null);
@@ -511,7 +511,7 @@ export async function approveCloseMatchUnreconciled(): Promise<{
             if (variance <= 0.02) {
                 // Within 2% — auto-approve
                 await db
-                    .from("invoices")
+                    .from("vendor_invoices")
                     .update({
                         status: "auto_approved",
                     })

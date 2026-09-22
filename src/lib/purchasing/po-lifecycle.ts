@@ -231,11 +231,11 @@ export async function transitionLifecycleState(
                         const [poRes, invRes] = await Promise.all([
                         db
                             .from("purchase_orders")
-                            .select("line_items, total, status")
+                            .select("line_items, total, status, receive_date")
                             .eq("po_number", poNumber)
                             .maybeSingle(),
                         db
-                            .from("invoices")
+                            .from("vendor_invoices")
                             .select("line_items, total, status")
                             .eq("po_number", poNumber)
                             .order("created_at", { ascending: false })

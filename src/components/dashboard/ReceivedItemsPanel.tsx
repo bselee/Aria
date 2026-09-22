@@ -690,18 +690,18 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             }
             ref={containerRef}
         >
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border-b border-zinc-800/60">
+            <div className="px-3 h-11 min-h-11 shrink-0 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md overflow-hidden">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receivings</span>
-                <span className="text-[10px] text-[var(--dash-ts)] font-mono">30d</span>
+                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Invoices</span>
+                <span className="text-[10px] text-[var(--dash-ts)] font-mono">unmatched</span>
                                 {matchSuggestions.length > 0 && (
                                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                        {matchSuggestions.length} match{matchSuggestions.length > 1 ? "es" : ""}
+                                        {matchSuggestions.length} need a PO
                                     </span>
                                 )}
                                 <div className="flex-1" />
-                {!loading && pos.length > 0 && (
-                    <span className="text-xs font-mono text-zinc-500">{pos.length} POs</span>
+                {!loading && (
+                    <span className="text-xs font-mono text-zinc-500">{matchSuggestions.length} invoices</span>
                 )}
                 <button onClick={() => fetchReceivings(true)} disabled={refreshing}
                     className="ml-2 text-zinc-700 hover:text-zinc-400 transition-colors disabled:opacity-40">
@@ -721,21 +721,13 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     <span className="text-zinc-600 uppercase tracking-wider shrink-0">AP</span>
                     {matchSuggestions.length > 0 ? (
                         <>
-                            <span className="text-amber-300">{matchSuggestions.length} match{matchSuggestions.length === 1 ? "" : "es"}</span>
+                            <span className="text-amber-300">{matchSuggestions.length} invoice{matchSuggestions.length === 1 ? "" : "s"} need a PO</span>
                             {matchDollars > 0 && (
                                 <span className="text-amber-200/90">${Math.round(matchDollars).toLocaleString()}</span>
                             )}
                         </>
                     ) : (
-                        <span className="text-emerald-400/80">0 open matches</span>
-                    )}
-                    <span className="text-zinc-700">·</span>
-                    <span>{pos.length} receipt{pos.length === 1 ? "" : "s"}</span>
-                    {exceptionCount > 0 && (
-                        <>
-                            <span className="text-zinc-700">·</span>
-                            <span className="text-rose-300">{exceptionCount} need review</span>
-                        </>
+                        <span className="text-emerald-400/80">every invoice is matched</span>
                     )}
                 </div>
             )}
@@ -749,48 +741,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             <button onClick={() => setModifySuccess(null)} className="text-emerald-400/50 hover:text-emerald-300">✕</button>
                         </div>
                     )}
-                    {!loading && !error && pos.length > 0 && (() => {
-                        const unmatched = pos.filter(p => {
-                            const lbl = apMap[p.orderId]?.label || "";
-                            return lbl === "UNMATCHED" || lbl === "";
-                        }).length;
-                        const partialCount = pos.filter(p => getDynamicReceiptStatus(p) === "partial").length;
-                        const discrepancyCount = pos.filter(p => {
-                            const lbl = apMap[p.orderId]?.label || "";
-                            return lbl === "RECONCILED ±";
-                        }).length;
-                        const pendingCount = pos.filter(p => {
-                            const lbl = apMap[p.orderId]?.label || "";
-                            return lbl === "PENDING";
-                        }).length;
-                        return (
-                            <div className="px-4 py-1.5 flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/30">
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                    {pos.length} Received
-                                </span>
-                                {unmatched > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-rose-400 font-semibold">{unmatched}</span> Unmatched
-                                    </span>
-                                )}
-                                {partialCount > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-amber-300 font-semibold">{partialCount}</span> Partial
-                                    </span>
-                                )}
-                                {discrepancyCount > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-blue-400 font-semibold">{discrepancyCount}</span> Discrepancy
-                                    </span>
-                                )}
-                                {pendingCount > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/60 border border-zinc-700/40 text-zinc-400">
-                                        <span className="text-amber-300 font-semibold">{pendingCount}</span> Pending Approval
-                                    </span>
-                                )}
-                            </div>
-                        );
-                    })()}
                     {loading ? (
                         <div className="px-4 py-3 space-y-2.5">
                             <div className="text-[10px] font-mono text-zinc-600 mb-1.5 animate-pulse">Loading received POs...</div>
@@ -803,7 +753,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         </div>
                     ) : error ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-rose-400">{error}</span></div>
-                    ) : pos.length === 0 ? (
+                    ) : pos.length === 0 && matchSuggestions.length === 0 ? (
                         <div className="px-4 py-2"><span className="text-xs font-mono text-zinc-500">No receipts in the last 30 days — all received POs have been processed</span></div>
                     ) : (
                         <div
@@ -942,12 +892,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     <span className="text-[10px] font-mono text-zinc-600">
                                         {recentAutoCompletions.length} auto-completed
                                     </span>
-                                    <button
-                                        onClick={() => document.querySelector('[role="tab"][aria-label="Activity"]')?.click()}
-                                        className="text-[9px] font-mono text-blue-500/50 hover:text-blue-400 underline underline-offset-2 decoration-blue-500/20 transition-colors"
-                                    >
-                                        view in Activity
-                                    </button>
                                 </div>
                             )}
                             {pos
