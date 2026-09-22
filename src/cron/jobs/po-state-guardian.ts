@@ -9,7 +9,7 @@ export const name = "po-state-guardian";
 defineJob({
   name: "po-state-guardian",
   schedule: "*/30 * * * *",
-  onFail: "telegram-will",
+  onFail: "log",
   description: "Detect accidental PO cancellations and enforce receive-before-forward",
   handler: async () => {
     const o = ops();

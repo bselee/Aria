@@ -467,8 +467,8 @@ describe("APAgent processInvoiceBuffer", () => {
         expect(docInsert).toBeDefined();
         expect(docInsert.action_required).toBe(false);
 
-        // 4. Invoice insert should set status to "completed"
-        const invUpsert = inserts.invoices[0];
+        // 4. Invoice upsert should land on vendor_invoices with status "completed"
+        const invUpsert = inserts.vendor_invoices[0];
         expect(invUpsert).toBeDefined();
         expect(invUpsert.status).toBe("completed");
 

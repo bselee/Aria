@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ─────────────────────────────────────────────────────────────────────────────
 // Hoisted mocks — created before module vi.mock() is evaluated
 // ─────────────────────────────────────────────────────────────────────────────
-const { createClientMock, dbState, sendTelegramNotifyMock } = vi.hoisted(
+const { createClientMock, dbState, localDbState, sendTelegramNotifyMock } = vi.hoisted(
     () => {
         const dbState = {
             data: null as any[] | null,
@@ -14,7 +14,7 @@ const { createClientMock, dbState, sendTelegramNotifyMock } = vi.hoisted(
         const createClientMock = vi.fn(() => {
             if (dbState.returnNull) return null;
 
-            // Real Supabase chains are thenables — any method can be awaited and
+            // Real PostgREST chains are thenables — any method can be awaited and
             // resolves to { data, error }. Add .then() so `await chain.in(...)` works.
             const chainBase: any = {
                 gte: vi.fn(() => chainBase),
@@ -27,7 +27,7 @@ const { createClientMock, dbState, sendTelegramNotifyMock } = vi.hoisted(
                 insert: vi.fn(() =>
                     Promise.resolve({ data: null, error: null }) as any,
                 ),
-                // Make the chain awaitable (Supabase thenable contract)
+                // Make the chain awaitable (PostgREST thenable contract)
                 then: vi.fn(
                     (resolve: any) =>
                         resolve({ data: dbState.data, error: dbState.error }),
@@ -38,11 +38,19 @@ const { createClientMock, dbState, sendTelegramNotifyMock } = vi.hoisted(
             };
         });
 
+        // Local SQLite mock — ap_local_forwards is the stuck-forward source of
+        // truth since the Supabase ap_inbox_queue pipeline was retired.
+        const localDbState = {
+            rows: [] as any[],
+            throws: false,
+        };
+
         const sendTelegramNotifyMock = vi.fn();
 
         return {
             createClientMock,
             dbState,
+            localDbState,
             sendTelegramNotifyMock,
         };
     },
@@ -55,8 +63,21 @@ vi.mock("../db", () => ({
     createClient: createClientMock,
 }));
 
-vi.mock("./telegram-notify", () => ({
-    sendTelegramNotify: sendTelegramNotifyMock,
+vi.mock("@/lib/storage/local-db", () => ({
+    getLocalDb: vi.fn(() => {
+        if (localDbState.throws) throw new Error("sqlite unavailable");
+        return {
+            prepare: vi.fn(() => ({
+                all: vi.fn(() => localDbState.rows),
+                get: vi.fn(() => undefined),
+                run: vi.fn(),
+            })),
+        };
+    }),
+}));
+
+vi.mock("./notify", () => ({
+    notify: sendTelegramNotifyMock,
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,30 +92,30 @@ import {
 
 // Helpers ─────────────────────────────────────────────────────────────────────
 
-/** Create a DB row shape as returned by ap_inbox_queue.select() */
-function dbRow(overrides: Partial<{
-    message_id: string;
-    extracted_json: Record<string, any> | null;
+const BASE_TIME = new Date("2026-06-05T12:00:00Z");
+
+/** Create a local ap_local_forwards row shape as returned by prepare().all() */
+function localRow(overrides: Partial<{
+    id: number;
+    email_from: string | null;
+    email_subject: string | null;
     status: string;
-    created_at: string;
-    updated_at: string;
+    error_message: string | null;
+    forwarded_at: string | null;
 }> = {}) {
     return {
-        message_id: "msg-001",
-        extracted_json: {
-            from: "vendor@example.com",
-            vendor_name: "Example Vendor",
-            subject: "Invoice #12345",
-        },
-        status: "ERROR_FORWARDING",
-        created_at: new Date(BASE_TIME.getTime() - 3 * 3600000).toISOString(),
-        updated_at: new Date(BASE_TIME.getTime() - 2.5 * 3600000).toISOString(),
+        id: 1,
+        email_from: "vendor@example.com",
+        email_subject: "Invoice #12345",
+        status: "ERROR",
+        error_message: null,
+        forwarded_at: new Date(BASE_TIME.getTime() - 3 * 3600000)
+            .toISOString()
+            .replace("T", " ")
+            .slice(0, 19),
         ...overrides,
     };
 }
-
-const BASE_TIME = new Date("2026-06-05T12:00:00Z");
-const THREE_HOURS_AGO = new Date(BASE_TIME.getTime() - 3 * 3600000).toISOString();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // formatForwardingAlerts
@@ -230,111 +251,46 @@ describe("formatForwardingAlerts", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// getStuckForwardingAlerts
+// getStuckForwardingAlerts (local SQLite ap_local_forwards)
 // ─────────────────────────────────────────────────────────────────────────────
 describe("getStuckForwardingAlerts", () => {
     beforeEach(() => {
         vi.useFakeTimers();
         vi.setSystemTime(BASE_TIME);
         vi.clearAllMocks();
-        dbState.data = null;
-        dbState.error = null;
-        dbState.returnNull = false;
+        localDbState.rows = [];
+        localDbState.throws = false;
     });
 
     afterEach(() => {
         vi.useRealTimers();
     });
 
-    it("returns [] when createClient returns null (missing env vars)", async () => {
-        dbState.returnNull = true;
-        const result = await getStuckForwardingAlerts();
-        expect(result).toEqual([]);
-        expect(createClientMock).toHaveBeenCalledOnce();
-    });
-
-    it("returns [] when DB returns empty array", async () => {
-        dbState.data = [];
+    it("returns [] when the local DB is unavailable", async () => {
+        localDbState.throws = true;
         const result = await getStuckForwardingAlerts();
         expect(result).toEqual([]);
     });
 
-    it("returns [] when DB response has an error", async () => {
-        dbState.data = [];
-        dbState.error = new Error("connection timeout");
+    it("returns [] when there are no stuck rows", async () => {
+        localDbState.rows = [];
         const result = await getStuckForwardingAlerts();
         expect(result).toEqual([]);
     });
 
-    it("returns [] when DB returns null for data", async () => {
-        dbState.data = null;
-        const result = await getStuckForwardingAlerts();
-        expect(result).toEqual([]);
-    });
-
-    it("filters out zombie records with null extracted_json", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-real", extracted_json: { from: "real@vendor.com", vendor_name: "Real Vendor", subject: "Invoice" } }),
-            dbRow({ message_id: "msg-zombie", extracted_json: null }),
-        ];
-        const result = await getStuckForwardingAlerts();
-        expect(result).toHaveLength(1);
-        expect(result[0].messageId).toBe("msg-real");
-    });
-
-    it("filters out zombie records with empty object extracted_json", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-real", extracted_json: { from: "real@vendor.com", vendor_name: "Real Vendor", subject: "Invoice" } }),
-            dbRow({ message_id: "msg-zombie", extracted_json: {} }),
-        ];
-        const result = await getStuckForwardingAlerts();
-        expect(result).toHaveLength(1);
-        expect(result[0].messageId).toBe("msg-real");
-    });
-
-    it("keeps records with extracted_json.from even without vendor_name or subject", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-no-vendor", extracted_json: { from: "vendor@example.com" } }),
-        ];
-        const result = await getStuckForwardingAlerts();
-        expect(result).toHaveLength(1);
-        expect(result[0].messageId).toBe("msg-no-vendor");
-        expect(result[0].from).toBe("vendor@example.com");
-    });
-
-    it("keeps records with extracted_json.vendor_name even without from or subject", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-no-from", extracted_json: { vendor_name: "Vendor Inc" } }),
-        ];
-        const result = await getStuckForwardingAlerts();
-        expect(result).toHaveLength(1);
-        expect(result[0].messageId).toBe("msg-no-from");
-        expect(result[0].from).toBe("Vendor Inc");
-    });
-
-    it("filters out records where extracted_json is a non-object (e.g. string)", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-real", extracted_json: { from: "real@vendor.com", vendor_name: "Real Vendor", subject: "Invoice" } }),
-            dbRow({ message_id: "msg-string", extracted_json: "some string" as any }),
-        ];
-        const result = await getStuckForwardingAlerts();
-        expect(result).toHaveLength(1);
-        expect(result[0].messageId).toBe("msg-real");
-    });
-
-    it("maps all fields correctly for valid records", async () => {
-        const created_at = new Date(BASE_TIME.getTime() - 10 * 3600000).toISOString();
-        dbState.data = [
-            dbRow({
-                message_id: "msg-042",
-                extracted_json: {
-                    from: "bill@acme.com",
-                    vendor_name: "Acme Corp",
-                    subject: "Invoice INV-2026-042",
-                    last_error: "Bill.com API rejected — invalid vendor ID",
-                },
-                status: "ERROR_FORWARDING",
-                created_at,
+    it("maps all fields correctly for a stuck row", async () => {
+        const forwarded_at = new Date(BASE_TIME.getTime() - 10 * 3600000)
+            .toISOString()
+            .replace("T", " ")
+            .slice(0, 19);
+        localDbState.rows = [
+            localRow({
+                id: 42,
+                email_from: "bill@acme.com",
+                email_subject: "Invoice INV-2026-042",
+                status: "ERROR",
+                error_message: "Bill.com API rejected — invalid vendor ID",
+                forwarded_at,
             }),
         ];
 
@@ -342,81 +298,38 @@ describe("getStuckForwardingAlerts", () => {
 
         expect(result).toHaveLength(1);
         expect(result[0]).toMatchObject({
-            messageId: "msg-042",
+            messageId: "42",
             from: "bill@acme.com",
             subject: "Invoice INV-2026-042",
-            status: "ERROR_FORWARDING",
+            status: "ERROR",
             ageHours: 10,
             lastError: "Bill.com API rejected — invalid vendor ID",
         });
     });
 
-    it("falls back to error_message then status when last_error is absent", async () => {
-        dbState.data = [
-            dbRow({
-                extracted_json: {
-                    from: "v@v.com",
-                    vendor_name: "V",
-                    subject: "Inv",
-                    error_message: "SMTP connection refused",
-                },
-            }),
-        ];
-
+    it("falls back to status when error_message is absent", async () => {
+        localDbState.rows = [localRow({ error_message: null, status: "CLAIMED" })];
         const result = await getStuckForwardingAlerts();
-        expect(result[0].lastError).toBe("SMTP connection refused");
+        expect(result[0].lastError).toBe("CLAIMED");
     });
 
-    it("falls back to status when neither last_error nor error_message exist", async () => {
-        dbState.data = [
-            dbRow({
-                extracted_json: { from: "v@v.com", vendor_name: "V", subject: "Inv" },
-            }),
-        ];
-
-        const result = await getStuckForwardingAlerts();
-        expect(result[0].lastError).toBe("ERROR_FORWARDING");
-    });
-
-    it("uses 'unknown sender' when from and vendor_name are both missing", async () => {
-        dbState.data = [
-            dbRow({
-                extracted_json: { subject: "Orphan Invoice" },
-            }),
-        ];
-
+    it("uses 'unknown sender' when email_from is null", async () => {
+        localDbState.rows = [localRow({ email_from: null })];
         const result = await getStuckForwardingAlerts();
         expect(result[0].from).toBe("unknown sender");
     });
 
-    it("calls from() with the correct table name and query chain", async () => {
-        dbState.data = [];
-        await getStuckForwardingAlerts();
-
-        const fromMock = createClientMock.mock.results[0].value.from;
-        expect(fromMock).toHaveBeenCalledWith("ap_inbox_queue");
-    });
-
-    it("handles multiple records in a mix of real and zombie", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-1", extracted_json: { from: "a@a.com", vendor_name: "A", subject: "Inv1" } }),
-            dbRow({ message_id: "msg-2", extracted_json: null }),
-            dbRow({ message_id: "msg-3", extracted_json: {} }),
-            dbRow({ message_id: "msg-4", extracted_json: { vendor_name: "B" } }),
-            dbRow({ message_id: "msg-5", extracted_json: { from: "c@c.com" } }),
-            dbRow({ message_id: "msg-6", extracted_json: { subject: "Inv6" } }),
+    it("handles multiple rows", async () => {
+        localDbState.rows = [
+            localRow({ id: 1 }),
+            localRow({ id: 2, email_from: "b@b.com", email_subject: "Inv2" }),
+            localRow({ id: 3, email_from: "c@c.com", email_subject: "Inv3" }),
         ];
 
         const result = await getStuckForwardingAlerts();
 
-        // 4 real: msg-1, msg-4, msg-5, msg-6
-        expect(result).toHaveLength(4);
-        expect(result.map((r) => r.messageId).sort()).toEqual([
-            "msg-1",
-            "msg-4",
-            "msg-5",
-            "msg-6",
-        ]);
+        expect(result).toHaveLength(3);
+        expect(result.map((r) => r.messageId)).toEqual(["1", "2", "3"]);
     });
 });
 
@@ -428,6 +341,8 @@ describe("runForwardingEscalation", () => {
         vi.useFakeTimers();
         vi.setSystemTime(BASE_TIME);
         vi.clearAllMocks();
+        localDbState.rows = [];
+        localDbState.throws = false;
         dbState.data = null;
         dbState.error = null;
         dbState.returnNull = false;
@@ -438,7 +353,7 @@ describe("runForwardingEscalation", () => {
     });
 
     it("does not send Telegram when there are no stuck alerts", async () => {
-        dbState.data = [];
+        localDbState.rows = [];
         const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
 
         await runForwardingEscalation();
@@ -452,20 +367,21 @@ describe("runForwardingEscalation", () => {
     });
 
     it("sends formatted Telegram message when alerts exist", async () => {
-        const created_at = new Date(BASE_TIME.getTime() - 4 * 3600000).toISOString();
-        dbState.data = [
-            dbRow({
-                message_id: "msg-001",
-                extracted_json: {
-                    from: "acme@acme.com",
-                    vendor_name: "Acme Corp",
-                    subject: "Invoice INV-042",
-                    last_error: "Forward API 503",
-                },
-                status: "ERROR_FORWARDING",
-                created_at,
+        const forwarded_at = new Date(BASE_TIME.getTime() - 4 * 3600000)
+            .toISOString()
+            .replace("T", " ")
+            .slice(0, 19);
+        localDbState.rows = [
+            localRow({
+                id: 1,
+                email_from: "acme@acme.com",
+                email_subject: "Invoice INV-042",
+                status: "ERROR",
+                error_message: "Forward API 503",
+                forwarded_at,
             }),
         ];
+        dbState.data = []; // no recent escalations → proceed to send
 
         const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -477,20 +393,17 @@ describe("runForwardingEscalation", () => {
         expect(sentText).toContain("🚨 *AP invoice stuck — never reached Bill.com*");
         expect(sentText).toContain("📩 *acme@acme.com*");
         expect(sentText).toContain("Invoice INV-042");
-        expect(sentText).toContain("4h ago | ERROR_FORWARDING");
-
-        expect(consoleLog).toHaveBeenCalledWith(
-            "[forwarding-alert] Alerted Bill: 1 AP invoice(s) stuck in ERROR_FORWARDING/ERROR_PROCESSING.",
-        );
+        expect(sentText).toContain("4h ago | ERROR");
 
         consoleLog.mockRestore();
     });
 
     it("sends one Telegram message for multiple alerts", async () => {
-        dbState.data = [
-            dbRow({ message_id: "msg-1", extracted_json: { from: "a@a.com", vendor_name: "A", subject: "Inv1" } }),
-            dbRow({ message_id: "msg-2", extracted_json: { from: "b@b.com", vendor_name: "B", subject: "Inv2" } }),
+        localDbState.rows = [
+            localRow({ id: 1, email_from: "a@a.com", email_subject: "Inv1" }),
+            localRow({ id: 2, email_from: "b@b.com", email_subject: "Inv2" }),
         ];
+        dbState.data = [];
 
         await runForwardingEscalation();
 
@@ -500,6 +413,7 @@ describe("runForwardingEscalation", () => {
     });
 
     it("still formats correctly when no client and skips silently", async () => {
+        localDbState.rows = [];
         dbState.returnNull = true;
         const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
 

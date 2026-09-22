@@ -531,7 +531,7 @@ export async function POST(req: Request) {
 
             // 3. Update invoices table: status = 'matched_approved' where po_number = orderId
             const { error: invErr } = await db
-                .from("invoices")
+                .from("vendor_invoices")
                 .update({ status: "matched_approved", updated_at: now })
                 .eq("po_number", orderId);
 
@@ -555,6 +555,15 @@ export async function POST(req: Request) {
 
         // Action 7b: Resend PO Email — re-sends the PO to the vendor via Gmail
         if (action === "resend_po_email") {
+            // Vendor-facing kill switch (Bill, 2026-09-21): never email a PO by
+            // accident. Refuse unless Aria PO sending is explicitly enabled.
+            if (process.env.NEXT_PUBLIC_ARIA_PO_SEND_ENABLED !== "true") {
+                return NextResponse.json(
+                    { error: "Vendor PO email is disabled (NEXT_PUBLIC_ARIA_PO_SEND_ENABLED). Send from Finale." },
+                    { status: 403 },
+                );
+            }
+
             // Fetch PO details from Finale to get vendor email
             const finale = new FinaleClient();
             let vendorEmail = "";

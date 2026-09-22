@@ -20,7 +20,7 @@
  */
 
 import { createClient } from "@/lib/db";
-import { sendTelegramNotifyWithButtons } from "@/lib/intelligence/telegram-notify";
+import { notify } from "@/lib/intelligence/notify";
 
 const supabase = createClient();
 
@@ -149,11 +149,11 @@ export async function escalateDeliveryExceptions(): Promise<ExceptionEscalationR
 
         const text = lines.join("\n");
         if (buttons.length > 0) {
-            await sendTelegramNotifyWithButtons(text, buttons);
+            await notify(text, buttons);
         } else {
             // No drafts (no vendor emails found) — still alert
-            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-            await sendTelegramNotify(text);
+            const { notify } = await import("@/lib/intelligence/notify");
+            await notify(text);
         }
 
         // Log to ap_activity_log for dedup

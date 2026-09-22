@@ -20,6 +20,11 @@ import { createHash, randomBytes } from "crypto";
 import { getLocalDb } from "@/lib/storage/local-db";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
+import {
+    buildStampedFilename,
+    shouldStampInvoice,
+    stampInvoicePdf,
+} from "@/lib/pdf/invoice-overlay";
 
 const BILL_COM_EMAIL =
   process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
@@ -38,6 +43,8 @@ export type SingleForwardSource =
   | "ap-agent"
   | "dashboard"
   | "scans-watcher"
+  | "aaa-split"
+  | "telegram"
   | "manual";
 
 export interface SingleForwardRequest {
@@ -350,16 +357,17 @@ function claimForward(
   }
 }
 
-function markClaimForwarded(claimId: number, billcomSentMessageId: string): void {
+function markClaimForwarded(claimId: number, billcomSentMessageId: string, sentFilename?: string): void {
   const db = getLocalDb();
   db.prepare(
     `UPDATE ap_local_forwards
      SET status = 'FORWARDED',
+         pdf_filename = COALESCE(?, pdf_filename),
          billcom_sent_message_id = ?,
          forwarded_at = datetime('now'),
          error_message = NULL
      WHERE id = ?`,
-  ).run(billcomSentMessageId, claimId);
+  ).run(sentFilename || null, billcomSentMessageId, claimId);
 }
 
 function markClaimError(claimId: number, message: string): void {
@@ -446,6 +454,19 @@ export async function forwardInvoiceOnce(
     };
   }
 
+  // Statement choke-point: no forward path may send a vendor statement to
+  // Bill.com. The local forwarder also gates this up front, but /apretry,
+  // ap-autonomous-poll, sandbox/aria-review watchers, and scans-watcher all
+  // call forwardInvoiceOnce directly — this is the single guarantee.
+  const { isStatementDocument } = await import("./ap-statement-gate");
+  if (isStatementDocument(req.emailSubject, req.pdfFilename, req.emailFrom)) {
+    return {
+      status: "blocked",
+      reason: `statement/non-invoice document (subject="${req.emailSubject}", file="${req.pdfFilename}")`,
+      pdfContentHash: sha256Pdf(req.pdfBuffer),
+    };
+  }
+
   const pdfHash = sha256Pdf(req.pdfBuffer);
   const safeFilename = sanitizeForwardFilename(req.pdfFilename || "invoice.pdf");
 
@@ -472,12 +493,123 @@ export async function forwardInvoiceOnce(
       gmail = GmailApi({ version: "v1", auth });
     }
 
+    // ── Invoice# stamp: vendors whose PDFs mis-OCR (AAA Cooper reads the
+    //    CUSTOMER/account number instead of the Pro#) get the reliable
+    //    subject-derived invoice number stamped onto page 1 BEFORE the send,
+    //    so Bill.com's own extraction keys the bill on the right number.
+    //    Never blocks the forward — on stamp failure we send the original.
+    let sendBuffer = req.pdfBuffer;
+    let sendFilename = safeFilename;
+    if (shouldStampInvoice(req.emailFrom, req.invoiceNumber)) {
+      try {
+        // Anchor-relative redaction (2026-09-17 plan 4.3): for template-matched
+        // senders, OCR-locate the customer-number contaminant on the ORIGINAL
+        // page and pass the boxes to the stamper alongside the static template
+        // boxes. Best-effort — on any failure the static boxes still apply.
+        let extraRedactionBoxes;
+        if (/aaacooper/i.test(req.emailFrom || "")) {
+          try {
+            const { locateCustomerNumberBoxes } = await import("./ap/invoice-ocr-gate");
+            const located = await locateCustomerNumberBoxes(req.pdfBuffer);
+            if (located?.boxes?.length) {
+              extraRedactionBoxes = located.boxes;
+              console.log(
+                `[ap-single-forward] 🎯 OCR-located ${located.boxes.length} customer# box(es) for redaction (${located.hits.join(", ")})`,
+              );
+            }
+          } catch (locErr: any) {
+            console.warn(`[ap-single-forward] redaction locate failed (static boxes apply): ${locErr?.message || locErr}`);
+          }
+        }
+        sendBuffer = await stampInvoicePdf(
+          req.pdfBuffer,
+          {
+            invoiceNumber: req.invoiceNumber!,
+            vendorName: req.vendorName,
+          },
+          req.emailFrom,
+          { extraRedactionBoxes },
+        );
+        sendFilename = buildStampedFilename(req.invoiceNumber!, req.vendorName);
+        console.log(
+          `[ap-single-forward] 📌 Stamped invoice# ${req.invoiceNumber} → ${sendFilename}`,
+        );
+      } catch (stampErr: any) {
+        console.warn(
+          `[ap-single-forward] Stamp failed (sending original): ${stampErr?.message || stampErr}`,
+        );
+      }
+    }
+
+    // ── Pre-send OCR gate: render page 1 of the FINAL prepared bytes and
+    //    assert (1) an invoice number is present and (2) the AAA Cooper
+    //    customer number is absent. Deterministic confidence layer — runs on
+    //    exactly what Bill.com receives. No Bill.com dependency, no WAF.
+    //
+    //    BLOCKING case: a WEIGHT TICKET / BOL (ticket label present, no
+    //    invoice number) is NOT a bill — Bill.com would mint a phantom bill
+    //    off the ticket# (the CR Minerals $23.56 class). It blocks, same as a
+    //    statement. The remaining cases stay non-blocking so a genuine invoice
+    //    is never withheld on an OCR doubt: customer_number (redaction failed)
+    //    and no_invoice_number WITHOUT a ticket label (could be a real invoice
+    //    that OCR read poorly) are logged + flagged, not blocked.
+    try {
+      const { verifyInvoiceForBillCom } = await import("./ap/invoice-ocr-gate");
+      const gate = await verifyInvoiceForBillCom(sendBuffer);
+
+      // Weight ticket / BOL / non-invoice → hard block (mirrors statement gate).
+      if (gate.verdict === "no_invoice_number" && gate.ticketDetected) {
+        getLocalDb()
+          .prepare(
+            `UPDATE ap_local_forwards
+             SET status = 'BLOCKED',
+                 error_message = ?,
+                 reconciliation_notes = COALESCE(reconciliation_notes || ' | ', '') || 'ocr-gate:blocked:' || ?
+             WHERE id = ?`,
+          )
+          .run(`weight ticket / BOL (${gate.reason.slice(0, 200)})`, gate.reason.slice(0, 300), claimId);
+        console.warn(
+          `[OCR-GATE] ⛔ BLOCKED weight ticket / BOL — ${gate.reason} (claim=${claimId})`,
+        );
+        return { status: "blocked", reason: `weight ticket / BOL: ${gate.reason}`, pdfContentHash: pdfHash };
+      }
+
+      if (gate.verdict === "pass") {
+        console.log(`[OCR-GATE] ✓ pass — ${gate.reason}`);
+      } else if (gate.verdict === "skipped") {
+        console.warn(`[OCR-GATE] ⚠ skipped — ${gate.reason} (sent unverified)`);
+      } else {
+        console.warn(
+          `[OCR-GATE] ⚠ ${gate.verdict.toUpperCase()} — ${gate.reason} (sent anyway)`,
+        );
+      }
+      try {
+        getLocalDb()
+          .prepare(
+            `UPDATE ap_local_forwards
+             SET reconciliation_notes = COALESCE(
+                   reconciliation_notes || ' | ',
+                   ''
+                 ) || 'ocr-gate:' || ? || ':' || ?
+             WHERE id = ?`,
+          )
+          .run(gate.verdict, gate.reason.slice(0, 300), claimId);
+      } catch {
+        /* notes update is best-effort */
+      }
+    } catch (gateErr: any) {
+      // The gate must NEVER break the forward path.
+      console.warn(
+        `[OCR-GATE] ⚠ gate error (sent unverified): ${gateErr?.message || gateErr}`,
+      );
+    }
+
     const sentId = await sendMime(
       gmail,
       req.emailSubject,
       req.emailFrom,
-      safeFilename,
-      req.pdfBuffer,
+      sendFilename,
+      sendBuffer,
     );
     if (!sentId) {
       markClaimError(claimId, "Gmail send returned no message id");
@@ -488,10 +620,43 @@ export async function forwardInvoiceOnce(
       };
     }
 
-    markClaimForwarded(claimId, sentId);
+    markClaimForwarded(claimId, sentId, sendFilename);
     console.log(
-      `[ap-single-forward] OK ${safeFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
+      `[ap-single-forward] OK ${sendFilename} claim=${claimId} source=${req.source} hash=${pdfHash.slice(0, 12)}`,
     );
+
+    // ── Immediate verify-in-Sent: fetch the sent message back and confirm it
+    // carries the PDF, then set verified=1 so the log answers "did it send?"
+    // at forward time rather than leaving the flag 0 forever. Best-effort —
+    // a lookup failure must not turn a successful forward into an ERROR row.
+    try {
+      const sent = await gmail.users.messages.get({
+        userId: "me",
+        id: sentId,
+        format: "full",
+      });
+      const hasPdf = (function walkPdf(part: any): boolean {
+        if (!part) return false;
+        if ((part.mimeType || "").toLowerCase() === "application/pdf") return true;
+        if ((part.filename || "").toLowerCase().endsWith(".pdf")) return true;
+        return Array.isArray(part.parts) && part.parts.some(walkPdf);
+      })(sent.data?.payload);
+      if (hasPdf) {
+        getLocalDb()
+          .prepare("UPDATE ap_local_forwards SET verified = 1 WHERE billcom_sent_message_id = ?")
+          .run(sentId);
+        console.log(`[ap-single-forward] ✅ Verified in Sent: ${sendFilename}`);
+      } else {
+        console.warn(
+          `[ap-single-forward] ⚠️ Sent message ${sentId} has no PDF attachment — investigate`,
+        );
+      }
+    } catch (verifyErr: any) {
+      console.warn(
+        `[ap-single-forward] Verify-in-Sent skipped: ${verifyErr?.message || verifyErr}`,
+      );
+    }
+
     return {
       status: "forwarded",
       billcomSentMessageId: sentId,

@@ -1590,6 +1590,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             unitPrice: number;
             orderIncrementQty?: number | null;
             isBulkDelivery?: boolean;
+            /** Optional human-readable product name stamped as the line description. */
+            productName?: string | null;
         }>,
         memo?: string,
         purchaseDestination?: string
@@ -1603,6 +1605,14 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         verification: import('../purchasing/po-verification').DraftVerification;
     }> {
         const today = new Date().toISOString().split('T')[0] + 'T00:00:00';
+
+        // ── Step 0-pre: Resolve real product names for the Description column ──
+        // DECISION(2026-09-21, Bill): Finale leaves `itemDescription` empty for
+        // programmatically-created order lines, so vendor-facing PO PDFs were
+        // rendering the raw SKU in the Description column. Resolve the real
+        // product name here (caller-supplied > SKU cache > live lookup) and
+        // stamp it on the line so Finale, the PDF, and the email all read right.
+        const productNames = await this.resolveProductNames(items.map(i => i.productId));
 
         // ── Step 0: Duplicate PO detection ──────────────────────────────────
         // DECISION(2026-03-04): Check for existing open/committed POs from the same
@@ -1625,7 +1635,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 }
             }
 
-            return (this as any).reuseExistingDraftPurchaseOrder(existing.orderId, items);
+            return (this as any).reuseExistingDraftPurchaseOrder(
+                existing.orderId,
+                items.map(i => ({ ...i, productName: (i as any).productName || productNames.get(i.productId) || null })),
+            );
         }
         let dups: Array<{ orderId: string; status: string; orderDate: string; overlappingSKUs: string[]; finaleUrl: string }> = [];
         try {
@@ -1700,6 +1713,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             const rawQty = item.quantity;
             const effectiveIncrement = item.orderIncrementQty ?? incrementFallback.get(item.productId) ?? null;
             const snapped = FinaleProductsClient.snapToIncrement(rawQty, effectiveIncrement);
+            const itemDescription = (item as any).productName || productNames.get(item.productId) || undefined;
 
             if (snapped !== rawQty) {
                 const source = item.orderIncrementQty != null ? 'passed' : 'cache-fallback';
@@ -1710,6 +1724,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
                 quantity: snapped,
                 unitPrice: item.unitPrice,
+                ...(itemDescription ? { itemDescription } : {}),
             };
         });
 
@@ -3411,6 +3426,112 @@ export class FinalePurchasingClient extends FinaleProductsClient {
      * Fetch a draft PO and return a structured review object for the commit/send flow.
      * Only returns canCommit=true when statusId === 'ORDER_CREATED'.
      */
+    /**
+     * Resolve human-readable product names for PO line-item SKUs.
+     *
+     * DECISION(2026-09-21, Bill): Finale leaves `itemDescription` empty on
+     * order lines we create through the API, which makes vendor-facing PO
+     * documents print the raw SKU where a product name belongs. This helper
+     * resolves the real name cache-first (`finale_sku_cache`) and only falls
+     * back to a live `lookupProduct()` call for genuine cache misses.
+     *
+     * Never throws and never blocks PO creation — a failed resolution simply
+     * yields no entry for that SKU and the caller falls back to the SKU.
+     *
+     * @param productIds - SKUs to resolve (duplicates collapsed).
+     * @returns Map of sku → product name, containing only SKUs that resolved
+     *          to a name that differs from the SKU itself.
+     */
+    protected async resolveProductNames(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
+        const names = new Map<string, string>();
+
+        // Under vitest both the persistent cache and Finale are off-limits.
+        // This is best-effort enrichment only, so it must stay invisible to
+        // tests that assert on fetch counts — same convention as
+        // verifyDraftAndExpectedDelivery().
+        if (process.env.VITEST) return names;
+
+        const unique = Array.from(new Set(
+            (productIds || []).map(id => String(id ?? '').trim()).filter(Boolean),
+        ));
+        if (unique.length === 0) return names;
+
+        // 1. Persistent SKU cache — no Finale traffic.
+        try {
+            const rows = await getFreshCachedSkus(unique);
+            for (const sku of unique) {
+                const name = rows.get(sku)?.raw_detail?.name;
+                if (name && name.trim() && name.trim().toLowerCase() !== sku.toLowerCase()) {
+                    names.set(sku, name.trim());
+                }
+            }
+        } catch (e: any) {
+            console.warn('[finale] resolveProductNames: cache read failed (non-blocking):', e?.message || e);
+        }
+
+        // 2. Cache misses → live lookup. Skipped under vitest so tests never
+        //    hit real Finale and never inflate fetch-call assertions.
+        const inTest = !!process.env.VITEST;
+        if (inTest) return names;
+
+        for (const sku of unique) {
+            if (names.has(sku)) continue;
+            try {
+                const detail = await this.lookupProduct(sku);
+                const name = detail?.name;
+                if (name && name.trim() && name.trim().toLowerCase() !== sku.toLowerCase()) {
+                    names.set(sku, name.trim());
+                }
+            } catch (e: any) {
+                console.warn(`[finale] resolveProductNames: lookup failed for ${sku} (non-blocking):`, e?.message || e);
+            }
+        }
+
+        return names;
+    }
+
+    /**
+     * Read a supplier's postal address off the Finale party record.
+     *
+     * Finale stores addresses in `contactMechList` as entries with
+     * `contactMechTypeId: "POSTAL_ADDRESS"` carrying `address1`, `city`,
+     * `stateProvinceGeoId`, `postalCode`, and `countryGeoId` (verified live
+     * against /buildasoilorganics/api/partygroup/10340, 2026-09-21).
+     *
+     * Never throws — a vendor PO is still valid without a supplier address.
+     *
+     * @param partyUrl - Finale REST URL of the supplier party group.
+     * @returns Address lines, e.g. ["8484 Hatchery Rd.", "Hotchkiss, CO 81419 USA"].
+     */
+    protected async resolvePartyAddressLines(partyUrl: string): Promise<string[]> {
+        try {
+            const data: any = await this.get(partyUrl);
+            const mechs: any[] = Array.isArray(data?.contactMechList) ? data.contactMechList : [];
+            const postal = mechs.find((m: any) => m?.contactMechTypeId === 'POSTAL_ADDRESS');
+            if (!postal) return [];
+
+            const lines: string[] = [];
+            const street = String(postal.address1 ?? postal.addressLine1 ?? '').trim();
+            if (street) lines.push(street);
+            const street2 = String(postal.address2 ?? postal.addressLine2 ?? '').trim();
+            if (street2) lines.push(street2);
+
+            const city = String(postal.city ?? '').trim();
+            const region = String(postal.stateProvinceGeoId ?? postal.state ?? '').trim();
+            const zip = String(postal.postalCode ?? '').trim();
+            const country = String(postal.countryGeoId ?? '').trim();
+            // Finale renders "Hotchkiss, CO 81419 USA" — city keeps its comma.
+            const last = [city ? `${city},` : '', region, zip, country]
+                .filter((v: string) => v.length > 0).join(' ').trim();
+            if (last) lines.push(last);
+
+            return lines;
+        } catch (e: any) {
+            console.warn('[finale] resolvePartyAddressLines failed (non-blocking):', e?.message || e);
+            return [];
+        }
+    }
+
     async getDraftPOForReview(orderId: string): Promise<DraftPOReview> {
         const po = await (this as any).getOrderDetails(orderId);
 
@@ -3429,17 +3550,43 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             }
         }
 
-        const items = (po.orderItemList || [])
-            .filter((item: any) => item.productId && (item.quantity ?? 0) > 0)
-            .map((item: any) => ({
+        // Resolve real product names for any line whose Finale itemDescription
+        // is blank or was auto-filled with the SKU — vendor-facing PDFs must
+        // show "Worm Castings 1cf", not "FWE101" (Bill, 2026-09-21).
+        const rawItems = (po.orderItemList || [])
+            .filter((item: any) => item.productId && (item.quantity ?? 0) > 0);
+        const resolvedNames = await this.resolveProductNames(
+            rawItems.map((item: any) => String(item.productId)),
+        );
+
+        const items = rawItems.map((item: any) => {
+            const sku = String(item.productId);
+            const desc = String(item.itemDescription || '').trim();
+            // A description that is just the SKU is not a description.
+            const usableDesc = desc && desc.toLowerCase() !== sku.toLowerCase() ? desc : '';
+            return {
                 productId: item.productId,
-                productName: item.itemDescription || item.productId,
+                productName: usableDesc || resolvedNames.get(sku) || sku,
                 quantity: item.quantity || 0,
                 unitPrice: item.unitPrice || 0,
                 lineTotal: (item.quantity || 0) * (item.unitPrice || 0),
                 supplierSku: item.supplierProductId || undefined,
                 packing: item.quantityUomId || undefined,
-            }));
+            };
+        });
+
+        // Supplier postal address — Finale prints it on the PO and vendors use
+        // it to confirm ship-from. Best-effort: a miss just omits the lines.
+        let vendorAddress: string[] = [];
+        if (supplierRole?.partyId) {
+            try {
+                vendorAddress = await this.resolvePartyAddressLines(
+                    `/${this.accountPath}/api/partygroup/${supplierRole.partyId}`,
+                );
+            } catch {
+                vendorAddress = [];
+            }
+        }
 
         const rawOrderUrl = po.orderUrl || `/${this.accountPath}/api/order/${orderId}`;
         const encodedUrl = Buffer.from(rawOrderUrl).toString("base64");
@@ -3449,6 +3596,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             orderId: po.orderId || orderId,
             vendorName,
             vendorPartyId,
+            ...(vendorAddress.length > 0 ? { vendorAddress } : {}),
             orderDate: po.orderDate || new Date().toISOString().split("T")[0],
             total: po.orderItemListTotal || items.reduce((s: number, i: any) => s + i.lineTotal, 0),
             items,

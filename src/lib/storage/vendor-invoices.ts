@@ -9,6 +9,7 @@
  */
 
 import { createClient } from "../db";
+import { sanitizeOcrPoCandidate } from "../purchasing/ocr-po-sanitize";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -89,17 +90,28 @@ export async function upsertVendorInvoice(
         }
     }
 
+    // A vendor name that reads like a price, a header, or a sentence is an
+    // extraction failure. Keep the row so the PDF is traceable, but mark it so
+    // it never enters the match pool.
+    const vendorLooksBroken = /total|sell price|invoice|qty|unknown vendor|^from:|consignee/i.test(vendorName)
+        || vendorName.length < 4
+        || /^[0-9.$]/.test(vendorName);
+
+    // A PO number has to be a real Finale PO shape. Tracking tails, account
+    // numbers, and phone numbers fail this and are stored as null instead.
+    const poNumber = sanitizeOcrPoCandidate(record.po_number);
+
     const payload = {
         vendor_name: vendorName,
         invoice_number: invoiceNumber,
         invoice_date: record.invoice_date ?? null,
         due_date: record.due_date ?? null,
-        po_number: record.po_number ?? null,
+        po_number: poNumber,
         subtotal: record.subtotal ?? 0,
         freight: record.freight ?? 0,
         tax: record.tax ?? 0,
         total: record.total ?? 0,
-        status: record.status ?? "received",
+        status: vendorLooksBroken ? "unmatched" : (record.status ?? "received"),
         source: record.source,
         source_ref: record.source_ref ?? null,
         pdf_storage_path: record.pdf_storage_path ?? null,

@@ -204,4 +204,49 @@ describe("forwardInvoiceOnce single-send invariant", () => {
       expect(r.reason).toContain("billcom_bills_ref");
     }
   });
+
+  it("blocks a statement (subject) from any forward path", async () => {
+    const r = await forwardInvoiceOnce({
+      gmailMessageId: "m-stmt-subject",
+      emailFrom: "loganreports@loganlabs.com",
+      emailSubject: "Statement from LOGAN LABS LLC",
+      pdfFilename: "Statement_3457.pdf",
+      pdfBuffer: Buffer.from("%PDF statement"),
+      source: "ap-agent",
+      gmail: mockGmail(),
+    });
+    expect(r.status).toBe("blocked");
+    if (r.status === "blocked") {
+      expect(r.reason).toMatch(/statement\/non-invoice/i);
+    }
+  });
+
+  it("blocks a statement (French subject) with opaque filename", async () => {
+    const r = await forwardInvoiceOnce({
+      gmailMessageId: "m-stmt-berger",
+      emailFrom: "recevableberger@berger.ca",
+      emailSubject: "STATEMENT/RELEVÉ DE COMPTE",
+      pdfFilename: "BUIAS1.pdf",
+      pdfBuffer: Buffer.from("%PDF statement"),
+      source: "manual",
+      gmail: mockGmail(),
+    });
+    expect(r.status).toBe("blocked");
+    if (r.status === "blocked") {
+      expect(r.reason).toMatch(/statement\/non-invoice/i);
+    }
+  });
+
+  it("does NOT block AAA Cooper 'Invoice Stmt' (a real invoice)", async () => {
+    const r = await forwardInvoiceOnce({
+      gmailMessageId: "m-aaa",
+      emailFrom: "act.statement@aaacooper.com",
+      emailSubject: "Invoice Stmt - Cust 0001159492 Pro#: 64058448",
+      pdfFilename: "64058448_AAA_Cooper_Transportation.pdf",
+      pdfBuffer: Buffer.from("%PDF invoice"),
+      source: "local-forwarder",
+      gmail: mockGmail("sent-aaa"),
+    });
+    expect(r.status).toBe("forwarded");
+  });
 });

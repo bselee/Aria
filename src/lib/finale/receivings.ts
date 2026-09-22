@@ -30,6 +30,7 @@ import {
     type SendPurchaseOrderEmailResult,
     type POInfo,
 } from "./core-client";
+import { freightAdjustmentForPo } from "./freight-adjustment";
 
 // ── Concurrency-limited async map ────────────────────────────────────────
 /**
@@ -781,6 +782,33 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
     }
 
     /**
+     * PO line weights for ADJ_BY_WEIGHT. Order items often omit `weight`;
+     * look up the product master so bag SKUs (50 lb) are not treated as 1 lb.
+     */
+    protected async freightAllocLines(
+        orderItemList: Array<{ productId?: string; quantity?: number; weight?: number }> | undefined,
+    ): Promise<Array<{ quantity: number; weight?: number }>> {
+        const items = orderItemList || [];
+        const lines: Array<{ quantity: number; weight?: number }> = [];
+        for (const item of items) {
+            const quantity = Number(item.quantity) || 0;
+            let weight = Number(item.weight) || 0;
+            if (quantity > 0 && weight <= 0 && item.productId) {
+                try {
+                    const product = await this.get(
+                        `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
+                    );
+                    weight = Number(product?.weight) || 0;
+                } catch {
+                    weight = 0;
+                }
+            }
+            lines.push({ quantity, weight: weight > 0 ? weight : undefined });
+        }
+        return lines;
+    }
+
+    /**
      * Add a fee/charge adjustment to a PO's orderAdjustmentList.
      * This uses Finale's native fee system and automatically affects landed cost per unit.
      *
@@ -820,11 +848,19 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             adj.productPromoUrl !== promoUrl &&
             !(adj.description || "").toLowerCase().includes(hint)
         );
-        adjustments.push({
-            amount,
-            description: description || fee.name,
-            productPromoUrl: promoUrl,
-        });
+        if (feeType === "FREIGHT") {
+            const items = await this.freightAllocLines(currentPO.orderItemList);
+            const existing = (currentPO.orderAdjustmentList || []).find((adj: { productPromoUrl?: string }) =>
+                adj.productPromoUrl === promoUrl,
+            ) as { orderAdjustmentAllocationList?: number[] } | undefined;
+            adjustments.push(freightAdjustmentForPo(amount, items, existing?.orderAdjustmentAllocationList));
+        } else {
+            adjustments.push({
+                amount,
+                description: description || fee.name,
+                productPromoUrl: promoUrl,
+            });
+        }
 
         // 4. POST the updated PO with the new adjustment
         const updated = await this.post(
@@ -866,11 +902,19 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             adj.productPromoUrl !== promoUrl &&
             !(adj.description || "").toLowerCase().includes(hint)
         ) as any[];
-        adjustments.push({
-            amount: newAmount,
-            description: descriptionHint || fee.name,
-            productPromoUrl: promoUrl,
-        });
+        if (feeType === "FREIGHT") {
+            const items = await this.freightAllocLines(currentPO.orderItemList);
+            const existing = (currentPO.orderAdjustmentList || []).find((adj: { productPromoUrl?: string }) =>
+                adj.productPromoUrl === promoUrl,
+            ) as { orderAdjustmentAllocationList?: number[] } | undefined;
+            adjustments.push(freightAdjustmentForPo(newAmount, items, existing?.orderAdjustmentAllocationList));
+        } else {
+            adjustments.push({
+                amount: newAmount,
+                description: descriptionHint || fee.name,
+                productPromoUrl: promoUrl,
+            });
+        }
 
         // 4. POST back
         const updated = await this.post(
@@ -1019,7 +1063,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
 
     protected mergeDraftOrderItems(
         existingItems: any[],
-        incomingItems: Array<{ productId: string; quantity: number; unitPrice: number }>,
+        incomingItems: Array<{ productId: string; quantity: number; unitPrice: number; productName?: string | null }>,
     ): any[] {
         const merged = [...(existingItems || [])];
 
@@ -1027,12 +1071,20 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             const index = merged.findIndex((item) => this.normalizeOrderLineProductId(item) === incoming.productId);
             if (index >= 0) {
                 const current = merged[index];
+                const existingDesc = String(current.itemDescription || '').trim();
+                const descIsSku = !existingDesc
+                    || existingDesc.toLowerCase() === String(incoming.productId).toLowerCase();
                 merged[index] = {
                     ...current,
                     productId: this.normalizeOrderLineProductId(current) || incoming.productId,
                     productUrl: current.productUrl || `/${this.accountPath}/api/product/${encodeURIComponent(incoming.productId)}`,
                     quantity: Math.max(Number(current.quantity || 0), incoming.quantity),
                     unitPrice: incoming.unitPrice > 0 ? incoming.unitPrice : current.unitPrice,
+                    // HERMIA(2026-09-21): stamp a real product description when
+                    // Finale auto-filled the line with the bare SKU.
+                    ...(descIsSku && incoming.productName
+                        ? { itemDescription: incoming.productName }
+                        : {}),
                 };
                 continue;
             }
@@ -1042,6 +1094,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(incoming.productId)}`,
                 quantity: incoming.quantity,
                 unitPrice: incoming.unitPrice,
+                ...(incoming.productName ? { itemDescription: incoming.productName } : {}),
             });
         }
 

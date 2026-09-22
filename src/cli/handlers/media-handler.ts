@@ -13,51 +13,31 @@ import type { FinaleClient } from '../../lib/finale/client';
 import { unifiedTextGeneration } from '../../lib/intelligence/llm';
 
 /**
- * Reusable helper to send emails with PDF attachment via Gmail API.
+ * Deliver an invoice PDF to Bill.com through the single-forward gate.
+ * A dropped file has no Gmail id, so the Telegram message id is the claim key.
+ * The gate still dedups on the PDF hash, so the same file cannot go twice.
  */
-export async function sendPdfEmail(
-    to: string,
-    subject: string,
-    body: string,
+async function forwardToBillCom(
+    ctx: Context,
     pdfBuffer: Buffer,
-    pdfFilename: string
+    pdfFilename: string,
+    subject: string,
+    invoiceNumber?: string,
 ): Promise<void> {
-    const { getAuthenticatedClient: getGmailAuth } = await import('../../lib/gmail/auth');
-    const { gmail: GmailApiDyn } = await import('@googleapis/gmail');
-    const auth = await getGmailAuth('default');
-    const gmail = GmailApiDyn({ version: 'v1', auth });
-
-    const boundary = '----=_Part_' + Date.now();
-    const mimeMessage = [
-        `To: ${to}`,
-        `Subject: ${subject}`,
-        `MIME-Version: 1.0`,
-        `Content-Type: multipart/mixed; boundary="${boundary}"`,
-        ``,
-        `--${boundary}`,
-        `Content-Type: text/plain; charset="UTF-8"`,
-        ``,
-        body,
-        ``,
-        `--${boundary}`,
-        `Content-Type: application/pdf; name="${pdfFilename}"`,
-        `Content-Disposition: attachment; filename="${pdfFilename}"`,
-        `Content-Transfer-Encoding: base64`,
-        ``,
-        pdfBuffer.toString('base64'),
-        `--${boundary}--`,
-    ].join('\r\n');
-
-    const encodedMessage = Buffer.from(mimeMessage)
-        .toString('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, '');
-
-    await gmail.users.messages.send({
-        userId: 'me',
-        requestBody: { raw: encodedMessage },
+    const { forwardInvoiceOnce } = await import('../../lib/intelligence/ap-single-forward');
+    const messageId = String((ctx.message as any)?.message_id ?? Date.now());
+    const result = await forwardInvoiceOnce({
+        gmailMessageId: `telegram-${messageId}-${pdfFilename}`,
+        emailFrom: 'telegram-upload',
+        emailSubject: subject,
+        pdfFilename,
+        pdfBuffer,
+        invoiceNumber,
+        source: 'telegram',
     });
+    if (result.status === 'error' || result.status === 'blocked') {
+        throw new Error(result.reason);
+    }
 }
 
 /**
@@ -429,12 +409,12 @@ If no invoice number found, use null for invoiceNumber. If no date found, use nu
                         }, { caption: `📄 Invoice ${invNum}` });
 
                         try {
-                            await sendPdfEmail(
-                                'buildasoilap@bill.com',
-                                `Invoice ${invNum}`,
-                                `Invoice ${invNum} attached.\nExtracted from: ${filename}`,
+                            await forwardToBillCom(
+                                ctx,
                                 pageBuffer,
                                 invFilename,
+                                `Invoice ${invNum}`,
+                                invNum,
                             );
                             emailsSent++;
                         } catch (emailErr: any) {
@@ -463,19 +443,9 @@ If no invoice number found, use null for invoiceNumber. If no date found, use nu
                         filename: cleanFilename,
                     }, { caption: `📊 Statement only (invoices removed)` });
 
-                    try {
-                        await sendPdfEmail(
-                            'buildasoilap@bill.com',
-                            `Vendor Statement - ${invoiceNums.join(', ') || filename}`,
-                            `Vendor statement attached. Invoice pages removed.\nOriginal: ${filename}\nInvoices: ${invoiceNums.join(', ') || 'N/A'}`,
-                            cleanedBuffer,
-                            cleanFilename,
-                        );
-                        await ctx.reply(`✉️ ✅ Sent statement to \`buildasoilap@bill.com\``, { parse_mode: 'Markdown' });
-                    } catch (emailErr: any) {
-                        console.error('Bill.com email error:', emailErr.message);
-                        await ctx.reply(`⚠️ PDF cleaned but email failed: ${emailErr.message}`, { parse_mode: 'Markdown' });
-                    }
+                    // Statements never go to Bill.com. The gate blocks them, and
+                    // sending one is what produced the duplicate-bill noise.
+                    await ctx.reply(`📊 Statement kept local. Not forwarded to bill.com.`, { parse_mode: 'Markdown' });
                     return;
                 }
 
@@ -491,12 +461,12 @@ If no invoice number found, use null for invoiceNumber. If no date found, use nu
                     await ctx.reply(reply, { parse_mode: 'Markdown' });
 
                     try {
-                        await sendPdfEmail(
-                            'buildasoilap@bill.com',
-                            `Invoice ${invNum}`,
-                            `Invoice ${invNum} attached.\nFile: ${filename}`,
+                        await forwardToBillCom(
+                            ctx,
                             buffer,
                             invFilename,
+                            `Invoice ${invNum}`,
+                            invNum,
                         );
                         await ctx.reply(`✉️ ✅ Sent to \`buildasoilap@bill.com\` — Invoice ${invNum}`, { parse_mode: 'Markdown' });
                     } catch (emailErr: any) {

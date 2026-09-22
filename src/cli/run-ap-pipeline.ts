@@ -372,13 +372,16 @@ async function main() {
                 console.error("   ❌ Document insert failed:", docError.message);
             }
 
-            const { error: invError } = await db.from("invoices").upsert({
+            // vendor_invoices, not the invoices view. The view casts invoice_date
+            // to text and exposes document_id as a null constant, so any upsert
+            // that sets them fails with 0A000. That failure is what kept the row
+            // stuck and the overwatch heal re-forwarding it to Bill.com.
+            const { error: invError } = await db.from("vendor_invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber || null,
                 invoice_date: invoiceData.invoiceDate,
                 due_date: invoiceData.dueDate || invoiceData.invoiceDate,
-                payment_terms: invoiceData.paymentTerms,
                 subtotal: invoiceData.subtotal,
                 freight: invoiceData.freight || 0,
                 tax: invoiceData.tax || 0,
@@ -386,11 +389,11 @@ async function main() {
                 labor: invoiceData.labor || 0,
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
-                amount_due: invoiceData.amountDue,
                 status: matched ? "matched_review" : "unmatched",
-                document_id: documentId,
-                raw_data: invoiceData,
-            }, { onConflict: "invoice_number" }).select("id").single();
+                source: "email_attachment",
+                source_ref: from,
+                raw_data: { ...invoiceData, document_id: documentId },
+            }, { onConflict: "vendor_name,invoice_number" }).select("id").single();
 
             if (invError) {
                 console.error("   ❌ Invoice upsert failed:", invError.message);
@@ -402,42 +405,12 @@ async function main() {
         }
     }
 
-    // ── Step 5: Forward to bill.com ───────────────────────────────────────────
-    console.log("\n6️⃣  Forwarding invoice to buildasoilap@bill.com...");
-    try {
-        const boundary = "b_aria_fwd_" + Math.random().toString(36).substring(2);
-
-        // Chunk the base64 string to adhere to RFC 2045 76-character line limit
-        const chunkedBase64 = pdfBase64Raw.match(/.{1,76}/g)?.join("\r\n") || pdfBase64Raw;
-
-        const mimeMessage = [
-            `To: buildasoilap@bill.com`,
-            `Subject: Fwd: ${subject}`,
-            `MIME-Version: 1.0`,
-            `Content-Type: multipart/mixed; boundary="${boundary}"`,
-            ``,
-            `--${boundary}`,
-            `Content-Type: text/plain; charset="UTF-8"`,
-            ``,
-            `Forwarded invoice.`,
-            ``,
-            `--${boundary}`,
-            `Content-Type: application/pdf; name="${filename}"`,
-            `Content-Transfer-Encoding: base64`,
-            `Content-Disposition: attachment; filename="${filename}"`,
-            ``,
-            chunkedBase64,
-            `--${boundary}--`,
-        ].join("\r\n");
-
-        await gmail.users.messages.send({
-            userId: "me",
-            requestBody: { raw: Buffer.from(mimeMessage).toString("base64url") },
-        });
-        console.log(`   ✅ Forwarded to buildasoilap@bill.com`);
-    } catch (err: any) {
-        console.error(`   ❌ bill.com forward failed: ${err.message}`);
-    }
+    // ── Step 5: Forward to bill.com — REMOVED ────────────────────────────────
+    // This CLI used to send the PDF itself, with no dedup. The overwatch heal
+    // called it on every stuck row, so the same invoice went to Bill.com once
+    // per tick (19 extra sends on 2026-09-21/22). Forwarding belongs only to
+    // forwardInvoiceOnce(). This script now stops at parse + reconcile.
+    console.log("\n6️⃣  Forward skipped — this CLI does not send to Bill.com.");
 
     // ── Step 6b: Telegram Notification ───────────────────────────────────────
     console.log("\n7️⃣  Sending Telegram notification...");

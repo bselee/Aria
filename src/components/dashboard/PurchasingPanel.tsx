@@ -418,6 +418,19 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const [checked, setChecked] = useState<Record<string, Record<string, boolean>>>({});
     const [qtys, setQtys] = useState<Record<string, Record<string, number>>>({});
     const [creatingPO, setCreatingPO] = useState<Set<string>>(new Set());
+
+    /**
+     * Vendor PO email kill switch (Bill, 2026-09-21): "only drafts created in
+     * Finale for now." Defaults to OFF — every send button is hidden and the
+     * commit route refuses send actions. Set NEXT_PUBLIC_ARIA_PO_SEND_ENABLED=true
+     * to re-enable vendor emailing.
+     */
+    const PO_SEND_ENABLED = process.env.NEXT_PUBLIC_ARIA_PO_SEND_ENABLED === "true";
+
+    /** Per-vendor re-entrancy lock: drops repeat Order clicks before React state settles. */
+    const draftInFlight = useRef<Set<string>>(new Set());
+    /** Per-PO re-entrancy lock: drops repeat Send clicks before React state settles. */
+    const sendInFlight = useRef<Set<string>>(new Set());
     const [createdPOs, setCreatedPOs] = useState<Record<string, POResult>>({});
     // Vendors that have been drafted/committed — disappear from Ordering immediately.
         // Seeded from sessionStorage so a hard refresh within 6h doesn't resurrect them
@@ -623,6 +636,29 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         setSnooze(updated);
         localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
         setSnoozeMenu(null);
+    }
+    function doUnsnoozeVendor(group: PurchasingGroup) {
+        const updated = { ...snooze };
+        delete updated[`v:${group.vendorPartyId}`];
+        for (const item of group.items) delete updated[item.productId];
+        setSnooze(updated);
+        localStorage.setItem(SNOOZE_LS, JSON.stringify(updated));
+        setSnoozeMenu(null);
+    }
+    function toggleShowSnoozed() {
+        const next = !showSnoozed;
+        setShowSnoozed(next);
+        if (next) {
+            setExpanded(prev => {
+                const n = new Set(prev);
+                for (const g of (data?.groups ?? [])) {
+                    if (vendorSnoozed(g) || g.items.some(i => isSnoozed(i.productId))) {
+                        n.add(g.vendorPartyId);
+                    }
+                }
+                return n;
+            });
+        }
     }
     function snoozeLabel(key: string): string {
         const e = snooze[key];
@@ -911,7 +947,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 );
         const hasChecked = selected.some(i => checked[pid]?.[i.productId]);
         const items = (ignoreCommitGuards || !hasChecked ? selected : selected.filter(i => checked[pid]?.[i.productId]))
-            .map(i => ({ productId: i.productId, quantity: i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false, leadTimeDays: (i as any).leadTimeDays ?? null }));
+            .map(i => ({ productId: i.productId, productName: i.productName ?? null, quantity: i.suggestedQty, unitPrice: i.unitPrice, orderIncrementQty: i.orderIncrementQty ?? null, isBulkDelivery: i.isBulkDelivery ?? false, leadTimeDays: (i as any).leadTimeDays ?? null }));
         if (items.length === 0) return null;
         const res = await fetch("/api/dashboard/purchasing", {
             method: "POST",
@@ -923,11 +959,101 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         return json as POResult;
     }
 
-    async function handleCreateAllDrafts(groups: PurchasingGroup[]) {
-        // One-click: draft, commit, and send each vendor individually.
-        // No confirmation — hands off to Purchases panel.
+    /**
+     * ORDER (draft-only) — the single entry point behind the "Order" button.
+     *
+     * DECISION(2026-09-21, Bill): Ordering must NEVER email a vendor. Clicking
+     * Order — once or repeatedly — only creates (or reuses) the Finale draft PO.
+     * Sending lives in its own function, handleSendDraftPO(), behind the explicit
+     * "Send" button, so no click on Order can put a PO in a vendor's inbox.
+     *
+     * Repeat clicks are safe: a per-vendor in-flight lock drops re-entrant calls,
+     * and Finale reuses a vendor's existing open draft regardless.
+     *
+     * @param group - Vendor group to draft in Finale.
+     */
+    async function handleOrderDraftOnly(group: PurchasingGroup): Promise<void> {
+        const pid = group.vendorPartyId;
+        if (draftInFlight.current.has(pid)) return;
+        draftInFlight.current.add(pid);
+        setCreatingPO(p => new Set(p).add(pid));
+        try {
+            const result = await createVendorPO(group, true); // bypass lead-time/cycle guards
+            if (!result?.orderId) {
+                setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
+                return;
+            }
+            setCreatedPOs(p => ({ ...p, [pid]: result }));
+            setCreatedPODetails(p => ({ ...p, [pid]: result }));
+            markVendorOrdered(pid, result.orderId);
+            const selItems = group.items.filter(
+                i => !isSnoozed(i.productId) && checked[pid]?.[i.productId] && canIncludeInDraftPO(i.reorderMethod),
+            );
+            const totalUnits = selItems.reduce(
+                (s, i) => s + (qtys[pid]?.[i.productId] ?? i.assessment?.recommendedQty ?? i.suggestedQty), 0,
+            );
+            lifecycle.notifyDraft({
+                vendorName: group.vendorName,
+                orderId: result.orderId,
+                itemCount: selItems.length || group.items.length,
+                totalUnits,
+            });
+            await load(true);
+        } catch (e: any) {
+            setError(`PO failed for ${group.vendorName}: ${e.message}`);
+        } finally {
+            draftInFlight.current.delete(pid);
+            setCreatingPO(p => { const n = new Set(p); n.delete(pid); return n; });
+        }
+    }
+
+    /**
+     * SEND (separate, explicit) — commits the Finale draft and emails the vendor.
+     *
+     * DECISION(2026-09-21, Bill): kept as its own function so the send path is a
+     * deliberate, reviewable action. Never invoked from handleOrderDraftOnly(),
+     * handleCreateAllDrafts(), or any other draft-creation path.
+     *
+     * @param orderId - Finale draft PO number to commit and email.
+     * @param vendorPartyId - Finale supplier party id owning the draft.
+     */
+    async function handleSendDraftPO(orderId: string, vendorPartyId: string): Promise<void> {
+        if (!orderId) return;
+        if (sendInFlight.current.has(orderId)) return;
+        sendInFlight.current.add(orderId);
+        setCommitLoading(orderId);
+        try {
+            const res = await fetch('/api/dashboard/purchasing/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'send-direct', orderId, vendorPartyId, confirmSend: true }),
+            });
+            if (res.ok) {
+                setSentPOs(p => new Set(p).add(orderId));
+                markVendorOrdered(vendorPartyId, orderId);
+            } else {
+                // Draft still exists in Finale — leave Ordering, retry from Purchases.
+                markVendorOrdered(vendorPartyId, orderId);
+                const json = await res.json().catch(() => ({}));
+                setError(`Send failed: ${(json as any).error || 'Unknown'} — PO stays in Finale as a draft.`);
+            }
+            await load(true);
+        } catch (e: any) {
+            setError(`Send failed: ${e.message}`);
+        } finally {
+            sendInFlight.current.delete(orderId);
+            setCommitLoading(null);
+        }
+    }
+
+    /**
+     * ORDER ALL — drafts only, one vendor at a time. Nothing is emailed; the
+     * drafts hand off to the Purchases panel (Bill, 2026-09-21).
+     *
+     * @param groups - Vendor groups with actionable order lines.
+     */
+    async function handleCreateAllDrafts(groups: PurchasingGroup[]): Promise<void> {
         for (const group of groups) {
-            const pid = group.vendorPartyId;
             const sel = group.items.filter(i =>
                 !isSnoozed(i.productId) &&
                 canIncludeInDraftPO(i.reorderMethod) &&
@@ -935,29 +1061,11 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 (i as any).assessment?.decision === 'order'
             );
             if (sel.length === 0) continue;
-            setCreatingPO(p => new Set(p).add(pid));
-            try {
-                const result = await createVendorPO(group, true);
-                if (result?.orderId) {
-                                    setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                    const res = await fetch('/api/dashboard/purchasing/commit', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                    });
-                                    // Draft (and usually commit) landed in Finale — leave Ordering now.
-                                    // Email failure must not keep the vendor on the board.
-                                    if (res.ok) setSentPOs(p => new Set(p).add(result.orderId!));
-                                    markVendorOrdered(pid, result.orderId);
-                                }
-            } catch (e: any) {
-                console.error(`[order-all] ${group.vendorName}:`, e.message);
-            } finally {
-                setCreatingPO(p => { const n = new Set(p); n.delete(pid); return n; });
-            }
+            await handleOrderDraftOnly(group);
         }
-        load(true);
+        await load(true);
     }
+
     async function handleCreateOne(group: PurchasingGroup, ignoreCommitGuards?: boolean) {
         const pid = group.vendorPartyId;
 
@@ -1281,7 +1389,17 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         );
     });
     const activeGroups = sortedGroups.filter(g => !vendorSnoozed(g) && !completedVendors.has(g.vendorPartyId));
-    const displayGroups = showSnoozed ? sortedGroups : activeGroups;
+    // Reveal must include snoozed vendors even when they sit outside the current
+    // WINDOW. Mixing them into sortedGroups without pinning made the eye look dead.
+    const displayGroups = sortedGroups
+        .filter(g => !completedVendors.has(g.vendorPartyId) && (showSnoozed || !vendorSnoozed(g)))
+        .sort((a, b) => {
+            if (!showSnoozed) return 0;
+            const aS = vendorSnoozed(a);
+            const bS = vendorSnoozed(b);
+            if (aS === bS) return 0;
+            return aS ? -1 : 1;
+        });
 
     // ── Helpers ──────────────────────────────────────────────────────────
     /** Map Finale PO status to a human-readable label */
@@ -1356,13 +1474,16 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const focusGroups = displayGroups
         .map(group => {
             const hasDraftPO = !!createdPOs[group.vendorPartyId];
+            const vSnoozed = vendorSnoozed(group);
             return {
                 ...group,
                 items: hasDraftPO
                     ? []
-                    : sortItemsByNeed(group.items.filter(item =>
-                        itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item)
-                    )),
+                    : sortItemsByNeed(group.items.filter(item => {
+                        const itemSnoozed = isSnoozed(item.productId) || vSnoozed;
+                        if (itemSnoozed) return showSnoozed;
+                        return itemMatchesFocus(item) && itemMatchesLifecycle(item) && !itemIsCovered(item);
+                    })),
             };
         })
         .filter(group => group.items.length > 0 || !!createdPOs[group.vendorPartyId]);
@@ -1423,7 +1544,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
     const estimatedGroupHeights = visibleGroups.map(group => {
         const pid = group.vendorPartyId;
         const vSnoozed = vendorSnoozed(group);
-        const isExpanded = !vSnoozed && (expanded.has(pid) || vendorTab === pid);
+        const isExpanded = (!vSnoozed || showSnoozed) && (expanded.has(pid) || vendorTab === pid);
         if (!isExpanded) return GROUP_HEADER_ESTIMATE;
         const itemCount = group.items.filter(item => showSnoozed || !isSnoozed(item.productId)).length;
         return GROUP_HEADER_ESTIMATE + SELECT_ALL_ESTIMATE + itemCount * ITEM_ROW_ESTIMATE;
@@ -1735,11 +1856,11 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             )}
 
             {/* ── Header ── cube icon + label + search + filters, outlined in thin white */}
-            <div className="px-4 py-2 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md">
+            <div className="px-3 h-11 min-h-11 shrink-0 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md overflow-hidden">
                 <Package className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-200 uppercase tracking-widest">Ordering</span>
                 <CrystalBallSearch onSelect={setSelectedItem} onVendorSelect={handleVendorSearchSelect} />
-                {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono">{timeAgo(data.cachedAt)}</span>}
+                {data && !scanning && <span className="text-[10px] text-[var(--dash-ts)] ml-auto mr-0 font-mono whitespace-nowrap shrink-0">{timeAgo(data.cachedAt)}</span>}
                 {/* Compact indicator (header) — only when warm cache exists; cold-load shows the centered card below */}
                 {isLoading && data && (
                     <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
@@ -1774,10 +1895,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                 {/* Snoozed badge — toggles reveal */}
                 {hiddenItemCount > 0 && (
                     <button
-                        onClick={() => setShowSnoozed(s => !s)}
-                        className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${showSnoozed
-                            ? "bg-zinc-700 text-zinc-300 border-zinc-600"
-                            : "bg-transparent text-zinc-600 border-zinc-800 hover:text-zinc-400 hover:border-zinc-700"
+                        onClick={toggleShowSnoozed}
+                        className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 transition-colors ${showSnoozed
+                            ? "bg-zinc-700 text-zinc-200 border-zinc-500"
+                            : "bg-transparent text-zinc-500 border-zinc-700 hover:text-zinc-300 hover:border-zinc-500"
                             }`}
                         title={showSnoozed ? "Hide snoozed" : "Show snoozed items"}
                     >
@@ -1851,7 +1972,13 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                     {hiddenItemCount > 0 && (
                         <>
                             <span className="text-zinc-700">·</span>
-                            <span className="text-zinc-500">{hiddenItemCount} snoozed</span>
+                            <button
+                                onClick={toggleShowSnoozed}
+                                className={`transition-colors ${showSnoozed ? "text-zinc-200 underline" : "text-zinc-500 hover:text-zinc-300"}`}
+                                title={showSnoozed ? "Hide snoozed" : "Show snoozed items"}
+                            >
+                                {hiddenItemCount} snoozed
+                            </button>
                         </>
                     )}
                 </div>
@@ -1868,7 +1995,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                 <CrystalBallDetail 
                                     item={selectedItem} 
                                     onClose={() => setSelectedItem(null)} 
-                                    onCommitPO={handleReviewAndSend}
+                                    onCommitPO={PO_SEND_ENABLED ? handleReviewAndSend : undefined}
                                 />
                             </div>
 
@@ -2160,7 +2287,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                     const isCreatingThis = creatingPO.has(pid);
                                     const po = createdPOs[pid];
                                     const vSnoozed = !po && vendorSnoozed(group);
-                                    const isExpanded = !vSnoozed && (expanded.has(pid) || vendorTab === pid);
+                                    const isExpanded = (!vSnoozed || showSnoozed) && (expanded.has(pid) || vendorTab === pid);
                                     const groupChecked = checked[pid] ?? {};
                                     const groupQtys = qtys[pid] ?? {};
                                     const activeItems = group.items.filter(i => !isSnoozed(i.productId));
@@ -2220,7 +2347,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                             }}
                                             onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, productIds: groupProductIds })}
                                             onMouseLeave={lifecycle.clearFocus}
-                                            className={`border-b border-zinc-800/60 cursor-pointer ${vSnoozed ? "opacity-25 hover:opacity-45 transition-opacity" : ""} ${groupBg}`}
+                                            className={`border-b border-zinc-800/60 cursor-pointer ${groupBg}`}
                                         >
                                             {/* ── Simplified row: vendor · urgency · items · $ · [Quick Draft] ▾ */}
                                             <div className="flex items-center gap-2 px-4 py-2 hover:bg-zinc-800/30 transition-colors">
@@ -2228,6 +2355,11 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                 <span className={`text-sm font-mono font-semibold ${vSnoozed ? "line-through text-zinc-600" : "text-zinc-100"}`}>
                                                     {group.vendorName}
                                                 </span>
+                                                {vSnoozed && showSnoozed && (
+                                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-400 shrink-0">
+                                                        {snoozeLabel(`v:${pid}`) || "snoozed"}
+                                                    </span>
+                                                )}
                                                 {!vSnoozed && cfg.label && (
                                                     <span className={`text-[10px] font-mono shrink-0 px-1.5 py-0.5 rounded border ${cfg.badge}`} title={cfg.label}>
                                                         {cfg.label}
@@ -2257,27 +2389,12 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                 <span className="text-[10px] font-mono text-emerald-400 px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10">
                                                                     ✓ PO #{createdPOs[pid].orderId}
                                                                 </span>
+                                                                {PO_SEND_ENABLED && (
                                                                 <button
-                                                                    onClick={async () => {
-                                                                                                                                            const poId = createdPOs[pid].orderId;
-                                                                                                                                            if (!poId) return;
-                                                                                                                                            const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                                method: 'POST',
-                                                                                                                                                headers: { 'Content-Type': 'application/json' },
-                                                                                                                                                body: JSON.stringify({ action: 'send-direct', orderId: poId, vendorPartyId: pid }),
-                                                                                                                                            });
-                                                                                                                                            if (res.ok) {
-                                                                                                                                                setSentPOs(p => new Set(p).add(poId));
-                                                                                                                                                markVendorOrdered(pid, poId);
-                                                                                                                                            } else {
-                                                                                                                                                // Draft already exists — still leave Ordering; retry email from Purchases/Finale.
-                                                                                                                                                markVendorOrdered(pid, poId);
-                                                                                                                                                const json = await res.json().catch(() => ({}));
-                                                                                                                                                setError(`Send failed: ${(json as any).error || 'Unknown'} — PO stays in Finale`);
-                                                                                                                                            }
-                                                                                                                                        }}
+                                                                    onClick={() => { void handleSendDraftPO(createdPOs[pid].orderId, pid); }}
                                                                     className="text-[10px] font-mono font-bold px-2 py-1 rounded border border-amber-500 bg-amber-600/30 hover:bg-amber-500/40 text-amber-200 transition-colors"
                                                                 >Send</button>
+                                                                )}
                                                             </div>
                                                         );
                                                     }
@@ -2304,38 +2421,10 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                             const wasInspected = expanded.has(pid);
                                                                                                             return (
                                                                                                                 <button
-                                                                                                                    onClick={async () => {
-                                                                                                                        if (wasInspected) {
-                                                                                                                            // You reviewed — draft only for safety
-                                                                                                                            handleCreateOne(group, true);
-                                                                                                                        } else {
-                                                                                                                            // You trust it — draft + commit + send
-                                                                                                                            try {
-                                                                                                                                                                                                                                                            const result = await createVendorPO(group, true);
-                                                                                                                                                                                                                                                            if (result?.orderId) {
-                                                                                                                                                                                                                                                                setCreatedPOs(p => ({ ...p, [pid]: result }));
-                                                                                                                                                                                                                                                                const res = await fetch('/api/dashboard/purchasing/commit', {
-                                                                                                                                                                                                                                                                    method: 'POST',
-                                                                                                                                                                                                                                                                    headers: { 'Content-Type': 'application/json' },
-                                                                                                                                                                                                                                                                    body: JSON.stringify({ action: 'send-direct', orderId: result.orderId, vendorPartyId: pid }),
-                                                                                                                                                                                                                                                                });
-                                                                                                                                                                                                                                                                if (res.ok) {
-                                                                                                                                                                                                                                                                    setSentPOs(p => new Set(p).add(result.orderId!));
-                                                                                                                                                                                                                                                                } else {
-                                                                                                                                                                                                                                                                    setError('Draft created — send failed. PO is in Finale; email may need manual send.');
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                // PO exists in Finale — leave Ordering regardless of email path.
-                                                                                                                                                                                                                                                                markVendorOrdered(pid, result.orderId);
-                                                                                                                                                                                                                                                                await load(true);
-                                                                                                                                                                                                                                                            } else {
-                                                                                                                                                                                                                                                                setError(`Nothing left to order for ${group.vendorName} — already on open/draft PO.`);
-                                                                                                                                                                                                                                                            }
-                                                                                                                                                                                                                                                        } catch (e: any) { setError(e.message); }
-                                                                                                                        }
-                                                                                                                    }}
+                                                                                                                    onClick={() => { void handleOrderDraftOnly(group); }}
                                                                                                                     disabled={anyCreating}
                                                                                                                     className="text-[10px] font-mono px-2 py-1 rounded border bg-emerald-900/30 hover:bg-emerald-800/40 text-emerald-300 border-emerald-800 transition-colors disabled:opacity-40 shrink-0"
-                                                                                                                    title={wasInspected ? "Draft only — you reviewed this vendor" : "Draft, commit, and send"}
+                                                                                                                    title="Create draft PO in Finale — draft only, never sends to the vendor"
                                                                                                                 >
                                                                                                                     Order
                                                                                                                 </button>
@@ -2343,6 +2432,13 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                         }
                                                     return null;
                                                 })()}
+                                                {vSnoozed && showSnoozed && (
+                                                    <button
+                                                        onClick={() => doUnsnoozeVendor(group)}
+                                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-emerald-500/30 text-emerald-400/80 hover:text-emerald-300 hover:bg-emerald-500/10 shrink-0"
+                                                        title="Unsnooze this vendor"
+                                                    >↩ unsnooze</button>
+                                                )}
                                                 <button onClick={() => toggleExpand(pid)}
                                                     className="text-[10px] font-mono px-1.5 py-1 rounded border bg-transparent text-zinc-600 border-zinc-800 hover:text-zinc-400 shrink-0">
                                                     ▾
@@ -2416,8 +2512,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                     }}
                                                                     onMouseEnter={() => lifecycle.setFocus({ source: "ordering", vendorName: group.vendorName, orderId: openOrderId, productIds: [item.productId] })}
                                                                     onMouseLeave={lifecycle.clearFocus}
-                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 cursor-pointer ${itemBg} ${itemSnoozed ? "opacity-20 hover:opacity-40 transition-opacity" : isChecked ? "" : "opacity-90"
-                                                                        }`}>
+                                                                    className={`px-4 py-3.5 border-b border-zinc-800/40 last:border-0 cursor-pointer ${itemBg} ${itemSnoozed ? "opacity-70" : isChecked ? "" : "opacity-90"}`}>
                                                                     <div className="flex items-start gap-3">
                                                                         {!itemSnoozed && (
                                                                             <input type="checkbox" checked={isChecked}
@@ -3008,12 +3103,14 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                 Draft PO #{item.draftPO.orderId} created on {item.draftPO.orderDate} by {item.draftPO.supplierName} contains {item.draftPO.quantity} units of this item. Please review and commit this PO instead of creating a duplicate.
                                                                                             </p>
                                                                                             <div className="flex items-center gap-2 pt-1">
+                                                                                                {PO_SEND_ENABLED && (
                                                                                                 <button
                                                                                                     onClick={(e) => { e.stopPropagation(); handleReviewAndSend(item.draftPO!.orderId); }}
                                                                                                     className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 transition-all font-semibold text-[10px]"
                                                                                                 >
                                                                                                     Commit & Send PO
                                                                                                 </button>
+                                                                                                )}
                                                                                                 <button
                                                                                                     onClick={(e) => { e.stopPropagation(); handleCancelDraft(item.draftPO!.orderId); }}
                                                                                                     className="px-2 py-1 rounded border border-rose-500/40 hover:bg-rose-500/20 hover:text-rose-200 text-rose-300 transition-all font-semibold text-[10px]"
@@ -3074,7 +3171,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                     {!isLoading && activeGroups.length === 0 && hiddenItemCount > 0 && !showSnoozed && (
                         <div className="px-4 py-3 border-t border-zinc-800/60 text-xs font-mono text-zinc-600">
                             All active items covered.{" "}
-                            <button onClick={() => setShowSnoozed(true)}
+                            <button onClick={toggleShowSnoozed}
                                 className="text-zinc-500 hover:text-zinc-300 underline transition-colors">
                                 {hiddenItemCount} snoozed
                             </button>

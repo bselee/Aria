@@ -111,9 +111,14 @@ vi.mock("../db", () => ({
     })),
 }));
 
-import { AcknowledgementAgent } from "./acknowledgement-agent";
+import { AcknowledgementAgent, EMAIL_TRIAGE_SYSTEM } from "./acknowledgement-agent";
 
 describe("AcknowledgementAgent", () => {
+    it("classifier prompt defaults to archive, not human-on-uncertainty", () => {
+        expect(EMAIL_TRIAGE_SYSTEM).toMatch(/Default to PROMOTIONAL/i);
+        expect(EMAIL_TRIAGE_SYSTEM).not.toMatch(/maximum caution/i);
+        expect(EMAIL_TRIAGE_SYSTEM).not.toMatch(/do NOT choose ROUTINE_INFO/i);
+    });
     beforeEach(() => {
         vi.clearAllMocks();
         queueState.messages = [];
@@ -140,7 +145,7 @@ describe("AcknowledgementAgent", () => {
         notifyViaTaskMock.mockResolvedValue("task-1");
     });
 
-    it("prepares a routine draft and NEVER auto-sends", async () => {
+    it("routine updates are silent — no draft, never auto-send", async () => {
         queueState.messages = [
             {
                 id: 1,
@@ -160,21 +165,10 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
-        expect(gmailModifyMock).toHaveBeenCalledWith({
-            userId: "me",
-            id: "gmail-1",
-            requestBody: {
-                addLabelIds: ["draft-ready-label"],
-            },
-        });
-        expect(recordEmailDraftPreparedMock).toHaveBeenCalledWith(
-            expect.objectContaining({
-                gmailMessageId: "gmail-1",
-                kind: "routine",
-            }),
-        );
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
+        expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
     it("does not auto-reply to marketplace shipping notices", async () => {
@@ -206,6 +200,36 @@ describe("AcknowledgementAgent", () => {
         });
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
+    });
+
+    it("does not draft or send to Google Calendar daily-agenda notifications", async () => {
+        // Regression: calendar-notification@google.com is a no-reply system sender
+        // that slipped past SYSTEM_SENDERS and isNoReply, so the LLM classified the
+        // "Daily Agenda" as ROUTINE_INFO and drafted a pointless "Thanks!" reply.
+        queueState.messages = [
+            {
+                id: 13,
+                gmail_message_id: "gmail-13",
+                thread_id: "thread-13",
+                rfc_message_id: "<msg-13>",
+                from_email: "calendar-notification@google.com",
+                subject: "Daily Agenda for Bill Selee as of 5am",
+                body_snippet: "here is your schedule for Wed Sep 9, 2026",
+                body_text: "Bill Selee, here is your schedule for: Wed Sep 9, 2026",
+                has_pdf: false,
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
+        expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
+        // Left in inbox (no unread/archive mutation) — Bill still sees his agenda.
+        expect(gmailModifyMock).not.toHaveBeenCalled();
     });
 
     it("does not draft or send on vendor PO threads that already have a buildasoil reply", async () => {
@@ -255,7 +279,7 @@ describe("AcknowledgementAgent", () => {
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("forces multi-turn conversation threads into human review with draft stub + labels", async () => {
+    it("forces multi-turn conversation threads into human review with labels, no stub draft", async () => {
         queueState.messages = [
             {
                 id: 2,
@@ -275,12 +299,20 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
         expect(gmailModifyMock).toHaveBeenCalledWith({
             userId: "me",
             id: "gmail-2",
             requestBody: {
-                addLabelIds: expect.arrayContaining(["needs-response-label", "draft-ready-label"]),
+                addLabelIds: expect.arrayContaining(["needs-response-label"]),
+            },
+        });
+        expect(gmailModifyMock).toHaveBeenCalledWith({
+            userId: "me",
+            id: "gmail-2",
+            requestBody: {
+                addLabelIds: expect.not.arrayContaining(["draft-ready-label"]),
             },
         });
         expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith({
@@ -469,6 +501,37 @@ describe("AcknowledgementAgent", () => {
             expect.stringContaining("Invoice 99122"),
         );
         expect(queueState.processedUpdates.some((u) => u.values.status === "invoice_queued")).toBe(true);
+    });
+
+    it("does not draft a reply to a broker FYI rate-secured update", async () => {
+        queueState.messages = [
+            {
+                id: 70,
+                gmail_message_id: "gmail-noah",
+                thread_id: "thread-noah",
+                rfc_message_id: "<msg-noah>",
+                from_email: "Noah.Julin@destinationtrans.com",
+                subject: "Re: Load",
+                body_snippet: "Got this secured at $2,250 today.",
+                body_text:
+                    "Hey Bill,\n\nGot this secured at $2,250 today.\n\nThanks,\n\nNoah Julin\nNational Account Executive\nDestiNATION Transport, LLC",
+                has_pdf: false,
+                processed_by_ack: false,
+                source_inbox: "default",
+            },
+        ];
+        unifiedObjectGenerationMock.mockResolvedValue({
+            intent: "REQUIRES_HUMAN",
+            reasoning: "dollar amount needs attention",
+        });
+
+        await new AcknowledgementAgent("default").processUnreadEmails();
+
+        expect(gmailSendMock).not.toHaveBeenCalled();
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
+        expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
+        expect(notifyViaTaskMock).not.toHaveBeenCalled();
     });
 
     it("marks obvious promotional mail promotional in the queue status", async () => {

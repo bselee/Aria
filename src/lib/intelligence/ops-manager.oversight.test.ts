@@ -39,23 +39,10 @@ vi.mock("./oversight-agent", () => ({
     },
 }));
 
-vi.mock("./workers/ap-identifier", () => ({
-    APIdentifierAgent: class {
-        identifyAndQueue = vi.fn().mockResolvedValue(undefined);
-    },
-}));
-
 vi.mock("./workers/email-ingestion", () => ({
     EmailIngestionWorker: class {
         run = vi.fn().mockResolvedValue(undefined);
         constructor(_inbox: string) {}
-    },
-}));
-
-vi.mock("./workers/ap-forwarder", () => ({
-    APForwarderAgent: class {
-        processPendingForwards = vi.fn().mockResolvedValue(undefined);
-        constructor(_bot: unknown) {}
     },
 }));
 
@@ -128,10 +115,10 @@ describe("OpsManager oversight wiring", () => {
         const deps = runEmailPollingCycleMock.mock.calls[0][0] as any;
         expect(typeof deps.onStageSuccess).toBe("function");
 
-        await deps.onStageSuccess("ap-identifier");
+        await deps.onStageSuccess("ap-email-pipeline");
         expect(oversightAgentInstance.registerHeartbeat).toHaveBeenCalledWith(
-            "ap-identifier",
-            "ap-identifier",
+            "ap-email-pipeline",
+            "ap-email-pipeline",
             { source: "email-polling-cycle" },
         );
     });

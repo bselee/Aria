@@ -64,11 +64,14 @@ const KNOWN_NON_PO_WORDS = new Set([
 function isPlausiblePoToken(s: string): boolean {
     if (!s || s.length < 3) return false;
 
-    // Pure numeric: 5-8 digits (e.g. "124813", "23324007")
-    if (/^\d{5,8}$/.test(s)) return true;
+    // BAS Finale POs are 6 digits starting 12 (125257) or 7 starting 123 (123514987).
+    // A bare 5-8 digit number is how tracking tails and account numbers got stored
+    // as POs, so anything outside those two shapes is rejected.
+    if (/^12\d{4}$/.test(s)) return true;
+    if (/^123\d{6}$/.test(s)) return true;
 
-    // Numeric with known suffix (e.g. "23497897-DropshipPO")
-    if (/^\d{5,8}-(?:[SD]-)?DropshipPO$/.test(s)) return true;
+    // Numeric with known suffix (e.g. "123514987-DropshipPO")
+    if (/^(?:12\d{4}|123\d{6})-(?:[SD]-)?DropshipPO$/.test(s)) return true;
 
     return false;
 }
@@ -223,10 +226,8 @@ export function sanitizeOcrPoCandidate(raw: string | null | undefined): string |
     // Step 6: Final plausibility check
     if (isPlausiblePoToken(s)) return s;
 
-    // Step 7: If entirely numeric already (after prefix strip), accept anything
-    // 5-8 digits the isPlausiblePoToken check should have caught this, but
-    // also handle plain numeric without length restriction
-    if (/^\d+$/.test(s) && s.length >= 4 && s.length <= 10) return s;
-
+    // Step 7: only the two Finale shapes survive. A plain numeric string of
+    // any other length is a tracking number, an account number, or a phone
+    // number, and those were being stored as POs.
     return null;
 }

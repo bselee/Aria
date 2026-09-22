@@ -93,26 +93,17 @@ async function resolveLinkedIssueFromTaskAction(
  * We don't store the original Telegram message_id, so we can't edit out the
  * buttons on the original; a fresh notification is the v1 contract.
  */
-async function notifyTelegramOfDashboardAction(
+async function notifyDashboardAction(
     actor: string,
     actionLabel: string,
     taskId: string,
     replyText: string,
 ): Promise<void> {
     if (!actor.startsWith(DASHBOARD_ACTOR_PREFIX)) return;
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) return;
-    try {
-        const summary = `📋 ${actionLabel} via dashboard (task ${taskId.slice(0, 8)})\n${replyText}`;
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: summary }),
-        });
-    } catch (err) {
-        console.warn('[task-actions] telegram bridge failed:', err);
-    }
+    // 2026-09-17: this was a direct api.telegram.org HTTP send. Telegram is gone;
+    // the action is recorded on the task itself (the hub is the source of truth)
+    // and logged locally.
+    console.log(`[task-actions] ${actionLabel} via dashboard (task ${taskId.slice(0, 8)}): ${replyText.slice(0, 200)}`);
 }
 
 /**
@@ -130,7 +121,7 @@ export async function approveTask(taskId: string, actor: string): Promise<TaskAc
         if (task.source_table === 'ap_pending_approvals' && task.source_id) {
             const result = await approvePendingReconciliation(task.source_id);
             const replyText = `${result.success ? '✅' : '⚠️'} ${result.message}`;
-            await notifyTelegramOfDashboardAction(actor, 'Approved', taskId, replyText);
+            await notifyDashboardAction(actor, 'Approved', taskId, replyText);
             return {
                 ok: true,
                 replyText,
@@ -146,7 +137,7 @@ export async function approveTask(taskId: string, actor: string): Promise<TaskAc
             const result = await createDraftPOTaskAfterApproval(taskId, actor);
             const replyText = result.message;
             await resolveLinkedIssueFromTaskAction(taskId, 'approved', actor);
-            await notifyTelegramOfDashboardAction(actor, 'Approved', taskId, replyText);
+            await notifyDashboardAction(actor, 'Approved', taskId, replyText);
             return {
                 ok: result.success,
                 replyText,
@@ -156,7 +147,7 @@ export async function approveTask(taskId: string, actor: string): Promise<TaskAc
         }
         await agentTask.decideApproval(taskId, 'approve', actor);
         await resolveLinkedIssueFromTaskAction(taskId, 'approved', actor);
-        await notifyTelegramOfDashboardAction(actor, 'Approved', taskId, '✅ Approved.');
+        await notifyDashboardAction(actor, 'Approved', taskId, '✅ Approved.');
         return { ok: true, replyText: '✅ Approved.', cbQueryText };
     } catch (err: any) {
         return {
@@ -182,7 +173,7 @@ export async function rejectTask(taskId: string, actor: string): Promise<TaskAct
         if (task.source_table === 'ap_pending_approvals' && task.source_id) {
             const message = await rejectPendingReconciliation(task.source_id);
             const replyText = `❌ ${message}`;
-            await notifyTelegramOfDashboardAction(actor, 'Rejected', taskId, replyText);
+            await notifyDashboardAction(actor, 'Rejected', taskId, replyText);
             return {
                 ok: true,
                 replyText,
@@ -192,7 +183,7 @@ export async function rejectTask(taskId: string, actor: string): Promise<TaskAct
         }
         await agentTask.decideApproval(taskId, 'reject', actor);
         await resolveLinkedIssueFromTaskAction(taskId, 'rejected', actor);
-        await notifyTelegramOfDashboardAction(actor, 'Rejected', taskId, '❌ Rejected.');
+        await notifyDashboardAction(actor, 'Rejected', taskId, '❌ Rejected.');
         return { ok: true, replyText: '❌ Rejected.', cbQueryText };
     } catch (err: any) {
         return {
@@ -215,7 +206,7 @@ export async function dismissTask(taskId: string, actor: string): Promise<TaskAc
             dismissed_at: new Date().toISOString(),
         });
         await resolveLinkedIssueFromTaskAction(taskId, 'dismissed', actor);
-        await notifyTelegramOfDashboardAction(actor, 'Dismissed', taskId, '✓ Dismissed.');
+        await notifyDashboardAction(actor, 'Dismissed', taskId, '✓ Dismissed.');
         return { ok: true, replyText: '✓ Dismissed.', cbQueryText };
     } catch (err: any) {
         return {

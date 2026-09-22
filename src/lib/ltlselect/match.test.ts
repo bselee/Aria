@@ -430,12 +430,12 @@ describe("findCorrelatedReception & label", () => {
         ).toBeNull();
     });
 
-    it("builds a simple Freight + BOL label (no origin/date prose)", () => {
+    it("uses the bare Freight label — BOL/PRO stay off the adjustment", () => {
         const entry = parseCollectEntry(rootwiseCollectInvoice())!;
-        expect(buildFreightLabel(entry)).toBe("Freight BOL 17165341");
+        expect(buildFreightLabel(entry)).toBe("Freight");
     });
 
-    it("falls back to PRO when BOL missing", () => {
+    it("still uses Freight when only a PRO exists", () => {
         const entry = parseCollectEntry(
             rootwiseCollectInvoice({
                 identifiers: {
@@ -446,7 +446,7 @@ describe("findCorrelatedReception & label", () => {
                 },
             }),
         )!;
-        expect(buildFreightLabel(entry)).toBe("Freight PRO 300183121811");
+        expect(buildFreightLabel(entry)).toBe("Freight");
     });
 });
 

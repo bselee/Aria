@@ -224,3 +224,9 @@ scripts/warm-purchasing-cache.mjs
 
 # Shell warm-up capture (13-byte "EXIT CODE: 0" artifact, never useful in repo)
 _warm_output.log
+
+# 2026-09-22: runtime state and working notes, never source
+.hermes/
+data/
+docs/
+scripts/archive/

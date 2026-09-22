@@ -128,8 +128,8 @@ describe("sanitizeOcrPoCandidate", () => {
         expect(sanitizeOcrPoCandidate("P.O.124813")).toBe("124813");
     });
 
-    it("strips # prefix: # 23324007 → 23324007", () => {
-        expect(sanitizeOcrPoCandidate("# 23324007")).toBe("23324007");
+    it("strips # prefix only when the number is a real PO shape", () => {
+        expect(sanitizeOcrPoCandidate("# 125257")).toBe("125257");
     });
 
     it("strips Ref prefix: Ref #124813 → 124813", () => {
@@ -169,13 +169,17 @@ describe("sanitizeOcrPoCandidate", () => {
         expect(sanitizeOcrPoCandidate("125137")).toBe("125137");
     });
 
-    it("accepts plain 8-digit PO numbers", () => {
-        expect(sanitizeOcrPoCandidate("23324007")).toBe("23324007");
+    it("rejects numbers that are not a Finale PO shape", () => {
+        // 8-digit tracking tails, account numbers, and phone numbers used to pass.
+        expect(sanitizeOcrPoCandidate("23324007")).toBeNull();
+        expect(sanitizeOcrPoCandidate("23514987")).toBeNull();
+        expect(sanitizeOcrPoCandidate("9897269125")).toBeNull();
+        expect(sanitizeOcrPoCandidate("QTY")).toBeNull();
     });
 
-    it("accepts DropshipPO suffix (digits retained for PO lookup)", () => {
-        const v = sanitizeOcrPoCandidate("23497897-DropshipPO");
-        expect(v === "23497897" || v === "23497897-DropshipPO").toBe(true);
+    it("accepts the 9-digit DropshipPO shape", () => {
+        const v = sanitizeOcrPoCandidate("123514987-DropshipPO");
+        expect(v === "123514987" || v === "123514987-DropshipPO").toBe(true);
     });
 });
 

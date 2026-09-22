@@ -10,6 +10,21 @@ import { executePOSendAction } from '@/lib/copilot/actions';
 import { invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 
 /**
+ * Whether Aria is allowed to email a purchase order to a vendor.
+ *
+ * DECISION(2026-09-21, Bill): "only drafts created in Finale for now" — the
+ * dashboard must not be able to put a PO in a vendor's inbox. Every
+ * vendor-facing send action is gated on this flag; it defaults to OFF, so a
+ * missing or unset variable means no sends. Set
+ * `NEXT_PUBLIC_ARIA_PO_SEND_ENABLED=true` to re-enable.
+ *
+ * @returns true only when the flag is explicitly set to "true".
+ */
+function poSendEnabled(): boolean {
+    return process.env.NEXT_PUBLIC_ARIA_PO_SEND_ENABLED === 'true';
+}
+
+/**
  * POST /api/dashboard/purchasing/commit
  *
  * Actions:
@@ -18,11 +33,23 @@ import { invalidatePurchasingCaches } from '@/lib/purchasing/cache';
  *   action=send-direct → combined review+send — commits and emails in one call (no modal)
  *   action=cancel      → discard pending send session, PO stays as draft in Finale
  *   action=cancel-draft→ cancel the PO in Finale (ORDER_CREATED → ORDER_CANCELED)
+ *
+ * Send actions (`send`, `send-direct`, `retry-email`) are refused with 403
+ * unless PO sending is explicitly enabled — see poSendEnabled().
  */
 export async function POST(req: NextRequest) {
     try {
         const body = await req.json();
         const { action } = body;
+
+        // Vendor-facing kill switch — checked before anything touches Finale
+        // or Gmail so a disabled system cannot email a vendor by any path.
+        if (['send', 'send-direct', 'retry-email'].includes(action) && !poSendEnabled()) {
+            return NextResponse.json(
+                { error: 'Vendor PO email is disabled (NEXT_PUBLIC_ARIA_PO_SEND_ENABLED). Send from Finale.' },
+                { status: 403 },
+            );
+        }
 
         if (action === 'review') {
             const { orderId } = body;
@@ -67,9 +94,20 @@ export async function POST(req: NextRequest) {
 
         } else if (action === 'send-direct') {
             // Combined review+send: commits PO and emails vendor in one call.
-            // No modal — used by the Send button on draft confirmation rows.
-            const { orderId, vendorPartyId } = body;
+            // No modal — used ONLY by the explicit Send button.
+            //
+            // DECISION(2026-09-21, Bill): draft creation must never email a
+            // vendor. Ordering builds drafts only; this action is the separate,
+            // deliberate send path. confirmSend is required so a stale or
+            // accidental send-direct call can never put a PO in a vendor inbox.
+            const { orderId, vendorPartyId, confirmSend } = body;
             if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+            if (confirmSend !== true) {
+                return NextResponse.json(
+                    { error: 'send-direct requires confirmSend:true — draft creation must not email vendors' },
+                    { status: 400 },
+                );
+            }
 
             const client = new FinaleClient();
             const review = await client.getDraftPOForReview(orderId);

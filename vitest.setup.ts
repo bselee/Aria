@@ -61,8 +61,8 @@ if (!ALLOW_LIVE) {
 
   // Outbound side effects that must never fire from a unit test. Empty values make
   // the notify/send helpers no-op instead of contacting Telegram/Slack/Finale for real.
-  process.env.TELEGRAM_BOT_TOKEN = "";
-  process.env.TELEGRAM_CHAT_ID = "";
+  // Telegram transport removed 2026-09-17 (Bill does not use it) — alerts now
+  // route to the agent_task hub, so there is no outbound notifier to neutralize.
   process.env.SLACK_BOT_TOKEN = "";
   process.env.SLACK_ACCESS_TOKEN = "";
   process.env.FINALE_API_KEY = "";

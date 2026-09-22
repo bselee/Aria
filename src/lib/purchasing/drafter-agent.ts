@@ -180,12 +180,14 @@ async function processVendorGroup(
     }
 
     // ── GATE 2: Commit guard — every orderable line must be "commit" ──
-    // Quinton's spec: reorder = lead time coverage + 90 days post-receipt supply
+    // Bill's floor (2026-09-21): lead time coverage + 30 days post-receipt supply.
+    // Confidence stays high-only (Gate 3) — 30d floor is permissive on coverage,
+    // not on trust.
     const guardBatch = assessPOCommitGuardsForLines(
         items.filter((line: any) =>
             line.assessment.decision === 'order' || line.assessment.decision === 'reduce'
         ),
-        { minimumPostLeadCoverageDays: 90 },
+        { minimumPostLeadCoverageDays: 30 },
     );
 
     const commitReadyProductIds = new Set(

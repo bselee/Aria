@@ -10,9 +10,10 @@
  *        • INLINE_INVOICE (PAID/CC) → nightshift → vendor_invoices + Finale prices
  *        • ROUTINE / OPPORTUNITY / HUMAN → Gmail DRAFT only (never auto-send)
  *   3. ap-email-pipeline       — Gmail ap@ → email_inbox_queue (source=ap)
- *   4. ap-identifier           — unpaid invoices → ap_inbox_queue (PENDING_FORWARD)
- *                                paid-on-AP blocked from Bill.com; dropship handled
- *   5. ap-forwarder            — ap_inbox_queue → Bill.com (+ local-forwarder in cron)
+ *   4. ap-local-forwarder      — the only forward stage. Claims the PDF hash
+ *                                and sends once via forwardInvoiceOnce().
+ *                                ap-identifier and ap-forwarder were removed;
+ *                                do not re-add them.
  *
  * Separate crons (NOT this cycle — still both inboxes):
  *   • email-tracking-ingest (every 2h) — tracking # + PO → shipments table
@@ -36,12 +37,6 @@ export interface EmailPollingCycleDeps {
     };
     emailIngestionAP: {
         run: () => Promise<void>;
-    };
-    apIdentifier: {
-        identifyAndQueue: () => Promise<void>;
-    };
-    apForwarder: {
-        processPendingForwards: () => Promise<void>;
     };
     onStageSuccess?: (stage: string) => Promise<void> | void;
 }
@@ -67,6 +62,4 @@ export async function runEmailPollingCycle(deps: EmailPollingCycleDeps): Promise
     await runEmailStage("default-email-pipeline", () => deps.emailIngestionDefault.run(), deps.onStageSuccess);
     await runEmailStage("default-acknowledgement", () => deps.acknowledgementAgent.processUnreadEmails(), deps.onStageSuccess);
     await runEmailStage("ap-email-pipeline", () => deps.emailIngestionAP.run(), deps.onStageSuccess);
-    await runEmailStage("ap-identifier", () => deps.apIdentifier.identifyAndQueue(), deps.onStageSuccess);
-    await runEmailStage("ap-forwarder", () => deps.apForwarder.processPendingForwards(), deps.onStageSuccess);
 }

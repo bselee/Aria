@@ -11,7 +11,7 @@
  * inline.
  */
 
-export type OnFailMode = "log" | "escalate-to-supervisor" | "telegram-will" | "silent";
+export type OnFailMode = "log" | "escalate-to-supervisor" | "silent";
 
 export interface JobBudget {
     /** Soft cap on LLM tokens per tick. Currently advisory; future enforcement TBD. */

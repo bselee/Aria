@@ -598,3 +598,37 @@ describe("PurchasingPanel - draft PO state", () => {
                 );
             });
         });
+
+describe("PurchasingPanel - snoozed vendor reveal", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        sessionStorage.clear();
+    });
+
+    it("eye toggle reveals a snoozed vendor outside the current window and lets it expand", async () => {
+        stubLocalStorage();
+        sessionStorage.clear();
+        localStorage.setItem("aria-dash-purchasing-snooze", JSON.stringify({
+            "v:20001": { until: "forever" },
+        }));
+        stubFetchWithMixedItems();
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        fireEvent.click(await screen.findByTitle("Show items projected short within 30 days"));
+
+        expect(await screen.findByText(/Colorful Packaging Ltd/i)).toBeTruthy();
+        expect(screen.queryByText("WatchVendor")).toBeNull();
+
+        const eye = (await screen.findAllByTitle("Show snoozed items"))[0];
+        expect(eye.textContent).toMatch(/1 snoozed/);
+        fireEvent.click(eye);
+
+        const snoozedName = await screen.findByText("WatchVendor");
+        expect(snoozedName).toBeTruthy();
+        expect(screen.getAllByTitle("Hide snoozed").length).toBeGreaterThan(0);
+        expect(await screen.findByText(/Watchlist SKU/i)).toBeTruthy();
+        expect(await screen.findByTitle("Unsnooze this vendor")).toBeTruthy();
+    });
+});

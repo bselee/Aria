@@ -16,11 +16,11 @@ import {
 } from "./vendor-opportunity";
 import { notifyViaTask } from "./notify-via-task";
 import {
-    composeHumanEscalationDraftStub,
     isSimpleVendorConfirmation,
     composeRoutineDraftBody,
     resolveEmailResponsePolicy,
 } from "./email-response-policy";
+import { isNoResponseNeededFyi } from "./email-draft-voice";
 
 /**
  * @file acknowledgement-agent.ts
@@ -31,6 +31,10 @@ import {
  * @author Antigravity
  * @updated 2026-08-05 — draft-only policy; BioChar-class opportunity path
  */
+/** Classifier bias lock — do not restore "maximum caution → REQUIRES_HUMAN". */
+export const EMAIL_TRIAGE_SYSTEM =
+    "You are an email triage assistant for BuildASoil purchasing. Default to PROMOTIONAL (archive silently) unless the email is clearly a real vendor/order update, a genuine business question, or a sales/sourcing opportunity. A dollar amount alone is not REQUIRES_HUMAN or INLINE_INVOICE.";
+
 export class AcknowledgementAgent {
     private tokenIdentifier: string;
     private labelCache = new Map<string, string>();
@@ -48,6 +52,7 @@ export class AcknowledgementAgent {
         '@notifications.google',  // Google Workspace notifications
         '@googlemail.l.google',   // Gmail system messages
         'noreply@google.com',     // Google Cloud, Calendar, etc.
+        '-notification@google.com', // Google notification services (calendar/forms/docs daily agenda + reminders)
         'no-reply@accounts.google', // Google account notifications
         'stripe.com',             // Stripe payment receipts
         'shopify.com',            // Shopify order confirmations
@@ -75,6 +80,7 @@ export class AcknowledgementAgent {
     private static SYSTEM_SUBJECT_PATTERNS = [
         /^OOS Report\b/i,             // ARIA's OOS report emails
         /^Out Of Stock\b/i,           // Stockie alert subject
+        /^Daily Agenda\b/i,           // Google Calendar daily agenda digest
     ];
 
     private isSystemSender(from: string): boolean {
@@ -243,18 +249,19 @@ Snippet: ${snippet}
 ${memoryContext}
 
 Labels:
-ROUTINE_INFO - Standard vendor updates: order confirmations, tracking numbers, invoice deliveries, or PO acknowledgements. Contains NO questions, NO pricing proposals, NO call offers.
-REQUIRES_HUMAN - The sender is asking a question, reporting a problem (backorder, price change, out of stock), requesting payment/approval, or needs dialogue.
+ROUTINE_INFO - Standard vendor updates with NO question to us: order confirmations, tracking numbers, invoice deliveries, PO acknowledgements, freight/load FYI ("got this secured at $X"). Contains NO questions, NO pricing proposals, NO call offers.
+REQUIRES_HUMAN - The sender is asking US a question, reporting a problem (backorder, price change, out of stock), requesting payment/approval, or needs a decision. A dollar amount alone is NOT this.
 VENDOR_OPPORTUNITY - Sales/sourcing reply: distributor pricing, quotes, tech sheets, product introductions, partnership pitches, or "schedule a call" after an inquiry. NEVER treat these as ROUTINE_INFO. Bare auto-thanks is wrong.
-PROMOTIONAL - Marketing, spam, newsletters, % off blasts.
-INLINE_INVOICE - The email body contains cost breakdowns, dollar amounts, totals, freight charges, or other invoice-like data but NO PDF is attached. This is a structured cost breakdown (not a casual price mention).
+PROMOTIONAL - Marketing, spam, newsletters, % off blasts, surveys, webinars.
+INLINE_INVOICE - The email body contains an invoice-style cost breakdown (subtotal/tax/total, line items) but NO PDF is attached. A single freight rate like "secured at $2,250" is NOT an invoice.
 
-NOTE: If you are even slightly unsure if human attention is needed, choose REQUIRES_HUMAN.
+NOTE: If no PO#, tracking number, order reference, invoice data, or a genuine question from a real business counterpart — it is PROMOTIONAL. When unsure between PROMOTIONAL and ROUTINE_INFO, choose PROMOTIONAL.
+NOTE: When unsure between REQUIRES_HUMAN and ROUTINE_INFO, choose ROUTINE_INFO unless there is a question or a problem we must act on.
 NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
 
         try {
             const res = await unifiedObjectGeneration({
-                system: "You are an email triage assistant for a purchasing department. Use maximum caution: if an email might need human attention or is a vendor sales opportunity, do NOT choose ROUTINE_INFO.",
+                system: EMAIL_TRIAGE_SYSTEM,
                 prompt,
                 schema,
                 schemaName: "EmailAcknowledgementIntent",
@@ -717,7 +724,18 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                 && intent !== "VENDOR_OPPORTUNITY"
                                 && isSimpleVendorConfirmation({ subject, bodyText })
                             ) {
-                                console.log(`     -> Simple vendor confirmation — Thanks! draft only`);
+                                console.log(`     -> Simple vendor confirmation — silent, no draft`);
+                                intent = "ROUTINE_INFO";
+                            }
+
+                            // Broker/vendor FYI with no question (Noah Julin "secured at $2,250")
+                            // must not become a draft stub or a Needs Response task.
+                            if (
+                                intent !== "PROMOTIONAL"
+                                && intent !== "VENDOR_OPPORTUNITY"
+                                && isNoResponseNeededFyi({ subject, bodyText })
+                            ) {
+                                console.log(`     -> FYI status update — no reply needed`);
                                 intent = "ROUTINE_INFO";
                             }
 
@@ -839,39 +857,8 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     await this.finalizeQueueStatus(m.id, "failed", err.message);
                                 }
                             } else {
-                                // REQUIRES_HUMAN — draft stub + escalate. Never auto-send.
+                                // REQUIRES_HUMAN — task + Needs Response. NO draft stub.
                                 const policy = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
-
-                                if (policy.createDraft && myEmail && rfcMessageId) {
-                                    const stub = composeHumanEscalationDraftStub({
-                                        from: senderEmail,
-                                        subject,
-                                        bodyText,
-                                    });
-                                    const draftId = await this.createReplyDraft({
-                                        gmail,
-                                        to: senderEmail,
-                                        from: myEmail,
-                                        subject,
-                                        inReplyTo: rfcMessageId,
-                                        threadId,
-                                        bodyText: stub,
-                                    });
-                                    if (draftId) {
-                                        console.log(`     📝 Human-escalation draft stub (${draftId}) — not sent`);
-                                        try {
-                                            await recordEmailDraftPrepared({
-                                                gmailMessageId,
-                                                threadId,
-                                                fromEmail: senderEmail,
-                                                subject,
-                                                replyBody: stub,
-                                                kind: "human_escalation",
-                                                draftId,
-                                            });
-                                        } catch { /* non-fatal */ }
-                                    }
-                                }
 
                                 try {
                                     await recordHumanReviewRequired({
@@ -886,7 +873,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                 }
 
                                 try {
-                                    await this.addMessageLabels(gmail, gmailMessageId, policy.labels.length ? policy.labels : ["Needs Response", "Draft Ready"]);
+                                    await this.addMessageLabels(gmail, gmailMessageId, policy.labels.length ? policy.labels : ["Needs Response"]);
                                 } catch { /* best effort */ }
 
                                 try {
@@ -914,7 +901,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     subject,
                                     snippet: (snippet || "").slice(0, 120),
                                 });
-                                console.log(`     ⚠️ Requires human attention — draft stub + task. Leaving in inbox.`);
+                                console.log(`     ⚠️ Requires human attention — task only, no draft. Leaving in inbox.`);
                                 await this.finalizeQueueStatus(m.id, "needs_response", humanReviewReason);
                             }
                         }
@@ -927,7 +914,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                 const isBusinessHours = hour >= 6 && hour <= 22; // 6am - 10pm MT
 
                 try {
-                    const { sendTelegramNotify } = await import('./telegram-notify');
+                    const { notify } = await import('./notify');
                     const lines: string[] = [];
 
                     if (requiresHumanBatch.length === 1) {
@@ -955,7 +942,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                         lines.push(`\n🌙 _Off-hours: holding notification for morning digest._`);
                         // Queue for morning digest instead of sending now
                         try {
-                            const { sendTelegramNotify: sendNow } = await import("@/lib/intelligence/telegram-notify");
+                            const { notify: sendNow } = await import("@/lib/intelligence/notify");
                             if (db) {
                                 // Write to agent_task for morning pickup
                                 const { upsertTask } = await import("@/lib/command-board/task-actions");
@@ -973,7 +960,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                         } catch { /* fall through to immediate notify */ }
                     }
 
-                    await sendTelegramNotify(lines.join("\n"));
+                    await notify(lines.join("\n"));
                     console.log(`📨 [Acknowledgement-Agent] Notified Bill: ${requiresHumanBatch.length} email(s) need response.`);
                 } catch (notifyErr: any) {
                     console.warn(`⚠️ [Acknowledgement-Agent] Failed to send REQUIRES_HUMAN batch notification: ${notifyErr.message}`);

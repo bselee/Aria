@@ -385,7 +385,7 @@ export async function POST(req: NextRequest) {
             invoiceId,
             adjustments,
             freightAdjustment: freightAdjustment ?? null,
-            freightDescription: freightDescription || "Freight adjustment from invoice reconciliation",
+            freightDescription: freightDescription || "Freight",
             notes: notes || undefined,
             triggeredBy: triggeredBy || "dashboard-po-modify",
         });

@@ -11,7 +11,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { notify } from "../intelligence/notify";
 import { isBusinessHours } from "../intelligence/alert-gate";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -139,7 +139,7 @@ export async function runBasautoRequestWatcher(): Promise<void> {
     }
 
     console.log(msg);
-    await sendTelegramNotify(msg).catch(() => {});
+    await notify(msg).catch(() => {});
 
     // Update seen IDs
     for (const r of pending) {

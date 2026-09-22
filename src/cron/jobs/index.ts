@@ -27,9 +27,22 @@ import { OpsManager } from "../../lib/intelligence/ops-manager";
 const ops = () => OpsManager.singleton;
 
 defineJob({
+    name: "ap-forward",
+    schedule: "*/15 * * * *",
+    onFail: "log",  // self-healing critical path — a dropped tick must surface
+    description:
+        "Self-healing Gmail→Bill.com forward (every 15 min). Decoupled from the Finale-heavy ap-polling so a blocked event loop can never strand invoices for 4+ hours. Idempotent via dedup; skips PO reconciliation (Finale matching stays on ap-polling 3×/day).",
+    handler: async () => {
+        const { runLocalApForward } = await import("@/lib/intelligence/workers/ap-local-forwarder");
+        await runLocalApForward({ skipReconciliation: true });
+    },
+    budget: { durationMs: 180_000 },
+});
+
+defineJob({
     name: "ap-polling",
     schedule: "0 8,12,17 * * *",
-    onFail: "telegram-will",  // core pipeline — if this fails, no invoices processed
+    onFail: "log",  // core pipeline — if this fails, no invoices processed
     description:
         "Poll bill.selee@ + ap@ : ingest → ACK/classify → paid-invoice nightshift + unpaid Bill.com forward; PO-sweep post-pass.",
     handler: async () => {
@@ -84,15 +97,15 @@ defineJob({
 defineJob({
     name: "build-risk",
     schedule: "0 8 * * 1-5",
-    onFail: "telegram-will",  // Bill orders based on this data
+    onFail: "log",  // Bill orders based on this data
     description: "Daily build risk analysis (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.runDailyBuildRisk(); },
 });
 
 defineJob({
     name: "jit-forward-projection",
-        schedule: "0 8 * * 1-5",
-        onFail: "telegram-will",  // Bill orders based on this data
+        schedule: "5 8 * * 1-5",
+        onFail: "log",  // Bill orders based on this data
     description: "8:00 AM (Mon-Fri): reads the latest build_risk_snapshot and fires a Telegram alert for any component whose order-trigger date is today or within the next 7 days. Replaces the previous daily build-risk summary with JIT-only alerts only — no news is good news.",
     handler: async () => {
         const { createClient } = await import("@/lib/supabase");
@@ -185,7 +198,11 @@ defineJob({
 
 defineJob({
     name: "ap-health-report",
-    schedule: "30 8 * * 1-5",
+    // KAIZEN(2026-09-17): 8:30 -> 8:50. At 8:30 this job fired inside a
+    // 14-job herd (4 daily + every periodic :30 job) that was blocking the
+    // node event loop and dropping cron ticks. Running LAST also means it
+    // reports on the jobs that ran at 8:35-8:45 instead of racing them.
+    schedule: "50 8 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Morning AP pipeline health report (Mon-Fri 8:30 AM).",
     handler: async () => {
@@ -289,7 +306,7 @@ defineJob({
 
 defineJob({
     name: "daily-summary",
-    schedule: "0 8 * * 1-5",
+    schedule: "15 8 * * 1-5",
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "Daily PO/invoice/email summary (Mon-Fri 8:00 AM).",
     handler: async () => { await ops()?.sendDailySummary(); },
@@ -342,7 +359,8 @@ defineJob({
 
 defineJob({
     name: "qty-calibration",
-    schedule: "30 8 * * *",
+    // KAIZEN(2026-09-17): 8:30 -> 8:35, out of the :00/:30 periodic pile-up.
+    schedule: "35 8 * * *",
     onFail: "escalate-to-supervisor",
     description: "Daily 8:30 AM calibration of recommendations vs received POs.",
     handler: async () => { await ops()?.runQtyCalibration(); },
@@ -491,7 +509,7 @@ defineJob({
 defineJob({
     name: "vendor-escalation",
         schedule: "40 8 * * 1-5",
-        onFail: "telegram-will",  // unresponsive vendors → late orders
+        onFail: "log",  // unresponsive vendors → late orders
     description: "L2/L3 escalation for unresponsive vendors (2x/day weekdays).",
     handler: async () => {
         const { runVendorEscalation } = await import("@/lib/purchasing/vendor-escalation");
@@ -907,7 +925,7 @@ defineJob({
 // vendor_profiles (human-vetted). Drafts only — never auto-sends.
 defineJob({
     name: "drafter-scan",
-    schedule: "0 8 * * 1-5", // KAIZEN #7: 7 AM → 8 AM (business hours start)
+    schedule: "10 8 * * 1-5", // KAIZEN #7: 7 AM → 8 AM (business hours start)
     onFail: "log",
     description: "Morning PO draft creation for vetted vendors. Runs once daily before arrival to present actionable drafts for review.",
     handler: async () => {
@@ -938,7 +956,9 @@ defineJob({
 
 defineJob({
     name: "autonomy-scan",
-    schedule: "30 8,13 * * 1-5", // KAIZEN #7: 7:30am → 8:30am + 1:30pm weekdays
+    // KAIZEN #7: 7:30am → 8:30am + 1:30pm weekdays
+    // KAIZEN(2026-09-17): 8:30 -> 8:40, out of the :30 periodic pile-up.
+    schedule: "40 8,13 * * 1-5",
     onFail: "log",
     description: "Process draft POs for Level 1 & 2 autonomy (2x/day weekdays).",
     handler: async () => {
@@ -1018,7 +1038,7 @@ defineJob({
 // vendor escalations, consumption spikes). If nothing actionable, stays silent.
 defineJob({
     name: "proactive-brief",
-    schedule: "0 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
+    schedule: "20 8 * * 1-5",  // KAIZEN #7: 7 AM → 8 AM
     onFail: "log",  // was telegram-will — demoted in frequency+alert audit
     description: "8 AM Mon-Fri: daily proactive brief — what needs action in the next 48h.",
     handler: async () => {
@@ -1037,15 +1057,12 @@ defineJob({
     onFail: "log",
     description: "7:30 AM Mon-Fri: daily Slack review of addressed messages (DM/@Bill) — unresponded count + SKUs.",
     handler: async () => {
-        const { getAddressedRequests, formatAddressedReview } =
-            await import("@/lib/slack/addressed-message-watcher");
-        const { sendTelegramNotify } = await import(
-            "@/lib/intelligence/telegram-notify"
-        );
+        const { getAddressedRequests, formatAddressedReview } = await import("@/lib/slack/addressed-message-watcher");
+        const { notify } = await import("@/lib/intelligence/notify");
         const report = await getAddressedRequests(24);
         const msg = formatAddressedReview(report);
         if (msg) {
-            await sendTelegramNotify(msg);
+            await notify(msg);
         } else {
             console.log(
                 "[daily-slack-review] No addressed messages in last 24h — silent.",
@@ -1059,8 +1076,8 @@ defineJob({
 // and presents one-tap-send. Runs 3x/day during business hours.
 defineJob({
     name: "stockout-driver",
-    schedule: "0 8,11,15 * * 1-5",
-    onFail: "telegram-will",  // draft POs for at-risk SKUs — critical
+    schedule: "25 8,11,15 * * 1-5",
+    onFail: "log",  // draft POs for at-risk SKUs — critical
     description: "3x/day: compute margin-to-zero per SKU, create draft POs, present actionable countdown.",
     handler: async () => {
         const { runStockoutDriver } = await import("@/lib/purchasing/stockout-driver");
@@ -1109,7 +1126,7 @@ defineJob({
 defineJob({
     name: "monday-briefing",
     schedule: "0 8 * * 1",
-    onFail: "telegram-will",  // weekly overview — Bill reads these
+    onFail: "log",  // weekly overview — Bill reads these
     description: "DISABLED 2026-07-27 (Kaizen): killed per Bill — output was unusable (Unknown Vendor across the board, receivings/matches sections empty, underlying data model didn't hold up). Was also the source of an 11x duplicate-send incident caused by an unrelated PM2 zombie-process bug (fixed separately in shutdown-guard.ts + pid-guard.ts). Re-enable only after the data gaps in build_risk_snapshots (vendor field) and ap_activity_log (PO_RECEIVED / RECONCILIATION_AUTO_APPLIED coverage) are confirmed fixed with real verified numbers.",
     enabled: false,
     handler: async () => {
@@ -1305,7 +1322,14 @@ defineJob({
     name: "billcom-ref-import",
     schedule: "0 7 * * *",  // Daily 7 AM
     onFail: "log",
-    description: "Daily 7 AM: download bill.com CSV then import into SQLite billcom_bills_ref.",
+    enabled: false, // DISABLED 2026-09-15: headless Playwright hits Bill.com's
+    // Cloudflare CAPTCHA every run (no CSV ever downloads), the import step
+    // then re-imports a stale data/AllBillsPage.csv, and the Supabase cleanup
+    // step is dead code (Supabase removed). The working path is Bill's manual
+    // AllBillsPage CSV + `reconcile-billcom.ts --csv=`, which imports AND
+    // sweeps in one read-only run. Leave disabled; do not re-enable until the
+    // download uses the computer_use live-session path instead of headless.
+    description: "DISABLED — was: daily 7 AM download Bill.com CSV + import. Headless Playwright is Cloudflare-walled; manual CSV + reconcile-billcom is the live path.",
     handler: async () => {
         try {
             // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)
@@ -1418,7 +1442,7 @@ defineJob({
 defineJob({
     name: "ltlselect-freight-reconcile",
     schedule: "0 9 * * 1",
-    onFail: "telegram-will",
+    onFail: "log",
     description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
@@ -1446,8 +1470,8 @@ defineJob({
                 (totalMatch ? ` | $${totalMatch[2]}` : "") +
                 ` | held: ${held} | unmatched: ${unmatched}`;
 
-            const { sendTelegramNotify } = await import("@/lib/intelligence/telegram-notify");
-            await sendTelegramNotify(message).catch(() => {});
+            const { notify } = await import("@/lib/intelligence/notify");
+            await notify(message).catch(() => {});
         } catch (err: any) {
             console.error(`[ltlselect-freight] Failed: ${err?.message ?? err}`);
             if (err?.stdout) console.error(err.stdout);
@@ -1464,7 +1488,8 @@ defineJob({
 // draft-review window so yesterday's drafts have settled.
 defineJob({
     name: "gold-sample-collection",
-    schedule: "0 8 * * 1-5",
+    // KAIZEN(2026-09-17): 8:30 -> 8:45, out of the :30 periodic pile-up.
+    schedule: "45 8 * * 1-5",
     onFail: "log",
     description:
         "Daily: check threads Aria drafted into → find Bill's sent reply → log gold voice samples.",
@@ -1473,7 +1498,7 @@ defineJob({
             const { getAuthenticatedClient } = await import(
                 "@/lib/gmail/auth"
             );
-            const { GmailApi } = await import("@googleapis/gmail");
+            const { gmail: GmailApi } = await import("@googleapis/gmail");
             const { collectGoldSamples } = await import(
                 "@/lib/intelligence/gold-sample-collector"
             );

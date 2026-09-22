@@ -23,7 +23,7 @@
 import { WebClient } from "@slack/web-api";
 import { FinaleClient } from "../finale/client";
 import { createClient } from "../db";
-import { sendTelegramNotify } from "../intelligence/telegram-notify";
+import { notify } from "../intelligence/notify";
 import { resolveSkuAlias, expandSkuToken } from "../sku-aliases";
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -867,7 +867,7 @@ export class SlackRequestDetector {
             out.push("Quiet — no public Slack post.");
             out.push(`[Slack →](${slackLink})`);
 
-            await sendTelegramNotify(out.join("\n")).catch(() => {});
+            await notify(out.join("\n")).catch(() => {});
             console.log(`[request-detector] TG DM sent: ${lines.length} SKU(s), ${byVendor.size} vendor(s) need POs`);
         }
         // If !foundInFinale: complete silence, no trace in Slack
@@ -919,7 +919,7 @@ export class SlackRequestDetector {
         } else {
             // Auto-post failed — fall back to TG draft
             const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
-            await sendTelegramNotify(
+            await notify(
                 `[Slack Draft — auto-post FAILED]\n` +
                 `#${channelName} — reply to ${sku} request\n` +
                 `Draft:\n${text}\n` +
@@ -999,7 +999,7 @@ export class SlackRequestDetector {
             await this.setAckEmoji(channelId, threadTs, "post").catch(() => {});
         } else {
             const slackLink = `https://buildasoil.slack.com/archives/${channelId}/p${threadTs.replace(".", "")}`;
-            await sendTelegramNotify(
+            await notify(
                 `[Slack Draft — auto-post FAILED]\n` +
                 `#${channelName} — PO# ${po.orderId} lookup reply\n` +
                 `Draft:\n${text}\n` +

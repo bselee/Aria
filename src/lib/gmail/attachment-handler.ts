@@ -180,20 +180,21 @@ export async function processDocument(
 
             // Type-specific DB storage
             if (classification.type === "INVOICE") {
-                await db.from("invoices").upsert({
+                // vendor_invoices, not the invoices view. The view is not
+                // writable, and vendor_id / matched_po_id are not real columns.
+                await db.from("vendor_invoices").upsert({
                     invoice_number: (extractedData as Record<string, unknown>).invoiceNumber,
-                    vendor_id: vendorId,
                     vendor_name: (extractedData as Record<string, unknown>).vendorName,
                     po_number: (extractedData as Record<string, unknown>).poNumber,
                     invoice_date: (extractedData as Record<string, unknown>).invoiceDate,
                     due_date: (extractedData as Record<string, unknown>).dueDate,
                     total: (extractedData as Record<string, unknown>).total,
-                    status: matchResult?.autoApprove ? "matched" : "unmatched",
-                    matched_po_id: matchResult?.matchedPO ? (extractedData as Record<string, unknown>).poNumber : null,
+                    status: matchResult?.autoApprove ? "reconciled" : "unmatched",
+                    source: "email_attachment",
+                    source_ref: meta.sourceRef,
                     discrepancies: matchResult?.discrepancies ?? [],
-                    document_id: savedDoc?.id,
-                    raw_data: extractedData,
-                }, { onConflict: "invoice_number" });
+                    raw_data: { ...(extractedData as Record<string, unknown>), document_id: savedDoc?.id ?? null },
+                }, { onConflict: "vendor_name,invoice_number" });
 
                 // Also archive into the unified vendor_invoices table
                 const ed = extractedData as Record<string, unknown>;

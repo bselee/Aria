@@ -1357,13 +1357,15 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 gmail_message_id: messageId || null,
             }).select("id").single();
 
-            await supabase.from("invoices").upsert({
+            // The invoices view is not writable (invoice_date is cast to text,
+            // document_id is a null constant), so this used to fail every run and
+            // leave the row looking stuck. vendor_invoices is the base table.
+            await supabase.from("vendor_invoices").upsert({
                 invoice_number: invoiceData.invoiceNumber,
                 vendor_name: invoiceData.vendorName,
                 po_number: finalePONumber,
                 invoice_date: invoiceData.invoiceDate,
                 due_date: invoiceData.dueDate || invoiceData.invoiceDate,
-                payment_terms: invoiceData.paymentTerms,
                 subtotal: invoiceData.subtotal,
                 freight: invoiceData.freight || 0,
                 tax: invoiceData.tax || 0,
@@ -1371,11 +1373,11 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 labor: invoiceData.labor || 0,
                 tracking_numbers: invoiceData.trackingNumbers || [],
                 total: invoiceData.total,
-                amount_due: invoiceData.amountDue,
                 status: isAAACooper ? "completed" : (matched ? "matched_review" : "unmatched"),
-                document_id: docData?.id || null,
-                raw_data: invoiceData
-            }, { onConflict: "invoice_number" });
+                source: "email_attachment",
+                source_ref: messageId || from,
+                raw_data: { ...invoiceData, document_id: docData?.id || null },
+            }, { onConflict: "vendor_name,invoice_number" });
 
             // 3a. Archive into unified vendor_invoices table (non-blocking)
             try {
@@ -1867,7 +1869,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                                     actual: fc.amount, verdict: fc.verdict, reason: fc.reason
                                 }))
                             ];
-                            await supabase.from("invoices").update({ status: newStatus, discrepancies })
+                            await supabase.from("vendor_invoices").update({ status: newStatus, discrepancies })
                                 .eq("invoice_number", result.invoiceNumber)
                                 .ilike("vendor_name", `%${result.vendorName}%`);
                         } catch {
@@ -2180,7 +2182,7 @@ INVOICE - Standard vendor bill (may or may not have a PO).
                 }))
             ];
 
-            await supabase.from("invoices").update({
+            await supabase.from("vendor_invoices").update({
                 status: newStatus,
                 discrepancies: discrepancies
             })

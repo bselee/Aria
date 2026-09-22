@@ -256,7 +256,31 @@ export function isSimpleVendorConfirmation(args: {
 }
 
 /**
+ * True when the inbound is a short FYI status update with no question and no ask.
+ * Example: Noah Julin "Got this secured at $2,250 today." — leave in inbox, no draft.
+ */
+export function isNoResponseNeededFyi(args: {
+    subject?: string;
+    bodyText?: string | null;
+}): boolean {
+    const raw = (args.bodyText || "").trim();
+    if (!raw) return false;
+
+    const original = raw.split(/\nOn .+ wrote:|\nFrom:\s|\n>+ /)[0].trim();
+    const head = original.slice(0, 800);
+    const beforeSignoff = head.split(/\n(?:Thanks|Thank you|Best|Regards|Sincerely)\b/i)[0];
+
+    const hasAsk =
+        /\b(?:can you|could you|please (?:confirm|advise|send|review|let me know)|what is|when will|do you need|would you|are you able)\b/i.test(beforeSignoff)
+        || (/\?/.test(beforeSignoff) && !/let me know if you have any questions/i.test(beforeSignoff));
+    if (hasAsk) return false;
+
+    return /\b(?:got (?:this |it )?secured|secured at|booked (?:at|for)|covered at|load is (?:covered|booked)|just (?:an? )?fyi|for your (?:info|information)|no action (?:needed|required)|heads.?up)\b/i.test(head);
+}
+
+/**
  * Extract first name: display name → body sign-off → never raw local-part junk.
+ * First.Last@domain uses the FIRST token (Noah.Julin@ → Noah), never the last.
  */
 export function extractReplyFirstName(from: string, bodyText?: string | null): string {
     // 1) Display name: "Cari Smith <cs@…>" or "Megan Bateman <…>"
@@ -281,13 +305,12 @@ export function extractReplyFirstName(from: string, bodyText?: string | null): s
         return capitalizeName(named[1]);
     }
 
-    // 4) Local-part only if it looks like a real name (not cs, ap, info)
-    const local = from.match(/([a-zA-Z]{3,})@/);
-    if (local && isUsableFirstName(local[1]) && !/[0-9]/.test(local[1])) {
-        const part = local[1].split(/[._-]/)[0];
-        if (part && isUsableFirstName(part) && part.length >= 3) {
-            return capitalizeName(part);
-        }
+    // 4) Local-part: First.Last@ → First. Never greet with the last token (Julin).
+    const addr = from.match(/<([^>]+)>/)?.[1] ?? from;
+    const local = (addr.split("@")[0] || "").replace(/^"+|"+$/g, "");
+    const firstToken = local.split(/[._+-]+/).filter(Boolean)[0] || "";
+    if (firstToken && isUsableFirstName(firstToken) && !/[0-9]/.test(firstToken)) {
+        return capitalizeName(firstToken);
     }
 
     return ""; // empty → no greeting
@@ -311,6 +334,7 @@ function capitalizeName(name: string): string {
 export function extractNameFromSignOff(body: string): string {
     // "Best regards,\nCari" / "Thanks,\nCari\nHerbsNOW"
     const patterns = [
+        /(?:best\s+regards|kind\s+regards|regards|thanks|thank\s+you|cheers|sincerely)\s*,\s*([A-Z][a-z]{1,20})\b/,
         /(?:best\s+regards|kind\s+regards|regards|thanks|thank\s+you|cheers|sincerely)\s*,?\s*\n+\s*([A-Z][a-z]{1,20})\b/,
         /\n\s*([A-Z][a-z]{2,20})\s*\n\s*[A-Z][A-Za-z0-9 &.-]{2,40}\s*$/, // Name\nCompany at end
     ];

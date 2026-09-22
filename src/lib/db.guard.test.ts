@@ -22,7 +22,8 @@ describe("test-isolation guardrails", () => {
 
     it("neutralizes outbound side-effect credentials", () => {
         // Empty => the notify/send helpers no-op instead of really contacting a service.
-        expect(process.env.TELEGRAM_BOT_TOKEN).toBe("");
+        // (TELEGRAM_BOT_TOKEN assertion removed 2026-09-17: the Telegram
+        // transport was deleted, so there is no Telegram credential to neutralize.)
         expect(process.env.SLACK_BOT_TOKEN).toBe("");
         expect(process.env.FINALE_API_KEY).toBe("");
         // The Bill.com forwarder gate must stay off unless a test opts in explicitly.
