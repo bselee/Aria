@@ -36,6 +36,7 @@ import { ensureFinaleToolsRegistered } from "../agents/register-finale-tools";
 import { FinaleClient, getShipmentReceiptItems } from "./client";
 import { InvoiceData } from "../pdf/invoice-parser";
 import { createClient } from "../db";
+import { decideSupplierPriceWrite, pairInvoiceLines } from "../purchasing/invoice-line-pair";
 import { upsertShipmentEvidence } from "../tracking/shipment-intelligence";
 import { recordFeedback } from "../intelligence/feedback-loop";
 import { getVendorPattern, storeVendorPattern } from "../intelligence/vendor-memory";
@@ -994,6 +995,8 @@ export interface PriceChange {
     packMultiplier?: number;
     /** How the pack multiplier was determined — receipt evidence beats UOM string. */
     packSource?: "receipt_qty" | "uom_string" | "none";
+    /** Vendor part number from the invoice. Not our SKU. Written to Supplier 1 product ID after a unique pair. */
+    vendorPart?: string | null;
 }
 
 export interface FeeChange {
@@ -1858,9 +1861,30 @@ function reconcileLineItems(
     totalReceived: number
 ): PriceChange[] {
     const changes: PriceChange[] = [];
-    const matchedPoProductIds = new Set<string>(); // prevent double-matching the same PO product
+    const matchedPoProductIds = new Set<string>();
+    const goodsIndexes: number[] = [];
+    invoice.lineItems.forEach((li, index) => {
+        if (li.unitPrice !== 0 && li.qty !== 0) goodsIndexes.push(index);
+    });
+    const pairs = pairInvoiceLines(
+        goodsIndexes.map((index) => {
+            const li = invoice.lineItems[index];
+            return {
+                vendorPart: li.sku ?? null,
+                quantity: li.qty,
+                unitPrice: li.unitPrice,
+            };
+        }),
+        (po.items ?? []).map((item) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+        })),
+    );
+    const pairByIndex = new Map(goodsIndexes.map((index, n) => [index, pairs[n]]));
 
-    for (const invLine of invoice.lineItems) {
+    for (let lineIndex = 0; lineIndex < invoice.lineItems.length; lineIndex++) {
+        const invLine = invoice.lineItems[lineIndex];
         // Skip adjustment/credit lines — these have $0 unit price or 0 qty and are
         // invoice metadata (e.g., "Pts Pr Adj", freight credits), not product lines.
         if (invLine.unitPrice === 0 || invLine.qty === 0) {
@@ -1868,8 +1892,13 @@ function reconcileLineItems(
             continue;
         }
 
-        // Try to match by SKU first, then by fuzzy description
-        const poLine = findMatchingPOLine({ ...invLine, sku: invLine.sku ?? undefined }, po.items);
+        const pair = pairByIndex.get(lineIndex);
+        const pairedId = pair?.status === "paired" ? pair.productId : null;
+        const poLine = pairedId
+            ? (po.items ?? []).find((item) => item.productId === pairedId) ?? null
+            : null;
+        const qtyDiffers = pair?.status === "paired" && pair.qtyDiffers;
+        const vendorPart = invLine.sku ?? null;
 
         // Skip if this PO product was already matched by a previous invoice line.
         // This prevents split description lines (OCR artifact) from double-matching the same product.
@@ -1890,7 +1919,10 @@ function reconcileLineItems(
                 percentChange: 100,
                 dollarImpact: invLine.total,
                 verdict: "no_match",
-                reason: "Invoice line item not found in PO — may be a new item or SKU mismatch",
+                reason: pair?.status === "hold"
+                    ? pair.reason
+                    : "Invoice line item not found in PO — may be a new item or SKU mismatch",
+                vendorPart,
             });
             continue;
         }
@@ -2044,6 +2076,7 @@ function reconcileLineItems(
             reason: pReason,
             receivedQty,
             receivingGap: Math.max(0, invoiceQtyBase - receivedQty),
+            vendorPart,
         };
 
         // 3-Way Quantity Verification — all comparisons in BASE units.
@@ -2069,6 +2102,11 @@ function reconcileLineItems(
                 changeItem.verdict = "needs_approval";
                 changeItem.reason += ` | OVERBILL: Invoice qty ${invoiceQtyBase} base units > PO qty ${poQty}.`;
             }
+        }
+
+        if (qtyDiffers && (changeItem.verdict === "auto_approve" || changeItem.verdict === "no_change")) {
+            changeItem.verdict = "needs_approval";
+            changeItem.reason += " | QTY DIFFERS: billed quantity is not the ordered quantity. Contact the vendor. Do not rewrite the PO quantity and do not complete.";
         }
 
         changes.push(changeItem);
@@ -2145,47 +2183,6 @@ function evaluatePriceChange(
         verdict: "needs_approval",
         reason: `${(percentChange * 100).toFixed(1)}% price ${direction} ($${poPrice.toFixed(2)} → $${invoicePrice.toFixed(2)}, impact: $${Math.abs(dollarImpact).toFixed(2)}) — exceeds ${RECONCILIATION_CONFIG.AUTO_APPROVE_PERCENT * 100}% auto-threshold.`,
     };
-}
-
-/**
- * Find the matching PO line item for an invoice line.
- * Tries exact SKU match first, then fuzzy description match.
- */
-function findMatchingPOLine(
-    invLine: { sku?: string; description: string; unitPrice: number },
-    poItems: Array<{ productId: string; unitPrice: number; quantity: number; description: string }>
-): { productId: string; unitPrice: number; quantity: number } | null {
-    // Strategy 1: Exact SKU match (case-insensitive)
-    if (invLine.sku) {
-        const skuLower = invLine.sku.toLowerCase();
-        const match = poItems.find(item => item.productId.toLowerCase() === skuLower);
-        if (match) return match;
-
-        // Strategy 1b: SKU as substring (vendor may add prefixes/suffixes)
-        const substringMatch = poItems.find(item =>
-            item.productId.toLowerCase().includes(skuLower) ||
-            skuLower.includes(item.productId.toLowerCase())
-        );
-        if (substringMatch) return substringMatch;
-    }
-
-    // Strategy 2: Description similarity (first 20 chars, case-insensitive)
-    if (invLine.description) {
-        const descLower = invLine.description.toLowerCase().slice(0, 30);
-        const descMatch = poItems.find(item =>
-            item.description.toLowerCase().includes(descLower) ||
-            descLower.includes(item.description.toLowerCase().slice(0, 30))
-        );
-        if (descMatch) return descMatch;
-    }
-
-    // Strategy 3: Price match (if only 1 item matches the price exactly)
-    const priceMatches = poItems.filter(item =>
-        Math.abs(item.unitPrice - invLine.unitPrice) < 0.01
-    );
-    if (priceMatches.length === 1) return priceMatches[0];
-
-    return null;
 }
 
 // ————————————————————————————————————————————————————————————
@@ -2389,6 +2386,29 @@ function reconcileTracking(invoice: InvoiceData): TrackingUpdate | null {
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
+ * Prior unit prices for one SKU from the local PO mirror.
+ * The mirror often has no unitPrice. An empty list means one live Supplier 1 price is the only prior.
+ */
+async function priorUnitPricesForSku(productId: string): Promise<number[]> {
+    const sb = createClient();
+    if (!sb) return [];
+    try {
+        const { data } = await sb.from("purchase_orders").select("line_items").limit(800);
+        const prices: number[] = [];
+        for (const row of (data ?? []) as Array<{ line_items?: Array<{ productId?: string; unitPrice?: number }> }>) {
+            for (const li of row.line_items ?? []) {
+                if (li.productId === productId && Number(li.unitPrice) > 0) {
+                    prices.push(Number(li.unitPrice));
+                }
+            }
+        }
+        return prices;
+    } catch {
+        return [];
+    }
+}
+
+/**
  * Apply auto-approved changes to Finale.
  * Only applies changes with verdict "auto_approve" or fee additions.
  * Returns a log of what was applied and what was skipped.
@@ -2513,13 +2533,26 @@ export async function applyReconciliation(
                         );
                         skuCostStatus = 'unit_mismatch_blocked';
                     } else {
-                        skuBaseUpdated = await withToolAudit(
-                            "finale_update_product_supplier_price",
-                            auditCtx,
-                            { productId: pc.productId, supplierPartyUrl: resolvedSupplierUrl, newPrice: priceToWrite },
-                            () => client.updateProductSupplierPrice(pc.productId, resolvedSupplierUrl, priceToWrite),
-                        );
-                        skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
+                        const priors = await priorUnitPricesForSku(pc.productId);
+                        const supplierDecision = decideSupplierPriceWrite({
+                            currentSupplierPrice: existingPrice ?? 0,
+                            invoicePrice: priceToWrite,
+                            priorPrices: priors,
+                        });
+                        if (!supplierDecision.write) {
+                            console.warn(
+                                `[reconciler] Supplier 1 price held for ${pc.productId}: ${supplierDecision.reason}`,
+                            );
+                            skuCostStatus = 'skipped';
+                        } else {
+                            skuBaseUpdated = await withToolAudit(
+                                "finale_update_product_supplier_price",
+                                auditCtx,
+                                { productId: pc.productId, supplierPartyUrl: resolvedSupplierUrl, newPrice: priceToWrite },
+                                () => client.updateProductSupplierPrice(pc.productId, resolvedSupplierUrl, priceToWrite),
+                            );
+                            skuCostStatus = skuBaseUpdated ? 'updated' : 'skipped';
+                        }
                     }
                 } catch (guardErr: any) {
                     // Guard could not run — do NOT blind-write. Skipping only affects
@@ -2539,6 +2572,16 @@ export async function applyReconciliation(
             // Store the per-product status; use the first non-skipped status as the overall result status
             if (!result.skuCostUpdateStatus || result.skuCostUpdateStatus === 'skipped') {
                 result.skuCostUpdateStatus = skuCostStatus;
+            }
+
+            const vendorPart = (pc.vendorPart ?? "").trim();
+            if (
+                vendorPart &&
+                vendorPart.toLowerCase() !== pc.productId.toLowerCase() &&
+                typeof client.rememberSupplier1ProductId === "function"
+            ) {
+                const remembered = await client.rememberSupplier1ProductId(pc.productId, vendorPart);
+                if (remembered) applied.push(`${pc.productId}: Supplier 1 product ID set to ${vendorPart}`);
             }
 
             applied.push(

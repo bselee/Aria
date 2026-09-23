@@ -44,7 +44,8 @@ import os from "os";
 import path from "path";
 
 import { FinaleClient } from "../lib/finale/client";
-import { freightAdjustmentForPo } from "../lib/finale/freight-adjustment";
+import { allocateFreightForDelivery, buildFinaleFreightAdjustment, freightAdjustmentForPo } from "../lib/finale/freight-adjustment";
+import { getShipmentReceiptDateTime, getShipmentReceiptItems } from "../lib/finale/core-client";
 import { ReconciliationRun } from "../lib/reconciliation/run-tracker";
 import { probePostgrest } from "../lib/db";
 import { upsertVendorInvoice, lookupVendorInvoices } from "../lib/storage/vendor-invoices";
@@ -64,6 +65,7 @@ import {
     findCorrelatedReception,
     findBestReception,
     pickPoForEntry,
+    pickShipmentItemsForBill,
     buildFreightLabel,
     receiveWindowDaysForVendor,
     scoreFreightApplyConfidence,
@@ -125,7 +127,8 @@ interface PoDoc {
         adjustmentAllocationEnumId?: string;
         orderAdjustmentAllocationList?: number[];
     }>;
-    orderItemList?: Array<{ quantity?: number; weight?: number }>;
+    orderItemList?: Array<{ productId?: string; quantity?: number; weight?: number }>;
+    shipmentUrlList?: string[];
     supplierName?: string;
     orderSourceName?: string;
     [key: string]: unknown;
@@ -137,6 +140,10 @@ interface FinaleWriteSurface {
     unlockForEditing(currentPO: PoDoc, orderId: string): Promise<string>;
     restoreOrderStatus(orderId: string, originalStatus: string): Promise<void>;
     post(endpoint: string, body: unknown): Promise<unknown>;
+    freightAllocLines(
+        orderItemList: Array<{ productId?: string; quantity?: number; weight?: number }> | undefined,
+    ): Promise<Array<{ quantity: number; weight?: number }>>;
+    getShipmentDetails(shipmentUrl: string): Promise<unknown>;
 }
 
 // ── Apply (live only) ────────────────────────────────────────────────────────
@@ -145,54 +152,106 @@ interface FinaleWriteSurface {
  * Add one FREIGHT adjustment to a Finale PO (GET → unlock → append/replace → POST →
  * restore), mirroring reconcile-fedex Phase 2.
  *
- * Single-delivery vendors: replace any existing freight (not just $0).
- * Multi-delivery vendors: append — each PRO/BOL gets its own line.
+ * One shipment: replace the freight line with that truck's split.
+ * Several shipments: append one Freight line for the matched truck only.
  * A lone $0 placeholder is replaced in place regardless.
  */
 async function applyFreightToPo(
     finale: FinaleWriteSurface,
     poId: string,
     amount: number,
-    label: string,
-    isMultiDelivery: boolean,
+    bill?: { pickupDate?: string | null; proNumber?: string | null; bolNumber?: string | null },
 ): Promise<void> {
     const po = await finale.getOrderDetails(poId);
-    const originalStatus = await finale.unlockForEditing(po, poId);
-
-    const adjustments = [...(po.orderAdjustmentList ?? [])];
-    const zeroFreightIdx = adjustments.findIndex(
-        (a) => (a.productPromoUrl ?? "").includes("/10007") && Number(a.amount) === 0,
-    );
-    const items = (po.orderItemList ?? []).map((item) => ({
+    const weighted = await finale.freightAllocLines(po.orderItemList);
+    const orderLines = (po.orderItemList ?? []).map((item, index) => ({
+        productId: item.productId,
         quantity: Number(item.quantity) || 0,
-        weight: Number(item.weight) || undefined,
+        weight: weighted[index]?.weight,
     }));
-    const existingFreight = adjustments.filter((a) => (a.productPromoUrl ?? "").includes("/10007"));
-    const existingAlloc = !isMultiDelivery && existingFreight.length === 1
-        ? existingFreight[0].orderAdjustmentAllocationList
-        : undefined;
-    const replacement = freightAdjustmentForPo(amount, items, existingAlloc);
+    const several = (po.shipmentUrlList ?? []).length > 1;
+    const shipItems = await shipmentItemsForBill(finale, po, bill);
 
-    if (zeroFreightIdx >= 0 && adjustments.length === 1) {
-        // Replace lone $0 placeholder
-        adjustments[zeroFreightIdx] = replacement;
-    } else if (!isMultiDelivery) {
-        // Single-delivery: remove ALL existing freight lines, keep only the new one
-        const nonFreight = adjustments.filter(
-            (a) => !(a.productPromoUrl ?? "").includes("/10007"),
-        );
-        adjustments.length = 0;
-        adjustments.push(...nonFreight, replacement);
+    let replacement = freightAdjustmentForPo(amount, weighted);
+    if (shipItems) {
+        const alloc = allocateFreightForDelivery(amount, orderLines, shipItems);
+        if (!alloc.some((n) => n > 0)) {
+            throw new Error("shipment SKUs are not on the order");
+        }
+        replacement = buildFinaleFreightAdjustment(amount, alloc);
+    } else if (several) {
+        throw new Error("no unique shipment for this bill");
     } else {
-        // Multi-delivery: append — each PRO/BOL gets its own allocated Freight line
-        adjustments.push(replacement);
+        const existingFreight = (po.orderAdjustmentList ?? []).filter((a) => (a.productPromoUrl ?? "").includes("/10007"));
+        const existingAlloc = existingFreight.length === 1
+            ? existingFreight[0].orderAdjustmentAllocationList
+            : undefined;
+        replacement = freightAdjustmentForPo(amount, weighted, existingAlloc);
     }
 
-    await finale.post(
-        `/${FINALE_ACCOUNT}/api/order/${encodeURIComponent(poId)}`,
-        { ...po, orderAdjustmentList: adjustments },
-    );
-    await finale.restoreOrderStatus(poId, originalStatus);
+    const originalStatus = await finale.unlockForEditing(po, poId);
+    try {
+        const fresh = await finale.getOrderDetails(poId);
+        const adjustments = [...(fresh.orderAdjustmentList ?? [])];
+        const zeroFreightIdx = adjustments.findIndex(
+            (a) => (a.productPromoUrl ?? "").includes("/10007") && Number(a.amount) === 0,
+        );
+
+        if (zeroFreightIdx >= 0 && adjustments.length === 1) {
+            adjustments[zeroFreightIdx] = replacement;
+        } else if (!several) {
+            const otherFreight = adjustments.filter((a) =>
+                (a.productPromoUrl ?? "").includes("/10007") &&
+                Number(a.amount) > 2.5 &&
+                Math.abs(Number(a.amount) - amount) >= 0.02,
+            );
+            if (otherFreight.length > 0) {
+                adjustments.push(replacement);
+            } else {
+                const nonFreight = adjustments.filter(
+                    (a) => !(a.productPromoUrl ?? "").includes("/10007"),
+                );
+                adjustments.length = 0;
+                adjustments.push(...nonFreight, replacement);
+            }
+        } else {
+            adjustments.push(replacement);
+        }
+
+        await finale.post(
+            `/${FINALE_ACCOUNT}/api/order/${encodeURIComponent(poId)}`,
+            { ...fresh, orderAdjustmentList: adjustments },
+        );
+    } finally {
+        await finale.restoreOrderStatus(poId, originalStatus);
+    }
+}
+
+/** Shipment lines for one bill. Null means hold: two receives share the date and neither carries the PRO. */
+async function shipmentItemsForBill(
+    finale: FinaleWriteSurface,
+    po: PoDoc,
+    bill?: { pickupDate?: string | null; proNumber?: string | null; bolNumber?: string | null },
+): Promise<Array<{ productId: string; quantity: number }> | null> {
+    const urls = (po.shipmentUrlList ?? []).map(String).filter(Boolean);
+    if (!urls.length || !bill?.pickupDate) return null;
+    const candidates = [];
+    for (const url of urls) {
+        const shipment = await finale.getShipmentDetails(url) as Record<string, unknown>;
+        const received = getShipmentReceiptDateTime(shipment);
+        const items = getShipmentReceiptItems(shipment);
+        if (!received || items.length === 0) continue;
+        candidates.push({
+            receiveDate: received.slice(0, 10),
+            tracking: typeof shipment.trackingCode === "string" ? shipment.trackingCode : null,
+            notes: [shipment.privateNotes, shipment.publicNotes].filter((v) => typeof v === "string").join(" "),
+            items,
+        });
+    }
+    return pickShipmentItemsForBill(candidates, bill.pickupDate, {
+        proNumber: bill.proNumber,
+        bolNumber: bill.bolNumber,
+    });
 }
 
 // ── Verification shared by po_ref and vendor_window paths ────────────────────
@@ -240,6 +299,17 @@ async function verifyPoForEntry(
     });
     if (hasThisFreight) {
         return { status: "already", note: vendorName };
+    }
+
+    // New writes are labeled exactly "Freight", so BOL-in-description never hits.
+    // Same dollar amount already on the PO means this bill is done, any vendor.
+    const amountAlready = adjustments.some((a) =>
+        (a.productPromoUrl ?? "").includes("/10007") &&
+        Math.abs(Number(a.amount) - entry.amount) < 0.02 &&
+        Number(a.amount) > 2.5,
+    );
+    if (amountAlready) {
+        return { status: "already", note: `${vendorName} (amount already on PO)` };
     }
 
     // Vendor-window matches on single-delivery vendors must not stack onto a
@@ -436,7 +506,7 @@ async function main(): Promise<void> {
                     }
                     scoreAndMaybeQueue(base, hit?.diffDays ?? null);
                 } else {
-                    base.note = `no PO for ${vendorMatch.vendor} with receive in window`;
+                    base.note = `no PO for ${vendorMatch.vendor} in the order window`;
                     scoreAndMaybeQueue(base, null);
                 }
                 continue;
@@ -507,9 +577,21 @@ async function main(): Promise<void> {
         // ── Step 6: apply freight (live only) ──────────────────────────────
         if (LIVE && toApply.length > 0) {
             console.log(`PHASE 2: Applying ${toApply.length} high-confidence freight adjustment(s)\n`);
-            for (const { poId, entry, label, vendor } of toApply) {
+            for (const { poId, entry, label } of toApply) {
                 try {
-                    await applyFreightToPo(finale, poId, entry.amount, label, isMultiDeliveryVendor(vendor));
+                    const prior = entry.proNumber
+                        ? await lookupVendorInvoices({ invoice_number: entry.proNumber })
+                        : [];
+                    const otherPo = prior.find((row) => row.po_number && row.po_number !== poId && row.status !== "void");
+                    if (otherPo) {
+                        console.log(`   skip PO ${poId}: PRO ${entry.proNumber} already on ${otherPo.po_number}`);
+                        continue;
+                    }
+                    await applyFreightToPo(finale, poId, entry.amount, {
+                        pickupDate: entry.pickupDate,
+                        proNumber: entry.proNumber,
+                        bolNumber: entry.bolNumber,
+                    });
                     run.recordFreight(Math.round(entry.amount * 100));
                     run.recordPoUpdated(poId);
                     const row = results.find((r) => r.entry === entry);

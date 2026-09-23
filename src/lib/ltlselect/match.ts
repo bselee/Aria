@@ -43,12 +43,13 @@ export const VENDOR_ORIGIN_MAP: ReadonlyArray<{
     { alias: /rootwise/i, vendor: "Rootwise Soil Dynamics" },
     { alias: /granite/i, vendor: "Granite Mill Farms" },
     { alias: /grokashi|gro\s*kashi/i, vendor: "Grokashi" },
-    { alias: /surepack|spusa|advantage\s*wh|\blvc\b/i, vendor: "Surepack USA" },
+    { alias: /surepack|spusa|advantage\s*wh|\blvc\b|\bsp\s*usa\b/i, vendor: "Surepack USA" },
     { alias: /seaforth/i, vendor: "Seaforth Mineral" },
     { alias: /concentrates/i, vendor: "Concentrates, Inc" },
     { alias: /diamond\s*k/i, vendor: "Diamond K" },
     { alias: /farm\s*fuel/i, vendor: "Farm Fuel" },
     { alias: /ams\s*logistics/i, vendor: "AMS Logistics" },
+    { alias: /thorvin/i, vendor: "Thorvin" },
     { alias: /molasses/i, vendor: "International Molasses" },
     { alias: /riceland/i, vendor: "Riceland" },
     { alias: /uline/i, vendor: "Uline" },
@@ -425,28 +426,31 @@ export function pickPoForEntry(
     recentPOs: PoCandidate[],
     mappedVendor: string,
 ): PoCandidate | null {
-    const vendorKey = mappedVendor.split(" ")[0].toLowerCase();
+    const vendorKey = mappedVendor.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ")[0];
+    const alias = VENDOR_ORIGIN_MAP.find((row) => row.vendor === mappedVendor)?.alias;
     const delMs = new Date(entry.pickupDate).getTime();
     if (Number.isNaN(delMs)) return null;
-    const multi = isMultiDeliveryVendor(mappedVendor);
     const window = receiveWindowDaysForVendor(mappedVendor);
 
     const vendorPOs = recentPOs.filter((po) => {
         if (/dropship/i.test(po.orderId || "")) return false;
         const name = (po.vendorName || "").toLowerCase();
-        if (!name.includes(vendorKey)) return false;
+        const named = (vendorKey && name.includes(vendorKey)) || (alias ? alias.test(po.vendorName || "") : false);
+        if (!named) return false;
         const orderMs = new Date(po.orderDate).getTime();
         if (Number.isNaN(orderMs)) return false;
         const daysDiff = (delMs - orderMs) / 86400000;
         if (daysDiff < -3 || daysDiff > 45) return false;
-        // Multi-delivery: must have a receive in the biz-day window.
-        if (multi) {
-            return !!findBestReception(po, entry.pickupDate, window);
-        }
         return true;
     });
 
     if (vendorPOs.length === 0) return null;
+
+    const withReceive = vendorPOs.filter((po) => findBestReception(po, entry.pickupDate, window));
+    if (withReceive.length === 0) {
+        // Bill adds freight before the receive. Only when one PO is in the window.
+        return vendorPOs.length === 1 ? vendorPOs[0] : null;
+    }
 
     vendorPOs.sort((a, b) => {
         const aHit = findBestReception(a, entry.pickupDate, window);
@@ -460,6 +464,54 @@ export function pickPoForEntry(
     });
 
     return vendorPOs[0] ?? null;
+}
+
+export type FreightShipmentCandidate = {
+    receiveDate: string;
+    tracking?: string | null;
+    notes?: string | null;
+    items: Array<{ productId: string; quantity: number }>;
+};
+
+/**
+ * Pick the shipment a bill belongs to.
+ * A PRO/BOL on the shipment wins. Otherwise the closest receive to pickup.
+ * Two shipments on that same date with no id match return null — do not guess.
+ */
+export function pickShipmentItemsForBill(
+    candidates: FreightShipmentCandidate[],
+    pickupDate: string,
+    ids: { proNumber?: string | null; bolNumber?: string | null },
+    maxDays = 10,
+): Array<{ productId: string; quantity: number }> | null {
+    const pickup = String(pickupDate || "").slice(0, 10);
+    const pickupMs = new Date(`${pickup}T12:00:00`).getTime();
+    if (!pickup || Number.isNaN(pickupMs)) return null;
+
+    const usable = candidates.filter((c) => c.items.some((line) => line.quantity > 0));
+    const needles = [ids.proNumber, ids.bolNumber]
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter((value) => value.length >= 4);
+    if (needles.length > 0) {
+        const tagged = usable.filter((c) => {
+            const blob = `${c.tracking || ""} ${c.notes || ""}`.toLowerCase();
+            return needles.some((needle) => blob.includes(needle));
+        });
+        if (tagged.length === 1) return tagged[0].items;
+    }
+
+    const dated = usable
+        .map((c) => {
+            const day = String(c.receiveDate || "").slice(0, 10);
+            const ms = new Date(`${day}T12:00:00`).getTime();
+            const diffDays = Number.isNaN(ms) ? Number.POSITIVE_INFINITY : Math.abs(ms - pickupMs) / 86400000;
+            return { c, day, diffDays };
+        })
+        .filter((row) => row.diffDays <= maxDays)
+        .sort((a, b) => a.diffDays - b.diffDays);
+    if (dated.length === 0) return null;
+    if (dated.length > 1 && dated[1].diffDays === dated[0].diffDays) return null;
+    return dated[0].c.items;
 }
 
 /**
@@ -568,6 +620,9 @@ export function scoreFreightApplyConfidence(input: FreightApplyScoreInput): Frei
 
     if (multi) {
         if (receiveDiffDays === null) {
+            if (vendorMatchedBy === "name" && hasScannedAmount) {
+                return { confidence: "high", reasons: [...reasons, "pre_receive"], mayApply: true };
+            }
             return {
                 confidence: "medium",
                 reasons: [...reasons, "multi_delivery_no_receive"],
@@ -609,6 +664,15 @@ export function scoreFreightApplyConfidence(input: FreightApplyScoreInput): Frei
         receiveDiffDays <= SINGLE_DELIVERY_RECEIVE_RANK_DAYS
     ) {
         reasons.push(`receive_ok_cal_${receiveDiffDays}`, "vendor_window");
+        return { confidence: "high", reasons, mayApply: true };
+    }
+    if (
+        matchSource === "vendor_window" &&
+        hasScannedAmount &&
+        vendorMatchedBy === "name" &&
+        receiveDiffDays === null
+    ) {
+        reasons.push("pre_receive");
         return { confidence: "high", reasons, mayApply: true };
     }
 

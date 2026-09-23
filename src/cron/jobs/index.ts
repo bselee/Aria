@@ -1417,8 +1417,9 @@ defineJob({
 });
 
 // DECISION(2026-08-05): Weekly LTL Select COLLECT freight → Finale PO reconcile.
-// Runs Monday 9 AM Denver — high-confidence only (multi-delivery receive ≤10 biz d).
-// Covers Rootwise, Granite, Seaforth, Concentrates, Molasses, Diamond K, AMS, etc.
+// Runs Monday 9 AM Denver — high-confidence only, last 14 days, no notify.
+// Match is vendor name + date for every inbound origin. Allocate to that shipment.
+// Several shipments on one PO get one Freight line per identifiable bill.
 // Uline is NOT on LTL Select (they call FedEx → general FBO).
 defineJob({
     name: "ltlselect-freight-reconcile",
@@ -1427,7 +1428,7 @@ defineJob({
     description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
-        console.log("[ltlselect-freight] Running weekly LTL Select reconcile (--live, --days 7)...");
+        console.log("[ltlselect-freight] Running weekly LTL Select reconcile (--live, --days 14)...");
         try {
             const stdout = execFileSync(
                 process.execPath,
@@ -1435,7 +1436,7 @@ defineJob({
                     "--import", "tsx",
                     `${process.cwd()}/src/cli/reconcile-ltlselect.ts`,
                     "--live",
-                    "--days", "7",
+                    "--days", "14",
                 ],
                 { encoding: "utf8", timeout: 300_000, env: process.env },
             );
@@ -1446,13 +1447,11 @@ defineJob({
             const held = (stdout.match(/MEDIUM \(hold\):\s+(\d+)/) || [])[1] || "0";
             const unmatched = (stdout.match(/Unmatched:\s+(\d+)/) || [])[1] || "0";
 
-            const message =
-                `📦 LTL Select weekly: ${applied} applied` +
+            console.log(
+                `[ltlselect-freight] ${applied} applied` +
                 (totalMatch ? ` | $${totalMatch[2]}` : "") +
-                ` | held: ${held} | unmatched: ${unmatched}`;
-
-            const { notify } = await import("@/lib/intelligence/notify");
-            await notify(message).catch(() => {});
+                ` | held: ${held} | unmatched: ${unmatched}`,
+            );
         } catch (err: any) {
             console.error(`[ltlselect-freight] Failed: ${err?.message ?? err}`);
             if (err?.stdout) console.error(err.stdout);
