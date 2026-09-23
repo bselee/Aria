@@ -1152,38 +1152,6 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scans Watcher — CR/CRMIN & Benny scan processing (added 2026-06-16)
-// CR_ / CRMIN_ → DM Parker the PDF with PU100 stock-on-order info.
-// Benny_ → Email PDF to buildasoilap@bill.com.
-// Runs every 6 hours during business hours (M-F 7AM-6PM MT).
-// ─────────────────────────────────────────────────────────────────────────────
-defineJob({
-    name: "scans-watcher",
-    schedule: "0 */6 * * 1-5", // M-F only — no weekends
-    onFail: "log",
-    description: "Check _FREIGHT/Documents/Scans/ for new CR Minerals Pumice invoices (DM Parker with PDF + stock info) or Benny invoices (email to Bill.com).",
-    handler: async () => {
-        // Business hours gate: skip if outside 7AM-6PM MT
-        const now = new Date();
-        const hourMT = new Date(
-            now.toLocaleString("en-US", { timeZone: "America/Denver" })
-        ).getHours();
-        if (hourMT < 7 || hourMT >= 18) {
-            console.log(`[scans-watcher] Outside business hours (${hourMT} MT) — skipping.`);
-            return;
-        }
-
-        const { runScansWatch } = await import("@/lib/scans-watcher");
-        const result = await runScansWatch();
-        if (result.scanned > 0 || result.errors > 0) {
-            console.log(`[scans-watcher] ${result.scanned} scanned, ${result.processed} processed, ${result.slackNotifications} Slack, ${result.emailForwards} email, ${result.errors} errors`);
-            for (const d of result.details) console.log(`  ${d}`);
-        }
-    },
-    budget: { durationMs: 60_000 },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // PO Reply Watcher — checks Gmail threads for vendor replies to sent POs.
 // Runs every 30 min during business hours. When a vendor replies, updates
 // purchase_orders (vendor_acknowledged_at, human_reply_detected_at) and
