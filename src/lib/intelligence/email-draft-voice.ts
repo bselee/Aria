@@ -50,6 +50,14 @@ FORMAT — CRITICAL
 - For very short vendor confirmations ("Sounds good", "I'll send the invoice"), the entire draft may be just:
   Thanks!
 
+ADDRESS / CONTACT — NEVER INVENT
+- Never invent a shipping address, billing address, ZIP, or phone number.
+- Only state an address when the reply genuinely needs a ship-to. Use EXACTLY these:
+  - Samples ship to: BuildASoil, 5016 N Townsend Ave, Montrose, CO 81401
+  - Order / freight ship-to: BuildASoil, 5146 N Townsend Ave, Montrose, CO 81401
+  - Phone: (855) 877-7645
+- If the reply does not need an address, omit it entirely.
+
 EXAMPLES (Bill's real style — follow these patterns exactly):
 
 Example 1 — Megan: traceability + videos + sample offer, no COA.
@@ -68,6 +76,28 @@ Thanks!"
 
 /** @deprecated Kept empty — Bill's Gmail signature is the only sign-off. */
 export const SIGN_OFF: readonly string[] = [];
+
+/**
+ * Canonical BuildASoil contact — the ONLY ship-to / bill-to / phone a draft may
+ * state. Any other street, ZIP, or phone in a draft is a hallucination.
+ *
+ * @since 2026-09-23 — drafts were inventing addresses (see grade gate below).
+ */
+export const BAS_ADDRESS = {
+    /** Billing + sample ship-to — street unit 5016. */
+    billTo: "BuildASoil\n5016 N Townsend Ave\nMontrose, CO 81401",
+    /** Order / freight ship-to — street unit 5146. */
+    shipTo: "BuildASoil\n5146 N Townsend Ave\nMontrose, CO 81401",
+    phone: "(855) 877-7645",
+    phoneDigits: "8558777645",
+    zip: "81401",
+    /** Both real addresses sit on Townsend Ave — any other street is invented. */
+    streetWord: "Townsend",
+} as const;
+
+/** Street/road suffix tokens — used to detect an invented address line. */
+const STREET_SUFFIX_RE =
+    /\b(?:street|st\b|avenue|ave\b|boulevard|blvd\b|drive|dr\b|road|rd\b|lane|ln\b|court|ct\b|way|highway|hwy\b|trail|tr\b)\b/i;
 
 export interface DraftGrade {
     score: number; // 0–100
@@ -179,6 +209,21 @@ export function gradeVendorReplyDraft(args: {
             warnings.push(`invented_cert_${cert}`);
             score -= 12;
         }
+    }
+
+    // ── Invented address / phone (2026-09-23) — a draft may only state the
+    // canonical BAS address; any other street/phone is a hallucination. ──
+    const phoneHits = draft.match(/\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/g) || [];
+    for (const p of phoneHits) {
+        if (p.replace(/\D/g, "") !== BAS_ADDRESS.phoneDigits) {
+            failures.push("invented_phone");
+            score -= 40;
+        }
+    }
+    // Self-described street line that is not on Townsend Ave = fabricated.
+    if (/\bBuildASoil\b/i.test(draft) && STREET_SUFFIX_RE.test(draft) && !/Townsend/i.test(draft)) {
+        failures.push("invented_address");
+        score -= 40;
     }
 
     // Substantive mail should thank + nod at something concrete
