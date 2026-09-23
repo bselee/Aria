@@ -663,7 +663,7 @@ async function enrichInvoiceForPoMatch(args: {
                     email_subject: args.emailSubject,
                     pdf_filename: args.pdfFilename,
                     ocr_chars: rawText.length,
-                    photo_invoice: true,
+                    photo_invoice: rawText.replace(/\s/g, "").length < 80,
                     local_cache_id: localId,
                 },
                 notes:

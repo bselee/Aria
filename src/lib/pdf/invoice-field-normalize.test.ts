@@ -61,5 +61,16 @@ describe("normalizeInvoiceForDb", () => {
         expect(n.vendorName).toBe("Down to Earth Worms");
         expect(n.total).toBe(7875);
         expect(n.poNumber).toMatch(/124661/);
+        expect(n.lineItems).toEqual([
+            expect.objectContaining({ qty: 21, unit_price: 375, ext_price: 7875 }),
+        ]);
+    });
+
+    it("keeps the text-layer lines when the model parse dropped them", () => {
+        const n = normalizeInvoiceForDb(
+            { invoiceNumber: "1682", vendorName: "Down to Earth Worms", total: 7875, lineItems: [] } as any,
+            DTE_OCR,
+        );
+        expect(n.lineItems[0]).toEqual(expect.objectContaining({ qty: 21, unit_price: 375, ext_price: 7875 }));
     });
 });

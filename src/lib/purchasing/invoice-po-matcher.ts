@@ -33,6 +33,52 @@ import { sanitizeOcrPoCandidate } from "@/lib/purchasing/ocr-po-sanitize";
 
 export { sanitizeOcrPoCandidate };
 
+/**
+ * The stored PDF is the invoice. When the row has no priced lines, read the
+ * text layer and keep the lines only if they add up to the printed total.
+ */
+async function overlayLinesFromPdf(
+    invoiceData: Record<string, unknown>,
+    inv: { id?: string; pdf_storage_path?: string | null; total?: unknown },
+    db: ReturnType<typeof createClient>,
+): Promise<Record<string, unknown>> {
+    const { invoiceLinesNeedPdfRead, extractGoodsLinesFromInvoiceText } = await import("@/lib/pdf/invoice-text-lines");
+    if (!invoiceLinesNeedPdfRead(invoiceData.lineItems) || !inv.pdf_storage_path || !db) return invoiceData;
+    const { downloadPDF } = await import("@/lib/storage/supabase-storage");
+    const pdfParse = (await import("pdf-parse")).default as (buf: Buffer) => Promise<{ text?: string }>;
+    const buf = await downloadPDF(inv.pdf_storage_path);
+    if (!buf) return invoiceData;
+    let rawText = "";
+    try {
+        const parsed = await pdfParse(buf);
+        rawText = parsed.text || "";
+    } catch {
+        return invoiceData;
+    }
+    const read = extractGoodsLinesFromInvoiceText(rawText, Number(inv.total || invoiceData.total || 0));
+    if (!read.balanced) return invoiceData;
+    await db.from("vendor_invoices").update({
+        line_items: read.lines.map((li) => ({
+            sku: li.sku,
+            description: li.description,
+            qty: li.qty,
+            unit_price: li.unitPrice,
+            ext_price: li.total,
+        })),
+    }).eq("id", inv.id);
+    return {
+        ...invoiceData,
+        lineItems: read.lines.map((li) => ({
+            sku: li.sku,
+            description: li.description,
+            qty: li.qty,
+            unitPrice: li.unitPrice,
+            total: li.total,
+        })),
+        poNumber: invoiceData.poNumber || read.poNumber,
+    };
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface InvoiceToMatch {
@@ -603,7 +649,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
     // Find invoices with no PO assigned, ordered by most recent
     const { data: unmatched } = await db
         .from("vendor_invoices")
-        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, raw_data, line_items")
+        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, raw_data, line_items, pdf_storage_path")
         .is("po_number", null)
         .order("created_at", { ascending: false })
         .limit(50);
@@ -658,7 +704,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                     typeof rawData.invoiceNumber === 'string' &&
                     typeof rawData.total === 'number';
 
-                const invoiceData = hasValidRawData ? rawData : {
+                const invoiceData = await overlayLinesFromPdf(hasValidRawData ? rawData : {
                     vendorName: inv.vendor_name,
                     invoiceNumber: inv.invoice_number,
                     invoiceDate: inv.invoice_date,
@@ -671,7 +717,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                     poNumber: result.bestMatch.orderId,
                     lineItems: inv.line_items || [],
                     confidence: "medium" as const,
-                };
+                }, inv, db);
 
                 const reconResult = await reconcileInvoiceToPO(
                     invoiceData as any,
@@ -781,7 +827,7 @@ export async function batchReconcileExistingFreight(limit: number = 10): Promise
     // Also exclude CANCELLED POs.
     const { data: candidates } = await db
         .from("vendor_invoices")
-        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, po_number, raw_data, line_items")
+        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, po_number, raw_data, line_items, pdf_storage_path")
         .gt("freight", 0)
         .not("po_number", "is", null)
         .order("created_at", { ascending: false })
@@ -860,7 +906,7 @@ export async function batchReconcileExistingFreight(limit: number = 10): Promise
                 typeof rawData.invoiceNumber === 'string' &&
                 typeof rawData.total === 'number';
 
-            const invoiceData = hasValidRawData ? rawData : {
+            const invoiceData = await overlayLinesFromPdf(hasValidRawData ? rawData : {
                 vendorName: inv.vendor_name,
                 invoiceNumber: inv.invoice_number,
                 invoiceDate: inv.invoice_date,
@@ -873,7 +919,7 @@ export async function batchReconcileExistingFreight(limit: number = 10): Promise
                 poNumber: inv.po_number,
                 lineItems: inv.line_items || [],
                 confidence: "medium" as const,
-            };
+            }, inv, db);
 
             const reconResult = await reconcileInvoiceToPO(
                 invoiceData as any,

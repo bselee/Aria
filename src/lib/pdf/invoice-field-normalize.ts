@@ -12,6 +12,7 @@
  * vendor_invoices upserts colliding on (vendor, UNKNOWN).
  */
 import type { InvoiceData } from "./invoice-parser";
+import { extractGoodsLinesFromInvoiceText } from "./invoice-text-lines";
 
 const BAD_SENTINELS = new Set([
     "",
@@ -164,7 +165,7 @@ export function normalizeInvoiceForDb(
 } {
     const fb = extractInvoiceFieldsFromOcrText(rawText);
     const inv = cleanInvoiceField(parsed?.invoiceNumber ?? null) || fb.invoiceNumber;
-    const po = cleanInvoiceField(parsed?.poNumber ?? null) || fb.poNumber;
+    let po = cleanInvoiceField(parsed?.poNumber ?? null) || fb.poNumber;
     let total = Number(parsed?.total) || 0;
     if (!total && fb.total) total = fb.total;
     let invoiceDate = cleanInvoiceField(parsed?.invoiceDate ?? null) || fb.invoiceDate;
@@ -190,6 +191,20 @@ export function normalizeInvoiceForDb(
               ext_price: Number(li.total ?? li.ext_price ?? li.extPrice) || 0,
           }))
         : [];
+    const priced = lineItems.filter((li) => li.qty > 0 && li.unit_price > 0);
+    const fromPdf = extractGoodsLinesFromInvoiceText(rawText, total || null);
+    // The forward already has this text. A set that adds up to the printed total
+    // wins over a model parse that dropped the lines.
+    const storedLines = fromPdf.balanced
+        ? fromPdf.lines.map((li) => ({
+              sku: li.sku,
+              description: li.description,
+              qty: li.qty,
+              unit_price: li.unitPrice,
+              ext_price: li.total,
+          }))
+        : priced;
+    if (!po && fromPdf.poNumber) po = fromPdf.poNumber;
 
     return {
         vendorName,
@@ -200,6 +215,6 @@ export function normalizeInvoiceForDb(
         freight,
         tax,
         subtotal,
-        lineItems,
+        lineItems: storedLines,
     };
 }
