@@ -81,6 +81,7 @@ export class AcknowledgementAgent {
         /^OOS Report\b/i,             // ARIA's OOS report emails
         /^Out Of Stock\b/i,           // Stockie alert subject
         /^Daily Agenda\b/i,           // Google Calendar daily agenda digest
+        /^Reorder summary\b/i,        // Finale reorder digest, not a PO
     ];
 
     private isSystemSender(from: string): boolean {
@@ -529,6 +530,13 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                             // (e.g. OOS Report emails sent to ourselves)
                             if (this.isSystemSubject(subject)) {
                                 console.log(`     -> Skipping system report email: ${subject}`);
+                                try {
+                                    await gmail.users.messages.modify({
+                                        userId: "me",
+                                        id: m.gmail_message_id,
+                                        requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+                                    });
+                                } catch { /* best effort */ }
                                 await this.finalizeQueueStatus(m.id, "system_noise");
                                 continue;
                             }

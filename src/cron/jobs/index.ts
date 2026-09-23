@@ -40,6 +40,19 @@ defineJob({
 });
 
 defineJob({
+    name: "inbox-screen",
+    schedule: "*/15 7-18 * * *",
+    onFail: "log",
+    description:
+        "bill.selee@ ingest + classify every 15 min from 7am, including a full drain of everything that landed before 8am. No Finale.",
+    handler: async () => {
+        const { screenDefaultInbox } = await import("@/lib/intelligence/inbox-screen");
+        await screenDefaultInbox();
+    },
+    budget: { durationMs: 180_000 },
+});
+
+defineJob({
     name: "ap-polling",
     schedule: "0 8,12,17 * * *",
     onFail: "log",  // core pipeline — if this fails, no invoices processed

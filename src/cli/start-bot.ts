@@ -622,6 +622,23 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
             } catch (e: any) {
                 console.warn(`[boot] AP catch-up failed (non-fatal): ${e.message}`);
             }
+            // Before 8am the inbox must already be screened. A restart at 7:0x
+            // used to wait for the 8:00 ap-polling tick, so overnight ads were
+            // still in Primary when Bill sat down.
+            try {
+                const hour = Number(new Date().toLocaleString("en-US", {
+                    timeZone: "America/Denver",
+                    hour: "numeric",
+                    hour12: false,
+                }));
+                if (hour < 8) {
+                    const { screenDefaultInbox } = await import("../lib/intelligence/inbox-screen");
+                    console.log("[boot] Before 8am — draining bill.selee@ inbox");
+                    await screenDefaultInbox();
+                }
+            } catch (e: any) {
+                console.warn(`[boot] inbox screen failed (non-fatal): ${e.message}`);
+            }
         })();
     }, 5_000);
 
@@ -631,6 +648,7 @@ bot.action(/^invoice_skip_(.+)$/, async (ctx) => {
     console.log('   🗓️   Weekly Review:     8:01 AM MT (Fridays)');
     console.log('   📦 PO Sync:           Every 4h');
     console.log('   🧹 Ad Cleanup:        Every hour');
+    console.log('   📥 Inbox screen:      Every 15 min, 7am-6pm MT');
 
     const hcUrl = process.env.HEALTHCHECK_PING_URL;
     if (hcUrl) fetch(hcUrl).catch(() => {});

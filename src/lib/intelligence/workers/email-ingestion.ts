@@ -146,8 +146,18 @@ export class EmailIngestionWorker {
                     source_inbox: this.tokenIdentifier
                 });
 
-                if (error && error.code !== '23505') { // Ignore unique violation if it sneaked in
+                if (error && error.code !== '23505') {
                     console.error(`   ❌ Failed to insert ${m.id} to queue:`, error.message);
+                } else if (error?.code === '23505' && isPromo) {
+                    // Already queued, but a prior pass left the ad in INBOX.
+                    // Archive anyway. A duplicate insert must not keep the ad visible.
+                    try {
+                        await gmail.users.messages.modify({
+                            userId: "me",
+                            id: m.id!,
+                            requestBody: { removeLabelIds: ["INBOX", "UNREAD"] },
+                        });
+                    } catch { /* best effort */ }
                 } else if (!error) {
                     insertedCount++;
                     if (isPromo) {
