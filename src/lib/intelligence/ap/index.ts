@@ -48,6 +48,7 @@ export {
     isFedExBillingOnlineEmail,
     isFedExBillingPacketFilename,
     isFedExCarrierBillExtractedJson,
+    isFedExExcludedFromBillCom,
     classifyFedExBillingAttachment,
     buildFedExBillComFilename,
     buildFedExCarrierBillQueueFields,

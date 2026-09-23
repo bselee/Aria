@@ -1,9 +1,8 @@
 /**
  * @file    fedex-billing-packet.ts
- * @purpose Detect FedEx Billing Online multi-page invoice packets and define
- *          AP handling rules: forward FIRST PAGE ONLY (page 1 = summary with
- *          the invoice number + total), pay-path only (Bill.com), never
- *          product-PO freight apply / Uline bas_freight.
+ * @purpose Detect FedEx Billing Online packets and Freight bills so AP can
+ *          keep them OUT of Bill.com. Bill 2026-09-23: no FedEx document is
+ *          forwarded. Detection remains for skip + reconcile no-bill class.
  *
  * Format (verified 2026-08-05):
  *   Email: noreply@fedex.com → ap@
@@ -256,7 +255,9 @@ const FEDEX_FREIGHT_INVOICE_RE = /^300\d{7,}$/;
  * forwarder skips them and reconcile-billcom treats them as "no bill expected".
  *
  * FBO parcel packets (noreply@fedex.com, "Your New FedEx Billing Online
- * invoice is attached", invoice # 9-XXX-XXXXX) MUST still forward.
+ * invoice is attached", invoice # 9-XXX-XXXXX) are also excluded from
+ * Bill.com (Bill 2026-09-23). Use isFedExExcludedFromBillCom(), not this
+ * freight-only helper, for the forward skip.
  *
  * @param args.from          Gmail From header
  * @param args.subject       Gmail Subject header
@@ -288,6 +289,54 @@ export function isFedExFreightOnlineBill(args: {
     // Freight invoice-number shape (10+ digits, 3004…) with FedEx context
     const inv = String(args.invoiceNumber || "").replace(/\D/g, "");
     if (inv && FEDEX_FREIGHT_INVOICE_RE.test(inv)) return true;
+    return false;
+}
+
+/**
+ * True when this message or attachment must not be sent to Bill.com.
+ *
+ * Bill 2026-09-23 reversed the 2026-08-18 "fedex can not be skipped" rule:
+ * FBO parcel, Freight LTL, past-due notices, and forwarded copies all skip.
+ * A vendor invoice that only mentions FedEx tracking is not this — the
+ * sender, vendor, subject, or filename has to be the FedEx document itself.
+ *
+ * @param args.from          Gmail From header, or a vendor string when reconciling
+ * @param args.subject       Gmail Subject header
+ * @param args.filename      attachment filename when known
+ * @param args.vendorName    parsed vendor name when known
+ * @param args.invoiceNumber invoice number when known
+ */
+export function isFedExExcludedFromBillCom(args: {
+    from?: string | null;
+    subject?: string | null;
+    filename?: string | null;
+    vendorName?: string | null;
+    invoiceNumber?: string | null;
+    /** Page text, when already extracted. Tight phrases only — a vendor
+     *  invoice that says "shipped via FedEx" must not match. */
+    pdfText?: string | null;
+}): boolean {
+    const from = String(args.from || "");
+    const subject = String(args.subject || "");
+    const filename = String(args.filename || "");
+    const vendor = String(args.vendorName || "");
+    const text = String(args.pdfText || "");
+    const base = filename.trim().split(/[/\\]/).pop() || "";
+
+    if (/fedex\.com/i.test(from) || /\bfedex\b/i.test(from)) return true;
+    if (/\bfedex\b/i.test(vendor)) return true;
+    if (isFedExBillingPacketFilename(base)) return true;
+    if (/^fedex[_\s.-]/i.test(base)) return true;
+    if (/fedex\s*(billing|freight|invoice)/i.test(subject)) return true;
+    if (/bill from fedex/i.test(subject)) return true;
+    if (/fedex\s+billing\s+online/i.test(text)) return true;
+    if (/fedex\s+(ground|express|freight)\s+services/i.test(text)) return true;
+    if (isFedExFreightOnlineBill({
+        from,
+        subject,
+        filename,
+        invoiceNumber: args.invoiceNumber,
+    })) return true;
     return false;
 }
 

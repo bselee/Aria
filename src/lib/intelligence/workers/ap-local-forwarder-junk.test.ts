@@ -42,16 +42,14 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
         ).toBe(false);
     });
 
-    // ── FedEx Billing Online (REVERSED 2026-08-18, Bill: "fedex can not be skipped!") ──
-    // Invoice-attached emails are FedEx carrier bills — they MUST forward
-    // (full packet, pay-path only via fedex-billing-packet.ts).
-    it("ALLOWS FedEx Billing Online invoice-attached email (carrier bill)", () => {
+    // ── FedEx is not a Bill.com bill (Bill 2026-09-23) ────────────────
+    it("skips FedEx Billing Online invoice-attached email", () => {
         expect(
             isNonInvoiceEmail({
                 from: "FedEx Billing Online <noreply@fedex.com>",
                 subject: "Your New FedEx Billing Online invoice is attached",
             }),
-        ).toBe(false);
+        ).toBe(true);
     });
 
     it("skips FedEx Billing Online past-due notice", () => {
@@ -61,6 +59,24 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
                 subject: "FedEx Billing Online - Invoice(s) Past Due",
             }),
         ).toBe(true);
+    });
+
+    it("skips an internal forward of a FedEx Billing Online invoice", () => {
+        expect(
+            isNonInvoiceEmail({
+                from: "BuildASoil Support <support@buildasoil.com>",
+                subject: "Fwd: Your New FedEx Billing Online invoice is attached",
+            }),
+        ).toBe(true);
+    });
+
+    it("ALLOWS a vendor invoice that only mentions FedEx tracking", () => {
+        expect(
+            isNonInvoiceEmail({
+                from: "accounts.receivable@uline.com",
+                subject: "Uline Invoice 211897049 shipped via FedEx",
+            }),
+        ).toBe(false);
     });
 
     // ── FedEx Freight LTL (billed online, never entered in Bill.com) ──────
@@ -87,7 +103,8 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
         ).toBe(true);
     });
 
-    // FBO parcel carrier bills must keep forwarding — different lane.
+    // Freight detector stays narrow. Parcel is excluded by isFedExExcludedFromBillCom,
+    // not by this helper. A parcel 9-XXX number must not look like Freight.
     it("ALLOWS FedEx Billing Online parcel invoice (9-XXX-XXXXX)", () => {
         expect(
             isFedExFreightOnlineBill({

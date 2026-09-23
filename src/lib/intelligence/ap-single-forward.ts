@@ -467,6 +467,24 @@ export async function forwardInvoiceOnce(
     };
   }
 
+  // Bill 2026-09-23: no FedEx document is entered in Bill.com. Same choke
+  // point so ap-agent, scans, and retry scripts cannot send one either.
+  const { isFedExExcludedFromBillCom } = await import("./ap/fedex-billing-packet");
+  if (isFedExExcludedFromBillCom({
+    from: req.emailFrom,
+    subject: req.emailSubject,
+    filename: req.pdfFilename,
+    vendorName: req.vendorName,
+    invoiceNumber: req.invoiceNumber,
+    pdfText: req.ocrRawText,
+  })) {
+    return {
+      status: "blocked",
+      reason: "FedEx is not entered in Bill.com",
+      pdfContentHash: sha256Pdf(req.pdfBuffer),
+    };
+  }
+
   const pdfHash = sha256Pdf(req.pdfBuffer);
   const safeFilename = sanitizeForwardFilename(req.pdfFilename || "invoice.pdf");
 
