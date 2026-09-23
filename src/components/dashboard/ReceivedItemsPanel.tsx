@@ -18,6 +18,8 @@ type ReceivedPO = {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
+    /** Goods subtotal. Freight already on the PO is total − this. Absent until the bulk query asks for it. */
+    subtotal?: number;
     items: Array<{
         productId: string;
         quantity: number;
@@ -1156,6 +1158,27 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         <div className="w-full">
                                                             <POFlowStepper steps={steps} compact />
                                                         </div>
+
+                                                        {/* The choice, on the row. Finale has no freight until we add the amount the invoice charges. */}
+                                                        {rec?.matchedInvoice && (() => {
+                                                            const inv = rec.matchedInvoice;
+                                                            const charged = Number(inv.freight) || 0;
+                                                            const onPo = po.subtotal != null && po.total > po.subtotal
+                                                                ? Math.round((po.total - po.subtotal) * 100) / 100
+                                                                : 0;
+                                                            const add = charged > onPo + 0.5 ? Math.round((charged - onPo) * 100) / 100 : 0;
+                                                            const priceNote = inv.subtotal > 0 && po.subtotal != null && Math.abs(inv.subtotal - po.subtotal) > 1
+                                                                ? `price ${inv.subtotal > po.subtotal ? "+" : ""}$${(inv.subtotal - po.subtotal).toFixed(0)}`
+                                                                : null;
+                                                            if (add <= 0 && !priceNote) return null;
+                                                            return (
+                                                                <div className="mt-1 text-[11px] font-mono text-zinc-300">
+                                                                    {add > 0 && <span>Add freight ${add.toFixed(2)}{onPo > 0 ? ` (PO has $${onPo.toFixed(0)})` : ""}</span>}
+                                                                    {add > 0 && priceNote && <span className="text-zinc-600"> · </span>}
+                                                                    {priceNote && <span className="text-amber-300/90">{priceNote}</span>}
+                                                                </div>
+                                                            );
+                                                        })()}
 
                                                         {/* Expanded approval card — shows exactly what's being approved */}
                                                         {rec?.hasPendingApproval && rec?.matchedInvoice && (

@@ -139,12 +139,14 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             receiveDate
                                         }
                                         total
+                                        subtotal
                                         supplier { name }
                                         itemList(first: 50) {
                                             edges {
                                                 node {
                                                     product { productId }
                                                     quantity
+                                                    unitPrice
                                                 }
                                             }
                                         }
@@ -1696,6 +1698,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                     dueDate
                                     receiveDate
                                     total
+                                    subtotal
                                     supplier { name partyUrl }
                                     shipmentList {
                                         shipmentId
@@ -1708,6 +1711,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             node {
                                                 product { productId }
                                                 quantity
+                                                unitPrice
                                             }
                                         }
                                     }
@@ -1724,7 +1728,11 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             return edges.map((edge: any) => {
                 const po = edge.node;
                 const items = (po.itemList?.edges || [])
-                    .map((e: any) => ({ productId: e.node?.product?.productId ?? '', quantity: e.node?.quantity ?? 0 }))
+                    .map((e: any) => ({
+                        productId: e.node?.product?.productId ?? '',
+                        quantity: e.node?.quantity ?? 0,
+                        unitPrice: parseFinaleNumber(e.node?.unitPrice),
+                    }))
                     .filter((i: any) => i.productId);
                 // Normalize any date to YYYY-MM-DD (Finale returns inconsistent formats like "4/2/2026")
                 const toISODate = (d: string | null | undefined): string | null => {
@@ -1747,6 +1755,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                     receiveDate: toISODate(po.receiveDate),
                     status: po.status ?? '',
                     total: parseFinaleNumber(po.total),
+                    subtotal: parseFinaleNumber(po.subtotal),
                     items,
                     finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
                     shipments
