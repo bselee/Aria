@@ -25,12 +25,59 @@ import { FinaleClient } from "@/lib/finale/client";
 import { reconcileInvoiceToPO, applyReconciliation, buildReconciliationIdentityMetadata } from "@/lib/finale/reconciler";
 import {
     normalizeVendorName,
+    normalizeVendorKey,
     resolveCanonicalVendor,
     loadVendorAliases,
 } from "@/lib/purchasing/vendor-name-normalize";
 import { sanitizeOcrPoCandidate } from "@/lib/purchasing/ocr-po-sanitize";
 
 export { sanitizeOcrPoCandidate };
+
+/**
+ * The stored PDF is the invoice. When the row has no priced lines, read the
+ * text layer and keep the lines only if they add up to the printed total.
+ */
+async function overlayLinesFromPdf(
+    invoiceData: Record<string, unknown>,
+    inv: { id?: string; pdf_storage_path?: string | null; total?: unknown },
+    db: ReturnType<typeof createClient>,
+): Promise<Record<string, unknown>> {
+    const { invoiceLinesNeedPdfRead, extractGoodsLinesFromInvoiceText } = await import("@/lib/pdf/invoice-text-lines");
+    if (!invoiceLinesNeedPdfRead(invoiceData.lineItems) || !inv.pdf_storage_path || !db) return invoiceData;
+    const { downloadPDF } = await import("@/lib/storage/supabase-storage");
+    const pdfParse = (await import("pdf-parse")).default as (buf: Buffer) => Promise<{ text?: string }>;
+    const buf = await downloadPDF(inv.pdf_storage_path);
+    if (!buf) return invoiceData;
+    let rawText = "";
+    try {
+        const parsed = await pdfParse(buf);
+        rawText = parsed.text || "";
+    } catch {
+        return invoiceData;
+    }
+    const read = extractGoodsLinesFromInvoiceText(rawText, Number(inv.total || invoiceData.total || 0));
+    if (!read.balanced) return invoiceData;
+    await db.from("vendor_invoices").update({
+        line_items: read.lines.map((li) => ({
+            sku: li.sku,
+            description: li.description,
+            qty: li.qty,
+            unit_price: li.unitPrice,
+            ext_price: li.total,
+        })),
+    }).eq("id", inv.id);
+    return {
+        ...invoiceData,
+        lineItems: read.lines.map((li) => ({
+            sku: li.sku,
+            description: li.description,
+            qty: li.qty,
+            unitPrice: li.unitPrice,
+            total: li.total,
+        })),
+        poNumber: invoiceData.poNumber || read.poNumber,
+    };
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -79,14 +126,19 @@ const MIN_SCORE_FOR_SUGGESTION = 50;
 // ── Scoring ────────────────────────────────────────────────────────────────
 
 function scoreVendorName(a: string, b: string): { score: number; reason: string } {
-    const al = normalizeVendorName(a);
-    const bl = normalizeVendorName(b);
+    // Compare on the canonical alphanumeric key so suffix/punctuation drift
+    // ("FertiOrganic Inc" vs "Ferti-Organic", "Belt Power, LLC" vs
+    // "Belt Power") scores as an exact match instead of a mismatch.
+    const al = normalizeVendorKey(a);
+    const bl = normalizeVendorKey(b);
     if (!al || !bl) return { score: 0, reason: "vendor name missing" };
     if (al === bl) return { score: 40, reason: "exact vendor match" };
     if (al.includes(bl) || bl.includes(al)) return { score: 30, reason: "vendor substring match" };
 
-    const wa = new Set(al.split(/\s+/).filter(w => w.length > 2));
-    const wb = new Set(bl.split(/\s+/).filter(w => w.length > 2));
+    // Word-overlap fallback needs word boundaries, which the key removes —
+    // use the space-preserving normalized form here.
+    const wa = new Set(normalizeVendorName(a).split(/\s+/).filter(w => w.length > 2));
+    const wb = new Set(normalizeVendorName(b).split(/\s+/).filter(w => w.length > 2));
     const overlap = [...wa].filter(w => wb.has(w)).length;
     if (overlap / Math.max(wa.size, wb.size, 1) >= 0.5) {
         return { score: 25, reason: `vendor word overlap (${overlap})` };
@@ -109,16 +161,6 @@ function scoreDateProximity(invDate: string, poDate: string): { score: number; r
     return { score: 0, reason: `${Math.round(days)}d — outside ${DATE_WINDOW_DAYS}d window` };
 }
 
-function scoreAmountProximity(invTotal: number, poTotal: number): { score: number; reason: string } {
-    if (invTotal <= 0 || poTotal <= 0) return { score: 0, reason: "missing amount" };
-    const pct = Math.abs(invTotal - poTotal) / poTotal;
-    if (pct <= 0.02) return { score: 30, reason: `${(pct * 100).toFixed(1)}% variance` };
-    if (pct <= 0.05) return { score: 25, reason: `${(pct * 100).toFixed(1)}% variance` };
-    if (pct <= 0.10) return { score: 18, reason: `${(pct * 100).toFixed(1)}% variance` };
-    if (pct <= 0.20) return { score: 8, reason: `${(pct * 100).toFixed(1)}% variance` };
-    return { score: 0, reason: `${(pct * 100).toFixed(1)}% variance` };
-}
-
 // ── Main matcher ───────────────────────────────────────────────────────────
 
 /**
@@ -138,6 +180,9 @@ function extractSearchTerms(vendorName: string): string[] {
         .replace(/^(?:UNKNOWN\s*[\|\-\/]\s*|Fwd?:\s*|Re:\s*)+/i, "")
         .trim();
     return cleaned
+        // Split camelCase so "FertiOrganic" → "Ferti Organic" and the term
+        // search can find "Ferti-Organic" (hyphen variant) by its halves.
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
         .split(/[\s,.\/\|\-]+/)
         .map(w => w.trim())
         .filter(w => w.length > 2 && !stopWords.has(w.toLowerCase()));
@@ -152,6 +197,45 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     const candidates: POCandidate[] = [];
 
     if (!db) return { invoice, candidates: [], bestMatch: null, autoApplyReady: false };
+
+    // ── Standard chain: the PO number printed on the document is the match key.
+    // Every vendor doc (ack, invoice, freight bill) names the PO. Read it first,
+    // before any vendor/date/amount guessing. If it names a PO that exists in
+    // the local mirror, that IS the match — no scoring.
+    const printedPo = sanitizeOcrPoCandidate(invoice.ocrPoCandidate)
+        || sanitizeOcrPoCandidate(invoice.ocrOrderCandidate);
+    if (printedPo && !/DropshipPO$/i.test(printedPo)) {
+        try {
+            const { data: byPo } = await db
+                .from("purchase_orders")
+                .select("po_number, vendor_name, issue_date, total_amount, total, status")
+                .eq("po_number", printedPo)
+                .limit(1);
+            const row = (byPo || [])[0] as any;
+            if (row?.po_number && !/DropshipPO$/i.test(String(row.po_number))) {
+                const candidate: POCandidate = {
+                    orderId: String(row.po_number),
+                    vendorName: row.vendor_name || "",
+                    orderDate: row.issue_date || "",
+                    total: Number(row.total_amount || row.total || 0),
+                    status: row.status || "unknown",
+                    score: 100,
+                    reasons: [`exact OCR PO match: ${printedPo}`, "PO number on document"],
+                    isOpen: ["open", "partial", "committed", "locked"].includes(
+                        String(row.status || "").toLowerCase()
+                    ),
+                };
+                return {
+                    invoice,
+                    candidates: [candidate],
+                    bestMatch: candidate,
+                    autoApplyReady: invoice.total > 0,
+                };
+            }
+        } catch (e: any) {
+            console.warn(`[invoice-po-matcher] PO-number fast-path failed: ${e?.message || e}`);
+        }
+    }
 
     // Load vendor aliases and resolve the invoice vendor name to a canonical
     // Finale supplier name. This bridges OCR-vs-Finale name mismatches.
@@ -275,8 +359,6 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     for (const po of (pos || []) as any[]) {
         let vendorScore = scoreVendorName(invoice.vendorName, po.vendor_name || "");
         const dateScore = scoreDateProximity(invoice.invoiceDate, po.issue_date || "");
-        const poTotal = Number(po.total_amount || po.total || 0);
-        const amountScore = scoreAmountProximity(invoice.total, poTotal);
 
         // ── Alias-match detection ───────────────────────────────────────────
         // When the invoice vendor name resolves to a canonical Finale supplier
@@ -333,7 +415,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             confirmedMatchReason = `previously confirmed by user (vendor=${invoice.vendorName}, PO=${poNumberKey})`;
         }
 
-        let total = vendorScore.score + dateScore.score + amountScore.score;
+        let total = vendorScore.score + dateScore.score;
         if (confirmedMatchReason) {
             total = 95;
         }
@@ -350,13 +432,13 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         // For auto-apply, require non-zero amount match
         const effectiveAutoApply = !isZeroAmount && total >= AUTO_APPLY_THRESHOLD;
 
-        const reasons = [vendorScore, dateScore, amountScore]
+        const reasons = [vendorScore, dateScore]
             .filter(r => r.score > 0)
             .map(r => r.reason);
         if (confirmedMatchReason) {
             reasons.push(confirmedMatchReason);
         }
-        if (isZeroAmount && amountScore.score === 0) {
+        if (isZeroAmount) {
             reasons.push("amount unknown (OCR may have missed total)");
         }
 
@@ -369,7 +451,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             orderId: po.po_number,
             vendorName: po.vendor_name,
             orderDate: po.issue_date,
-            total: poTotal,
+            total: Number(po.total_amount || po.total || 0),
             status: po.status || "unknown",
             score: total,
             reasons,
@@ -447,20 +529,15 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
     }
 
-    // ── Tier A: Unique vendor + amount ±2% + date ±14d ────────────────────
-    // When only one candidate meets all three tight criteria, it's high-
-    // confidence even if the base score is below threshold.
+    // ── Tier A: Unique vendor + date ±14d ─────────────────────────────────
+    // When only one candidate matches the vendor name and is within 14 days,
+    // it's high-confidence even if the base score is below threshold.
     if (!autoApplyReady && candidates.length > 0 && invoice.total > 0) {
         const tightCandidates = candidates.filter(c => {
             if (isDropshipPo(c.orderId)) return false;
             // Vendor score >= 30 (exact, substring, or alias match)
             const vScore = scoreVendorName(invoice.vendorName, c.vendorName);
             if (vScore.score < 30) return false;
-
-            // Amount variance <= 2%
-            if (c.total <= 0) return false;
-            const amtPct = Math.abs(invoice.total - c.total) / c.total;
-            if (amtPct > 0.02) return false;
 
             // Date within 14 days
             const normDate = (s: string) => (s || "").slice(0, 10);
@@ -476,7 +553,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         if (tightCandidates.length === 1) {
             tightCandidates[0].score = Math.max(tightCandidates[0].score, 90);
             tightCandidates[0].reasons.push(
-                "unique vendor+amount±2%+date±14d"
+                "unique vendor+date±14d"
             );
             candidates.sort((a, b) => b.score - a.score);
             autoApplyReady = !isDropshipPo(tightCandidates[0].orderId);
@@ -505,7 +582,7 @@ export interface HighConfidenceDecision {
     poNumber: string;
     score: number;
     reason: string;
-    tier: "exact_ocr" | "unique_vendor_amount_date";
+    tier: "exact_ocr" | "unique_vendor_date";
 }
 
 export function tryHighConfidenceAutoMatch(
@@ -532,14 +609,11 @@ export function tryHighConfidenceAutoMatch(
         }
     }
 
-    // Tier A-2: Unique vendor + amount ±2% + date ±14d (exclude dropship)
+    // Tier A-2: Unique vendor + date ±14d (exclude dropship)
     const tightCandidates = candidates.filter(c => {
         if (isDropshipPo(c.orderId)) return false;
         const vScore = scoreVendorName(invoice.vendorName, c.vendorName);
         if (vScore.score < 30) return false;
-        if (c.total <= 0) return false;
-        const amtPct = Math.abs(invoice.total - c.total) / c.total;
-        if (amtPct > 0.02) return false;
         const normDate = (s: string) => (s || "").slice(0, 10);
         const invTs = new Date(normDate(invoice.invoiceDate) + "T12:00:00Z").getTime();
         const poTs = new Date(normDate(c.orderDate) + "T12:00:00Z").getTime();
@@ -552,8 +626,8 @@ export function tryHighConfidenceAutoMatch(
         return {
             poNumber: tightCandidates[0].orderId,
             score: Math.max(tightCandidates[0].score, 90),
-            reason: "unique vendor+amount±2%+date±14d",
-            tier: "unique_vendor_amount_date",
+            reason: "unique vendor+date±14d",
+            tier: "unique_vendor_date",
         };
     }
 
@@ -575,7 +649,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
     // Find invoices with no PO assigned, ordered by most recent
     const { data: unmatched } = await db
         .from("vendor_invoices")
-        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, raw_data, line_items")
+        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, raw_data, line_items, pdf_storage_path")
         .is("po_number", null)
         .order("created_at", { ascending: false })
         .limit(50);
@@ -630,7 +704,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                     typeof rawData.invoiceNumber === 'string' &&
                     typeof rawData.total === 'number';
 
-                const invoiceData = hasValidRawData ? rawData : {
+                const invoiceData = await overlayLinesFromPdf(hasValidRawData ? rawData : {
                     vendorName: inv.vendor_name,
                     invoiceNumber: inv.invoice_number,
                     invoiceDate: inv.invoice_date,
@@ -643,7 +717,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
                     poNumber: result.bestMatch.orderId,
                     lineItems: inv.line_items || [],
                     confidence: "medium" as const,
-                };
+                }, inv, db);
 
                 const reconResult = await reconcileInvoiceToPO(
                     invoiceData as any,
@@ -753,7 +827,7 @@ export async function batchReconcileExistingFreight(limit: number = 10): Promise
     // Also exclude CANCELLED POs.
     const { data: candidates } = await db
         .from("vendor_invoices")
-        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, po_number, raw_data, line_items")
+        .select("id, vendor_name, invoice_number, invoice_date, subtotal, freight, tax, total, po_number, raw_data, line_items, pdf_storage_path")
         .gt("freight", 0)
         .not("po_number", "is", null)
         .order("created_at", { ascending: false })
@@ -832,7 +906,7 @@ export async function batchReconcileExistingFreight(limit: number = 10): Promise
                 typeof rawData.invoiceNumber === 'string' &&
                 typeof rawData.total === 'number';
 
-            const invoiceData = hasValidRawData ? rawData : {
+            const invoiceData = await overlayLinesFromPdf(hasValidRawData ? rawData : {
                 vendorName: inv.vendor_name,
                 invoiceNumber: inv.invoice_number,
                 invoiceDate: inv.invoice_date,
@@ -845,7 +919,7 @@ export async function batchReconcileExistingFreight(limit: number = 10): Promise
                 poNumber: inv.po_number,
                 lineItems: inv.line_items || [],
                 confidence: "medium" as const,
-            };
+            }, inv, db);
 
             const reconResult = await reconcileInvoiceToPO(
                 invoiceData as any,

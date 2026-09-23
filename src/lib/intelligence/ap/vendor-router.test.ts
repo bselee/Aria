@@ -24,6 +24,12 @@ describe("vendor-router domain match", () => {
         expect(r?.label).toContain("Gorgias");
     });
 
+    it("matches fedex.com → skip (not a Bill.com bill)", () => {
+        const r = matchVendorRouting("noreply@fedex.com", "FedEx Billing Online", "Your New FedEx Billing Online invoice is attached");
+        expect(r?.action).toBe("skip");
+        expect(r?.label).toContain("FedEx");
+    });
+
     it("matches google.com → skip", () => {
         const r = matchVendorRouting("noreply@google.com", "Google", "Receipt");
         expect(r?.action).toBe("skip");

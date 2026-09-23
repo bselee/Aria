@@ -17,10 +17,10 @@
  *   Phone photos are converted to single-page PDF before send so:
  *     (a) ap-single-forward / Bill.com MIME stay PDF,
  *     (b) pdf-parse + reconciliation handoff can populate vendor_invoices for PO match.
- *   Exceptions: internal emails, Bill.com self-notifications, FedEx past-due, Amazon tracking.
+ *   Exceptions: internal emails, Bill.com self-notifications, all FedEx
+ *   (FBO parcel, Freight, past-due — never Bill.com), Amazon tracking.
  *   Dropship vendors still forward but skip PO reconciliation (no Finale PO exists).
- *   FedEx Billing Online packets (12.99999.*.pdf): forward FULL multi-page PDF, no trim,
- *   skip product-PO / Uline bas_freight (pay-path carrier bill only).
+ *   FedEx (any lane) is not a Bill.com bill (Bill 2026-09-23). Mark read, archive.
  *
  * FLOW:
  *   1. Scan Gmail for unread emails in the ap@ inbox (max 20 per cycle)
@@ -42,11 +42,8 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import { createClient } from "@/lib/db";
 import { matchVendorRouting, VendorRoutingRule } from "@/lib/intelligence/ap/vendor-router";
 import {
-    FEDEX_CARRIER_BILL_ACTION,
-    buildFedExBillComFilename,
     classifyFedExBillingAttachment,
-    isFedExFreightOnlineBill,
-    trimToFirstPage,
+    isFedExExcludedFromBillCom,
 } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isDuplicate, isAlreadyForwarded, recordSkippedForward } from "@/lib/intelligence/ap-dedup";
 import { deriveInvoiceNumberFromSubject } from "@/lib/intelligence/ap/invoice-number";
@@ -182,11 +179,10 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
     ) {
         return true;
     }
-    // FedEx Freight LTL (acct 646135168) — billed and paid online (Billtrust
-    // presentment), never entered in Bill.com (Bill, 2026-09-21). Forwarding
-    // them creates unmatched-bill noise in reconcile-billcom forever. FBO
-    // parcel packets (noreply@fedex.com) are a different lane and still forward.
-    if (isFedExFreightOnlineBill({ from, subject })) return true;
+    // FedEx is never a Bill.com bill (Bill 2026-09-23). FBO parcel, Freight
+    // LTL, past-due, and forwarded copies all archive here. A vendor invoice
+    // that only mentions FedEx tracking does not match.
+    if (isFedExExcludedFromBillCom({ from, subject })) return true;
 
     // AAA Cooper Transportation (2026-08-13): forward INDIVIDUAL invoices only.
     // Their correspondence bundles ("Account 1159492 - BUILDASOIL"), statements,
@@ -212,9 +208,8 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
  * plus the generic junk classes measured in ap_local_forwards on 2026-08-13
  * (37 of 106 FORWARDED rows were not invoices):
  *
- *   - FedEx Billing Online statement packets — "Your New FedEx Billing Online
- *     invoice is attached" from noreply@fedex.com. Multi-invoice billing
- *     packets, NOT a single invoice; must never reach Bill.com.
+ *   - FedEx (any lane) — FBO parcel, Freight, past-due. Not a Bill.com bill
+ *     (Bill 2026-09-23). Mark read and archive. Never forward.
  *   - Vendor order acknowledgments — "Acknowledgment for OrderNumber:
  *     3259787-00 has been created." from BFG Supply (an order ack, not an
  *     invoice; the existing 'order acknowledgement' classes miss this shape).
@@ -243,16 +238,9 @@ export function isNonInvoiceEmail(args: { from: string; subject: string }): bool
     // Historical gate stays intact — every class it skipped is still skipped.
     if (isNonInvoiceSender(from, subject)) return true;
 
-    // FedEx Billing Online past-due NOTICES — "FedEx Billing Online -
-    // Invoice(s) Past Due" from BillingOnline@fedex.com. These carry NO
-    // invoice PDF (the notice, not the bill) — skip. The invoice-attached
-    // emails ("Your New FedEx Billing Online invoice is attached" from
-    // noreply@fedex.com) MUST forward: they are the FedEx carrier bills
-    // (full packet, pay-path only via fedex-billing-packet.ts).
-    // REVERSED (2026-08-18, Bill): the 08-13 gate that skipped the whole
-    // channel was wrong — "fedex can not be skipped!". The packet channel
-    // forwards as carrier_bill; only past-due notices stay skipped.
-    if (subjectLower.includes("fedex billing online") && subjectLower.includes("past due")) return true;
+    // FedEx that only shows up in the subject of a forward (sender is internal).
+    // isNonInvoiceSender already catches FedEx senders; this is the same predicate.
+    if (isFedExExcludedFromBillCom({ from, subject })) return true;
 
     // BFG Supply order acknowledgments: "Acknowledgment for OrderNumber:
     // 3259787-00 has been created." (also covers British spelling).
@@ -535,6 +523,14 @@ async function enrichInvoiceForPoMatch(args: {
     if (args.invoiceNumberHint) {
         norm.invoiceNumber = args.invoiceNumberHint;
     }
+    // Subject is the labeled invoice number ("Grassroots Invoice 34645").
+    // OCR often misses it, and a null invoice_number cannot dedup, so the
+    // same PDF lands as a PO-only row and an invoice-only row. Fill only
+    // when OCR found nothing, and never from a reminder/dunning subject.
+    if (!norm.invoiceNumber && !suspectSubjectReason(args.emailSubject)) {
+        const fromSubject = deriveInvoiceNumberFromSubject(args.emailSubject, args.pdfFilename);
+        if (fromSubject) norm.invoiceNumber = fromSubject;
+    }
     // Subject-line PO fallback
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
@@ -667,7 +663,7 @@ async function enrichInvoiceForPoMatch(args: {
                     email_subject: args.emailSubject,
                     pdf_filename: args.pdfFilename,
                     ocr_chars: rawText.length,
-                    photo_invoice: true,
+                    photo_invoice: rawText.replace(/\s/g, "").length < 80,
                     local_cache_id: localId,
                 },
                 notes:
@@ -1368,6 +1364,23 @@ export async function runLocalApForward(opts?: {
             // Process each invoice attachment (PDF as-is; images converted → PDF)
             let allPdfsForwarded = true;
             for (const att of invoiceAttachments) {
+                // FedEx document attached to a non-FedEx forward (internal Fwd
+                // with a generic subject). Never Bill.com. Email still archives
+                // below when every attachment is handled.
+                if (isFedExExcludedFromBillCom({ from, subject, filename: att.filename })) {
+                    console.log(`   [AP-Local] FedEx excluded from Bill.com: ${att.filename}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: att.filename,
+                        reason: "FedEx excluded from Bill.com (Bill 2026-09-23)",
+                        vendorRoutingAction: "skip",
+                    });
+                    summary.skipped++;
+                    continue;
+                }
+
                 // Statement / collections PDFs — log, never Bill.com
                 if (isStatementAttachment(att.filename, from, subject)) {
                     console.log(`   [AP-Local] Statement attachment — log only: ${att.filename}`);
@@ -1444,28 +1457,26 @@ export async function runLocalApForward(opts?: {
 
                 const pdfHash = crypto.createHash("sha256").update(pdfBuffer).digest("hex");
 
-                // FedEx Billing Online packets: full PDF, clean name, no product-PO match.
+                // Belt: classification can see a packet the filename gate missed.
+                // Do not rename, trim, or send. Archive with the rest of the email.
                 const fedexPacket = classifyFedExBillingAttachment({
                     from,
                     subject,
-                    filename: pdfFilename,
+                    filename: att.filename,
                     pdfTextPreview: undefined,
                 });
-                const isFedExCarrierBill = fedexPacket.isPacket;
-                if (isFedExCarrierBill) {
-                    pdfFilename = buildFedExBillComFilename(fedexPacket, pdfFilename);
-                    // First-page-only forward (2026-09-15): page 1 = summary +
-                    // invoice number + total. Trimming defeats Bill.com's OCR
-                    // mis-read of the dashed invoice # across 100–150 pages.
-                    if (fedexPacket.mayTrimPages) {
-                        const trimmed = await trimToFirstPage(pdfBuffer);
-                        if (trimmed !== pdfBuffer) {
-                            pdfBuffer = trimmed;
-                        }
-                    }
-                    console.log(
-                        `   [AP-Local] 📦 FedEx carrier bill → ${pdfFilename} (page 1 of ${fedexPacket.mayTrimPages ? "multi" : "1"}, skip PO match)`,
-                    );
+                if (fedexPacket.isPacket || isFedExExcludedFromBillCom({ from, subject, filename: att.filename })) {
+                    console.log(`   [AP-Local] FedEx packet excluded from Bill.com: ${att.filename}`);
+                    recordSkippedForward({
+                        gmailMessageId,
+                        emailFrom: from,
+                        emailSubject: subject,
+                        pdfFilename: att.filename,
+                        reason: "FedEx packet excluded from Bill.com (Bill 2026-09-23)",
+                        vendorRoutingAction: "skip",
+                    });
+                    summary.skipped++;
+                    continue;
                 }
 
                 // Dedup: hash / message+file / vendor+inv — log, never re-send
@@ -1528,18 +1539,6 @@ export async function runLocalApForward(opts?: {
                     continue;
                 }
 
-                const fedexMeta = isFedExCarrierBill
-                    ? classifyFedExBillingAttachment({
-                        from,
-                        subject,
-                        filename: att.filename,
-                        pdfTextPreview: paidCheck.rawText,
-                    })
-                    : fedexPacket;
-                if (isFedExCarrierBill) {
-                    pdfFilename = buildFedExBillComFilename(fedexMeta, att.filename);
-                }
-
                 // Forward to Bill.com — ONLY via single-forward gate (DB claim first).
                 // Gate records FORWARDED/ERROR itself — do not write a second ERROR row
                 // with a different filename (that used to UNIQUE-block retries forever).
@@ -1553,18 +1552,12 @@ export async function runLocalApForward(opts?: {
                         source: "local-forwarder",
                         gmail,
                         ocrRawText: paidCheck.rawText,
-                        vendorRoutingAction: isFedExCarrierBill
-                            ? FEDEX_CARRIER_BILL_ACTION
-                            : skipReconciliation
-                              ? "dropship"
+                        vendorRoutingAction: skipReconciliation ? "dropship" : undefined,
+                        vendorName: aaaProNumber
+                            ? "AAA Cooper Transportation"
+                            : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
+                              ? "Down to Earth Worms"
                               : undefined,
-                        vendorName: isFedExCarrierBill
-                            ? "FedEx"
-                            : aaaProNumber
-                              ? "AAA Cooper Transportation"
-                              : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
-                                ? "Down to Earth Worms"
-                                : undefined,
                         invoiceNumber: aaaProNumber || undefined,
                     });
                     if (once.status === "already_forwarded") {
@@ -1632,8 +1625,7 @@ export async function runLocalApForward(opts?: {
                     // Vision/OCR + vendor_invoices so Receivings can PO-match.
                     // Photo invoices need LLM OCR (pdf-parse returns ~0 text).
                     // Non-fatal: Bill.com already has the bill.
-                    // FedEx carrier bills: skip product-PO enrich (wrong product).
-                    if (!isFedExCarrierBill && !skipReconciliation) {
+                    if (!skipReconciliation) {
                         try {
                             await enrichInvoiceForPoMatch({
                                 gmailMessageId,
@@ -1655,10 +1647,6 @@ export async function runLocalApForward(opts?: {
                                 `   [AP-Local] PO-match enrich failed for ${pdfFilename}: ${enrichErr?.message || enrichErr}`,
                             );
                         }
-                    } else if (isFedExCarrierBill) {
-                        console.log(
-                            `   [AP-Local] ⏭️ FedEx carrier bill — skipped product-PO enrich (${pdfFilename})`,
-                        );
                     }
                 } catch (e: any) {
                     summary.errors++;

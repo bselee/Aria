@@ -64,7 +64,9 @@ export interface ReceivedPO {
     receiptStatus?: "full" | "partial" | "received";
     supplier: string;
     total: number;
-    items: Array<{ productId: string; quantity: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
+    /** Goods subtotal from the bulk query. Freight is total − subtotal. Finale has no freight until we add it. */
+    subtotal?: number;
+    items: Array<{ productId: string; quantity: number; unitPrice?: number; orderedQuantity?: number; receivedQuantity?: number; openQuantity?: number }>;
     receiptHistory?: Array<{
         shipmentId: string;
         receiveDate: string;
@@ -217,9 +219,11 @@ export interface FullPO {
     total: number;
     notes?: string | null;       // Internal notes
     comments?: string | null;    // External notes (to vendor)
-    items: Array<{ productId: string; quantity: number }>;
     finaleUrl: string;
     shipments?: Array<{ shipmentId: string; status: string; receiveDate: string | null; shipDate: string | null }>;
+    /** Goods subtotal. Freight already on the PO is total − subtotal. */
+    subtotal?: number;
+    items: Array<{ productId: string; quantity: number; unitPrice?: number }>;
 }
 
 export interface DraftPOReview {
@@ -679,10 +683,12 @@ export function deriveReceivedPurchaseOrders(
                 receiptStatus: getReceiptStatusFromPoStatus(po.status),
                 supplier: po.supplier?.name || "Unknown",
                 total: parseFinaleNumber(po.total),
+                subtotal: parseFinaleNumber(po.subtotal),
                 items: (po.itemList?.edges || []).map((ie: any) => ({
                     productId: ie.node.product?.productId || "?",
                     quantity: parseFinaleNumber(ie.node.quantity),
                     orderedQuantity: parseFinaleNumber(ie.node.quantity),
+                    unitPrice: parseFinaleNumber(ie.node.unitPrice),
                 })),
                 finaleUrl: `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`,
             } satisfies ReceivedPO;

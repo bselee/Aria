@@ -58,13 +58,22 @@ export async function syncPurchaseOrders(daysBack = 90): Promise<POSyncStats> {
             try {
                 const isNew = !existingSet.has(po.orderId);
 
+                const goods = (po.items || []).reduce(
+                    (sum: number, it: { quantity?: number; unitPrice?: number }) =>
+                        sum + (Number(it.quantity) || 0) * (Number(it.unitPrice) || 0),
+                    0,
+                );
+                const poTotal = Number(po.total) || 0;
+                const stated = Number((po as { subtotal?: number }).subtotal) || 0;
+                const subtotal = stated > 0 ? stated : goods;
                 await db.from("purchase_orders").upsert({
                     po_number: po.orderId,
                     vendor_name: po.vendorName || null,
                     vendor_party_id: (po as any).vendorPartyId || null,
                     status: normalizePOStatus(po.status),
                     issue_date: po.orderDate || null,
-                    total_amount: po.total || 0,
+                    total_amount: poTotal || subtotal,
+                    total: poTotal || subtotal,
                     line_items: po.items || [],
                     updated_at: new Date().toISOString(),
                 }, { onConflict: "po_number" });

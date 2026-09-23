@@ -22,6 +22,7 @@ import {
     matchVendorFromOrigin,
     parseCollectEntry,
     pickPoForEntry,
+    pickShipmentItemsForBill,
     receiveWindowDaysForVendor,
     scoreFreightApplyConfidence,
 } from "./match";
@@ -307,7 +308,7 @@ describe("pickPoForEntry", () => {
         expect(pick?.orderId).toBe("120123");
     });
 
-    it("Rootwise does not match on orderDate alone without a receive in window", () => {
+    it("matches the only open PO when nothing has been received yet", () => {
         const noRec = [
             {
                 orderId: "120999",
@@ -317,7 +318,16 @@ describe("pickPoForEntry", () => {
             },
         ];
         const entry = parseCollectEntry(rootwiseCollectInvoice())!;
-        expect(pickPoForEntry(entry, noRec, "Rootwise Soil Dynamics")).toBeNull();
+        expect(pickPoForEntry(entry, noRec, "Rootwise Soil Dynamics")?.orderId).toBe("120999");
+    });
+
+    it("does not guess when two open POs have no receive", () => {
+        const two = [
+            { orderId: "120999", vendorName: "Rootwise Soil Dynamics", orderDate: "2026-07-20", shipments: [] },
+            { orderId: "120998", vendorName: "Rootwise Soil Dynamics", orderDate: "2026-07-18", shipments: [] },
+        ];
+        const entry = parseCollectEntry(rootwiseCollectInvoice())!;
+        expect(pickPoForEntry(entry, two, "Rootwise Soil Dynamics")).toBeNull();
     });
 
     it("Granite allows longer calendar span still under 10 biz days", () => {
@@ -473,11 +483,14 @@ describe("scoreFreightApplyConfidence", () => {
         expect(s.mayApply).toBe(true);
     });
 
-    it("MEDIUM multi-delivery without receive", () => {
-        const s = scoreFreightApplyConfidence(baseInput({ receiveDiffDays: null }));
-        expect(s.confidence).toBe("medium");
-        expect(s.mayApply).toBe(false);
-        expect(s.reasons).toContain("multi_delivery_no_receive");
+    it("HIGH when the vendor is known and the PO has no receive yet", () => {
+        const s = scoreFreightApplyConfidence(baseInput({
+            vendor: "Concentrates, Inc",
+            receiveDiffDays: null,
+        }));
+        expect(s.confidence).toBe("high");
+        expect(s.mayApply).toBe(true);
+        expect(s.reasons).toContain("pre_receive");
     });
 
     it("LOW unmatched / excluded / dropship / already", () => {
@@ -534,5 +547,47 @@ describe("scoreFreightApplyConfidence", () => {
             }),
         )!;
         expect(extractHardFinalePoNumber(entry)).toBeNull();
+    });
+});
+
+describe("pickShipmentItemsForBill", () => {
+    const trucks = [
+        {
+            receiveDate: "2026-07-31",
+            items: [{ productId: "RMC100", quantity: 560 }],
+        },
+        {
+            receiveDate: "2026-08-13",
+            tracking: "300422768801",
+            items: [{ productId: "RBE101", quantity: 108 }],
+        },
+        {
+            receiveDate: "2026-08-27",
+            items: [{ productId: "RWBP100", quantity: 80 }],
+        },
+        {
+            receiveDate: "2026-08-27",
+            items: [{ productId: "RWBP104", quantity: 33 }],
+        },
+    ];
+
+    it("picks the closest receive when dates differ", () => {
+        expect(pickShipmentItemsForBill(trucks, "2026-07-30", {})).toEqual([
+            { productId: "RMC100", quantity: 560 },
+        ]);
+    });
+
+    it("uses the PRO when two shipments share a receive date", () => {
+        const sameDay = [
+            { receiveDate: "2026-08-27", tracking: "PRO-A", items: [{ productId: "RWBP100", quantity: 80 }] },
+            { receiveDate: "2026-08-27", tracking: "PRO-B", items: [{ productId: "RWBP104", quantity: 33 }] },
+        ];
+        expect(pickShipmentItemsForBill(sameDay, "2026-08-26", { proNumber: "PRO-B" })).toEqual([
+            { productId: "RWBP104", quantity: 33 },
+        ]);
+    });
+
+    it("holds when two shipments share the date and neither has the PRO", () => {
+        expect(pickShipmentItemsForBill(trucks, "2026-08-26", { proNumber: "missing" })).toBeNull();
     });
 });

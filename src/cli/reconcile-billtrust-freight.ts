@@ -64,6 +64,9 @@ interface FinaleWriteSurface {
     unlockForEditing(currentPO: PoDoc, orderId: string): Promise<string>;
     restoreOrderStatus(orderId: string, originalStatus: string): Promise<void>;
     post(endpoint: string, body: unknown): Promise<unknown>;
+    freightAllocLines(
+        orderItemList: Array<{ productId?: string; quantity?: number; weight?: number }> | undefined,
+    ): Promise<Array<{ quantity: number; weight?: number }>>;
 }
 
 /**
@@ -84,10 +87,7 @@ async function applyFreightToPo(
     const zeroFreightIdx = adjustments.findIndex(
         (a) => (a.productPromoUrl ?? "").includes("/10007") && Number(a.amount) === 0,
     );
-    const items = (po.orderItemList ?? []).map((item) => ({
-        quantity: Number(item.quantity) || 0,
-        weight: Number(item.weight) || undefined,
-    }));
+    const items = await finale.freightAllocLines(po.orderItemList);
     const existingFreight = adjustments.filter((a) => (a.productPromoUrl ?? "").includes("/10007"));
     const existingAlloc = !isMultiDelivery && existingFreight.length === 1
         ? existingFreight[0].orderAdjustmentAllocationList
@@ -373,7 +373,7 @@ async function matchToFinalePOs(
             freightAlreadyOnPO: false,
             confidence: "low",
             confidenceReasons: [],
-            label: inv.bol ? `Freight BOL ${inv.bol}` : `Freight ${inv.invoiceNumber}`,
+            label: "Freight",
         };
 
         // 1. Direct PO# match (never Dropship / non-numeric junk)

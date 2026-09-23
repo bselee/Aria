@@ -16,6 +16,7 @@
 import { z } from "zod";
 import { unifiedObjectGeneration } from "./llm";
 import {
+    BAS_ADDRESS,
     BILL_VENDOR_REPLY_VOICE,
     extractReplyFirstName,
     gradeVendorReplyDraft,
@@ -178,6 +179,12 @@ Attachments: ${pdfs || "(none listed)"}
 
 Email:
 ${body}
+
+Canonical contact — use ONLY these; never invent an address or phone number:
+- Samples ship to: ${BAS_ADDRESS.billTo.replace(/\n/g, ", ")}
+- Order / freight ship-to: ${BAS_ADDRESS.shipTo.replace(/\n/g, ", ")}
+- Phone: ${BAS_ADDRESS.phone}
+Only include a ship-to address if the reply actually needs one; otherwise omit it.
 
 Return JSON:
 - draftBody: full plain-text reply including Hi/Name and Bill sign-off on separate lines

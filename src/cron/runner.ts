@@ -23,6 +23,7 @@ const _inFlight = new Set<string>();
 
 import { getJob, listJobs } from "./registry";
 import { recordStart, recordEnd, lastRun, isSuccessStatus, type CronRunStatus } from "./history";
+import { tryAcquireProcessLock } from "./process-lock";
 
 // One Bottleneck per job. concurrency comes from JobDef.
 const _limiters = new Map<string, Bottleneck>();
@@ -94,6 +95,15 @@ export async function runJobOnce(
         return { status: "skipped", durationMs: 0, failureReason: "concurrency-locked" };
     }
 
+    // Cross-process lock. Bottleneck only sees this process. An orphan PM2
+    // fork has its own limiter and will otherwise run the same tick.
+    const releaseLock = tryAcquireProcessLock(jobName);
+    if (!releaseLock) {
+        console.warn(`[cron-runner] ${jobName}: skipped, another process holds the lock`);
+        return { status: "skipped", durationMs: 0, failureReason: "process-locked" };
+    }
+
+    try {
     const correlationId = `${jobName}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     const startMs = Date.now();
     const startedAtIso = new Date().toISOString();
@@ -159,6 +169,9 @@ export async function runJobOnce(
     });
 
     return result;
+    } finally {
+        releaseLock();
+    }
 }
 
 /**

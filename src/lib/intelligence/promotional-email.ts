@@ -21,6 +21,9 @@ const PROMOTIONAL_SENDERS = [
     "mail.aliexpress.com",
     "notice.alibaba.com",
     "buynotice.alibaba.com",
+    "comms.dell.com",
+    "e.citymarketmail.com",
+    "mg.homedepot.com",
 ];
 
 const PROMOTIONAL_TERMS = [

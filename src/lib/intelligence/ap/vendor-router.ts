@@ -2,7 +2,7 @@
  * @file    src/lib/intelligence/ap/vendor-router.ts
  * @purpose Minimal vendor routing rules. Core principle: ALL PDF invoices forward
  *          to Bill.com. Only skip: internal emails, Bill.com self-notifications,
- *          FedEx past-due notices, Amazon order confirmations, own statements,
+ *          all FedEx (not a Bill.com bill), Amazon order confirmations, own statements,
  *          shipment notices / order acks / vendor statements.
  *          Dropship markers are PO-matching hints only — still forward.
  * @author  Hermia
@@ -24,8 +24,9 @@
 //   Skips are for: prepaid/online vendors (no discoverable amount to forward),
 //   internal emails, Bill.com self-notifications, FedEx past-due notices,
 //   Amazon tracking, own statements, and non-invoice classes (shipment/ack/statement).
-//   FedEx is the corrected exception: was wrongly marked autopay.
-//   Invoice PDFs from noreply@fedex.com flow through to forwarding + PO matching.
+//   FedEx is not entered in Bill.com (Bill 2026-09-23). FBO parcel, Freight,
+//   past-due, and forwarded copies all skip. A vendor invoice that only
+//   mentions FedEx tracking still forwards.
 //
 // HERMIA(2026-07-17):
 //   Toyota Industries Commercial Finance (TICF / BillTrust) = paid online — never Bill.com.
@@ -71,9 +72,15 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     { match: { domain: 'billtrust.com', senderContains: 'toyota' }, action: 'skip', label: 'Toyota CF via BillTrust (Paid Online)' },
     { match: { domain: 'toyotacf.com' }, action: 'skip', label: 'Toyota CF Domain (Paid Online)' },
 
-    // ── Skip: FedEx past-due notices (no invoice PDF) ──────────────────
-    // Invoice PDFs come from noreply@fedex.com and flow through normally.
-    { match: { fromExact: 'billingonline@fedex.com' }, action: 'skip', label: 'FedEx Past Due (No Invoice)' },
+    // ── Skip: all FedEx (Bill 2026-09-23 — not a Bill.com bill) ────────
+    // FBO parcel (noreply@fedex.com), Freight, past-due, and forwarded copies.
+    // A vendor invoice that only mentions FedEx tracking does not match.
+    { match: { domain: 'fedex.com' }, action: 'skip', label: 'FedEx (not a Bill.com bill)' },
+    { match: { senderContains: 'fedex' }, action: 'skip', label: 'FedEx sender (not a Bill.com bill)' },
+    { match: { subjectContains: 'fedex billing online' }, action: 'skip', label: 'FedEx Billing Online (not a Bill.com bill)' },
+    { match: { subjectContains: 'fedex freight' }, action: 'skip', label: 'FedEx Freight (not a Bill.com bill)' },
+    { match: { subjectContains: 'bill from fedex' }, action: 'skip', label: 'FedEx bill notice (not a Bill.com bill)' },
+    { match: { filenameContains: '12.99999.' }, action: 'skip', label: 'FedEx FBO packet (not a Bill.com bill)' },
 
     // ── Skip: BuildASoil own statements ────────────────────────────────
     { match: { subjectContains: 'build a soil statement' }, action: 'skip', label: 'BuildASoil Statement (Internal)' },

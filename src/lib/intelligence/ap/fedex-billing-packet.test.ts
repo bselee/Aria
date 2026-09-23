@@ -15,6 +15,7 @@ import {
     isFedExBillingOnlineEmail,
     isFedExBillingPacketFilename,
     isFedExCarrierBillExtractedJson,
+    isFedExExcludedFromBillCom,
     extractFedExInvoiceNumberFromText,
     detectFedExBillingServiceHint,
     trimToFirstPage,
@@ -46,6 +47,37 @@ describe("extract + format invoice #", () => {
     it("parses Invoice Number from summary text", () => {
         const text = "Invoice Number\n9-398-79901\nAccount Number\nXXXX-X525-0\nTOTAL THIS INVOICE\nUSD\n$10,958.44";
         expect(extractFedExInvoiceNumberFromText(text)).toBe("9-398-79901");
+    });
+});
+
+describe("isFedExExcludedFromBillCom", () => {
+    it("excludes FBO parcel, Freight, past-due, and packet filenames", () => {
+        expect(isFedExExcludedFromBillCom({
+            from: "FedEx Billing Online <noreply@fedex.com>",
+            subject: "Your New FedEx Billing Online invoice is attached",
+        })).toBe(true);
+        expect(isFedExExcludedFromBillCom({
+            from: "BillingOnline <BillingOnline@fedex.com>",
+            subject: "FedEx Billing Online - Invoice(s) Past Due",
+        })).toBe(true);
+        expect(isFedExExcludedFromBillCom({
+            from: "BuildASoil Support <support@buildasoil.com>",
+            subject: "Fwd: invoice",
+            filename: "12.99999.10033.939879901.XXXXX5250.000030.pdf",
+        })).toBe(true);
+        expect(isFedExExcludedFromBillCom({
+            from: "support@buildasoil.com",
+            subject: "Fwd: Acct No. 646135168: Your Bill from FedEx Freight is Available Online",
+        })).toBe(true);
+    });
+
+    it("does not exclude a vendor invoice that only mentions FedEx", () => {
+        expect(isFedExExcludedFromBillCom({
+            from: "accounts.receivable@uline.com",
+            subject: "Uline Invoice 211897049 shipped via FedEx",
+            filename: "Uline_Invoice_201.pdf",
+            pdfText: "Ship Via FEDEX FREIGHT COLLECT",
+        })).toBe(false);
     });
 });
 

@@ -30,7 +30,7 @@ import {
     type SendPurchaseOrderEmailResult,
     type POInfo,
 } from "./core-client";
-import { freightAdjustmentForPo } from "./freight-adjustment";
+import { freightAdjustmentForPo, weightInPounds } from "./freight-adjustment";
 
 // ── Concurrency-limited async map ────────────────────────────────────────
 /**
@@ -139,12 +139,14 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             receiveDate
                                         }
                                         total
+                                        subtotal
                                         supplier { name }
                                         itemList(first: 50) {
                                             edges {
                                                 node {
                                                     product { productId }
                                                     quantity
+                                                    unitPrice
                                                 }
                                             }
                                         }
@@ -793,17 +795,20 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
         for (const item of items) {
             const quantity = Number(item.quantity) || 0;
             let weight = Number(item.weight) || 0;
+            let uom: string | undefined;
             if (quantity > 0 && weight <= 0 && item.productId) {
                 try {
                     const product = await this.get(
                         `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
                     );
                     weight = Number(product?.weight) || 0;
+                    uom = typeof product?.weightUomId === "string" ? product.weightUomId : undefined;
                 } catch {
                     weight = 0;
                 }
             }
-            lines.push({ quantity, weight: weight > 0 ? weight : undefined });
+            const pounds = weightInPounds(weight, uom);
+            lines.push({ quantity, weight: pounds > 0 ? pounds : undefined });
         }
         return lines;
     }
@@ -1311,6 +1316,32 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
     }
 
     /**
+     * Store the vendor's part number on Supplier 1 when that field is blank.
+     * Does not overwrite an ID that is already there. Does not ask anyone to upload a list.
+     *
+     * @param productId - Our SKU
+     * @param vendorPart - Part number printed on the vendor invoice
+     * @returns True when the blank field was filled
+     */
+    async rememberSupplier1ProductId(productId: string, vendorPart: string): Promise<boolean> {
+        const part = vendorPart.trim();
+        if (!part || part.toLowerCase() === productId.toLowerCase()) return false;
+        const url = `/${this.accountPath}/api/product/${encodeURIComponent(productId)}`;
+        try {
+            const product = await this.get(url);
+            const slot = (product.supplierList || [])[0];
+            if (!slot) return false;
+            if (String(slot.supplierProductId || "").trim()) return false;
+            slot.supplierProductId = part;
+            await this.post(url, product);
+            return true;
+        } catch (error: any) {
+            console.warn(`⚠️ [FinaleClient] Failed to store Supplier 1 product ID for ${productId}:`, error.message);
+            return false;
+        }
+    }
+
+    /**
      * Fetch full shipment details via REST API.
      * @param shipmentUrl - Full shipment URL path (e.g., "/buildasoilorganics/api/shipment/577917")
      */
@@ -1696,6 +1727,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                     dueDate
                                     receiveDate
                                     total
+                                    subtotal
                                     supplier { name partyUrl }
                                     shipmentList {
                                         shipmentId
@@ -1708,6 +1740,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                             node {
                                                 product { productId }
                                                 quantity
+                                                unitPrice
                                             }
                                         }
                                     }
@@ -1724,7 +1757,11 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             return edges.map((edge: any) => {
                 const po = edge.node;
                 const items = (po.itemList?.edges || [])
-                    .map((e: any) => ({ productId: e.node?.product?.productId ?? '', quantity: e.node?.quantity ?? 0 }))
+                    .map((e: any) => ({
+                        productId: e.node?.product?.productId ?? '',
+                        quantity: e.node?.quantity ?? 0,
+                        unitPrice: parseFinaleNumber(e.node?.unitPrice),
+                    }))
                     .filter((i: any) => i.productId);
                 // Normalize any date to YYYY-MM-DD (Finale returns inconsistent formats like "4/2/2026")
                 const toISODate = (d: string | null | undefined): string | null => {
@@ -1747,6 +1784,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                     receiveDate: toISODate(po.receiveDate),
                     status: po.status ?? '',
                     total: parseFinaleNumber(po.total),
+                    subtotal: parseFinaleNumber(po.subtotal),
                     items,
                     finaleUrl: `https://app.finaleinventory.com/${this.accountPath}/sc2/?order/purchase/order/${Buffer.from(po.orderUrl || '').toString('base64')}`,
                     shipments

@@ -35,7 +35,7 @@
 import { getLocalDb } from "@/lib/storage/local-db";
 import { importCsvFile, parseCSV, type ParsedRow } from "./import-billcom-ref";
 import { isStatementDocument } from "@/lib/intelligence/ap-statement-gate";
-import { isFedExFreightOnlineBill } from "@/lib/intelligence/ap/fedex-billing-packet";
+import { isFedExExcludedFromBillCom } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isQuoteOrSpecDocument } from "@/lib/intelligence/ap/quote-spec-gate";
 import fs from "fs";
 import os from "os";
@@ -631,13 +631,13 @@ async function main(): Promise<void> {
     // BFG order acks, Uline payment-information docs, AAA Cooper collection
     // correspondence. Router rules prevent these from forwarding today.
     const filename = f.pdf_filename || "";
-    // FedEx Freight LTL (acct 646135168, invoice 3004…) is presented and paid
-    // online — Bill never enters it in Bill.com (confirmed 2026-09-21 for
-    // 300408064402 / 300408264007). Never a missing bill.
-    const fedexFreightOnline = isFedExFreightOnlineBill({
-      from: f.email_from,
+    // FedEx (FBO parcel and Freight) is not a Bill.com bill (Bill 2026-09-23).
+    // Historical forwards must not keep showing up as missing.
+    const fedexNotABill = isFedExExcludedFromBillCom({
+      from: `${f.email_from || ""} ${displayVendor || ""}`,
       subject: f.email_subject,
       filename,
+      vendorName: displayVendor,
       invoiceNumber: invoice,
     });
     // Quote / spec-sheet documents (Century Equipment, 2026-09-16) are not
@@ -647,7 +647,7 @@ async function main(): Promise<void> {
       filename,
       pdfText: f.ocr_raw_text,
     });
-    const noBillClass = fedexFreightOnline
+    const noBillClass = fedexNotABill
       || quoteSpecDoc
       || /acknowledgment_/i.test(filename)
       || /us payment information/i.test(filename)

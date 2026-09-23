@@ -166,6 +166,57 @@ Thanks!`;
         expect(g.failures).toEqual([]);
         expect(g.pass).toBe(true);
     });
+
+    it("FAILS a draft that invents a shipping address", () => {
+        const bad = `Hi Surya,
+
+A sample would be welcome. Please ship to:
+BuildASoil
+123 Main Street
+Montrose, CO 81401
+
+Thanks!`;
+        const g = gradeVendorReplyDraft({
+            draftBody: bad,
+            inboundFrom: "Surya <care@medikonda.com>",
+            inboundSubject: "FD Coconut Powder sample",
+            inboundBody: "Hi Bill, would you like a sample of our FD Coconut Powder?",
+        });
+        expect(g.pass).toBe(false);
+        expect(g.failures).toEqual(expect.arrayContaining(["invented_address"]));
+    });
+
+    it("FAILS a draft that invents a phone number", () => {
+        const bad = `Hi David,
+
+Thanks for the spec sheet. Please quote one super sack to start. Call me at 970-123-4567.
+
+Thanks!`;
+        const g = gradeVendorReplyDraft({
+            draftBody: bad,
+            inboundFrom: "David <davidc@lonestarbarite.com>",
+            inboundSubject: "Calcium bentonite spec sheet",
+            inboundBody: "Hi Bill, here is the spec sheet you requested.",
+        });
+        expect(g.pass).toBe(false);
+        expect(g.failures).toEqual(expect.arrayContaining(["invented_phone"]));
+    });
+
+    it("PASSES a draft using the canonical sample ship-to", () => {
+        const good = `Hi Surya,
+
+A sample would be welcome. Please ship to BuildASoil, 5016 N Townsend Ave, Montrose, CO 81401.
+
+Thanks!`;
+        const g = gradeVendorReplyDraft({
+            draftBody: good,
+            inboundFrom: "Surya <care@medikonda.com>",
+            inboundSubject: "FD Coconut Powder sample",
+            inboundBody: "Hi Bill, would you like a sample of our FD Coconut Powder?",
+        });
+        expect(g.failures).toEqual([]);
+        expect(g.pass).toBe(true);
+    });
 });
 
 describe("composeSimpleThanks / Cari path", () => {

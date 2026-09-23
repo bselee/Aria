@@ -8,6 +8,7 @@ import { _resetRegistry, listJobs, getJob } from "../registry";
 
 const EXPECTED_JOBS = [
     "ap-polling",
+    "inbox-screen",
     "build-risk",
     "daily-summary",
     "weekly-summary",
