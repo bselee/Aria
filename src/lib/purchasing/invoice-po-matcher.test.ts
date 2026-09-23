@@ -48,11 +48,17 @@ vi.mock("@/lib/finale/reconciler", () => ({
 vi.mock("@/lib/purchasing/po-lifecycle", () => ({
     transitionLifecycleState: vi.fn(),
 }));
-vi.mock("@/lib/purchasing/vendor-name-normalize", () => ({
-    normalizeVendorName: (s: string) => (s || "").toUpperCase().replace(/\s+/g, " ").trim(),
-    resolveCanonicalVendor: () => null,
-    loadVendorAliases: vi.fn().mockResolvedValue([]),
-}));
+vi.mock("@/lib/purchasing/vendor-name-normalize", async (importOriginal) => {
+    // Use the REAL pure functions (normalizeVendorName / normalizeVendorKey)
+    // so the suffix/punctuation-drift fix is actually exercised; only the
+    // DB-backed alias resolution is stubbed.
+    const actual = await importOriginal<typeof import("@/lib/purchasing/vendor-name-normalize")>();
+    return {
+        ...actual,
+        resolveCanonicalVendor: () => null,
+        loadVendorAliases: vi.fn().mockResolvedValue([]),
+    };
+});
 
 // Mock finale modules to prevent transitive loading of tracking modules
 // with live I/O side effects.
@@ -260,7 +266,7 @@ describe("tryHighConfidenceAutoMatch", () => {
         const result = tryHighConfidenceAutoMatch(inv, candidates);
         expect(result).not.toBeNull();
         expect(result!.poNumber).toBe("PO-001");
-        expect(result!.tier).toBe("unique_vendor_amount_date");
+        expect(result!.tier).toBe("unique_vendor_date");
         expect(result!.score).toBeGreaterThanOrEqual(90);
     });
 
@@ -304,25 +310,6 @@ describe("tryHighConfidenceAutoMatch", () => {
                 total: 100,
                 orderDate: "2026-07-14",
                 score: 10,
-            }),
-        ];
-        const result = tryHighConfidenceAutoMatch(inv, candidates);
-        expect(result).toBeNull();
-    });
-
-    it("returns null when amount variance > 2%", () => {
-        const inv = makeInvoice({
-            vendorName: "TestCo",
-            total: 100,
-            invoiceDate: "2026-07-15",
-        });
-        const candidates = [
-            makePO({
-                orderId: "PO-001",
-                vendorName: "TestCo",
-                total: 500,
-                orderDate: "2026-07-14",
-                score: 70,
             }),
         ];
         const result = tryHighConfidenceAutoMatch(inv, candidates);

@@ -11,6 +11,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
     normalizeVendorName,
+    normalizeVendorKey,
     resolveCanonicalVendor,
     loadVendorAliases,
     clearVendorAliasesCache,
@@ -98,6 +99,40 @@ describe("normalizeVendorName", () => {
         expect(result).toBe("DIA!OND K GYPSUM, INC.");
         // Ensure the exclamation mark is preserved (it's a valid ASCII char)
         expect(result).toContain("!");
+    });
+});
+
+// ── normalizeVendorKey ──────────────────────────────────────────────────────
+
+describe("normalizeVendorKey", () => {
+    it("collapses corporate-suffix drift (FertiOrganic Inc vs Ferti-Organic)", () => {
+        expect(normalizeVendorKey("FertiOrganic Inc")).toBe("fertiorganic");
+        expect(normalizeVendorKey("Ferti-Organic")).toBe("fertiorganic");
+    });
+
+    it("collapses LLC suffix drift (Belt Power, LLC vs Belt Power)", () => {
+        expect(normalizeVendorKey("Belt Power, LLC")).toBe("beltpower");
+        expect(normalizeVendorKey("Belt Power")).toBe("beltpower");
+    });
+
+    it("collapses comma + suffix (Logan Labs, LLC vs LOGAN LABS LLC)", () => {
+        expect(normalizeVendorKey("Logan Labs, LLC")).toBe("loganlabs");
+        expect(normalizeVendorKey("LOGAN LABS LLC")).toBe("loganlabs");
+    });
+
+    it("collapses period + suffix (Grassroots Fabric Pots Inc.)", () => {
+        expect(normalizeVendorKey("Grassroots Fabric Pots Inc.")).toBe(
+            "grassrootsfabricpots",
+        );
+        expect(normalizeVendorKey("Grassroots Fabric Pots")).toBe(
+            "grassrootsfabricpots",
+        );
+    });
+
+    it("returns empty string for null/empty input", () => {
+        expect(normalizeVendorKey(null)).toBe("");
+        expect(normalizeVendorKey(undefined)).toBe("");
+        expect(normalizeVendorKey("")).toBe("");
     });
 });
 

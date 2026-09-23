@@ -67,6 +67,47 @@ export function normalizeVendorName(raw: string | null | undefined): string {
         .toUpperCase();
 }
 
+// Corporate-suffix drift: legal suffixes that differ between OCR/Bill.com
+// and Finale (e.g. "Belt Power, LLC" vs "Belt Power", "Logan Labs, LLC" vs
+// "LOGAN LABS LLC"). Stripped at word boundaries, case-insensitive.
+const SUFFIX_LC_RE =
+    /\b(inc|llc|l\.?\s?l\.?\s?c|ltd|co|corp|company|incorporated|corporation|group)\b/g;
+
+/**
+ * Build a canonical comparison key for vendor names — the aggressive form of
+ * `normalizeVendorName` used ONLY for equality/substring scoring (never for
+ * display or alias resolution). It strips legal suffixes and collapses all
+ * non-alphanumeric characters (including hyphens and spaces) so that
+ * cross-system variants resolve to the same token:
+ *
+ *   normalizeVendorKey("FertiOrganic Inc")  // → "fertiorganic"
+ *   normalizeVendorKey("Ferti-Organic")     // → "fertiorganic"
+ *   normalizeVendorKey("Belt Power, LLC")   // → "beltpower"
+ *   normalizeVendorKey("Belt Power")        // → "beltpower"
+ *
+ * This is the fix documented in
+ * `vendor-name-normalization/references/ocr-vendor-junk-and-suffix-drift.md`
+ * (§2 "Corporate-suffix drift") that was previously only applied in a
+ * one-off reconciliation script, not the shared normalizer.
+ *
+ * @param raw  Raw vendor name from an invoice or PO.
+ * @returns    Lowercase alphanumeric key, or '' for null/empty input.
+ */
+export function normalizeVendorKey(raw: string | null | undefined): string {
+    if (raw === null || raw === undefined || raw === "") return "";
+
+    return raw
+        .toLowerCase()
+        // Punctuation to space, so "Logan Labs, LLC" → "logan labs  llc"
+        .replace(/[.,/\\|]/g, " ")
+        // Strip legal suffixes ("Inc", "LLC", "Co", "Corp", …)
+        .replace(SUFFIX_LC_RE, " ")
+        // Collapse every remaining non-alphanumeric run (spaces, hyphens, &c.)
+        // so "Ferti-Organic" and "FertiOrganic" both become "fertiorganic".
+        .replace(/[^a-z0-9]+/g, "")
+        .trim();
+}
+
 // ── Resolve canonical vendor via aliases ────────────────────────────────────
 
 /**
