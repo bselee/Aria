@@ -64,6 +64,11 @@ describe("suspectSubjectReason", () => {
         ).toBeNull();
     });
 
+    it("does not flag a Grassroots invoice subject (that number is the invoice)", () => {
+        expect(suspectSubjectReason("Grassroots Invoice 34645")).toBeNull();
+        expect(suspectSubjectReason("Fwd: Grassroots Invoice 32654")).toBeNull();
+    });
+
     it("handles null/empty subjects", () => {
         expect(suspectSubjectReason(null)).toBeNull();
         expect(suspectSubjectReason(undefined)).toBeNull();
