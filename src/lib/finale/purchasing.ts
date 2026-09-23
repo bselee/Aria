@@ -48,6 +48,7 @@ import {
     _skuHasNoBomCache,
     _bomComponent404Cache,
 } from "./products";
+import { isMissingLabelArtworkSku } from "./purchasing-sku-skip";
 import { getFreshCachedSkus, upsertSkuCache, cachedRowToProductDetail } from "./finale-sku-cache";
 import {
     type FinaleReorderMethod,
@@ -2800,6 +2801,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             while (queue.length > 0) {
                 const candidate = queue.shift()!;
                 const sku = candidate.productId;
+                if (_bomComponent404Cache.has(sku) || isMissingLabelArtworkSku(sku)) continue;
                 try {
                     // Step A: REST product data — cached via finale_sku_cache (24h TTL)
                     // DECISION(2026-07-24): The persistent cache prevents ~700 per-SKU
@@ -3299,6 +3301,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 } catch (err) {
                     // Skip products that error — non-fatal, but surface the cause
                     const msg = err instanceof Error ? err.message : String(err);
+                    if (/Finale API 404\b/.test(msg)) _bomComponent404Cache.add(sku);
                     console.warn(`[finale] getPurchasingIntelligence: SKU ${sku} skipped — ${msg}`);
                 }
                 // 100ms breathing room between SKUs — keeps sustained load ~180 req/min
