@@ -10,7 +10,7 @@
  *
  * @author  Hermia
  * @created 2026-07-30
- * @updated 2026-07-30 — Initial implementation; replaces placeholder cron ref.
+ * @updated 2026-09-24 — weekly CSV export is the source. No Bill.com login download.
  * @deps    better-sqlite3 (via local-db)
  *
  * Usage:
@@ -340,7 +340,7 @@ export async function importCsvFile(csvPath: string): Promise<{ inserted: number
 
   if (!fs.existsSync(csvPath)) {
     console.error(`[billcom-import] CSV not found at ${csvPath}`);
-    console.error("[billcom-import] Run download-billcom-ref.ts first, or provide --csv=path/to/file.csv");
+    console.error("[billcom-import] Export AllBillsPage.csv from Bill.com, or pass --csv=path/to/file.csv");
     process.exitCode = 1;
     return { inserted: 0, updated: 0, errors: 0, rows: 0 };
   }

@@ -22,8 +22,8 @@
  *
  * Usage:
  *   npx tsx --env-file=.env.local src/cli/reconcile-billcom.ts
- *       # imports ~/Downloads newest multi-vendor AllBillsPage*.csv if fresh,
- *       # then sweeps last 14 days
+ *       # imports the newest AllBillsPage*.csv under 10 days (weekly export),
+ *       # then sweeps last 14 days. No Bill.com login.
  *   npx tsx --env-file=.env.local src/cli/reconcile-billcom.ts --csv="C:/path/AllBillsPage (4).csv"
  *       # explicit export (always pass when Bill just downloaded)
  *   npx tsx --env-file=.env.local src/cli/reconcile-billcom.ts --days=30

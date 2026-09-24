@@ -1284,75 +1284,11 @@ defineJob({
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// HERMIA(2026-07-30): Daily bill.com reference data refresh.
-// Step 1: Download AllBillsPage.csv from bill.com via Playwright with persistent
-//         browser profile. If Chrome is unavailable or login fails, logs a
-//         warning and re-imports the last downloaded CSV instead.
-// Step 2: Import the CSV into SQLite billcom_bills_ref table.
-//
-// Runs daily at 7 AM MT. This keeps the dedup check in ap-single-forward.ts
-// (isAlreadyClaimedOrForwarded → billcom_bills_ref lookup) current within
-// ~24 hours, reducing duplicate Bill.com forwards when bills are manually
-// uploaded outside of Aria's pipeline.
-//
-// First-time setup: run `npx tsx src/cli/download-billcom-ref.ts --headed`
-// once to establish the persistent browser profile + log into bill.com.
-// Subsequent headless runs will reuse the session cookies.
-// ─────────────────────────────────────────────────────────────────────────────
-defineJob({
-    name: "billcom-ref-import",
-    schedule: "0 7 * * *",  // Daily 7 AM
-    onFail: "log",
-    enabled: false, // DISABLED 2026-09-15: headless Playwright hits Bill.com's
-    // Cloudflare CAPTCHA every run (no CSV ever downloads), the import step
-    // then re-imports a stale data/AllBillsPage.csv, and the Supabase cleanup
-    // step is dead code (Supabase removed). The working path is Bill's manual
-    // AllBillsPage CSV + `reconcile-billcom.ts --csv=`, which imports AND
-    // sweeps in one read-only run. Leave disabled; do not re-enable until the
-    // download uses the computer_use live-session path instead of headless.
-    description: "DISABLED — was: daily 7 AM download Bill.com CSV + import. Headless Playwright is Cloudflare-walled; manual CSV + reconcile-billcom is the live path.",
-    handler: async () => {
-        try {
-            // Step 1: Download CSV from bill.com (--cron = non-fatal if Chrome unavailable)
-            const { main: downloadBillComRef } = await import("@/cli/download-billcom-ref");
-            await downloadBillComRef();
-        } catch (err: any) {
-            console.warn(`[billcom-ref-import] Download step warning: ${err?.message ?? err}`);
-            console.warn("[billcom-ref-import] Proceeding with import of existing CSV...");
-        }
-
-        try {
-            // Step 2: Import existing CSV into SQLite
-            const { main: importBillComRef } = await import("@/cli/import-billcom-ref");
-            await importBillComRef();
-        } catch (err: any) {
-            console.error(`[billcom-ref-import] Import step failed: ${err?.message ?? err}`);
-        }
-
-        // Step 3: Clean up old ap_activity_log entries (keep 90 days)
-        try {
-            const { createClient } = await import("@/lib/supabase");
-            const db = createClient();
-            if (db) {
-                const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-                const { data, error } = await db
-                    .from("ap_activity_log")
-                    .delete()
-                    .lt("created_at", cutoff);
-                if (error) {
-                    console.warn(`[billcom-ref-import] Log cleanup warning: ${error.message}`);
-                } else {
-                    const count = typeof data === 'number' ? data : (Array.isArray(data) ? data.length : 0);
-                    console.log(`[billcom-ref-import] Log cleanup: removed entries older than 90 days`);
-                }
-            }
-        } catch (err: any) {
-            console.warn(`[billcom-ref-import] Log cleanup skipped: ${err?.message ?? err}`);
-        }
-    },
-    budget: { durationMs: 120_000 },
-});
-
+// HERMIA(2026-09-24): The old 7 AM billcom-ref-import job is gone.
+// It tried to log into Bill.com and download the CSV. That does not work.
+// Bill exports AllBillsPage.csv about once a week. reconcile-billcom.ts
+// imports the newest file under 10 days from Downloads or
+// Downloads/Aria-Ingest/billcom. Do not add the login job back.
 // ─────────────────────────────────────────────────────────────────────────────
 // Invoice → PO Auto-Matcher — finds unmatched invoices and suggests PO matches.
 // Runs every 30 min. Auto-applies matches scoring ≥80 with exactly one candidate.
