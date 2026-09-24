@@ -16,6 +16,12 @@ export interface SkuLeadSample {
     days: number;
     /** ISO receive date (Finale receiveDate) — used for time weight + trend. */
     receiveDate: string;
+    /** Finale order id, so a thread hold can drop this cycle. */
+    orderId?: string;
+    /** True when the PO thread said sold out / backorder for this cycle. */
+    holdExcluded?: boolean;
+    /** Short reason shown on the card when this cycle is dropped. */
+    holdNote?: string;
 }
 
 export const SKU_LEAD_MIN_SAMPLES_ANY = 1;
@@ -23,6 +29,12 @@ export const SKU_LEAD_MIN_SAMPLES_ANY = 1;
 export const SKU_LEAD_EWMA_HALF_LIFE_DAYS = 90;
 /** Soft ceiling — matches Finale history sanity bound. */
 export const SKU_LEAD_MAX_DAYS = 365;
+/** A single cycle longer than this does not set the plan. 2× the 21d default. */
+export const LONE_LONG_CYCLE_DAYS = 42;
+/** One sample this far above the rest is a one-off, not the lead. */
+export const LEAD_OUTLIER_RATIO = 2.5;
+
+const _exclusionNotes = new Map<string, string>();
 
 let _skuLeadSamples: Map<string, SkuLeadSample[]> = new Map();
 let _skuLeadAt = 0;
@@ -31,6 +43,7 @@ const SKU_LEAD_TTL_MS = 4 * 60 * 60 * 1000;
 export function clearSkuLeadTimeCache(): void {
     _skuLeadSamples = new Map();
     _skuLeadAt = 0;
+    _exclusionNotes.clear();
 }
 
 /** Replace cache (called from FinalePurchasingClient.getVendorLeadTimeHistory). */
@@ -176,19 +189,65 @@ export interface SkuLeadPlan {
 }
 
 /**
+ * Drop stockout holds and a single cycle that is >2.5× the rest.
+ * Repeating long cycles stay. A short cluster of one is enough to plan from.
+ */
+export function guardLeadSamples(samples: SkuLeadSample[]): {
+    kept: SkuLeadSample[];
+    notes: string[];
+} {
+    const notes: string[] = [];
+    const kept = samples.filter((s) => {
+        if (!s.holdExcluded) return true;
+        notes.push(s.holdNote || `PO ${s.orderId ?? "?"} stockout hold excluded`);
+        return false;
+    });
+    if (kept.length < 2) return { kept, notes };
+    const max = kept.reduce((a, b) => (a.days >= b.days ? a : b));
+    const others = kept.filter((s) => s !== max).map((s) => s.days).sort((a, b) => a - b);
+    const med = percentileNearest(others, 50);
+    if (med > 0 && max.days > med * LEAD_OUTLIER_RATIO && max.days - med >= 14) {
+        notes.push(`excluded ${Math.round(max.days)}d one-off`);
+        return { kept: kept.filter((s) => s !== max), notes };
+    }
+    return { kept, notes };
+}
+
+/**
+ * Drop one cycle that is >2.5× the rest. Repeating long cycles stay.
+ * Used for vendor median and P90 so one stockout does not set the lead for every SKU.
+ */
+export function dropLoneLeadOutlier(days: number[]): number[] {
+    if (days.length < 2) return days;
+    const maxIdx = days.reduce((best, d, i) => (d >= days[best] ? i : best), 0);
+    const max = days[maxIdx];
+    if (days.filter((d) => d === max).length > 1) return days;
+    const others = days.filter((_, i) => i !== maxIdx).sort((a, b) => a - b);
+    const med = percentileNearest(others, 50);
+    if (med > 0 && max > med * LEAD_OUTLIER_RATIO && max - med >= 14) {
+        return days.filter((_, i) => i !== maxIdx);
+    }
+    return days;
+}
+
+/**
  * Wizard planning lead from dated SKU samples.
  *
+ * - Hold-stamped cycles and a single >2.5× outlier are dropped first
+ * - A lone cycle longer than 42d does not set the plan
  * - IQR-robust when enough points
  * - EWMA (90d half-life) tracks vendor drift / season without thrash
  * - If recent half is clearly slower, ride recent (don't average away bad news)
  * - Floor at p50; use p75/p90 pressure when n supports it
- * - Never below a single observation when n=1
+ * - A single short observation still sets the plan
  */
 export function planSkuLead(samples: SkuLeadSample[], asOfMs = Date.now()): SkuLeadPlan | null {
-    const dated = samples.filter(
+    const guarded = guardLeadSamples(samples);
+    const dated = guarded.kept.filter(
         (s) => Number.isFinite(s.days) && s.days >= 0 && s.days <= SKU_LEAD_MAX_DAYS,
     );
     if (dated.length === 0) return null;
+    if (dated.length === 1 && dated[0].days > LONE_LONG_CYCLE_DAYS) return null;
 
     const robustDays = robustLeadDays(dated);
     const summary = summarizeLeadSamples(robustDays)!;
@@ -237,7 +296,8 @@ export function planSkuLead(samples: SkuLeadSample[], asOfMs = Date.now()): SkuL
             : trend === "speeding"
               ? ` · speeding ${Math.round(trendDelta)}d`
               : "";
-    const provenance = `${days}d SKU plan · n=${summary.n} ewma=${Math.round(ewma)} p50=${summary.p50} p90=${summary.p90}${trendBit}`;
+    const noteBit = guarded.notes.length ? ` · ${guarded.notes.join("; ")}` : "";
+    const provenance = `${days}d SKU plan · n=${summary.n} ewma=${Math.round(ewma)} p50=${summary.p50} p90=${summary.p90}${trendBit}${noteBit}`;
 
     return {
         days,
@@ -262,6 +322,37 @@ export function planningLeadDaysFromSamples(days: number[]): number | null {
 }
 
 /**
+ * Card label for the lead the recommender actually used.
+ * A SKU-observed plan must not be captioned as the 21d default.
+ * A dropped stockout cycle must say why the default was used.
+ */
+export function cardLeadLabel(params: {
+    resolvedProvenance: string;
+    skuObserved: boolean;
+    baseProvenance: string;
+    exclusionNote: string | null;
+    powderOverride: boolean;
+    vendorPolicyDays?: number | null;
+}): string {
+    if (params.powderOverride) return params.resolvedProvenance;
+    if (params.skuObserved) return params.resolvedProvenance;
+    if (params.vendorPolicyDays != null && params.vendorPolicyDays > 0) {
+        return `${params.vendorPolicyDays}d vendor policy override`;
+    }
+    if (params.exclusionNote) return `${params.baseProvenance} · ${params.exclusionNote}`;
+    return params.baseProvenance;
+}
+
+/**
+ * Note left when a SKU's observed cycles were dropped (stockout hold or lone long cycle).
+ * Empty when the plan used the samples as-is.
+ */
+export function getSkuLeadExclusionNote(productId: string | null | undefined): string | null {
+    if (!productId) return null;
+    return _exclusionNotes.get(String(productId).trim().toUpperCase()) ?? null;
+}
+
+/**
  * Look up cached SKU observed planning lead (populated by lead-history fetch).
  */
 export function getObservedSkuLeadDays(productId: string | null | undefined): {
@@ -276,6 +367,14 @@ export function getObservedSkuLeadDays(productId: string | null | undefined): {
     const key = String(productId).trim().toUpperCase();
     const samples = _skuLeadSamples.get(key);
     if (!samples || samples.length < SKU_LEAD_MIN_SAMPLES_ANY) return null;
+    const guarded = guardLeadSamples(samples);
+    const loneLong = guarded.kept.length === 1 && guarded.kept[0].days > LONE_LONG_CYCLE_DAYS;
+    const note = [
+        ...guarded.notes,
+        loneLong ? `lone ${Math.round(guarded.kept[0].days)}d cycle not used as lead` : "",
+    ].filter(Boolean).join("; ");
+    if (note) _exclusionNotes.set(key, note);
+    else _exclusionNotes.delete(key);
     const plan = planSkuLead(samples);
     if (!plan) return null;
     return {

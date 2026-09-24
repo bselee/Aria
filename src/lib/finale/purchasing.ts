@@ -15,7 +15,7 @@ import {
     resolveLeadTimeDays,
     OAG_POWDER_FAVORITE_BATCHES,
 } from "@/lib/purchasing/oag-powder-policy";
-import { getObservedSkuLeadDays, setSkuLeadTimeSamples, type SkuLeadSample } from "@/lib/purchasing/sku-lead-time";
+import { getObservedSkuLeadDays, getSkuLeadExclusionNote, setSkuLeadTimeSamples, cardLeadLabel, dropLoneLeadOutlier, type SkuLeadSample } from "@/lib/purchasing/sku-lead-time";
 import {
     loadActiveReservations,
     loadAllVendorReorderPolicies,
@@ -1265,13 +1265,16 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             // send timestamp as the lead-time anchor instead of Finale's orderDate
             // (which is the draft-creation time and inflates lead times when POs
             // sit in draft for a day or more before being emailed).
-            const { loadPOSentTimestamps, resolveLeadTimeAnchor } = await import('../purchasing/lead-time-enricher');
+            const { loadPOSentTimestamps, resolveLeadTimeAnchor, loadPoThreadHolds, stampLeadSample, countsTowardVendorLead } = await import('../purchasing/lead-time-enricher');
             // DECISION(2026-05-20): Load sentAtMap with a wider window than daysBack.
             // A PO sent 300 days ago but received 100 days ago would be inside the
             // receiveDate window but outside a 180d sentAt window — the anchor would
             // silently fall back to orderDate. Adding MAX_VENDOR_LEAD_TIME_DAYS (90d)
             // ensures any PO we might receive during this window has its sentAt available.
-            const sentAtMap = await loadPOSentTimestamps(daysBack + MAX_VENDOR_LEAD_TIME_DAYS).catch(() => new Map<string, string>());
+            const [sentAtMap, holdStamps] = await Promise.all([
+                loadPOSentTimestamps(daysBack + MAX_VENDOR_LEAD_TIME_DAYS).catch(() => new Map<string, string>()),
+                loadPoThreadHolds().catch(() => new Map()),
+            ]);
 
             const data = await this.graphql(query, 'Vendor Lead Time History');
             const edges = data?.orderViewConnection?.edges || [];
@@ -1300,11 +1303,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 if (isNaN(orderMs) || isNaN(receiveMs)) continue;
                 const days = Math.round((receiveMs - orderMs) / 86_400_000);
                 if (days < 0 || days > 365) continue; // sanity check
-                if (!byVendor.has(vendor)) byVendor.set(vendor, []);
-                byVendor.get(vendor)!.push(days);
-                // Capture dated entry for temporal analysis (spread_days, dates, recent-30d trend)
-                if (!dateEntries.has(vendor)) dateEntries.set(vendor, []);
-                dateEntries.get(vendor)!.push({ receiveDate: po.receiveDate, days });
+                const countsForVendor = countsTowardVendorLead(po.orderId, holdStamps);
+                if (countsForVendor) {
+                    if (!byVendor.has(vendor)) byVendor.set(vendor, []);
+                    byVendor.get(vendor)!.push(days);
+                    if (!dateEntries.has(vendor)) dateEntries.set(vendor, []);
+                    dateEntries.get(vendor)!.push({ receiveDate: po.receiveDate, days });
+                }
                 // SKU grain: dated samples for time-weighted / trend-aware planning
                 const lineSkus = (po.itemList?.edges || [])
                     .map((ie: any) => String(ie?.node?.product?.productId || "").trim().toUpperCase())
@@ -1312,7 +1317,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 const receiveDateStr = String(po.receiveDate).slice(0, 10);
                 for (const sku of lineSkus) {
                     if (!bySku.has(sku)) bySku.set(sku, []);
-                    bySku.get(sku)!.push({ days, receiveDate: receiveDateStr });
+                    bySku.get(sku)!.push(stampLeadSample({ days, receiveDate: receiveDateStr, orderId: String(po.orderId) }, holdStamps));
                 }
             }
 
@@ -1320,9 +1325,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             // vendors had too few POs in the 90d window to qualify).
             const result2 = new Map<string, number>();
             const onTimeMap = new Map<string, number>();
+            const cleanByVendor = new Map<string, number[]>();
             for (const [vendor, days] of byVendor) {
-                if (days.length < 2) continue;
-                const sorted = [...days].sort((a, b) => a - b);
+                const clean = dropLoneLeadOutlier(days);
+                cleanByVendor.set(vendor, clean);
+                if (clean.length < 2) continue;
+                const sorted = [...clean].sort((a, b) => a - b);
                 const mid = Math.floor(sorted.length / 2);
                 const median = sorted.length % 2 === 0
                     ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
@@ -1331,13 +1339,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                 // On-time rate: count POs that arrived within median + 7d buffer.
                 const tolerance = median + 7;
-                const onTime = days.filter(d => d <= tolerance).length;
-                onTimeMap.set(vendor, onTime / days.length);
+                const onTime = clean.filter(d => d <= tolerance).length;
+                onTimeMap.set(vendor, onTime / clean.length);
             }
-            // Stash the raw distribution for callers that want P90 — see
-            // getVendorLeadTimeDistribution(). Module-level cache because
-            // FinaleClient is reinstantiated frequently.
-            _vendorLeadTimeRawCache = byVendor;
+            _vendorLeadTimeRawCache = cleanByVendor;
             _vendorLeadTimeRawCacheAt = Date.now();
             _vendorOnTimeRateCache = onTimeMap;
             _vendorOnTimeRateCacheAt = Date.now();
@@ -2312,6 +2317,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // Policy override: powder MTO SKU (120d) > vendor_reorder_policies > Finale.
                     // Stockout multiplier NOT applied to overrides — they are ground truth.
                     const skuObsBom = getObservedSkuLeadDays(compSku);
+                    const exclusionNote = getSkuLeadExclusionNote(compSku);
                     const resolvedLead = resolveLeadTimeDays({
                         productId: compSku,
                         vendorPolicyLeadDays: bomPolicy?.leadTimeOverrideDays,
@@ -2320,13 +2326,17 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         baseLeadDays: leadTimeDays,
                     });
                     const effectiveLeadTimeDays = resolvedLead.days;
-                    const leadTimeProvenance = bomPolicy?.leadTimeOverrideDays && !getOagPowderLeadOverrideDays(compSku)
-                        ? `${effectiveLeadTimeDays}d vendor policy override (was ${leadTimeDays}d ${lt.label})`
-                        : getOagPowderLeadOverrideDays(compSku)
-                            ? resolvedLead.provenance
-                        : priorStockouts > 0
-                            ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
-                            : lt.label;
+                    const baseBomProvenance = priorStockouts > 0
+                        ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
+                        : lt.label;
+                    const leadTimeProvenance = cardLeadLabel({
+                        resolvedProvenance: resolvedLead.provenance,
+                        skuObserved: skuObsBom != null,
+                        baseProvenance: baseBomProvenance,
+                        exclusionNote,
+                        powderOverride: getOagPowderLeadOverrideDays(compSku) != null,
+                        vendorPolicyDays: bomPolicy?.leadTimeOverrideDays,
+                    });
 
                     // DECISION(2026-05-12): Receipt velocity is the primary signal.
                     // Captures seasonality, builds, contracts, wholesale, growth —
@@ -3044,6 +3054,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     // v2.1 — vendor policy lead-time override; powder MTO SKU wins (120d).
                     const skuObs = getObservedSkuLeadDays(sku);
+                    const exclusionNote = getSkuLeadExclusionNote(sku);
                     const resolvedLead = resolveLeadTimeDays({
                         productId: sku,
                         vendorPolicyLeadDays: reorderPolicy?.leadTimeOverrideDays,
@@ -3052,11 +3063,14 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         baseLeadDays: leadTimeDays,
                     });
                     const effectiveLeadTimeDays = resolvedLead.days;
-                    const effectiveLeadTimeProvenance = getOagPowderLeadOverrideDays(sku)
-                        ? resolvedLead.provenance
-                        : reorderPolicy?.leadTimeOverrideDays
-                        ? `${reorderPolicy.leadTimeOverrideDays}d vendor policy override`
-                        : leadTimeProvenance;
+                    const effectiveLeadTimeProvenance = cardLeadLabel({
+                        resolvedProvenance: resolvedLead.provenance,
+                        skuObserved: skuObs != null,
+                        baseProvenance: leadTimeProvenance,
+                        exclusionNote,
+                        powderOverride: getOagPowderLeadOverrideDays(sku) != null,
+                        vendorPolicyDays: reorderPolicy?.leadTimeOverrideDays,
+                    });
                     // DECISION(2026-05-21): Leg-aware stock-on-order for bulk vendors.
                     // For vendors with isBulkVendor=true and explicit po_shipment_legs rows,
                     // credit only legs arriving within the reorder horizon instead of the full

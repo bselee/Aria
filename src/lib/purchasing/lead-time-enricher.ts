@@ -22,6 +22,7 @@
  */
 
 import { createClient } from '@/lib/db';
+import { applyHoldStamp } from '@/lib/purchasing/po-thread-clock';
 
 /**
  * Loads a map of PO number → po_sent_verified_at (ISO string) for all POs
@@ -64,6 +65,59 @@ export async function loadPOSentTimestamps(daysBack = 365): Promise<Map<string, 
     }
 
     return map;
+}
+
+/** A PO whose thread said the vendor could not fill. Send-to-receive is not lead. */
+export interface PoThreadHoldStamp {
+    snippet: string;
+}
+
+/**
+ * PO numbers whose email thread was a sold-out or backorder hold.
+ * Empty when the column is missing or PostgREST is down. Callers then
+ * rely on the shape gate alone.
+ */
+export async function loadPoThreadHolds(): Promise<Map<string, PoThreadHoldStamp>> {
+    const map = new Map<string, PoThreadHoldStamp>();
+    const db = createClient();
+    if (!db) return map;
+    try {
+        const { data, error } = await db
+            .from('purchase_orders')
+            .select('po_number, thread_hold_snippet')
+            .eq('thread_hold', true);
+        if (error || !data) {
+            console.warn('[lead-time-enricher] thread-hold query failed:', error?.message);
+            return map;
+        }
+        for (const row of data as Array<{ po_number: string; thread_hold_snippet: string | null }>) {
+            if (!row.po_number) continue;
+            map.set(String(row.po_number), { snippet: row.thread_hold_snippet || '' });
+        }
+    } catch (err: any) {
+        console.warn('[lead-time-enricher] thread-hold load failed:', err.message);
+    }
+    return map;
+}
+
+/**
+ * Attach a thread-hold stamp to one receipt sample. No-op when the PO was not a hold.
+ */
+export function stampLeadSample<T extends { orderId?: string; holdExcluded?: boolean; holdNote?: string }>(
+    sample: T,
+    holds: Map<string, PoThreadHoldStamp>,
+): T {
+    if (!sample.orderId) return sample;
+    return applyHoldStamp(sample, holds.get(String(sample.orderId)));
+}
+
+/** A hold-stamped PO does not enter vendor median or P90. Every SKU on that vendor is affected. */
+export function countsTowardVendorLead(
+    orderId: string | null | undefined,
+    holds: Map<string, PoThreadHoldStamp>,
+): boolean {
+    if (!orderId) return true;
+    return !holds.has(String(orderId));
 }
 
 /**

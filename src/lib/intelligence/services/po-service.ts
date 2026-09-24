@@ -863,7 +863,7 @@ export class POService {
 
             if (trackingUpdatesBatch.length > 0) {
                 const lines = trackingUpdatesBatch.map((b) =>
-                    `\u2022 #${b.poNumber} ${b.vendorName}: ${b.newOnes.join(", ")}`,
+                    `• #${b.poNumber} ${b.vendorName}: ${b.newOnes.join(", ")}`,
                 );
                 const msg = `Tracking Updates (${trackingUpdatesBatch.length})\n\n${lines.join("\n")}`;
                 try {
@@ -871,6 +871,16 @@ export class POService {
                 } catch (e: any) {
                     console.warn("[po-sync] tracking batch send failed:", e.message);
                 }
+            }
+
+            try {
+                const { stampStockoutThreads } = await import("@/lib/purchasing/po-thread-clock-stamp");
+                const stamped = await stampStockoutThreads();
+                if (stamped.stamped.length > 0) {
+                    console.log(`[po-sync] thread-clock holds: ${stamped.stamped.join(", ")}`);
+                }
+            } catch (clockErr: any) {
+                console.warn("[po-sync] thread-clock stamp failed:", clockErr?.message ?? clockErr);
             }
         } catch (err: any) {
             console.error("PO Sync error:", err.message);

@@ -7,6 +7,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
     clearSkuLeadTimeCache,
+    cardLeadLabel,
+    dropLoneLeadOutlier,
     ewmaLeadDays,
     getObservedSkuLeadDays,
     planSkuLead,
@@ -120,5 +122,70 @@ describe("sku-lead-time wizardry", () => {
 
     it("day-array helper still works", () => {
         expect(planningLeadDaysFromSamples([10, 20, 30, 40, 50])).toBeGreaterThan(0);
+    });
+
+    it("a lone 60d cycle does not set the plan", () => {
+        expect(planSkuLead([s(60, "2026-09-17")])).toBeNull();
+    });
+
+    it("a lone normal receipt still sets the plan", () => {
+        const plan = planSkuLead([s(14, "2026-06-01")])!;
+        expect(plan.days).toBe(14);
+    });
+
+    it("drops one long cycle against a short cluster", () => {
+        const plan = planSkuLead([
+            s(16, "2026-03-01"),
+            s(60, "2026-09-17"),
+        ], new Date("2026-09-24").getTime())!;
+        expect(plan.days).toBeLessThanOrEqual(21);
+        expect(plan.provenance.toLowerCase()).toMatch(/exclud/);
+    });
+
+    it("keeps a repeated long lead when nothing is short", () => {
+        const plan = planSkuLead([
+            s(55, "2026-01-01"),
+            s(60, "2026-04-01"),
+            s(58, "2026-07-01"),
+        ], new Date("2026-09-01").getTime())!;
+        expect(plan.days).toBeGreaterThanOrEqual(55);
+    });
+
+    it("drops a sample the PO thread marked as a stockout hold", () => {
+        const plan = planSkuLead([
+            s(16, "2026-03-01"),
+            { days: 56, receiveDate: "2026-09-17", orderId: "125126", holdExcluded: true, holdNote: "PO 125126 sold out" },
+        ])!;
+        expect(plan.days).toBeLessThanOrEqual(21);
+        expect(plan.provenance).toMatch(/125126/);
+    });
+
+    it("a lone long cycle does not set the vendor lead for every SKU", () => {
+        expect(dropLoneLeadOutlier([14, 16, 15, 60])).toEqual([14, 16, 15]);
+        expect(dropLoneLeadOutlier([43, 44, 50, 57])).toEqual([43, 44, 50, 57]);
+    });
+
+    it("does not caption a SKU plan as the 21d default", () => {
+        expect(cardLeadLabel({
+            resolvedProvenance: "16d SKU plan · n=1",
+            skuObserved: true,
+            baseProvenance: "21d default",
+            exclusionNote: null,
+            powderOverride: false,
+        })).toBe("16d SKU plan · n=1");
+        expect(cardLeadLabel({
+            resolvedProvenance: "21d base",
+            skuObserved: false,
+            baseProvenance: "21d default",
+            exclusionNote: "PO 125126 stockout hold excluded",
+            powderOverride: false,
+        })).toMatch(/125126/);
+        expect(cardLeadLabel({
+            resolvedProvenance: "21d base",
+            skuObserved: false,
+            baseProvenance: "21d default",
+            exclusionNote: null,
+            powderOverride: false,
+        })).toBe("21d default");
     });
 });
