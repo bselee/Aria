@@ -65,7 +65,9 @@ export class FinaleProductsClient extends FinaleCoreClient {
         DISCOUNT_20: { id: "10011", url: "/buildasoilorganics/api/productpromo/10011", name: "Discount 20%" },
         DISCOUNT_10: { id: "10012", url: "/buildasoilorganics/api/productpromo/10012", name: "Discount 10%" },
         TARIFF: { id: "10013", url: "/buildasoilorganics/api/productpromo/10013", name: "Tariff" },
-        LOGISTICS: { id: "10014", url: "/buildasoilorganics/api/productpromo/10014", name: "Logistics" }
+        DUTIES_TARIFF: { id: "10014", url: "/buildasoilorganics/api/productpromo/10014", name: "Duties/Tariff" },
+        KASHI_BOM: { id: "10018", url: "/buildasoilorganics/api/productpromo/10018", name: "KASHI GOLD BOM ITEMS" },
+        RICE_BRAN_ALAN: { id: "10019", url: "/buildasoilorganics/api/productpromo/10019", name: "Rice Bran - Alan" }
     };
 
     constructor() {
