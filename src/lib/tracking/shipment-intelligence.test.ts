@@ -64,6 +64,24 @@ describe("normalizeTrackingIdentity", () => {
             trackingKind: "ltl_pro",
         });
     });
+
+    it("classifies a parcel carrier encoded with ::: as parcel, not LTL", () => {
+        expect(normalizeTrackingIdentity("FedEx:::383864295713")).toMatchObject({
+            trackingKey: "fedex:383864295713",
+            trackingNumber: "FedEx:::383864295713",
+            normalizedTrackingNumber: "383864295713",
+            carrierName: "FedEx",
+            carrierKey: "fedex",
+            trackingKind: "parcel",
+        });
+    });
+
+    it("keeps FedEx Freight encoded tracking as LTL", () => {
+        expect(normalizeTrackingIdentity("FedEx Freight:::1234567890")).toMatchObject({
+            carrierName: "FedEx Freight",
+            trackingKind: "ltl_pro",
+        });
+    });
 });
 
 describe("mergeShipmentEvidence", () => {

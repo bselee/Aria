@@ -6,6 +6,7 @@ import {
     carrierUrl,
     detectCarrier,
     getTrackingStatus,
+    isParcelCarrierName,
     TRACKING_PATTERNS,
     type TrackingCategory,
     type TrackingStatus,
@@ -217,7 +218,13 @@ export function normalizeTrackingIdentity(trackingNumber: string): {
         const [carrierNameRaw, actualNumberRaw] = trimmed.split(":::", 2);
         const carrierName = titleCaseCarrierName(carrierNameRaw.trim()) || "Freight";
         const actualNumber = actualNumberRaw.trim();
-        const kind: ShipmentTrackingKind = "ltl_pro";
+        // KAIZEN(2026-09-24): the ":::" encoding is used for BOTH LTL PROs and
+        // parcel numbers pulled from email (e.g. "FedEx:::383864295713"). It used
+        // to be stamped "ltl_pro" unconditionally, which mislabelled parcel
+        // tracking on the board and sent its refreshes to the LTL scrape path.
+        const kind: ShipmentTrackingKind = isParcelCarrierName(carrierNameRaw)
+            ? "parcel"
+            : "ltl_pro";
         return {
             trackingNumber: `${carrierName}:::${actualNumber}`,
             normalizedTrackingNumber: actualNumber,

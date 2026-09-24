@@ -184,6 +184,19 @@ type FilterOp =
 class QueryBuilder {
   private table: string;
   private _select: string = "*";
+  /**
+   * True once the caller chains `.select(...)` explicitly.
+   *
+   * KAIZEN(2026-09-24): the representation check used to be
+   * `this._select !== "*"`, which could never be true for the very common
+   * `.upsert(x).select("*")` / `.update(x).select("*")` shape — the default
+   * `_select` IS "*". PostgREST then got no `Prefer: return=representation`,
+   * answered 204 with an empty body, and the caller received `{data: null,
+   * error: null}` for a write that actually succeeded. Supabase semantics are
+   * "chained .select() ⇒ return the rows", including "*"; this flag encodes
+   * that intent.
+   */
+  private _selectExplicit: boolean = false;
   private _filters: string[] = [];
   private _order: string | null = null;
   private _orderDir: "asc" | "desc" = "asc";
@@ -205,6 +218,7 @@ class QueryBuilder {
 
   select(columns: string = "*"): this {
     this._select = columns;
+    this._selectExplicit = true;
     return this;
   }
 
@@ -394,7 +408,7 @@ class QueryBuilder {
     }
     if (
       (this._method === "POST" || this._method === "PATCH") &&
-      this._select !== "*"
+      this._selectExplicit
     ) {
       preferValues.push("return=representation");
     }
@@ -441,7 +455,7 @@ class QueryBuilder {
       url.searchParams.set("select", this._select);
     } else if (
       (this._method === "POST" || this._method === "PATCH") &&
-      this._select !== "*"
+      this._selectExplicit
     ) {
       url.searchParams.set("select", this._select);
     }

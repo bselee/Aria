@@ -15,6 +15,8 @@ import {
     parseTrackingContent,
     detectLTLCarrier,
     isFedExNumber,
+    isParcelCarrierName,
+    splitEncodedTracking,
     buildFollowUpEmail,
     TRACKING_PATTERNS,
 } from './tracking-service';
@@ -174,6 +176,56 @@ describe('carrierUrl', () => {
     it('should URL-encode PRO numbers in LTL links', () => {
         const url = carrierUrl('Old Dominion:::123 456');
         expect(url).toContain('123%20456');
+    });
+});
+
+// ──────────────────────────────────────────────────
+// isParcelCarrierName / splitEncodedTracking
+// ──────────────────────────────────────────────────
+
+describe('isParcelCarrierName', () => {
+    it('matches parcel carriers regardless of case', () => {
+        expect(isParcelCarrierName('FedEx')).toBe(true);
+        expect(isParcelCarrierName('fedex')).toBe(true);
+        expect(isParcelCarrierName('UPS')).toBe(true);
+        expect(isParcelCarrierName('USPS')).toBe(true);
+        expect(isParcelCarrierName('DHL')).toBe(true);
+    });
+
+    it('rejects LTL carriers, including freight-branded parcel names', () => {
+        expect(isParcelCarrierName('FedEx Freight')).toBe(false);
+        expect(isParcelCarrierName('UPS Freight')).toBe(false);
+        expect(isParcelCarrierName('TForce Freight')).toBe(false);
+        expect(isParcelCarrierName('Old Dominion')).toBe(false);
+        expect(isParcelCarrierName('XPO Logistics')).toBe(false);
+        expect(isParcelCarrierName('Unknown Freight')).toBe(false);
+    });
+
+    it('rejects empty input', () => {
+        expect(isParcelCarrierName('')).toBe(false);
+    });
+});
+
+describe('splitEncodedTracking', () => {
+    it('splits an encoded carrier:::number string', () => {
+        expect(splitEncodedTracking('FedEx:::383864295713')).toEqual({
+            carrierName: 'FedEx',
+            rawNumber: '383864295713',
+        });
+    });
+
+    it('returns the number unchanged when no encoding is present', () => {
+        expect(splitEncodedTracking('383864295713')).toEqual({
+            carrierName: null,
+            rawNumber: '383864295713',
+        });
+    });
+
+    it('preserves extra ":::" segments in the raw number', () => {
+        expect(splitEncodedTracking('AAA Cooper:::71473626-1')).toEqual({
+            carrierName: 'AAA Cooper',
+            rawNumber: '71473626-1',
+        });
     });
 });
 

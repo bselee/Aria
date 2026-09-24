@@ -143,6 +143,41 @@ const LTL_DIRECT_LINKS: Record<string, string> = {
 // ──────────────────────────────────────────────────
 
 /**
+ * True when an encoded-tracking carrier prefix names a PARCEL carrier.
+ *
+ * Ingest encodes tracking as `"Carrier:::Number"` ("FedEx:::383864295713").
+ * Parcel carriers and LTL carriers share that encoding, but they need opposite
+ * lookup paths: parcel → carrier API, LTL → PRO page scrape.
+ *
+ * DECISION(2026-09-24): "FedEx Freight" / "UPS Freight" / "TForce Freight" are
+ * LTL and must NOT match, even though they start with a parcel brand name.
+ */
+export function isParcelCarrierName(carrierName: string): boolean {
+    const normalized = String(carrierName || "").trim().toLowerCase();
+    if (!normalized) return false;
+    if (/freight/.test(normalized)) return false;
+    return /^(fedex|ups|usps|dhl)\b/.test(normalized);
+}
+
+/**
+ * Split an encoded `"Carrier:::Number"` tracking string.
+ * Plain tracking numbers return `{ carrierName: null, rawNumber: trackingNumber }`.
+ */
+export function splitEncodedTracking(trackingNumber: string): {
+    carrierName: string | null;
+    rawNumber: string;
+} {
+    const value = String(trackingNumber || "");
+    if (!value.includes(":::")) return { carrierName: null, rawNumber: value };
+
+    const [carrierName, ...rest] = value.split(":::");
+    return {
+        carrierName: carrierName.trim(),
+        rawNumber: rest.join(":::").trim(),
+    };
+}
+
+/**
  * Detect the carrier from a tracking number format.
  * Returns the carrier key or null if unrecognized.
  */
@@ -476,15 +511,22 @@ async function getLTLTrackingStatus(trackingNumber: string): Promise<TrackingSta
 /**
  * Get the tracking status for any tracking number.
  * Routes to the appropriate carrier API:
- *   - LTL (:::) → carrier page scraping (free)
- *   - FedEx → direct FedEx Track API (free with credentials)
- *   - All others → EasyPost API
+ *   - "LTL carrier:::PRO"  → carrier page scraping (free)
+ *   - parcel ("FedEx:::123…" or bare) → FedEx direct API, else EasyPost
  */
 export async function getTrackingStatus(trackingNumber: string): Promise<TrackingStatus | null> {
-    const rawNumber = trackingNumber.includes(":::") ? trackingNumber.split(":::", 2)[1] : trackingNumber;
+    const { carrierName, rawNumber } = splitEncodedTracking(trackingNumber);
 
-    // LTL (:::) — try carrier page fetch first (free, no credentials)
-    if (trackingNumber.includes(":::")) {
+    // LTL freight ("Carrier:::PRO") — carrier page fetch first (free, no credentials)
+    //
+    // KAIZEN(2026-09-24): this branch previously captured EVERY ":::" value,
+    // including parcel carriers. Email ingest encodes FedEx parcel numbers the
+    // same way ("FedEx:::383864295713"), so those rows scraped the JS-only
+    // fedex.com track page, parsed nothing, and returned null forever — every
+    // FedEx/UPS parcel link from email ingest was permanently unverified
+    // (no last_checked_at, no ETA, stuck "in_transit"). Parcel carriers encoded
+    // with ":::" now fall through to the parcel APIs below.
+    if (carrierName && !isParcelCarrierName(carrierName)) {
         return getLTLTrackingStatus(trackingNumber);
     }
 
@@ -499,7 +541,7 @@ export async function getTrackingStatus(trackingNumber: string): Promise<Trackin
     try {
         const client = new EasyPostClient(apiKey);
 
-        const reqParam: any = { tracking_code: trackingNumber };
+        const reqParam: any = { tracking_code: rawNumber };
 
         const tracker = await client.Tracker.create(reqParam);
 
