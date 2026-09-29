@@ -1073,6 +1073,20 @@ class FinaleWriter extends FinaleClient {
     async fetchPo(po: string): Promise<WritablePo> {
         return this.getOrderDetails(po) as Promise<WritablePo>;
     }
+    /**
+     * Create an empty PURCHASE_ORDER and return its id.
+     * Finale assigns the 6-digit number; the caller then POSTs the document with
+     * the supplier, date, lines and status, the same GET -> POST path every other
+     * writer in this repo uses.
+     */
+    async createEmptyPo(): Promise<string> {
+        const created = await this.post(`/${this.accountPath}/api/order`, {
+            orderTypeId: "PURCHASE_ORDER",
+        });
+        const id = String(created?.orderId || "");
+        if (!id) throw new Error("Finale did not return an orderId for the new PO");
+        return id;
+    }
     /** Unlock a committed/completed PO; returns the status to restore. */
     async unlock(doc: WritablePo, po: string): Promise<string> {
         return this.unlockForEditing(doc, po);
@@ -1144,81 +1158,363 @@ async function applyPlan(writer: FinaleWriter, plan: PoPlan): Promise<string> {
  * passes. An Amazon line whose ASIN is in here is stock we already buy, so a
  * purchase of it without a PO is a capture gap rather than a new item.
  */
-function asinSkuMap(findings: PoFinding[]): Map<string, { sku: string; po: string }> {
-    const map = new Map<string, { sku: string; po: string }>();
+function asinSkuMap(findings: PoFinding[]): Map<string, { sku: string; po: string; unitsPerPack: number }> {
+    const map = new Map<string, { sku: string; po: string; unitsPerPack: number }>();
     for (const f of findings) {
         for (const p of [...f.pairs, ...f.titleMatches, ...f.candidates]) {
-            if (p.amazon.asin && !map.has(p.amazon.asin)) {
-                map.set(p.amazon.asin, { sku: p.finale.productId, po: f.po });
+            if (!p.amazon.asin || p.amazon.quantity <= 0) continue;
+            // Finale units per Amazon pack, the ratio Bill's own POs already use
+            // (20 label packs -> 80 rolls, 10 mailer packs -> 1000 mailers). A
+            // quantity-mismatch pair carries no usable ratio, and where the POs
+            // disagree (TN830 booked both as packs and as cartridges) the larger
+            // ratio wins, which is the cartridge-level reading.
+            const usable = !p.qtyMismatch && p.dividesEvenly && p.amazon.quantity > 0;
+            const ratio = usable ? Math.round((p.finale.quantity / p.amazon.quantity) * 1e4) / 1e4 : 0;
+            const existing = map.get(p.amazon.asin);
+            if (existing) {
+                if (ratio > existing.unitsPerPack) existing.unitsPerPack = ratio;
+                continue;
             }
+            map.set(p.amazon.asin, { sku: p.finale.productId, po: f.po, unitsPerPack: ratio > 0 ? ratio : 1 });
         }
     }
     return map;
 }
 
-/** Categories that are never stock; the rest need Bill's eye. */
-const NON_INVENTORY_CATEGORY = /kitchen|baby|beauty|health|personal computer|domestic applian|furniture/i;
+type CaptureClass =
+    | "STOCK-CONSUMABLE"
+    | "PRODUCTION-CONSUMABLE"
+    | "REPAIR-ONE-OFF"
+    | "NON-INVENTORY"
+    | "REVIEW";
+
+/**
+ * Hand classification of every ASIN that showed up with no PO number, reviewed
+ * one line at a time on 2026-09-29. A keyword rule can misfire on these (a
+ * "cartridge" is both 3M PPE and printer toner; a "fan" is both a PC part and a
+ * break-room appliance), so the ASIN decides and the rules only cover new ones.
+ */
+const ASIN_CLASS: Record<string, [CaptureClass, string]> = {
+    // Shipping and print consumables we buy over and over
+    B00AEFCP0E: ["STOCK-CONSUMABLE", "3M 6006 respirator cartridges, 50 pairs over two lines, shop PPE"],
+    B0CPMDDTGX: ["STOCK-CONSUMABLE", "Brother DR830 drum unit, same family as the TN830 we stock"],
+    B07MF1598K: ["STOCK-CONSUMABLE", "PSBM 10x13 poly mailers, same family as S-11481 and PM13x16x4"],
+    B09P2WVQ65: ["STOCK-CONSUMABLE", "MUNBYN thermal receipt paper, check against S-16160 (2.25x85)"],
+    // Small use-it-up production supplies
+    B07571T12F: ["PRODUCTION-CONSUMABLE", "hygienic wipes"],
+    B0064O7Y64: ["PRODUCTION-CONSUMABLE", "Star San acid sanitizer"],
+    B08HL7VHTV: ["PRODUCTION-CONSUMABLE", "fermentation pH test strips"],
+    // Repair and maintenance of buildings and equipment, one-offs by nature
+    B0F7XF2M16: ["REPAIR-ONE-OFF", "garage door lock"],
+    B0BYNVQRRT: ["REPAIR-ONE-OFF", "garage door side locks, 4 pack"],
+    B0GRTW6FCZ: ["REPAIR-ONE-OFF", "garage door deadlock"],
+    B09NYLJ1FZ: ["REPAIR-ONE-OFF", "toilet fill valve"],
+    B0BZX4BY85: ["REPAIR-ONE-OFF", "LED high bay fixtures, 10 pack"],
+    B09GTYXGB1: ["REPAIR-ONE-OFF", "solar motion lights"],
+    B0GFJKKT51: ["REPAIR-ONE-OFF", "15 outdoor power strips, confirm it is not a stocked item"],
+    B0D47J76HR: ["REPAIR-ONE-OFF", "hex key wrenches"],
+    B0G13M8CQJ: ["REPAIR-ONE-OFF", "nail magnetic sweeper"],
+    B0BDCKFJJT: ["REPAIR-ONE-OFF", "500W PSU, PC repair"],
+    B0FH26SQ8V: ["REPAIR-ONE-OFF", "ARGB case fans, bought twice"],
+    B0D1VGZP7Z: ["REPAIR-ONE-OFF", "RGB case fans, bought twice"],
+    B0DGTDGWV1: ["REPAIR-ONE-OFF", "replacement 12V cord for the Sceptre monitor"],
+    B0D2VVX6HP: ["REPAIR-ONE-OFF", "USB hub"],
+    B0D5ZHG8JX: ["REPAIR-ONE-OFF", "ethernet couplers"],
+    B07K14NR8P: ["REPAIR-ONE-OFF", "VGA to HDMI adapter"],
+    B097SVQ2S5: ["REPAIR-ONE-OFF", "camlock fittings"],
+    B0CRB56GZP: ["REPAIR-ONE-OFF", "PVC suction hose"],
+    B08L4XTB2G: ["REPAIR-ONE-OFF", "IBC vented lid"],
+    B0F83XBSPC: ["REPAIR-ONE-OFF", "IBC tote drain adapter"],
+    B0GHYFSDCY: ["REPAIR-ONE-OFF", "IBC tote hose adapter"],
+    B01MQIN56L: ["REPAIR-ONE-OFF", "rain barrel inlet adapter"],
+    B08FSMYWZ3: ["REPAIR-ONE-OFF", "garden hose adapter"],
+    // Admin, facility, breakroom, and equipment
+    B0G69256FH: ["NON-INVENTORY", "massage chair, one-off, disregard"],
+    B087ZMJ98M: ["NON-INVENTORY", "diaper bag, one-off, disregard"],
+    B0GBVMN3HS: ["NON-INVENTORY", "DVD, not a business purchase"],
+    B09MDQ9KD6: ["NON-INVENTORY", "standing desk"],
+    B0BY4JVXPL: ["NON-INVENTORY", "desk organizers"],
+    B0BZ7F34CX: ["NON-INVENTORY", "whiteboards, bought twice"],
+    B0BW9L8ZGK: ["NON-INVENTORY", "breakroom fan"],
+    B09BXT3J9Z: ["NON-INVENTORY", "facial tissues"],
+    B09B1T3ZF7: ["NON-INVENTORY", "dish soap"],
+    B0CV9CMWKT: ["NON-INVENTORY", "hand soap"],
+    B00WVPIHXY: ["NON-INVENTORY", "3M Cavilon barrier cream, first aid"],
+    B0032JLFZK: ["NON-INVENTORY", "3M Duraprep remover, first aid"],
+    B0DFMD8RDM: ["NON-INVENTORY", "acrylic drawer organizer"],
+    B0C7162144: ["NON-INVENTORY", "kitchen scale"],
+    B001CDTLGS: ["NON-INVENTORY", "Winco utility scoop"],
+    B002P5RGMI: ["NON-INVENTORY", "compost thermometer, tool"],
+    B0897BW3B9: ["NON-INVENTORY", "digital lab scale, tool"],
+    B0BL352NXF: ["NON-INVENTORY", "water flow meter, tool"],
+};
+
+/** Fallback for an ASIN nobody has classified yet. */
+const CLASS_RULES: Array<{ klass: CaptureClass; re: RegExp; why: string }> = [
+    { klass: "STOCK-CONSUMABLE", re: /toner|drum unit|ink cartridge|printhead/i, why: "printer consumable" },
+    { klass: "STOCK-CONSUMABLE", re: /thermal (label|postage|receipt|paper)|poly (mailer|bag)|mailer/i, why: "shipping consumable" },
+    { klass: "STOCK-CONSUMABLE", re: /respirator (cartridge|filter)|particulate|n95/i, why: "shop PPE" },
+    { klass: "REPAIR-ONE-OFF", re: /garage door|fill valve|camlock|cam lock|ibc tote|rain barrel|hose|power cord|usb hub|ethernet|adapter|coupler|sweeper|hex key|power strip|high bay|solar/i, why: "repair or site part" },
+    { klass: "PRODUCTION-CONSUMABLE", re: /sanitizer|sanitizing|test strip|wipe/i, why: "production supply" },
+    { klass: "NON-INVENTORY", re: /desk|organizer|white ?board|chair|diaper|dvd|tissue|soap|scale|meter|thermometer|fan/i, why: "facility, office or tool" },
+];
+
+/**
+ * Classify one unmatched Amazon line. Known SKUs are stock by definition; an
+ * ASIN reviewed by hand wins over the keyword rules; anything else is REVIEW.
+ */
+function classifyCapture(line: AmazonLine, knownSku?: string): { klass: CaptureClass; why: string } {
+    if (knownSku) return { klass: "STOCK-CONSUMABLE", why: `already stocked as ${knownSku}` };
+    const hand = ASIN_CLASS[line.asin];
+    if (hand) return { klass: hand[0], why: hand[1] };
+    for (const rule of CLASS_RULES) {
+        if (rule.re.test(line.title)) return { klass: rule.klass, why: rule.why };
+    }
+    return { klass: "REVIEW", why: "not classified yet, needs a call" };
+}
 
 /**
  * Write the capture worksheet: one row per Amazon line bought with no PO number,
- * with the Finale SKU when the ASIN is already known, and blank columns for the
- * decision. Nothing is written to Finale from here.
+ * classified as stock, production consumable, repair one-off, or non-inventory,
+ * with the Finale SKU when the ASIN is already known. Nothing is written to
+ * Finale from here.
  */
-function writeCaptureSheet(report: Report, map: Map<string, { sku: string; po: string }>, outPath: string): number {
+function writeCaptureSheet(
+    report: Report,
+    map: Map<string, { sku: string; po: string; unitsPerPack: number }>,
+    outPath: string,
+): number {
     const header = [
-        "order_date", "order_id", "asin", "title", "qty", "unit_price", "subtotal", "shipping",
-        "promotion", "tax", "net", "category", "seller", "known_finale_sku", "seen_on_po",
-        "capture_suggestion", "DECIDE (po / expense / new-sku)", "FINE_SKU_TO_USE", "notes",
+        "class", "why", "order_date", "order_id", "asin", "title", "qty", "unit_price", "subtotal",
+        "shipping", "promotion", "tax", "net", "category", "seller", "known_finale_sku", "seen_on_po",
+        "DECIDE (po / expense / new-sku)", "FINE_SKU_TO_USE", "notes",
     ];
-    const rows: string[] = [];
-    let knownSpend = 0;
-    let unknownSpend = 0;
-    const orders = [...report.noPoOrders].sort((a, b) => (a.orderDate > b.orderDate ? 1 : -1));
-    for (const order of orders) {
+    const sorted = [...report.noPoOrders].sort((a, b) => (a.orderDate > b.orderDate ? 1 : -1));
+    const lines: Array<{ line: AmazonLine; klass: CaptureClass; why: string; sku?: string; po?: string }> = [];
+    for (const order of sorted) {
         for (const line of order.lines) {
             const hit = map.get(line.asin);
-            if (hit) knownSpend += line.net;
-            else unknownSpend += line.net;
-            const suggestion = hit
-                ? `we stock this as ${hit.sku} (PO ${hit.po}) - needs a PO`
-                : NON_INVENTORY_CATEGORY.test(line.category)
-                  ? "likely non-inventory - expense it"
-                  : "needs classification (consumable or new SKU)";
-            rows.push(
-                [
-                    line.orderDate,
-                    line.orderId,
-                    line.asin,
-                    line.title,
-                    line.quantity,
-                    line.ppu.toFixed(2),
-                    line.subtotal.toFixed(2),
-                    line.shipping.toFixed(2),
-                    line.promotion.toFixed(2),
-                    line.tax.toFixed(2),
-                    line.net.toFixed(2),
-                    line.category,
-                    line.seller,
-                    hit?.sku ?? "",
-                    hit?.po ?? "",
-                    suggestion,
-                    "",
-                    "",
-                    "",
-                ]
-                    .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-                    .join(","),
-            );
+            const cls = classifyCapture(line, hit?.sku);
+            lines.push({ line, klass: cls.klass, why: cls.why, sku: hit?.sku, po: hit?.po });
         }
     }
+    const order: CaptureClass[] = ["STOCK-CONSUMABLE", "PRODUCTION-CONSUMABLE", "REPAIR-ONE-OFF", "NON-INVENTORY", "REVIEW"];
+    lines.sort((a, b) => {
+        const byClass = order.indexOf(a.klass) - order.indexOf(b.klass);
+        if (byClass !== 0) return byClass;
+        return b.line.net - a.line.net;
+    });
+
+    const totals = new Map<CaptureClass, { n: number; net: number }>();
+    const rows = lines.map(({ line, klass, why, sku, po }) => {
+        const acc = totals.get(klass) || { n: 0, net: 0 };
+        acc.n += 1;
+        acc.net += line.net;
+        totals.set(klass, acc);
+        const suggestion =
+            klass === "STOCK-CONSUMABLE"
+                ? sku
+                    ? `we stock this as ${sku} (PO ${po}) - needs a PO`
+                    : "stock consumable - needs a SKU before a PO"
+                : klass === "REPAIR-ONE-OFF"
+                  ? "one-off repair or site part - no PO"
+                  : klass === "NON-INVENTORY"
+                    ? "not inventory - expense it"
+                    : klass === "PRODUCTION-CONSUMABLE"
+                      ? "small production supply - expense or SKU"
+                      : "needs a call";
+        return [
+            klass,
+            why,
+            line.orderDate,
+            line.orderId,
+            line.asin,
+            line.title,
+            line.quantity,
+            line.ppu.toFixed(2),
+            line.subtotal.toFixed(2),
+            line.shipping.toFixed(2),
+            line.promotion.toFixed(2),
+            line.tax.toFixed(2),
+            line.net.toFixed(2),
+            line.category,
+            line.seller,
+            sku ?? "",
+            po ?? "",
+            suggestion,
+            "",
+            "",
+        ]
+            .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+            .join(",");
+    });
+
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, [header.join(","), ...rows].join("\n"), "utf8");
-    console.log(
-        `\nCapture worksheet: ${rows.length} line(s), no PO number.\n` +
-            `  we already stock (ASIN known): $${knownSpend.toFixed(2)}\n` +
-            `  no SKU on record:             $${unknownSpend.toFixed(2)}`,
-    );
+
+    console.log(`\nCapture worksheet: ${rows.length} line(s) with no PO number, by class`);
+    for (const klass of order) {
+        const acc = totals.get(klass);
+        if (!acc) continue;
+        console.log(`  ${klass.padEnd(22)} ${String(acc.n).padStart(3)} line(s)  $${acc.net.toFixed(2).padStart(9)}`);
+    }
+    console.log(`Worksheet: ${outPath}`);
     return rows.length;
+}
+
+/**
+ * Create the capture PO from a plan: empty PO, then one POST carrying the
+ * supplier, the Amazon order date, the lines at the price actually paid, and a
+ * committed status so it can be received. Shipping goes on afterwards as a bare
+ * Freight line so it rolls into landed cost.
+ */
+async function createCapturePo(writer: FinaleWriter, plan: CapturePoPlan): Promise<string> {
+    const po = await writer.createEmptyPo();
+    const doc = await writer.fetchPo(po);
+    const items = plan.lines.map((l) => ({
+        productId: l.sku,
+        productUrl: `/${(writer as unknown as { accountPath: string }).accountPath}/api/product/${encodeURIComponent(l.sku)}`,
+        quantity: l.finaleqty,
+        unitPrice: Math.round((l.unitPrice + Number.EPSILON) * 1e6) / 1e6,
+    }));
+    await writer.postOrder(po, {
+        ...doc,
+        orderDate: `${plan.isoDate}T18:00:00`,
+        orderRoleList: [{ roleTypeId: "SUPPLIER", partyId: AMAZON_PARTY_ID }],
+        orderItemList: items,
+        statusId: "ORDER_LOCKED",
+    });
+    if (plan.freight > 0.005) {
+        await writer.setFreight(po, plan.freight);
+    }
+    await writer.restore(po, "ORDER_LOCKED");
+
+    const after = await writer.fetchPo(po);
+    const read = readFinalePo(after);
+    const lines = read.lines.map((l) => `${l.productId} x${l.quantity}@${l.unitPrice.toFixed(5)}`).join(" ");
+    return (
+        `   created PO ${po} ${read.statusId} ${read.orderDate} | ${lines} | ` +
+        `freight ${read.freight.map((f) => f.amount.toFixed(2)).join("+") || "0.00"} | total ${read.booked.toFixed(2)} ` +
+        `(amazon ${plan.amazonNet.toFixed(2)})`
+    );
+}
+
+// ── Capture POs (spend with no PO, stock consumables only) ────────────────────
+
+interface CapturePoLine {
+    sku: string;
+    /** Finale units, converted from Amazon packs using the ratio the POs already use. */
+    finaleqty: number;
+    unitPrice: number;
+    asin: string;
+    title: string;
+    amazonNet: number;
+}
+
+interface CapturePoPlan {
+    order: AmazonOrder;
+    isoDate: string;
+    lines: CapturePoLine[];
+    freight: number;
+    amazonNet: number;
+    notes: string[];
+}
+
+/** "06/19/2026" (Amazon) -> "2026-06-19" (Finale). */
+function amazonDateToIso(date: string): string {
+    const m = date.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    return m ? `${m[3]}-${m[1]}-${m[2]}` : date;
+}
+
+/**
+ * One PO per Amazon order, carrying only the stock consumables that order held.
+ * Units come from the pack ratio the existing POs already established (4 rolls
+ * per label pack, 100 mailers per pack), so a capture PO books the same unit of
+ * measure Bill's own POs use. Lines with no money and no quantity (free
+ * replacements) are listed as notes instead.
+ */
+function buildCapturePos(
+    report: Report,
+    map: Map<string, { sku: string; po: string; unitsPerPack: number }>,
+): CapturePoPlan[] {
+    const plans: CapturePoPlan[] = [];
+    for (const order of [...report.noPoOrders].sort((a, b) => (a.orderDate > b.orderDate ? 1 : -1))) {
+        const lines: CapturePoLine[] = [];
+        const notes: string[] = [];
+        let freight = 0;
+        let amazonNet = 0;
+        for (const line of order.lines) {
+            const hit = map.get(line.asin);
+            const cls = classifyCapture(line, hit?.sku);
+            if (cls.klass !== "STOCK-CONSUMABLE" || !hit) {
+                if (cls.klass === "STOCK-CONSUMABLE") {
+                    notes.push(`${line.title.slice(0, 40)} is stock but has no SKU yet`);
+                }
+                continue;
+            }
+            if (line.quantity <= 0 || line.net <= 0.005) {
+                notes.push(`${hit.sku}: ${line.title.slice(0, 34)} booked no money (replacement), skipped`);
+                continue;
+            }
+            const perPack = hit.unitsPerPack > 0 ? hit.unitsPerPack : 1;
+            const finaleqty = Math.round(line.quantity * perPack * 1e4) / 1e4;
+            const goods = line.subtotal + line.promotion;
+            // One Finale line per SKU: Amazon splits the same item across rows.
+            const merged = lines.find((l) => l.sku === hit.sku);
+            if (merged) {
+                // Total the dollars first, then re-derive the unit price: using the
+                // already-updated quantity here double counts the earlier line.
+                const mergedTotal = merged.finaleqty * merged.unitPrice + goods;
+                merged.finaleqty = Math.round((merged.finaleqty + finaleqty) * 1e4) / 1e4;
+                merged.unitPrice = mergedTotal / merged.finaleqty;
+                merged.amazonNet = round2(merged.amazonNet + line.net);
+            } else {
+                lines.push({
+                    sku: hit.sku,
+                    finaleqty,
+                    unitPrice: goods / finaleqty,
+                    asin: line.asin,
+                    title: line.title,
+                    amazonNet: line.net,
+                });
+            }
+            if (/monitor|standing desk|massage chair|lab scale|handheld inkjet/i.test(line.title)) {
+                notes.push(`${hit.sku}: looks like hardware rather than a consumable, include or drop`);
+            }
+            freight += line.shipping;
+            amazonNet += line.net;
+        }
+        if (!lines.length) continue;
+        plans.push({
+            order,
+            isoDate: amazonDateToIso(order.orderDate),
+            lines,
+            freight: round2(freight),
+            amazonNet: round2(amazonNet),
+            notes,
+        });
+    }
+    return plans;
+}
+
+function printCapturePlans(plans: CapturePoPlan[], live: boolean): void {
+    console.log(`\n${live ? "CREATING" : "CAPTURE PO PLAN (dry run)"} — ${plans.length} PO(s)\n`);
+    let total = 0;
+    for (const plan of plans) {
+        total += plan.amazonNet;
+        console.log(
+            `${plan.order.orderDate} order ${plan.order.orderId} -> PO dated ${plan.isoDate}, vendor Amazon`,
+        );
+        for (const l of plan.lines) {
+            console.log(
+                `   ${l.sku.padEnd(12)} ${String(l.finaleqty).padStart(7)} x ${l.unitPrice.toFixed(5).padStart(10)} = ` +
+                    `${(l.finaleqty * l.unitPrice).toFixed(2).padStart(8)}  (${l.asin}) ${l.title.slice(0, 40)}`,
+            );
+        }
+        console.log(`   freight ${plan.freight.toFixed(2)}  total ${(plan.amazonNet).toFixed(2)}\n`);
+        for (const note of plan.notes) console.log(`   note: ${note}`);
+    }
+    console.log(`${plans.length} PO(s), $${total.toFixed(2)} of missed stock consumables.`);
 }
 
 async function main(): Promise<void> {
@@ -1229,8 +1525,8 @@ async function main(): Promise<void> {
     };
     const fixMode = argv.includes("--fix");
     const live = argv.includes("--live");
-    if (live && !fixMode) {
-        console.error("--live only applies with --fix. Run --fix first to see the plan.");
+    if (live && !fixMode && !argv.includes("--capture-po")) {
+        console.error("--live only applies with --fix or --capture-po. Run without --live first to see the plan.");
         process.exit(2);
     }
 
@@ -1332,6 +1628,26 @@ async function main(): Promise<void> {
         const sheet =
             arg("--capture-out") ?? path.join(path.dirname(outPath), `amazon-capture-${stamp}.csv`);
         writeCaptureSheet(report, asinSkuMap(findings), sheet);
+    }
+
+    if (argv.includes("--capture-po")) {
+        const plans = buildCapturePos(report, asinSkuMap(findings));
+        printCapturePlans(plans, live);
+        if (!live) {
+            console.log("\nDry run. Re-run with --capture-po --live to create these POs in Finale.");
+            return;
+        }
+        const writer = new FinaleWriter();
+        for (const plan of plans) {
+            try {
+                console.log(await createCapturePo(writer, plan));
+            } catch (err: unknown) {
+                const message = err instanceof Error ? err.message : String(err);
+                console.error(`   FAILED ${plan.order.orderId} — ${message.split("\n")[0]}`);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+        return;
     }
 
     if (!fixMode) return;
