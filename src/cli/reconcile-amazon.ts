@@ -50,8 +50,27 @@ import { FinaleClient } from "../lib/finale/client";
 /** Finale product promo URLs that carry tax and freight. */
 const TAX_PROMO = "/10008";
 const FREIGHT_PROMO = "/10007";
+/**
+ * Reviewed ASIN -> Finale SKU conversions (2026-09-29, one line at a time against both
+ * exports). Price-pairing can name a SKU but cannot be trusted to divide quantities: a
+ * name-matched ASIN once turned 10 free mailer packs into 1,000 phantom units. Anything
+ * not in this table falls back to what a price-verified pair can prove, and an ASIN whose
+ * link is only guessed stays out of purchase totals — that is a decision for Bill, not
+ * something to invent.
+ */
+const ASIN_SKU_UNITS: Record<string, { sku: string; unitsPerPack: number }> = {
+    B01MAZEN5X: { sku: "DASH101", unitsPerPack: 4 }, // Dasher thermal labels, 4 rolls/pack
+    B0BX248NJ2: { sku: "TN830", unitsPerPack: 2 }, // Brother TN830XL, 2 cartridges/pack
+    B00NMH29PM: { sku: "S-11481", unitsPerPack: 100 }, // ABC gusseted poly mailers 11x13, 100/pack
+    B07M6QP7Y9: { sku: "S-11481", unitsPerPack: 100 }, // PSBM expansion poly mailers 11x13 — Bill books these to S-11481 too (PO 125059, 125150)
+    B0DHXN386Z: { sku: "LR44BATT", unitsPerPack: 60 }, // NICEBATT LR44, 60/pack
+    B0FT21HKZ6: { sku: "MONI101", unitsPerPack: 1 }, // Sceptre 22" monitor
+};
+
 /** Party id Finale holds Amazon orders against (partygroup "Amazon"). */
 const AMAZON_PARTY_ID = "10154";
+/** Every Amazon PO in Finale destinates to the soil facility; a PO without one cannot be received. */
+const DESTINATION_FACILITY = "10005";
 /** A pair matches when the unit prices agree to within this much (pack rounding). */
 const UNIT_TOLERANCE = 0.15;
 /** An order is clean when booked and charged agree to within this much. */
@@ -1065,7 +1084,15 @@ function printPlans(plans: PoPlan[], live: boolean): void {
 
 /** A Finale order document as the writer mutates it. */
 type WritableOrderItem = { productId?: unknown; quantity?: unknown; unitPrice?: number };
-type WritablePo = RawFinaleOrder & { orderItemList?: WritableOrderItem[]; statusId?: string };
+type WritablePo = RawFinaleOrder & {
+    orderItemList?: WritableOrderItem[];
+    statusId?: string;
+    /** Present on every PO read back from Finale; used to derive the API prefix. */
+    orderUrl?: string;
+    /** Every Amazon PO destinates to the soil facility (10005). */
+    destinationFacilityUrl?: string;
+};
+
 
 /** Writes through the Finale client's own GET -> unlock -> POST -> restore pattern. */
 class FinaleWriter extends FinaleClient {
@@ -1087,6 +1114,30 @@ class FinaleWriter extends FinaleClient {
         if (!id) throw new Error("Finale did not return an orderId for the new PO");
         return id;
     }
+    /**
+     * Units already booked by capture POs from earlier runs. Only the export's POs are
+     * visible to the reconciler; a capture PO carries no Amazon PO number, so it has to be
+     * read back by id or the next run books the same stock again.
+     */
+    async capturePoUnits(pos: string[]): Promise<Map<string, number>> {
+        const units = new Map<string, number>();
+        for (const po of pos) {
+            try {
+                const doc = await this.fetchPo(po);
+                if (String(doc.statusId ?? "").toUpperCase().includes("CANCEL")) continue;
+                for (const l of doc.orderItemList ?? []) {
+                    const sku = l.productId ? String(l.productId).trim() : "";
+                    if (!sku) continue;
+                    units.set(sku, (units.get(sku) ?? 0) + Number(l.quantity ?? 0));
+                }
+            } catch {
+                // a deleted or unreadable PO simply contributes nothing
+            }
+            await new Promise((r) => setTimeout(r, 700));
+        }
+        return units;
+    }
+
     /** Unlock a committed/completed PO; returns the status to restore. */
     async unlock(doc: WritablePo, po: string): Promise<string> {
         return this.unlockForEditing(doc, po);
@@ -1158,24 +1209,47 @@ async function applyPlan(writer: FinaleWriter, plan: PoPlan): Promise<string> {
  * passes. An Amazon line whose ASIN is in here is stock we already buy, so a
  * purchase of it without a PO is a capture gap rather than a new item.
  */
-function asinSkuMap(findings: PoFinding[]): Map<string, { sku: string; po: string; unitsPerPack: number }> {
-    const map = new Map<string, { sku: string; po: string; unitsPerPack: number }>();
+function asinSkuMap(
+    findings: PoFinding[],
+): Map<string, { sku: string; po: string; unitsPerPack: number; verified: boolean; source?: string }> {
+    const map = new Map<
+        string,
+        { sku: string; po: string; unitsPerPack: number; verified: boolean; source?: string }
+    >();
+    // Verified pairs first: they are price-matched against a real PO line and give the only
+    // pack ratio worth trusting. A name-matched or candidate link may still name a SKU, but
+    // its quantity cannot be converted, so it is flagged and kept out of purchase totals.
+    for (const [asin, conv] of Object.entries(ASIN_SKU_UNITS)) {
+        map.set(asin, { sku: conv.sku, po: "", unitsPerPack: conv.unitsPerPack, verified: true, source: "table" });
+    }
+    const ordered: Array<{ p: PairResult; verified: boolean }> = [];
     for (const f of findings) {
-        for (const p of [...f.pairs, ...f.titleMatches, ...f.candidates]) {
+        for (const p of f.pairs) ordered.push({ p, verified: true });
+        for (const p of [...f.titleMatches, ...f.candidates]) ordered.push({ p, verified: false });
+    }
+    {
+        for (const { p, verified } of ordered) {
             if (!p.amazon.asin || p.amazon.quantity <= 0) continue;
             // Finale units per Amazon pack, the ratio Bill's own POs already use
             // (20 label packs -> 80 rolls, 10 mailer packs -> 1000 mailers). A
             // quantity-mismatch pair carries no usable ratio, and where the POs
             // disagree (TN830 booked both as packs and as cartridges) the larger
             // ratio wins, which is the cartridge-level reading.
-            const usable = !p.qtyMismatch && p.dividesEvenly && p.amazon.quantity > 0;
+            const usable = verified && !p.qtyMismatch && p.dividesEvenly && p.amazon.quantity > 0;
             const ratio = usable ? Math.round((p.finale.quantity / p.amazon.quantity) * 1e4) / 1e4 : 0;
             const existing = map.get(p.amazon.asin);
             if (existing) {
+                if (existing.verified) continue; // the reviewed table wins
                 if (ratio > existing.unitsPerPack) existing.unitsPerPack = ratio;
+                if (verified) existing.verified = true;
                 continue;
             }
-            map.set(p.amazon.asin, { sku: p.finale.productId, po: f.po, unitsPerPack: ratio > 0 ? ratio : 1 });
+            map.set(p.amazon.asin, {
+                sku: p.finale.productId,
+                po: findings.find((f) => f.pairs.includes(p) || f.titleMatches.includes(p) || f.candidates.includes(p))?.po ?? "",
+                unitsPerPack: ratio > 0 ? ratio : 1,
+                verified,
+            });
         }
     }
     return map;
@@ -1368,7 +1442,7 @@ function writeCaptureSheet(
  * committed status so it can be received. Shipping goes on afterwards as a bare
  * Freight line so it rolls into landed cost.
  */
-async function createCapturePo(writer: FinaleWriter, plan: CapturePoPlan): Promise<string> {
+async function createCapturePo(writer: FinaleWriter, plan: CapturePoPlan): Promise<{ po: string; log: string }> {
     const po = await writer.createEmptyPo();
     const doc = await writer.fetchPo(po);
     const items = plan.lines.map((l) => ({
@@ -1377,10 +1451,12 @@ async function createCapturePo(writer: FinaleWriter, plan: CapturePoPlan): Promi
         quantity: l.finaleqty,
         unitPrice: Math.round((l.unitPrice + Number.EPSILON) * 1e6) / 1e6,
     }));
+    const facilityUrl = (doc.orderUrl ?? "").replace(/\/api\/order\/.*$/, "") + `/api/facility/${DESTINATION_FACILITY}`;
     await writer.postOrder(po, {
         ...doc,
         orderDate: `${plan.isoDate}T18:00:00`,
         orderRoleList: [{ roleTypeId: "SUPPLIER", partyId: AMAZON_PARTY_ID }],
+        destinationFacilityUrl: facilityUrl,
         orderItemList: items,
         statusId: "ORDER_LOCKED",
     });
@@ -1392,11 +1468,13 @@ async function createCapturePo(writer: FinaleWriter, plan: CapturePoPlan): Promi
     const after = await writer.fetchPo(po);
     const read = readFinalePo(after);
     const lines = read.lines.map((l) => `${l.productId} x${l.quantity}@${l.unitPrice.toFixed(5)}`).join(" ");
-    return (
-        `   created PO ${po} ${read.statusId} ${read.orderDate} | ${lines} | ` +
-        `freight ${read.freight.map((f) => f.amount.toFixed(2)).join("+") || "0.00"} | total ${read.booked.toFixed(2)} ` +
-        `(amazon ${plan.amazonNet.toFixed(2)})`
-    );
+    return {
+        po,
+        log:
+            `   created PO ${po} ${read.statusId} ${read.orderDate} | ${lines} | ` +
+            `freight ${read.freight.map((f) => f.amount.toFixed(2)).join("+") || "0.00"} | total ${read.booked.toFixed(2)} ` +
+            `(amazon ${plan.amazonNet.toFixed(2)})`,
+    };
 }
 
 // ── Capture POs (spend with no PO, stock consumables only) ────────────────────
@@ -1433,10 +1511,99 @@ function amazonDateToIso(date: string): string {
  * measure Bill's own POs use. Lines with no money and no quantity (free
  * replacements) are listed as notes instead.
  */
+/**
+ * Per-SKU coverage: how many Finale units Amazon actually sold, versus how many are
+ * already booked on a PO. Bill writes one PO that covers several Amazon orders and
+ * often leaves the PO field blank on the later ones, so a blank PO field does NOT
+ * mean the goods were never booked — purchase orders must be compared as SKU totals,
+ * never order by order, or the capture run double-books stock the shelf already has.
+ */
+function skuCoverage(
+    report: Report,
+    map: Map<string, { sku: string; po: string; unitsPerPack: number; verified: boolean; source?: string }>,
+    allOrders: AmazonOrder[],
+    extraBooked?: Map<string, number>,
+): Map<string, { sku: string; bought: number; booked: number }> {
+    const cover = new Map<string, { sku: string; bought: number; booked: number }>();
+    /** For --debug-cover: which ASIN/order contributed what. */
+    const trace = new Map<string, string[]>();
+    const at = (sku: string) => {
+        let entry = cover.get(sku);
+        if (!entry) {
+            entry = { sku, bought: 0, booked: 0 };
+            cover.set(sku, entry);
+        }
+        return entry;
+    };
+    // Bought units come straight from the export, one count per purchased line: the
+    // pairing machinery can surface the same line under several bases.
+    // Object identity: the same line can appear under several pairing bases, but two
+    // genuinely separate rows of the same item in one order are different objects.
+    const seen = new Set<AmazonLine>();
+    for (const order of allOrders) {
+        for (const line of order.lines) {
+            // A $0 line is a free replacement of stock already counted; it is not a purchase.
+            if (!line.asin || line.quantity <= 0 || line.net <= 0.005 || /cancel/i.test(line.orderStatus ?? "")) continue;
+            const hit = map.get(line.asin);
+            // Only the reviewed table may drive purchase totals. A price-verified pair proves
+            // two lines cost alike, not that they are the same product — a matched ASIN of a
+            // different brand would otherwise invent stock that was never bought.
+            if (!hit?.verified || hit.source !== "table") continue;
+            if (seen.has(line)) continue;
+            seen.add(line);
+            const units = line.quantity * (hit.unitsPerPack > 0 ? hit.unitsPerPack : 1);
+            at(hit.sku).bought += units;
+            trace.set(hit.sku, [...(trace.get(hit.sku) ?? []), `${line.asin} ${order.orderDate} q${line.quantity}x${hit.unitsPerPack}=${units}`]);
+        }
+    }
+    // Booked: every line on a PO the export knows, plus POs this tool created earlier
+    // (they carry no Amazon PO number, so the export cannot see them).
+    for (const finding of report.findings) {
+        for (const l of finding.finale.lines) {
+            if (!l.productId) continue;
+            at(l.productId.trim()).booked += l.quantity;
+        }
+    }
+    for (const [sku, units] of extraBooked ?? []) at(sku.trim()).booked += units;
+    for (const [sku, parts] of trace) {
+        if ((cover.get(sku)?.bought ?? 0) > (cover.get(sku)?.booked ?? 0) + 0.005) {
+            cover.set(`trace:${sku}`, { sku, bought: 0, booked: 0 });
+            trace.set(`trace:${sku}`, parts);
+        }
+    }
+    (cover as unknown as { traces?: Map<string, string[]> }).traces = trace;
+    return cover;
+}
+
+/** Capture POs created on earlier runs, so their units are never booked twice. */
+const CAPTURE_STATE = path.join(process.cwd(), ".hermes", "amazon-capture-pos.json");
+
+function readCapturePoState(): string[] {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(CAPTURE_STATE, "utf8"));
+        return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+        return [];
+    }
+}
+
+function rememberCapturePo(po: string): void {
+    const all = [...new Set([...readCapturePoState(), String(po)])];
+    fs.mkdirSync(path.dirname(CAPTURE_STATE), { recursive: true });
+    fs.writeFileSync(CAPTURE_STATE, JSON.stringify(all, null, 1), "utf8");
+}
+
+
 function buildCapturePos(
     report: Report,
-    map: Map<string, { sku: string; po: string; unitsPerPack: number }>,
+    map: Map<string, { sku: string; po: string; unitsPerPack: number; verified: boolean }>,
+    cover?: Map<string, { sku: string; bought: number; booked: number }>,
 ): CapturePoPlan[] {
+    // Remaining unbooked units per SKU, spent oldest order first as the plans are built.
+    const shortfall = new Map<string, number>();
+    if (cover) {
+        for (const [sku, c] of cover) shortfall.set(sku, c.bought - c.booked);
+    }
     const plans: CapturePoPlan[] = [];
     for (const order of [...report.noPoOrders].sort((a, b) => (a.orderDate > b.orderDate ? 1 : -1))) {
         const lines: CapturePoLine[] = [];
@@ -1457,7 +1624,22 @@ function buildCapturePos(
                 continue;
             }
             const perPack = hit.unitsPerPack > 0 ? hit.unitsPerPack : 1;
-            const finaleqty = Math.round(line.quantity * perPack * 1e4) / 1e4;
+            let finaleqty = Math.round(line.quantity * perPack * 1e4) / 1e4;
+            const room = shortfall.get(hit.sku);
+            if (room !== undefined) {
+                if (room <= 0.005) {
+                    notes.push(
+                        `${hit.sku}: ${line.title.slice(0, 30)} already booked - SKU total ` +
+                            `${cover?.get(hit.sku)?.bought ?? 0} bought vs ${cover?.get(hit.sku)?.booked ?? 0} booked, skipped`,
+                    );
+                    continue;
+                }
+                if (finaleqty > room) {
+                    notes.push(`${hit.sku}: trimmed ${finaleqty} to the unbooked ${room} units`);
+                    finaleqty = room;
+                }
+                shortfall.set(hit.sku, Math.round((room - finaleqty) * 1e4) / 1e4);
+            }
             const goods = line.subtotal + line.promotion;
             // One Finale line per SKU: Amazon splits the same item across rows.
             const merged = lines.find((l) => l.sku === hit.sku);
@@ -1631,16 +1813,33 @@ async function main(): Promise<void> {
     }
 
     if (argv.includes("--capture-po")) {
-        const plans = buildCapturePos(report, asinSkuMap(findings));
+        const map = asinSkuMap(findings);
+        const writer = new FinaleWriter();
+        const priorPos = readCapturePoState();
+        const priorUnits = await writer.capturePoUnits(priorPos);
+        const cover = skuCoverage(report, map, [...orders.values()], priorUnits);
+        if (priorPos.length) console.log(`   counting ${priorPos.length} capture PO(s) from earlier runs: ${priorPos.join(", ")}`);
+        if (argv.includes("--debug-cover")) {
+            for (const [sku, c] of cover) {
+                if (sku.startsWith("trace:")) continue;
+                console.log(`   cover ${sku}: bought ${c.bought} booked ${c.booked} short ${c.bought - c.booked}`);
+            }
+            const tr = (cover as unknown as { traces?: Map<string, string[]> }).traces;
+            for (const [sku, parts] of tr ?? []) {
+                if (sku.startsWith("trace:")) console.log(`   how ${sku.slice(6)}: ${parts.join(" | ")}`);
+            }
+        }
+        const plans = buildCapturePos(report, map, cover);
         printCapturePlans(plans, live);
         if (!live) {
             console.log("\nDry run. Re-run with --capture-po --live to create these POs in Finale.");
             return;
         }
-        const writer = new FinaleWriter();
         for (const plan of plans) {
             try {
-                console.log(await createCapturePo(writer, plan));
+                const created = await createCapturePo(writer, plan);
+                rememberCapturePo(created.po);
+                console.log(created.log);
             } catch (err: unknown) {
                 const message = err instanceof Error ? err.message : String(err);
                 console.error(`   FAILED ${plan.order.orderId} — ${message.split("\n")[0]}`);
