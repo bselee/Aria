@@ -82,6 +82,8 @@ const AMOUNT_TOLERANCE = 0.01;
  * materials; personal spend has no home at all and is flagged rather than forced.
  */
 const FINALOOP_CATEGORIES = ["Repairs", "Supplies & materials", "Packaging materials"];
+/** Bill, 2026-09-29: anything already coded Distributions is deliberate — leave it alone. */
+const DISREGARD_CATEGORIES = ["Distributions"];
 const COLLAPSE_TO = "Supplies & materials";
 const NO_HOME = "no fit in Finaloop - needs a call";
 
@@ -396,6 +398,10 @@ function buildReview(charges: BankCharge[], orders: Order[], finaloop: boolean):
         });
 
     for (const charge of charges) {
+        if (DISREGARD_CATEGORIES.includes(charge.category)) {
+            rows.push({ ...base(charge), order: "", po: "", what: "", items: "", rec: charge.category, action: "OK", type: "ok" });
+            continue;
+        }
         if (NON_AMAZON_RETAIL.test(charge.merchant)) {
             rows.push({ ...base(charge), order: "", po: "", what: "AWS", items: "AWS", rec: "Software", action: "OK", type: "ok" });
             continue;
