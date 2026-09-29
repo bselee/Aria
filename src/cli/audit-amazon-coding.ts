@@ -76,10 +76,11 @@ const DEFAULT_CATEGORY = "Office supplies & equipment";
 const AMOUNT_TOLERANCE = 0.01;
 
 /**
- * Finaloop only offers these three categories for Amazon charges (Bill, 2026-09-29),
- * so --finaloop collapses every recommendation onto one of them. Toner, monitors,
- * printers and the like have no office bucket to go to and land in Supplies &
- * materials; personal spend has no home at all and is flagged rather than forced.
+ * Optional three-bucket view, opt-in via --finaloop. Finaloop does have both office
+ * categories — its own export codes nine charges to Office supplies and one to Office
+ * supplies & equipment — so never apply this by default: a screenshot showing three
+ * suggestions for one transaction is not the taxonomy. Collapsing puts office and IT
+ * goods into Supplies & materials, which Bill rightly rejected for a PC build.
  */
 const FINALOOP_CATEGORIES = ["Repairs", "Supplies & materials", "Packaging materials"];
 /** Bill, 2026-09-29: anything already coded Distributions is deliberate — leave it alone. */
