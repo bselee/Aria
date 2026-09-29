@@ -18,6 +18,7 @@
  *   node --import tsx src/cli/audit-amazon-coding.ts                     # newest bank + orders exports
  *   node --import tsx src/cli/audit-amazon-coding.ts --bank <path.csv> --orders <path.csv>
  *   node --import tsx src/cli/audit-amazon-coding.ts --out <out.csv>
+ *   node --import tsx src/cli/audit-amazon-coding.ts --list --finaloop   # collapse onto Finaloop's three categories
  *
  * Checks:
  *   miscoded charge   Finaloop category vs the category the items imply
@@ -73,6 +74,16 @@ const DEFAULT_CATEGORY = "Office supplies & equipment";
 
 /** A charge matches an order or line when the amounts agree to within this much. */
 const AMOUNT_TOLERANCE = 0.01;
+
+/**
+ * Finaloop only offers these three categories for Amazon charges (Bill, 2026-09-29),
+ * so --finaloop collapses every recommendation onto one of them. Toner, monitors,
+ * printers and the like have no office bucket to go to and land in Supplies &
+ * materials; personal spend has no home at all and is flagged rather than forced.
+ */
+const FINALOOP_CATEGORIES = ["Repairs", "Supplies & materials", "Packaging materials"];
+const COLLAPSE_TO = "Supplies & materials";
+const NO_HOME = "no fit in Finaloop - needs a call";
 
 /**
  * Hand-written plain names for ASINs whose Amazon title reads badly once the
@@ -328,6 +339,16 @@ function chargeTime(date: string): number {
 
 // ── Categorisation ───────────────────────────────────────────────────────────
 
+/**
+ * Collapse a category onto the three Finaloop offers. Returns the category to use,
+ * or NO_HOME when the spend is personal and must not be forced into an expense bucket.
+ */
+function collapseToFinaloop(category: string): string {
+    if (FINALOOP_CATEGORIES.includes(category)) return category;
+    if (category === "Personal / non-business") return NO_HOME;
+    return COLLAPSE_TO;
+}
+
 /** Two office buckets differing only in name are a preference, not a miscode. */
 function isNamingOnly(a: string, b: string): boolean {
     return [a, b].every((c) => c === "Office supplies" || c === "Office supplies & equipment");
@@ -354,7 +375,7 @@ function recommendCategory(items: Array<{ title: string; net: number }>): string
  * dated on or before the charge are preferred so returns and re-bills do not
  * steal an earlier match.
  */
-function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
+function buildReview(charges: BankCharge[], orders: Order[], finaloop: boolean): ReviewRow[] {
     /** Every review row restates the charge it came from. */
     const base = (c: BankCharge): Omit<ReviewRow, "order" | "po" | "what" | "items" | "rec" | "action" | "type"> => ({
         date: c.date,
@@ -388,15 +409,16 @@ function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
             usedOrders.add(o.orderId);
             o.lines.forEach((l) => usedLines.add(l));
             const rec = recommendCategory(o.lines);
+            const target = finaloop ? collapseToFinaloop(rec) : rec;
             rows.push({
                 ...base(charge),
                 order: o.orderId,
                 po: o.po,
                 what: humanizeLines(o.lines),
                 items: o.lines.map((l) => `${l.asin} q${l.quantity} ${l.title.slice(0, 44)}`).join("; "),
-                rec,
-                action: rec === charge.category ? "OK" : "FIX",
-                type: rec === charge.category ? "ok" : isNamingOnly(charge.category, rec) ? "optional" : "change",
+                rec: target,
+                action: target === charge.category ? "OK" : "FIX",
+                type: target === charge.category ? "ok" : isNamingOnly(charge.category, target) ? "optional" : "change",
             });
             continue;
         }
@@ -408,15 +430,16 @@ function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
             const { o: line } = closestFirst(lineHits)[0];
             usedLines.add(line);
             const rec = recommendCategory([line]);
+            const target = finaloop ? collapseToFinaloop(rec) : rec;
             rows.push({
                 ...base(charge),
                 order: line.orderId,
                 po: line.po,
                 what: humanizeLines([line]),
                 items: `${line.asin} q${line.quantity} ${line.title.slice(0, 52)} (one line of a split shipment)`,
-                rec,
-                action: rec === charge.category ? "OK" : "FIX",
-                type: rec === charge.category ? "ok" : isNamingOnly(charge.category, rec) ? "optional" : "change",
+                rec: target,
+                action: target === charge.category ? "OK" : "FIX",
+                type: target === charge.category ? "ok" : isNamingOnly(charge.category, target) ? "optional" : "change",
             });
             continue;
         }
@@ -548,7 +571,7 @@ function main(): void {
 
     const charges = loadCharges(bankFile);
     const orders = loadOrders(ordersFile);
-    const rows = buildReview(charges, orders);
+    const rows = buildReview(charges, orders, argv.includes("--finaloop"));
     printSummary(rows, bankFile, ordersFile, outPath);
     if (argv.includes("--list")) printChangeList(rows);
     writeReview(rows, outPath);
