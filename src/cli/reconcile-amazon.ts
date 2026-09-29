@@ -65,6 +65,10 @@ const ASIN_SKU_UNITS: Record<string, { sku: string; unitsPerPack: number }> = {
     B07M6QP7Y9: { sku: "S-11481", unitsPerPack: 100 }, // PSBM expansion poly mailers 11x13 — Bill books these to S-11481 too (PO 125059, 125150)
     B0DHXN386Z: { sku: "LR44BATT", unitsPerPack: 60 }, // NICEBATT LR44, 60/pack
     B0FT21HKZ6: { sku: "MONI101", unitsPerPack: 1 }, // Sceptre 22" monitor
+    // Amazon "1 Pair" is exactly the S-12527 "(2 Pk)" unit, so the ratio is 1:1
+    B00AEFCP0E: { sku: "S-12527", unitsPerPack: 1 }, // 3M 6006 respirator cartridges
+    B0CPMDDTGX: { sku: "DR830", unitsPerPack: 1 }, // Brother DR830 drum unit (SKU already existed)
+    B09P2WVQ65: { sku: "S-16160", unitsPerPack: 10 }, // MUNBYN receipt paper, 10 rolls/pack -> S-16160 (Bill, 2026-09-29)
 };
 
 /** Party id Finale holds Amazon orders against (partygroup "Amazon"). */
