@@ -74,6 +74,71 @@ const DEFAULT_CATEGORY = "Office supplies & equipment";
 /** A charge matches an order or line when the amounts agree to within this much. */
 const AMOUNT_TOLERANCE = 0.01;
 
+/**
+ * Hand-written plain names for ASINs whose Amazon title reads badly once the
+ * marketing is stripped. Everything else falls through to humanizeTitle, so a
+ * new ASIN still produces a usable name without an edit here.
+ */
+const PRODUCT_NAMES: Record<string, string> = {
+    B0BX248NJ2: "Brother TN830XL toner",
+    B0CPMDDTGX: "Brother DR830 drum unit",
+    B0FT21HKZ6: "Sceptre 22-inch monitor",
+    B01H1MKQTO: "DYMO 30252 labels",
+    B0DZ6HN56D: "handheld inkjet printer",
+    B0D78KJ8T3: "inkjet ink cartridge",
+    B0CXX8CD3Y: "blank printable business cards",
+    B0D47J76HR: "hex key wrench set",
+    B0BKH9HY7H: "Inspire 6mil heavy-duty bag",
+    B0BKH6Q6J3: "Inspire 6mil heavy-duty bag",
+    B0BKH6F16T: "Inspire 6mil heavy-duty bag",
+    B0GMQCLK9S: "torch tip dust cover",
+    B00NNQSDHS: "hand soap",
+    B00F1U0YB4: "hand soap",
+    B00NU9MJYS: "hand soap",
+    B0D1VGZP7Z: "RGB case fans, 5-pack",
+    B0FH26SQ8V: "ARGB PWM case fans, 6-pack",
+    B097SVQ2S5: "camlock fitting",
+    B0F83XBSPC: "IBC tote",
+    B08L4XTB2G: "IBC vented lid",
+    B08FSMYWZ3: "garden hose adapter",
+    B01MQIN56L: "rain barrel inlet adapter",
+    B0CRB56GZP: "PVC reinforced tubing",
+    B08HL7VHTV: "fermentation pH test strips",
+    B09BXT3J9Z: "facial tissues",
+    B0C7162144: "kitchen scale",
+    B002P5RGMI: "compost thermometer",
+    B0897BW3B9: "digital lab scale",
+    B0G69256FH: "Osaki 4D massage chair",
+    B087ZMJ98M: "diaper bag",
+    B0GBVMN3HS: "Zootopia 2 DVD",
+    B0BZX4BY85: "Sunco UFO LED high bay lights, 10-pack",
+    B014W3EM2W: "Thermaltake 500W power supply",
+    B092L9GF5N: "AMD Ryzen 5 5600G CPU",
+    B0DMHS9HQ4: "500GB NVMe SSD",
+    B089D1YG11: "MSI B550M motherboard",
+    B07NZYJ9ZJ: "ATX mid-tower PC case",
+};
+
+/** Strip Amazon's marketing padding off a title so a charge reads like an invoice line. */
+function humanizeTitle(title: string): string {
+    let t = title.replace(/\s*[|,].*$/, "");
+    t = t.replace(/\s*\([^()]*\)/g, "");
+    t = t.replace(/^(Amazon Basics|AmazonCommercial|Brother Genuine|Genuine)\s*/i, "");
+    t = t.replace(/\s+(for|with|Compatible)\s+.*$/i, "");
+    t = t.replace(/\s+/g, " ").trim().replace(/[-–]\s*$/, "");
+    return t.slice(0, 44).trim();
+}
+
+/** "ASIN x qty title" lines -> "name x qty + name x qty". */
+function humanizeLines(lines: Array<{ asin: string; quantity: number; title: string }>): string {
+    const seen = new Map<string, number>();
+    for (const l of lines) {
+        const name = PRODUCT_NAMES[l.asin] ?? humanizeTitle(l.title);
+        seen.set(name, (seen.get(name) ?? 0) + l.quantity);
+    }
+    return [...seen.entries()].map(([name, qty]) => (qty > 1 ? `${name} x${qty}` : name)).join(" + ");
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface BankCharge {
@@ -110,9 +175,14 @@ interface ReviewRow {
     amount: number;
     order: string;
     po: string;
+    /** Plain-English name of what was bought — the column to read in Finaloop. */
+    what: string;
+    /** ASIN-keyed line detail, for traceability back to the export. */
     items: string;
     rec: string;
     action: "OK" | "FIX" | "INVESTIGATE";
+    /** change = recode this; optional = naming preference only; unresolved = no order match. */
+    type: "change" | "optional" | "unresolved" | "ok";
 }
 
 // ── CSV parsing (RFC 4180; Amazon wraps identifiers as ="value") ─────────────
@@ -258,6 +328,11 @@ function chargeTime(date: string): number {
 
 // ── Categorisation ───────────────────────────────────────────────────────────
 
+/** Two office buckets differing only in name are a preference, not a miscode. */
+function isNamingOnly(a: string, b: string): boolean {
+    return [a, b].every((c) => c === "Office supplies" || c === "Office supplies & equipment");
+}
+
 /** Category implied by the goods on an order, scored by dollars. */
 function recommendCategory(items: Array<{ title: string; net: number }>): string {
     const score = new Map<string, number>();
@@ -281,7 +356,7 @@ function recommendCategory(items: Array<{ title: string; net: number }>): string
  */
 function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
     /** Every review row restates the charge it came from. */
-    const base = (c: BankCharge): Omit<ReviewRow, "order" | "po" | "items" | "rec" | "action"> => ({
+    const base = (c: BankCharge): Omit<ReviewRow, "order" | "po" | "what" | "items" | "rec" | "action" | "type"> => ({
         date: c.date,
         account: c.account,
         merchant: c.merchant,
@@ -301,7 +376,7 @@ function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
 
     for (const charge of charges) {
         if (NON_AMAZON_RETAIL.test(charge.merchant)) {
-            rows.push({ ...base(charge), order: "", po: "", items: "AWS", rec: "Software", action: "OK" });
+            rows.push({ ...base(charge), order: "", po: "", what: "AWS", items: "AWS", rec: "Software", action: "OK", type: "ok" });
             continue;
         }
         const ct = chargeTime(charge.date);
@@ -317,9 +392,11 @@ function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
                 ...base(charge),
                 order: o.orderId,
                 po: o.po,
+                what: humanizeLines(o.lines),
                 items: o.lines.map((l) => `${l.asin} q${l.quantity} ${l.title.slice(0, 44)}`).join("; "),
                 rec,
                 action: rec === charge.category ? "OK" : "FIX",
+                type: rec === charge.category ? "ok" : isNamingOnly(charge.category, rec) ? "optional" : "change",
             });
             continue;
         }
@@ -335,9 +412,11 @@ function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
                 ...base(charge),
                 order: line.orderId,
                 po: line.po,
+                what: humanizeLines([line]),
                 items: `${line.asin} q${line.quantity} ${line.title.slice(0, 52)} (one line of a split shipment)`,
                 rec,
                 action: rec === charge.category ? "OK" : "FIX",
+                type: rec === charge.category ? "ok" : isNamingOnly(charge.category, rec) ? "optional" : "change",
             });
             continue;
         }
@@ -345,9 +424,11 @@ function buildReview(charges: BankCharge[], orders: Order[]): ReviewRow[] {
             ...base(charge),
             order: "",
             po: "",
+            what: "not identifiable from the Amazon export",
             items: "no order or line in the Amazon export at this amount",
             rec: "REVIEW",
             action: "INVESTIGATE",
+            type: "unresolved",
         });
     }
     return rows;
@@ -402,15 +483,50 @@ function printSummary(rows: ReviewRow[], bankFile: string, ordersFile: string, o
     console.log(`\nwrote ${outPath}`);
 }
 
+/** Date order, because that is the order Finaloop lists transactions in. */
+function byDate(rows: ReviewRow[]): ReviewRow[] {
+    return [...rows].sort((a, b) => chargeTime(a.date) - chargeTime(b.date) || b.amount - a.amount);
+}
+
 function writeReview(rows: ReviewRow[], outPath: string): void {
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    const header = ["date", "account", "merchant", "current", "amount", "order", "po", "items", "rec", "action"];
+    const header = ["date", "amount", "what_was_bought", "finaloop_now", "finaloop_should_be", "type", "order_id", "asins"];
     const esc = (v: string | number): string => `"${String(v).replace(/"/g, '""')}"`;
-    const ordered = [...rows].sort((a, b) => (a.action === b.action ? 0 : a.action === "FIX" ? -1 : 1));
-    const body = ordered.map((r) =>
-        [r.date, r.account, r.merchant, r.current, r.amount.toFixed(2), r.order, r.po, r.items, r.rec, r.action].map(esc).join(","),
-    );
+    const body = byDate(rows)
+        .filter((r) => r.action !== "OK")
+        .map((r) =>
+            [
+                r.date,
+                r.amount.toFixed(2),
+                r.what,
+                r.current || "(blank)",
+                r.action === "INVESTIGATE" ? "needs a decision" : r.rec,
+                r.type,
+                r.order,
+                r.items,
+            ].map(esc).join(","),
+        );
     fs.writeFileSync(outPath, [header.map(esc).join(","), ...body].join("\r\n") + "\r\n", "utf8");
+}
+
+/** The date-ordered recode list, ready to work top-down against Finaloop. */
+function printChangeList(rows: ReviewRow[]): void {
+    const todo = byDate(rows).filter((r) => r.action !== "OK");
+    const changes = todo.filter((r) => r.type === "change");
+    console.log(
+        `\n${todo.length} charges to review in Finaloop (${changes.length} recodes, ` +
+            `${todo.filter((r) => r.type === "optional").length} naming-only, ` +
+            `${todo.filter((r) => r.type === "unresolved").length} unresolved) — date order\n`,
+    );
+    console.log("date        amount  now                        should be                  what was bought");
+    for (const r of todo) {
+        const target = r.action === "INVESTIGATE" ? "needs a decision" : r.rec;
+        const tag = r.type === "optional" ? " (naming)" : r.type === "unresolved" ? " (no match)" : "";
+        console.log(
+            `  ${r.date} ${money(r.amount)}  ${(r.current || "(blank)").slice(0, 24).padEnd(26)} ` +
+                `${target.slice(0, 26).padEnd(27)} ${r.what}${tag}`,
+        );
+    }
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
@@ -434,6 +550,7 @@ function main(): void {
     const orders = loadOrders(ordersFile);
     const rows = buildReview(charges, orders);
     printSummary(rows, bankFile, ordersFile, outPath);
+    if (argv.includes("--list")) printChangeList(rows);
     writeReview(rows, outPath);
 }
 
