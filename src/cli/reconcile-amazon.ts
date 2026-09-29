@@ -1272,7 +1272,11 @@ const ASIN_CLASS: Record<string, [CaptureClass, string]> = {
     // Shipping and print consumables we buy over and over
     B00AEFCP0E: ["STOCK-CONSUMABLE", "3M 6006 respirator cartridges, 50 pairs over two lines, shop PPE"],
     B0CPMDDTGX: ["STOCK-CONSUMABLE", "Brother DR830 drum unit, same family as the TN830 we stock"],
-    B07MF1598K: ["STOCK-CONSUMABLE", "PSBM 10x13 poly mailers, same family as S-11481 and PM13x16x4"],
+    B07MF1598K: [
+        "NON-INVENTORY",
+        "PSBM 10x13 poly mailers ordered in error 07/06/2026; staff consumed them instead of " +
+            "sending them back, so it is a one-off expense — no SKU, no PO (Bill, 2026-09-29)",
+    ],
     B09P2WVQ65: ["STOCK-CONSUMABLE", "MUNBYN thermal receipt paper, check against S-16160 (2.25x85)"],
     // Small use-it-up production supplies
     B07571T12F: ["PRODUCTION-CONSUMABLE", "hygienic wipes"],
