@@ -6,7 +6,7 @@ module.exports = {
   apps: [{
     name: 'aria-bot',
     script: 'src/cli/start-bot.ts',
-    interpreter: 'node',
+    interpreter: 'C:/Program Files/nodejs/node.exe',
     node_args: '--import tsx',
     cwd: 'C:/Users/BuildASoil/Documents/Projects/aria',
     windowsHide: true,
