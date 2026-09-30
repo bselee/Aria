@@ -53,7 +53,7 @@ async function main() {
     console.log(`[dry-run] ledger: ${burning.length} SKUs with net consumption over ${days}d`);
 
     // "Before" = what the dashboard is currently serving.
-    let before: Lite[] = [];
+    const before: Lite[] = [];
     // The route persists resale and BOM snapshots separately.
     const cacheDir = process.env.ARIA_PURCHASING_CACHE_DIR || join(process.cwd(), ".aria-cache", "purchasing");
     for (const file of ["purchasing-resale.json", "purchasing-bom.json"]) {
@@ -86,7 +86,11 @@ async function main() {
         for (const i of g.items || []) {
             after.push({
                 productId: i.productId, supplierName: g.vendorName ?? i.supplierName,
-                urgency: i.urgency, decision: i.assessment?.decision,
+                urgency: i.urgency,
+                // getPurchasingIntelligence() returns the raw engine items; the
+                // order/hold decision is added later by the route's assessment
+                // layer, so there is nothing to read here yet.
+                decision: "",
                 dailyRate: num(i.dailyRate), rateSource: i.dailyRateSource || "",
                 stockOnHand: num(i.stockOnHand),
                 leadTime: num(i.effectiveLeadTimeDays ?? i.leadTimeDays),
