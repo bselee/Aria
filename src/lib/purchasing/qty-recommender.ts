@@ -17,7 +17,12 @@
  */
 
 import { roundToCleanQty } from "./cognitive-round";
-import { rawIngredientMinimumFor, rawIngredientMinimumLabel } from "./raw-ingredient-minimums";
+import {
+    rawIngredientMinimumFor,
+    rawIngredientMinimumLabel,
+    rawIngredientMaximumFor,
+    rawIngredientMaximumLabel,
+} from "./raw-ingredient-minimums";
 
 // Bumped on every behavioral change so the calibration loop can bucket
 // error rates per formula. See .agents/plans/2026-05-05-canonical-recommender.md.
@@ -737,6 +742,25 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
                 value: deviationPct,
             });
         }
+    }
+
+    // v2.9 (2026-09-30): raw-ingredient order CEILING, applied last so it bounds every
+    // bump above. Bill: "err on the conservative side while providing coverage for
+    // builds in the window. We rarely need more than 1-1.5 loads per month." A
+    // build-derived rate produced a 126,000 lb (3-load) worm-castings suggestion.
+    const rawMaximum = rawIngredientMaximumFor(input.sku);
+    if (rawMaximum != null && suggestedQty > rawMaximum) {
+        const capped = suggestedQty;
+        suggestedQty = rawMaximum;
+        reviewReasons.push(
+            `Capped at the ${rawIngredientMaximumLabel(rawMaximum)} — the raw requirement implied `
+            + `${capped} units. Order more only if a build window genuinely needs it.`,
+        );
+        trace.push({
+            step: "raw_ingredient_ceiling",
+            detail: `Capped ${capped} → ${rawMaximum}: ${rawIngredientMaximumLabel(rawMaximum)}`,
+            value: rawMaximum,
+        });
     }
 
     const reviewRequired = reviewReasons.length > 0;

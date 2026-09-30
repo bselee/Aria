@@ -10,8 +10,10 @@
  */
 import { describe, it, expect } from "vitest";
 import {
-    RAW_INGREDIENT_MIN_ORDER_QTY,
+    RAW_LOAD_QTY,
+    rawIngredientBoundsFor,
     rawIngredientMinimumFor,
+    rawIngredientMaximumFor,
     rawIngredientMinimumLabel,
 } from "./raw-ingredient-minimums";
 import { recommendQty } from "./qty-recommender";
@@ -19,11 +21,20 @@ import { recommendQty } from "./qty-recommender";
 const THREE_RAWS = ["RAWWORMCASTINGS", "RAWSEACOASTCOMPOST", "RAWMALIBUCOMPOST"];
 
 describe("rawIngredientMinimumFor", () => {
-    it("returns 42,000 for exactly the three raw ingredients", () => {
+    it("applies the expected bounds to exactly the three raw ingredients", () => {
         for (const sku of THREE_RAWS) {
             expect(rawIngredientMinimumFor(sku)).toBe(42_000);
+            expect(rawIngredientMaximumFor(sku)).toBe(63_000);
         }
-        expect(Object.keys(RAW_INGREDIENT_MIN_ORDER_QTY).sort()).toEqual([...THREE_RAWS].sort());
+        expect(RAW_LOAD_QTY).toBe(42_000);
+        // 1.5 loads: conservative ceiling. Bill rarely buys more than 1-1.5 loads/mo.
+        expect(rawIngredientMaximumFor("RAWWORMCASTINGS")).toBe(RAW_LOAD_QTY * 1.5);
+    });
+
+    it("returns null bounds for unconstrained SKUs", () => {
+        expect(rawIngredientBoundsFor("PU100")).toBeNull();
+        expect(rawIngredientMaximumFor("SCO101")).toBeNull();
+        expect(rawIngredientMaximumFor("MC101")).toBeNull();
     });
 
     it("is case- and whitespace-insensitive", () => {
@@ -157,5 +168,62 @@ describe("42,000 lb floor through the recommender", () => {
             targetCoverDays: 30,
         }));
         expect(r.suggestedQty).toBeGreaterThanOrEqual(42_000);
+    });
+});
+
+describe("raw-ingredient order ceiling (1.5 loads)", () => {
+    it("caps the 126,000 lb worm-castings suggestion at 63,000", () => {
+        // Reproduces the live case: build-derived 2,800/day over 90d cover against
+        // 72,357 on hand produced 126,000 lb — 3 loads. Bill: "a ridiculous amount".
+        const r = recommendQty(inputFor("RAWWORMCASTINGS", {
+            dailyRate: 2_800,
+            stockOnHand: 72_357,
+            stockOnOrder: 0,
+            openPOCount: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 30,
+            targetCoverDays: 90,
+            orderIncrementQty: 1,
+            historicalLineQtys: [],
+            historicalCapMultiple: null,
+        }));
+        expect(r.suggestedQty).toBe(63_000);
+        expect(r.provenance.some(p => p.step === "raw_ingredient_ceiling")).toBe(true);
+        expect(r.reviewReasons.join(" ")).toMatch(/capped/i);
+    });
+
+    it("does not touch a requirement already under the ceiling", () => {
+        const r = recommendQty(inputFor("RAWMALIBUCOMPOST", {
+            dailyRate: 200,
+            stockOnHand: 0,
+            stockOnOrder: 0,
+            openPOCount: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 0,
+            targetCoverDays: 30,
+            orderIncrementQty: 1,
+            historicalLineQtys: [],
+            historicalCapMultiple: null,
+        }));
+        expect(r.suggestedQty).toBeGreaterThanOrEqual(42_000);
+        expect(r.suggestedQty).toBeLessThan(63_000);
+        expect(r.provenance.some(p => p.step === "raw_ingredient_ceiling")).toBe(false);
+    });
+
+    it("does not cap SKUs with no raw bounds", () => {
+        const r = recommendQty(inputFor("PU100", {
+            dailyRate: 5_000,
+            stockOnHand: 0,
+            stockOnOrder: 0,
+            openPOCount: 0,
+            leadTimeDays: 14,
+            coverBufferDays: 30,
+            targetCoverDays: 90,
+            orderIncrementQty: 1,
+            historicalLineQtys: [],
+            historicalCapMultiple: null,
+        }));
+        expect(r.suggestedQty).toBeGreaterThan(63_000);
+        expect(r.provenance.some(p => p.step === "raw_ingredient_ceiling")).toBe(false);
     });
 });
