@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding, computeTrendAdjustedVelocity } from './bom-demand';
+import { computeComponentBurnRates, classifyUrgency, mergeIntoGroups, chooseBomVelocity, computeReceiptConfidence, computeMedianPOGap, classifyBomUrgency, projectNextOrderDate, applyCommonOrderRounding, computeTrendAdjustedVelocity, shelfDidNotTakeBomBurn } from './bom-demand';
 import { FinaleClient, __bomComponent404CacheForTests, __skuHasNoBomCacheForTests } from './client';
 
 describe('computeComponentBurnRates', () => {
@@ -46,8 +46,12 @@ describe('classifyUrgency', () => {
 });
 
 describe('chooseBomVelocity', () => {
-    it('prefers receipt velocity when present', () => {
-        expect(chooseBomVelocity({ receiptVelocity: 0.42, bomDerivedVelocity: 0.18 }))
+    it('uses finished-goods burn when present, even if receipts are higher', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 166.67, bomDerivedVelocity: 0.22 }))
+            .toEqual({ value: 0.22, source: 'demand' });
+    });
+    it('uses receipts only when finished-goods burn is zero', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 0.42, bomDerivedVelocity: 0 }))
             .toEqual({ value: 0.42, source: 'receipts' });
     });
     it('falls back to BOM-derived velocity when receipts are zero', () => {
@@ -57,6 +61,36 @@ describe('chooseBomVelocity', () => {
     it('returns none when both signals are zero', () => {
         expect(chooseBomVelocity({ receiptVelocity: 0, bomDerivedVelocity: 0 }))
             .toEqual({ value: 0, source: 'none' });
+    });
+});
+
+describe('shelfDidNotTakeBomBurn', () => {
+    it('holds when the last buy is still on the shelf and the BOM rate would have eaten it', () => {
+        const r = shelfDidNotTakeBomBurn({
+            stockOnHand: 60,
+            bomDailyRate: 2.88,
+            lastPurchaseQty: 60,
+            daysSinceLastPurchase: 48,
+        });
+        expect(r.hold).toBe(true);
+    });
+    it('does not hold when the shelf has actually drawn down', () => {
+        const r = shelfDidNotTakeBomBurn({
+            stockOnHand: 12,
+            bomDailyRate: 2.88,
+            lastPurchaseQty: 60,
+            daysSinceLastPurchase: 48,
+        });
+        expect(r.hold).toBe(false);
+    });
+    it('does not hold a buy that landed too recently to judge', () => {
+        const r = shelfDidNotTakeBomBurn({
+            stockOnHand: 60,
+            bomDailyRate: 2.88,
+            lastPurchaseQty: 60,
+            daysSinceLastPurchase: 5,
+        });
+        expect(r.hold).toBe(false);
     });
 });
 
@@ -242,17 +276,22 @@ describe('applyCommonOrderRounding', () => {
         expect(r.commonOrderQty).toBeNull();
         expect(r.rationale).toBe('no-history');
     });
-    it('snaps up to single historical qty', () => {
-        // Raw 3, single past order of 12 → snap to 12
-        const r = applyCommonOrderRounding({ rawSuggestedQty: 3, purchaseQtys: [12] });
+    it('does not refill the last PO when that lot is more than twice the gap', () => {
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 2628, purchaseQtys: [15000] });
+        expect(r.suggestedQty).toBe(2628);
+        expect(r.commonOrderQty).toBe(15000);
+        expect(r.rationale).toBe('single');
+    });
+    it('snaps up to a single historical qty only when it is close to the gap', () => {
+        const r = applyCommonOrderRounding({ rawSuggestedQty: 10, purchaseQtys: [12] });
         expect(r.suggestedQty).toBe(12);
         expect(r.commonOrderQty).toBe(12);
         expect(r.rationale).toBe('single');
     });
-    it('snaps up to mode when ≥40% of orders match', () => {
-        // Raw 3, mode = 12 (3 of 5 orders) → snap to 12
+    it('does not snap a tiny gap up to a much larger usual order', () => {
         const r = applyCommonOrderRounding({ rawSuggestedQty: 3, purchaseQtys: [12, 12, 12, 24, 6] });
-        expect(r.suggestedQty).toBe(12);
+        expect(r.suggestedQty).toBe(3);
+        expect(r.commonOrderQty).toBe(12);
         expect(r.rationale).toBe('mode');
     });
     it('multiplies the mode when raw need exceeds it', () => {
@@ -303,6 +342,9 @@ describe('projectNextOrderDate', () => {
 });
 
 describe('mergeIntoGroups', () => {
+    /** Test fixtures deliberately omit fields the merger never reads. */
+    type GroupItem = Parameters<typeof mergeIntoGroups>[0][number]['items'][number];
+
     it('merges BOM items into existing vendor group', () => {
         const resaleGroups = [{
             vendorName: 'Acme Corp', vendorPartyId: 'p1', urgency: 'ok' as const,
@@ -364,6 +406,69 @@ describe('mergeIntoGroups', () => {
         expect(mergedItem.feedsFinishedGoods).toHaveLength(1);
         expect(mergedItem.feedsFinishedGoods[0].sku).toBe('BLEND');
         expect(mergedItem.runwayDays).toBeCloseTo(31 / 0.9, 1); // Recalculated runway!
+    });
+
+    it('does NOT sum a ledger rate with a BOM rate (same consumption, not two streams)', () => {
+        // 2026-09-30: the resale path rates off total stock movement, which already
+        // CONTAINS the build pull the BOM path measures. Summing them double-counted
+        // RAWWORMCASTINGS at 1654.12 + 2800.00 = 4454.12/day and drove a 126,000-unit
+        // order. Take the larger measurement instead.
+        const resaleGroups = [{
+            vendorName: 'Gary Ambriol', vendorPartyId: 'p1', urgency: 'warning' as const,
+            items: [{
+                productId: 'RAWWORMCASTINGS',
+                supplierPartyId: 'p1',
+                itemType: 'resale' as const,
+                dailyRate: 1654.12,
+                dailyRateSource: 'ledger' as const,
+                stockOnHand: 72356,
+                stockOnOrder: 0,
+                suggestedQty: 0,
+                urgency: 'warning' as const,
+                explanation: '90d ledger consumption.',
+                feedsFinishedGoods: [],
+                candidate: { directDemand: 0, bomDemand: 0 },
+            } as unknown as GroupItem],
+        }];
+        const bomGroups = [{
+            vendorName: 'Gary Ambriol', vendorPartyId: 'p1', urgency: 'warning' as const,
+            items: [{
+                productId: 'RAWWORMCASTINGS',
+                supplierPartyId: 'p1',
+                itemType: 'bom-component' as const,
+                dailyRate: 2800,
+                stockOnHand: 72356,
+                stockOnOrder: 0,
+                suggestedQty: 126000,
+                urgency: 'warning' as const,
+                explanation: 'BOM builds coverage low.',
+                feedsFinishedGoods: [{ sku: 'PU100', name: 'Power Bloom', buildsWorth: 10 }],
+                candidate: { directDemand: 0, bomDemand: 2800 },
+            } as unknown as GroupItem],
+        }];
+
+        const merged = mergeIntoGroups(resaleGroups, bomGroups);
+        const mergedItem = merged[0].items[0];
+        expect(mergedItem.itemType).toBe('resale-bom');
+        expect(mergedItem.dailyRate).toBe(2800); // max, NOT 4454.12
+        expect(mergedItem.dailyRate).not.toBe(4454.12);
+    });
+
+    it('still sums two non-ledger rates (independent demand streams)', () => {
+        const resaleGroups = [{
+            vendorName: 'Acme', vendorPartyId: 'p1', urgency: 'ok' as const,
+            items: [{ productId: 'X1', supplierPartyId: 'p1', itemType: 'resale' as const,
+                dailyRate: 3, dailyRateSource: 'demand' as const, stockOnHand: 100,
+                suggestedQty: 0, urgency: 'ok' as const, feedsFinishedGoods: [] } as unknown as GroupItem],
+        }];
+        const bomGroups = [{
+            vendorName: 'Acme', vendorPartyId: 'p1', urgency: 'ok' as const,
+            items: [{ productId: 'X1', supplierPartyId: 'p1', itemType: 'bom-component' as const,
+                dailyRate: 2, stockOnHand: 100, suggestedQty: 0, urgency: 'ok' as const,
+                feedsFinishedGoods: [] } as unknown as GroupItem],
+        }];
+        const merged = mergeIntoGroups(resaleGroups, bomGroups);
+        expect(merged[0].items[0].dailyRate).toBe(5);
     });
 
     it('keeps vendor groups separate when different vendors', () => {

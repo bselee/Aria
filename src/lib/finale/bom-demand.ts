@@ -72,15 +72,48 @@ export function classifyUrgency(runwayDays: number, leadTimeDays: number): 'crit
 }
 
 /**
- * Pick a daily-burn signal for a BOM component. Receipt velocity is primary
- * (encodes seasonality, builds, contract production); FG-derived burn is the
- * fallback when the component has no purchase history yet.
+ * Pick a daily-burn signal for a BOM component.
+ * Finished-goods burn is the constraint. Receipt velocity is what we already
+ * bought. Using it to size the next PO is circular (3.0BAGCP: 166/d receipts
+ * vs 0.22/d FG burn). Receipts are the fallback only when FG burn is zero.
  */
 export function chooseBomVelocity(input: { receiptVelocity: number; bomDerivedVelocity: number }):
     { value: number; source: 'receipts' | 'demand' | 'none' } {
-    if (input.receiptVelocity > 0) return { value: input.receiptVelocity, source: 'receipts' };
     if (input.bomDerivedVelocity > 0) return { value: input.bomDerivedVelocity, source: 'demand' };
+    if (input.receiptVelocity > 0) return { value: input.receiptVelocity, source: 'receipts' };
     return { value: 0, source: 'none' };
+}
+
+/**
+ * BOM qty-per-FG is not consumption until the shelf moves.
+ * GRIP101: BOM said 2.88/d, last buy 60 on 08/11/2026, stock still 60.
+ * Hold. A dated build that needs more than stock still orders.
+ */
+export function shelfDidNotTakeBomBurn(input: {
+    stockOnHand: number;
+    bomDailyRate: number;
+    lastPurchaseQty?: number | null;
+    daysSinceLastPurchase?: number | null;
+    forwardShortfall?: number;
+}): { hold: boolean; detail: string } {
+    const stock = input.stockOnHand;
+    const rate = input.bomDailyRate;
+    const lastQty = input.lastPurchaseQty ?? 0;
+    const days = input.daysSinceLastPurchase ?? 0;
+    if ((input.forwardShortfall ?? 0) > stock) {
+        return { hold: false, detail: "dated build needs more than stock" };
+    }
+    if (!(stock > 0) || !(rate > 0) || !(lastQty > 0) || days < 21) {
+        return { hold: false, detail: "" };
+    }
+    const ratio = stock / lastQty;
+    if (ratio < 0.8 || ratio > 1.2) return { hold: false, detail: "" };
+    const expectedUsed = rate * days;
+    if (expectedUsed < lastQty * 0.5) return { hold: false, detail: "" };
+    return {
+        hold: true,
+        detail: `Shelf still holds ${Math.round(stock)} of last buy ${Math.round(lastQty)} after ${Math.round(days)}d. BOM rate ${rate.toFixed(2)}/d did not leave the building.`,
+    };
 }
 
 /**
@@ -222,6 +255,16 @@ export function computeTrendAdjustedVelocity(input: {
  *   - 2+ past qtys, no mode, low variance (CV<0.4) → snap up to median
  *   - 2+ past qtys, high variance  → no rounding (orders are too variable)
  */
+/** Historical lot may round a real gap. It may not refill a PO more than 2× the gap. */
+const MAX_HISTORY_OVER_RAW = 2;
+
+function snapToHistoricalUnit(raw: number, unit: number): number | null {
+    if (!(unit > 0) || !(raw > 0)) return null;
+    const snapped = Math.max(unit, Math.ceil(raw / unit) * unit);
+    if (snapped > raw * MAX_HISTORY_OVER_RAW) return null;
+    return snapped;
+}
+
 export function applyCommonOrderRounding(input: {
     rawSuggestedQty: number;
     purchaseQtys?: number[];
@@ -238,8 +281,13 @@ export function applyCommonOrderRounding(input: {
 
     if (purchaseQtys.length === 1) {
         const qty = purchaseQtys[0];
-        const snapped = Math.max(qty, Math.ceil(rawSuggestedQty / qty) * qty);
-        return { suggestedQty: snapped, rawSuggestedQty, commonOrderQty: qty, rationale: 'single' };
+        const snapped = snapToHistoricalUnit(rawSuggestedQty, qty);
+        return {
+            suggestedQty: snapped ?? rawSuggestedQty,
+            rawSuggestedQty,
+            commonOrderQty: qty,
+            rationale: 'single',
+        };
     }
 
     // Try mode first — value appearing in ≥40% of POs is the "usual" size.
@@ -251,8 +299,13 @@ export function applyCommonOrderRounding(input: {
         if (c > modeCount) { modeCount = c; modeQty = q; }
     }
     if (modeQty != null && modeCount / purchaseQtys.length >= 0.4) {
-        const snapped = Math.max(modeQty, Math.ceil(rawSuggestedQty / modeQty) * modeQty);
-        return { suggestedQty: snapped, rawSuggestedQty, commonOrderQty: modeQty, rationale: 'mode' };
+        const snapped = snapToHistoricalUnit(rawSuggestedQty, modeQty);
+        return {
+            suggestedQty: snapped ?? rawSuggestedQty,
+            rawSuggestedQty,
+            commonOrderQty: modeQty,
+            rationale: 'mode',
+        };
     }
 
     // Coefficient of variation = stddev / mean. Low CV = consistent order size.
@@ -264,8 +317,13 @@ export function applyCommonOrderRounding(input: {
         const sorted = [...purchaseQtys].sort((a, b) => a - b);
         const mid = Math.floor(sorted.length / 2);
         const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-        const snapped = Math.max(median, Math.ceil(rawSuggestedQty / median) * median);
-        return { suggestedQty: snapped, rawSuggestedQty, commonOrderQty: median, rationale: 'median' };
+        const snapped = snapToHistoricalUnit(rawSuggestedQty, median);
+        return {
+            suggestedQty: snapped ?? rawSuggestedQty,
+            rawSuggestedQty,
+            commonOrderQty: median,
+            rationale: 'median',
+        };
     }
 
     return { suggestedQty: rawSuggestedQty, rawSuggestedQty, commonOrderQty: null, rationale: 'variable' };
@@ -318,13 +376,34 @@ export function mergeIntoGroups(
                 if (dupIndex >= 0) {
                     const resaleItem = existing.items[dupIndex];
                     
+                    // HERMIA(2026-09-30): never sum two measurements of the SAME
+                    // physical consumption.
+                    //
+                    // The resale path used to rate these SKUs off Finale's demand
+                    // field, which flip-flopped near zero. Now that it rates them off
+                    // the stock ledger, the resale rate is TOTAL stock movement — and
+                    // the BOM rate is a subset of that same movement (the build pull).
+                    // Summing them double-counted: RAWWORMCASTINGS shipped 1654.12
+                    // (ledger) + 2800.00 (BOM) = 4454.12/day, 2.7x its real burn, and
+                    // drove a 126,000-unit order.
+                    //
+                    // Summing is only correct when the two sides measure genuinely
+                    // independent demand streams. When either side is ledger-sourced
+                    // the numbers overlap, so take the larger measurement instead.
+                    const bothNonZero = (resaleItem.dailyRate ?? 0) > 0 && (bomItem.dailyRate ?? 0) > 0;
+                    const ledgerInvolved = resaleItem.dailyRateSource === "ledger"
+                        || bomItem.dailyRateSource === "ledger";
+                    const mergedDailyRate = bothNonZero && ledgerInvolved
+                        ? Math.max(resaleItem.dailyRate ?? 0, bomItem.dailyRate ?? 0)
+                        : (resaleItem.dailyRate ?? 0) + (bomItem.dailyRate ?? 0);
+
                     // DECISION(2026-05-26): Consolidate duplicate products across resale
                     // and BOM pipelines into a single 'resale-bom' item with combined rate,
                     // feedsFinishedGoods, and max suggested qty. Recalculate runway dynamically.
                     const combinedItem: any = {
                         ...resaleItem,
                         urgency: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.urgency : resaleItem.urgency,
-                        dailyRate: (resaleItem.dailyRate ?? 0) + (bomItem.dailyRate ?? 0),
+                        dailyRate: mergedDailyRate,
                         purchaseVelocity: Math.max(resaleItem.purchaseVelocity ?? 0, bomItem.purchaseVelocity ?? 0),
                         salesVelocity: Math.max(resaleItem.salesVelocity ?? 0, bomItem.salesVelocity ?? 0),
                         demandVelocity: Math.max(resaleItem.demandVelocity ?? 0, bomItem.demandVelocity ?? 0),
