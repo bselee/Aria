@@ -97,6 +97,65 @@ export class CalendarClient {
     }
 
     /**
+     * List ALL events on a calendar within a time range, paginated.
+     * Returns raw event fields (id, summary, description, date, created/updated)
+     * so callers can reconcile the calendar in place — the basis for the
+     * minimal, idempotent purchasing-calendar sync.
+     *
+     * @param calendarId - Calendar ID (email or group calendar ID)
+     * @param timeMin - ISO lower bound
+     * @param timeMax - ISO upper bound
+     */
+    async listEvents(
+        calendarId: string,
+        timeMin: string,
+        timeMax: string
+    ): Promise<Array<{
+        id: string;
+        summary: string;
+        description: string;
+        date: string;       // YYYY-MM-DD (all-day) or dateTime start, normalized to YYYY-MM-DD
+        created: string;
+        updated: string;
+    }>> {
+        await this.init();
+        const out: Array<{
+            id: string;
+            summary: string;
+            description: string;
+            date: string;
+            created: string;
+            updated: string;
+        }> = [];
+        let pageToken: string | undefined;
+        do {
+            const res = await this.calendar!.events.list({
+                calendarId,
+                timeMin,
+                timeMax,
+                singleEvents: true,
+                orderBy: 'startTime',
+                maxResults: 2500,
+                pageToken,
+            });
+            const items = res.data.items || [];
+            for (const ev of items) {
+                const start = ev.start?.date || ev.start?.dateTime || '';
+                out.push({
+                    id: ev.id || '',
+                    summary: ev.summary || '',
+                    description: ev.description || '',
+                    date: start.split('T')[0],
+                    created: ev.created || '',
+                    updated: ev.updated || '',
+                });
+            }
+            pageToken = res.data.nextPageToken || undefined;
+        } while (pageToken);
+        return out;
+    }
+
+    /**
      * Fetch raw event data for a single event.
      * Returns the event's summary, description, and other fields.
      */
@@ -220,7 +279,7 @@ export class CalendarClient {
     }
 
     /**
-     * Update an existing event by ID. Used by syncPurchasingCalendar.
+     * Update an existing event by ID. Used by syncPurchasingCalendarMinimal.
      * 
      * On Forbidden (event deleted on Google side) or Not Found — attempts to delete
      * the stale DB record and recreate the event so the calendar stays in sync.

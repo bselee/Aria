@@ -557,12 +557,9 @@ export class OpsManager {
         return this.poService.pollPOReceivings();
     }
 
-    /**
-     * Main Purchasing Calendar Sync Loop.
-     * Delegates to POService.
-     */
-    async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number; cleared: number }> {
-        return this.poService.syncPurchasingCalendar(daysBack);
+    /** Minimal idempotent calendar sync — one event per incoming PO, no prefixes. */
+    public async syncPurchasingCalendarMinimal(): Promise<{ created: number; updated: number; deleted: number }> {
+        return this.poService.syncPurchasingCalendarMinimal();
     }
 
     /**

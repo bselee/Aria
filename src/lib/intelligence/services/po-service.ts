@@ -15,25 +15,17 @@
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "../../gmail/auth";
 import { createClient } from "../../db";
-import { getLocalDb, dedupSeen, dedupMark } from "../../storage/local-db";
+import { dedupSeen, dedupMark } from "../../storage/local-db";
 import { Telegraf } from "telegraf";
 import { CalendarClient, CALENDAR_IDS, PURCHASING_CALENDAR_ID } from "../../google/calendar";
 import { BuildParser } from "../build-parser";
 import { FinaleClient, finaleClient } from "../../finale/client";
 import {
     TRACKING_PATTERNS,
-    carrierUrl,
     detectLTLCarrier,
-    type TrackingStatus,
 } from "../../carriers/tracking-service";
-import {
-    derivePurchasingLifecycle,
-    getPurchasingEventDate,
-} from "../../purchasing/calendar-lifecycle";
-import { derivePOCompletionState } from "../../purchasing/po-completion-state";
-import { hasPurchaseOrderReceipt, resolvePurchaseOrderReceiptDate } from "../../purchasing/po-receipt-state";
+import { loadActivePurchases, type ActivePurchase } from "../../purchasing/active-purchases";
 import { runPOSweep as runPOSweepModule } from "../../matching/po-sweep";
-import { leadTimeService } from "../../builds/lead-time-service";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { businessHoursAlert } from "../alert-gate";
@@ -72,93 +64,6 @@ function _walkMsgParts(parts: any[], bodyParts: string[]) {
 
 export class POService {
     constructor(private bot: Telegraf) {}
-
-    /**
-     * Helper to add N days to a date string.
-     * @param date - ISO date string (YYYY-MM-DD)
-     * @param days - Number of days to add
-     * @returns New ISO date string
-     */
-    private addDays(date: string, days: number): string {
-        const d = new Date(date);
-        d.setDate(d.getDate() + days);
-        return d.toISOString().split("T")[0];
-    }
-
-    /**
-     * Builds a descriptive title for the calendar event.
-     * @param po - Purchase order object
-     * @param lifecycle - Purchasing lifecycle state
-     * @returns Formatted event title string
-     */
-    private buildPOEventTitle(po: any, lifecycle: any): string {
-        const vendor = po.vendorName || "Unknown Vendor";
-        const poNum = po.orderId || "???";
-        return `${lifecycle.prefixText} PO #${poNum} - ${vendor}`;
-    }
-
-    /**
-     * Builds a rich description for the Google Calendar event.
-     * @param po - Purchase order object
-     * @param expectedDate - Expected delivery date (ISO)
-     * @param leadProvenance - Source of lead time estimate
-     * @param trackingNumbers - Array of tracking number strings
-     * @param trackingStatuses - Map of tracking number to status
-     * @param lifecycle - Purchasing lifecycle object
-     * @param latestETA - Latest ETA from tracking (ISO string or undefined)
-     * @param highConfTracking - High-confidence tracking data array
-     * @param poLifecycleData - Additional lifecycle metadata
-     * @returns HTML-formatted event description string
-     */
-    private async buildPOEventDescription(
-        po: any,
-        expectedDate: string,
-        leadProvenance: string,
-        trackingNumbers: string[],
-        trackingStatuses: Map<string, TrackingStatus | null>,
-        lifecycle: any,
-        latestETA: string | undefined,
-        highConfTracking: any[] | undefined,
-        poLifecycleData: any,
-    ): Promise<string> {
-        const accountPath = process.env.FINALE_ACCOUNT_PATH || "buildasoilorganics";
-        const rawOrderUrl = po.orderUrl || `/${accountPath}/api/order/${po.orderId}`;
-        const encodedUrl = Buffer.from(rawOrderUrl).toString("base64");
-        const finaleUrl = `https://app.finaleinventory.com/${accountPath}/sc2/?order/purchase/order/${encodedUrl}`;
-
-        let desc = `<b><a href="${finaleUrl}">PO #${po.orderId}</a></b>\n`;
-        desc += `Vendor: ${po.vendorName}\n`;
-
-        if (po.items && po.items.length > 0) {
-            desc += `\n<b>Items:</b>\n`;
-            for (const item of po.items) {
-                desc += `- ${item.productId}: ${item.quantity}\n`;
-            }
-        }
-
-        desc += `\nStatus: ${po.status}\n`;
-        desc += `\n<b>Timeline:</b>\n`;
-        desc += `Order Date: ${po.orderDate}\n`;
-        desc += `Expected: ${expectedDate} (${leadProvenance})\n`;
-        if (latestETA) desc += `Live ETA: ${new Date(latestETA).toLocaleDateString()}\n`;
-        if (po.receiveDate) desc += `Actual Receipt: ${po.receiveDate}\n`;
-        desc += `\n<b>Lifecycle:</b> ${lifecycle.calendarStatus.toUpperCase()}\n`;
-        if (poLifecycleData?.lifecycle_stage) desc += `Stage: ${poLifecycleData.lifecycle_stage}\n`;
-
-        if (trackingNumbers.length > 0) {
-            desc += `\n<b>Tracking:</b>\n`;
-            for (const t of trackingNumbers) {
-                const ts = trackingStatuses.get(t);
-                const status = ts?.display || "Pending";
-                const link = ts?.public_url || carrierUrl(t);
-                desc += `- <a href="${link}">${t}</a>: ${status}\n`;
-            }
-        }
-
-        if (po.notes) desc += `\n<b>Internal Notes:</b>\n${po.notes}\n`;
-
-        return desc;
-    }
 
     /**
      * Watcher: identify Finale POs that satisfy all auto-complete gates AND
@@ -248,9 +153,119 @@ export class POService {
         }
     }
 
-    /** Purchasing calendar sync wrapper (60-day window). */
+    /** Purchasing calendar sync wrapper — minimal incoming mirror. */
     public async runPurchasingCalendarSync(): Promise<void> {
-        await this.syncPurchasingCalendar(60);
+        await this.syncPurchasingCalendarMinimal();
+    }
+
+    /**
+     * Minimal, idempotent purchasing-calendar sync.
+     *
+     * One event per ACTIVE (incoming, not-yet-received) PO. Source of truth is
+     * `loadActivePurchases` — the same "what's incoming" set the dashboard shows,
+     * so received/cancelled POs drop off automatically. Title carries no lifecycle
+     * prefix; status/timeline live in the event body.
+     *
+     * Replaces the old lifecycle-prefixed sync, which deduped against a
+     * `process.cwd()`-relative SQLite mapping (3 divergent copies on disk) and
+     * never deleted calendar events — producing 10-66 duplicate events per PO.
+     *
+     * Idempotent: reconciles by PO number extracted from the event title, so
+     * repeated runs neither duplicate nor drift.
+     *
+     * @returns Counts of created / updated / deleted events
+     */
+    async syncPurchasingCalendarMinimal(): Promise<{ created: number; updated: number; deleted: number }> {
+        const counts = { created: 0, updated: 0, deleted: 0 };
+        try {
+            const active = await loadActivePurchases(finaleClient, 60);
+            const activeById = new Map(active.map((p) => [String(p.orderId), p]));
+
+            const calendar = new CalendarClient();
+            const timeMin = new Date(Date.now() - 365 * 86400000).toISOString();
+            const timeMax = new Date(Date.now() + 365 * 86400000).toISOString();
+            const events = await calendar.listEvents(PURCHASING_CALENDAR_ID, timeMin, timeMax);
+
+            const byPo = new Map<string, Array<{ id: string; summary: string; created: string }>>();
+            for (const ev of events) {
+                const m = /PO #(\d+)/.exec(ev.summary || "");
+                const key = m ? m[1] : "__other__";
+                if (!byPo.has(key)) byPo.set(key, []);
+                byPo.get(key)!.push({ id: ev.id, summary: ev.summary, created: ev.created });
+            }
+
+            // Remove received/stale POs + any non-PO events (no longer incoming).
+            for (const [po, evs] of byPo) {
+                if (po === "__other__" || !activeById.has(po)) {
+                    for (const ev of evs) {
+                        await calendar.deleteEvent(PURCHASING_CALENDAR_ID, ev.id);
+                        counts.deleted++;
+                    }
+                }
+            }
+
+            // For active POs: keep exactly one event, retitle, fix date + body.
+            for (const [po, evs] of byPo) {
+                if (po === "__other__" || !activeById.has(po)) continue;
+                const p = activeById.get(po)!;
+                evs.sort((a, b) => (b.created || "").localeCompare(a.created || ""));
+                const keep = evs[0];
+                for (const ev of evs.slice(1)) {
+                    await calendar.deleteEvent(PURCHASING_CALENDAR_ID, ev.id);
+                    counts.deleted++;
+                }
+                const title = `PO #${po} - ${p.vendorName || "Unknown Vendor"}`;
+                const date = (p.expectedDate || new Date().toISOString().slice(0, 10)).slice(0, 10);
+                const description = this.buildMinimalPOEventDescription(p);
+                const ok = await calendar.updateEvent(PURCHASING_CALENDAR_ID, keep.id, { title, description, date });
+                if (ok) {
+                    counts.updated++;
+                } else {
+                    // Event vanished on Google's side — recreate.
+                    await calendar.createEvent(PURCHASING_CALENDAR_ID, { title, description, date });
+                    counts.created++;
+                }
+            }
+
+            // Create events for active POs that have none yet.
+            for (const [po, p] of activeById) {
+                if (byPo.has(po) && byPo.get(po)!.length > 0) continue;
+                const title = `PO #${po} - ${p.vendorName || "Unknown Vendor"}`;
+                const date = (p.expectedDate || new Date().toISOString().slice(0, 10)).slice(0, 10);
+                const description = this.buildMinimalPOEventDescription(p);
+                await calendar.createEvent(PURCHASING_CALENDAR_ID, { title, description, date });
+                counts.created++;
+            }
+
+            console.log(`[cal-sync-minimal] created=${counts.created} updated=${counts.updated} deleted=${counts.deleted} (active=${activeById.size})`);
+        } catch (err: any) {
+            console.error("[cal-sync-minimal] Fatal error:", err.message);
+        }
+        return counts;
+    }
+
+    /**
+     * Build a clean event body for the minimal calendar: Finale link, vendor,
+     * line items, status, order date, expected arrival. No lifecycle/tracking
+     * churn — just what the team needs to see what's incoming.
+     */
+    private buildMinimalPOEventDescription(po: ActivePurchase): string {
+        const finaleUrl = po.finaleUrl;
+
+        let desc = `<b><a href="${finaleUrl}">PO #${po.orderId}</a></b>\n`;
+        desc += `Vendor: ${po.vendorName}\n`;
+        if (po.items && po.items.length > 0) {
+            desc += `\n<b>Items:</b>\n`;
+            for (const item of po.items) {
+                desc += `- ${item.productId}: ${item.quantity}\n`;
+            }
+        }
+        desc += `\nStatus: ${po.status}\n`;
+        desc += `Order Date: ${po.orderDate}\n`;
+        desc += `Expected: ${(po.expectedDate || "").slice(0, 10)}`;
+        if (po.leadProvenance) desc += ` (${po.leadProvenance})`;
+        desc += `\n`;
+        return desc;
     }
 
     /**
@@ -483,163 +498,6 @@ export class POService {
                 );
             } catch { /* swallow */ }
         }
-    }
-
-    /**
-     * Main Purchasing Calendar Sync Loop.
-     * Uses local SQLite as the primary source of truth for event mappings.
-     * @param daysBack - Number of days to look back for POs (default: 60)
-     * @returns Object with counts of created, updated, skipped, cleared events
-     */
-    async syncPurchasingCalendar(daysBack: number = 7): Promise<{ created: number; updated: number; skipped: number; cleared: number }> {
-        const counts = { created: 0, updated: 0, skipped: 0, cleared: 0 };
-        try {
-            const finale = finaleClient;
-            const db = createClient();
-            const localDb = getLocalDb();
-
-            const [pos] = await Promise.all([
-                finale.getRecentPurchaseOrders(daysBack),
-                leadTimeService.warmCache(),
-            ]);
-
-            let missingMultiPOs: string[] = [];
-            try {
-                if (db) {
-                    const { data: multiPORows } = await supabase
-                        .from("purchase_orders")
-                        .select("po_number")
-                        .eq("is_intended_multi", true);
-
-                    const existingPOIds = new Set(pos.map((p: any) => p.orderId));
-                    missingMultiPOs = (multiPORows ?? [])
-                        .map((r: any) => r.po_number)
-                        .filter((poNum: string) => !existingPOIds.has(poNum));
-                }
-            } catch { /* Suppress Supabase errors */ }
-
-            let allPOSet = pos;
-            if (missingMultiPOs.length > 0) {
-                const olderPOs = await finale.getRecentPurchaseOrders(365);
-                const matching = olderPOs.filter((p: any) => missingMultiPOs.includes(p.orderId));
-                allPOSet = [...pos, ...matching];
-            }
-
-            if (allPOSet.length === 0) return counts;
-
-            const localRows = localDb.prepare("SELECT po_number, event_id, calendar_id, status, last_tracking FROM purchasing_calendar_events").all() as any[];
-            const existing = new Map<string, { event_id: string; calendar_id: string; status: string; last_tracking: string }>();
-            for (const row of localRows) {
-                existing.set(row.po_number, row);
-            }
-
-            const calendar = new CalendarClient();
-
-            console.log(`[cal-sync] Syncing ${allPOSet.length} POs with local state...`);
-            for (const po of allPOSet) {
-                if (!po.orderId || po.orderId.toLowerCase().includes("dropship")) continue;
-
-                const status = (po.status || "").toLowerCase();
-                if (!["committed", "completed", "received"].includes(status)) continue;
-
-                let expectedDate: string;
-                let leadProvenance: string;
-                if (po.orderDate) {
-                    const lt = await leadTimeService.getForVendor(po.vendorName);
-                    expectedDate = this.addDays(po.orderDate, lt.days);
-                    leadProvenance = lt.label;
-                } else {
-                    expectedDate = new Date().toISOString().split("T")[0];
-                    leadProvenance = "21d default";
-                }
-
-                const { getHighConfidenceTrackingForPOs } = await import("../../tracking/shipment-intelligence");
-                let highConfTracking: any[] = [];
-                try {
-                    highConfTracking = await getHighConfidenceTrackingForPOs([po.orderId]);
-                } catch {
-                    highConfTracking = (po.shipments || []).map((s: any) => ({
-                        trackingNumber: s.shipmentId,
-                        status: s.status,
-                        eta: s.receiveDate ? `${s.receiveDate}T12:00:00Z` : null,
-                    }));
-                }
-
-                const trackingNumbers = highConfTracking.map((t: any) => t.trackingNumber);
-                const trackingStatuses = new Map<string, TrackingStatus | null>();
-                for (const t of highConfTracking) {
-                    trackingStatuses.set(t.trackingNumber, {
-                        category: (t.status?.toLowerCase().includes("delivered") ? "delivered" : "shipped") as any,
-                        display: t.status || "Shipped",
-                        public_url: t.carrierUrl || "",
-                        estimated_delivery_at: t.eta,
-                    });
-                }
-
-                const trackingHash = trackingNumbers.sort().join(",") + "|" +
-                    Array.from(trackingStatuses.values()).map((ts) => ts?.display || "").join(",");
-
-                const actualReceiveDate = resolvePurchaseOrderReceiptDate({
-                    status: po.status,
-                    receiveDate: po.receiveDate,
-                    shipments: po.shipments,
-                });
-
-                const completionState = derivePOCompletionState({
-                    finaleReceived: hasPurchaseOrderReceipt({ status: po.status, receiveDate: po.receiveDate, shipments: po.shipments }),
-                    trackingDelivered: trackingNumbers.length > 0 && Array.from(trackingStatuses.values()).every((ts) => ts?.category === "delivered"),
-                    hasMatchedInvoice: false,
-                    reconciliationVerdict: null,
-                    freightResolved: false,
-                    unresolvedBlockers: [],
-                });
-
-                const latestETA = highConfTracking.map((t: any) => t.eta).filter(Boolean).sort().pop();
-                const derivedExpectedDate = latestETA ? latestETA.split("T")[0] : expectedDate;
-
-                const lifecycle = derivePurchasingLifecycle(
-                    po.status,
-                    Array.from(trackingStatuses.values()),
-                    completionState,
-                    derivedExpectedDate,
-                    actualReceiveDate,
-                    po.shipments,
-                    { is_intended_multi: false, notes: po.notes, comments: po.comments },
-                );
-
-                const title = this.buildPOEventTitle(po, lifecycle);
-                const description = await this.buildPOEventDescription(po, expectedDate, leadProvenance, trackingNumbers, trackingStatuses, lifecycle, latestETA, highConfTracking, null);
-                const eventDate = getPurchasingEventDate(expectedDate, actualReceiveDate, lifecycle, latestETA);
-
-                const existingRow = existing.get(po.orderId);
-                const colorId = lifecycle.colorId;
-
-                if (!existingRow) {
-                    try {
-                        const eventId = await calendar.createEvent(PURCHASING_CALENDAR_ID, { title, description, date: eventDate, colorId });
-                        localDb.prepare("INSERT INTO purchasing_calendar_events (po_number, event_id, calendar_id, status, last_tracking, title) VALUES (?, ?, ?, ?, ?, ?)").run(po.orderId, eventId, PURCHASING_CALENDAR_ID, lifecycle.calendarStatus, trackingHash, title);
-                        counts.created++;
-                        console.log(`Created PO #${po.orderId} calendar event.`);
-                    } catch (e: any) {
-                        console.warn(`[cal-sync] Fail PO #${po.orderId}: ${e.message}`);
-                    }
-                } else if (existingRow.status !== lifecycle.calendarStatus || existingRow.last_tracking !== trackingHash || ["past_due", "exception"].includes(lifecycle.calendarStatus)) {
-                    const ok = await calendar.updateEvent(existingRow.calendar_id, existingRow.event_id, { title, description, colorId, date: eventDate });
-                    if (ok === null) {
-                        localDb.prepare("DELETE FROM purchasing_calendar_events WHERE po_number = ?").run(po.orderId);
-                    } else {
-                        localDb.prepare("UPDATE purchasing_calendar_events SET status = ?, last_tracking = ?, title = ?, updated_at = CURRENT_TIMESTAMP WHERE po_number = ?").run(lifecycle.calendarStatus, trackingHash, title, po.orderId);
-                        counts.updated++;
-                    }
-                } else {
-                    counts.skipped++;
-                }
-            }
-            console.log(`[cal-sync] Complete: ${counts.created} created, ${counts.updated} updated.`);
-        } catch (err: any) {
-            console.error("[cal-sync] Fatal error:", err.message);
-        }
-        return counts;
     }
 
     /**

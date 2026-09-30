@@ -566,9 +566,9 @@ defineJob({
 
 defineJob({
     name: "purchasing-calendar-sync",
-    schedule: "0 */4 * * *",
+    schedule: "0 7,11,15,19 * * 1-5",
     onFail: "log",
-    description: "Sync PO lifecycle to Google Calendar (every 4h).",
+    description: "Mirror incoming POs to Google Calendar (Mon-Fri business hours; idempotent, one event per PO).",
     handler: async () => { await ops()?.runPurchasingCalendarSync(); },
 });
 
