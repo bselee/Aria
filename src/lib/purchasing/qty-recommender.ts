@@ -17,6 +17,7 @@
  */
 
 import { roundToCleanQty } from "./cognitive-round";
+import { rawIngredientMinimumFor, rawIngredientMinimumLabel } from "./raw-ingredient-minimums";
 
 // Bumped on every behavioral change so the calibration loop can bucket
 // error rates per formula. See .agents/plans/2026-05-05-canonical-recommender.md.
@@ -27,7 +28,8 @@ import { roundToCleanQty } from "./cognitive-round";
 //   v2.3-vendor-fallback-increments-2026-05-07 — vendor-specific fallback increments
 //   v2.7-capped-30d-floor-2026-06-11 — 2× cap on 30d supply floor
 //   v2.8-residual-reorder-cap-2026-07-10 — open-PO residual uses order-point window, not full target cover
-export const QTY_FORMULA_VERSION = "v2.8-residual-topup-cap-2026-07-10";
+//   v2.9-raw-ingredient-minimum-2026-09-30 — per-SKU physical minimum order qty (raw ingredients, 42,000 lb)
+export const QTY_FORMULA_VERSION = "v2.9-raw-ingredient-minimum-2026-09-30";
 
 /** Round a quantity up to the nearest multiple of `incrementQty`, with a floor of `incrementQty`. */
 export function snapToIncrement(quantity: number, incrementQty: number | null | undefined): number {
@@ -41,7 +43,7 @@ export interface RecommenderInput {
     sku: string;
     vendorName?: string;
     dailyRate: number;
-    dailyRateSource: "demand" | "sales" | "receipts" | "none";
+    dailyRateSource: "demand" | "sales" | "receipts" | "ledger" | "none";
     dailyRateLabel: string;             // e.g. "90d demand", "365d sales", "365d receipts"
     velocityInflated?: boolean;
     velocityRawRate?: number;
@@ -629,16 +631,51 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     // that always ships 20.
     let historicalFloorApplied = false;
 
-    // v2.6a: explicit standard_order_qty override (takes priority)
+    // v2.6a: explicit standard_order_qty override (vendor-wide floor)
     const standardOrderQty = input.standardOrderQty ?? null;
-    if (standardOrderQty && standardOrderQty > 0 && suggestedQty > 0 && suggestedQty < standardOrderQty) {
+
+    // v2.9 (2026-09-30): raw-ingredient minimum. Physical lot size (one truckload),
+    // keyed by SKU. Combined with the vendor policy floor by taking whichever is
+    // larger, so a vendor-wide floor never masks a stricter per-SKU one.
+    //
+    // IMPORTANT: applied only when there is NO open PO. The minimum is a constraint
+    // on CREATING a PO, not a reason to overbuy against one already inbound. With a
+    // 42k PO in flight and a 2k residual to the order point, forcing the floor would
+    // buy 40k lb nobody asked for and would defeat the v2.8 residual cap. In that
+    // case the residual is left alone and flagged for review instead.
+    const rawMinimum = rawIngredientMinimumFor(input.sku);
+    const hasOpenPO = (input.openPOCount ?? 0) > 0 || (input.stockOnOrder ?? 0) > 0;
+    const floorQty = Math.max(standardOrderQty ?? 0, hasOpenPO ? 0 : (rawMinimum ?? 0)) || null;
+    const floorReason = rawMinimum != null && (standardOrderQty == null || rawMinimum >= standardOrderQty)
+        ? `${rawIngredientMinimumLabel(rawMinimum)} — cannot create a PO below this`
+        : `vendor standard order qty (explicit policy)`;
+    if (floorQty && suggestedQty > 0 && suggestedQty < floorQty) {
         const beforeQty = suggestedQty;
-        suggestedQty = standardOrderQty;
+        suggestedQty = floorQty;
         historicalFloorApplied = true;
         trace.push({
             step: "standard_order_floor",
-            detail: `Bumped from ${beforeQty} to ${standardOrderQty} — vendor standard order qty (explicit policy)`,
-            value: standardOrderQty,
+            detail: `Bumped from ${beforeQty} to ${floorQty} — ${floorReason}`,
+            value: floorQty,
+        });
+    }
+    if (rawMinimum != null && hasOpenPO && suggestedQty > 0 && suggestedQty < rawMinimum) {
+        // A sub-truckload top-up. It CANNOT become a valid PO (the minimum is 42,000),
+        // so suppress it rather than emit an unactionable number that a draft PO would
+        // happily turn into a rule-breaking order. Force a review instead: with an
+        // inbound truckload the shortfall is usually a few days of cover and is best
+        // absorbed, but a human should see it.
+        const suppressed = suggestedQty;
+        suggestedQty = 0;
+        reviewReasons.push(
+            `Needs only ${suppressed} more, but the ${rawIngredientMinimumLabel(rawMinimum)} applies and `
+            + `a PO is already inbound — not orderable on its own. Wait, or top up the inbound PO.`,
+        );
+        trace.push({
+            step: "raw_minimum_residual_suppressed",
+            detail: `Suppressed a ${suppressed}-unit top-up: below the ${rawIngredientMinimumLabel(rawMinimum)} `
+                + `and a PO is already inbound.`,
+            value: 0,
         });
     }
 

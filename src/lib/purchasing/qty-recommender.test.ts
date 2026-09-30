@@ -518,18 +518,22 @@ describe("recommendQty — vendor reorder policy", () => {
     });
 
     it("formula version reflects the current recommender version", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+        expect(QTY_FORMULA_VERSION).toBe("v2.9-raw-ingredient-minimum-2026-09-30");
     });
 });
 
 describe("recommendQty — residual reorder cap (v2.8)", () => {
     it("caps open-PO residual to order-point window, not full aggressive cover", () => {
-        // RAWWORM-style: high cover (90d) with large open PO still left a huge residual.
+        // High cover (90d) with large open PO still left a huge residual.
         // daily 1000, lead 14, cover 90 → target 90k
         // on hand 0 + open 42k → full residual 48k
         // order-point (14+30)=44d → 44k; residual at OP = max(0, 44k-42k) = 2k
+        //
+        // SKU is a plain product on purpose: a raw ingredient with a minimum order
+        // qty now suppresses a sub-minimum residual instead of emitting it, which is
+        // covered in raw-ingredient-minimums.test.ts. This test isolates the v2.8 cap.
         const result = recommendQty(baseInput({
-            sku: "RAWWORMCASTINGS",
+            sku: "PU100",
             dailyRate: 1000,
             stockOnHand: 0,
             stockOnOrder: 42000,
@@ -622,7 +626,7 @@ describe("recommendQty — cognitive rounding integration", () => {
     });
 
     it("formula version is bumped to current", () => {
-        expect(QTY_FORMULA_VERSION).toBe("v2.8-residual-topup-cap-2026-07-10");
+        expect(QTY_FORMULA_VERSION).toBe("v2.9-raw-ingredient-minimum-2026-09-30");
     });
 
     it("emits 2 rounding alternatives for the UI dropdown", () => {
