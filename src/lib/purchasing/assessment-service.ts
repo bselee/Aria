@@ -72,7 +72,15 @@ function shouldSuppressAsNonMoving(item: PurchasingItem): boolean {
     const method = item.reorderMethod ?? "default";
     if (method === "do_not_reorder") return true;
 
-    const hasMovement = (item.salesVelocity ?? 0) > 0
+    // HERMIA(2026-09-30): the resolved daily rate counts as movement. Finale's
+    // per-product fields (demandVelocity / finaleConsumptionQty / finaleDemandQty)
+    // flip to zero on component SKUs while stock keeps moving, so a SKU whose rate
+    // came from the stock ledger has a positive dailyRate and zero product fields.
+    // Testing only the product fields suppressed those SKUs as "non-moving" even
+    // though the board had already established that they burn. dailyRate is the
+    // same number the board displays, whatever its source, so use it.
+    const hasMovement = (item.dailyRate ?? 0) > 0
+        || (item.salesVelocity ?? 0) > 0
         || (item.demandVelocity ?? 0) > 0
         || (item.purchaseVelocity ?? 0) > 0
         || (item.finaleConsumptionQty ?? 0) > 0

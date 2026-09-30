@@ -99,4 +99,47 @@ describe("shouldIncludePurchasingCandidate (v2.8 multi-signal OR gate)", () => {
             })).toBe(true);
         });
     });
+
+    describe("Stock ledger consumption (Path 6)", () => {
+        it("admits a SKU whose only signal is physical ledger consumption", () => {
+            // The BLANKBAGCF / S-4796 / OAG223 shape: Finale reports zero for
+            // every product-level field, but the movement ledger shows burn.
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: null,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+                ledgerNetConsumption: 2490,
+            })).toBe(true);
+        });
+
+        it("still rejects when the ledger shows no consumption either", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: null,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+                ledgerNetConsumption: 0,
+            })).toBe(false);
+        });
+
+        it("treats a negative ledger net as no consumption", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 0,
+                finaleConsumptionQty: 0,
+                finaleDemandQty: 0,
+                finaleDemandPerDay: 0,
+                ledgerNetConsumption: -420,
+            })).toBe(false);
+        });
+
+        it("does not require the ledger signal when a product signal exists", () => {
+            expect(shouldIncludePurchasingCandidate({
+                finaleReorderQty: 39,
+                finaleConsumptionQty: 94,
+                finaleDemandQty: 94,
+                finaleDemandPerDay: 1.04,
+            })).toBe(true);
+        });
+    });
 });

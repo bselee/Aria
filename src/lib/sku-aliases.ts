@@ -40,15 +40,20 @@ export interface SkuAliasEntry {
  */
 export const SKU_ALIASES: SkuAliasEntry[] = [
     // ── Stock Depot Bags ────────────────────────────────────────────────
+    // HERMIA(2026-09-30): labels realigned to the Finale product names, which
+    // are the system of record for product identity. The prior labels
+    // ("8×11 Bag (2 mil)" / "7×11 Bag (2 mil)") did not match Finale, and the
+    // Finale name is authoritative: both SKUs are kraft metallized stand-up
+    // pouches. Aliases are unchanged so existing human references still resolve.
     {
         finaleSku: 'SBD21410811',
-        label: 'Stock Depot — 8×11 Bag (2 mil)',
+        label: 'Stock Depot — Pouch Natural Kraft Metallized Stand Up Zip (4lb)',
         vendor: 'Stock Depot',
         aliases: ['0811bags', '0811bag', '0811b', '811bags', '811bag', 'stock depot 811', 'stockdepot 0811'],
     },
     {
         finaleSku: 'SBD21410711',
-        label: 'Stock Depot — 7×11 Bag (2 mil)',
+        label: 'Stock Depot — Pouch Natural Kraft Metallized Stand Up Zip (2lb)',
         vendor: 'Stock Depot',
         aliases: ['0711bags', '0711bag', '0711b', '711bags', '711bag', 'stock depot 711', 'stockdepot 0711'],
     },

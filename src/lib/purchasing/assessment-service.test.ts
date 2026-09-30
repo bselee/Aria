@@ -194,6 +194,55 @@ describe("assessPurchasingGroups", () => {
         expect(result.actionableLines).toHaveLength(0);
     });
 
+    it("keeps a ledger-sourced SKU whose Finale product fields are all zero", () => {
+        // 2026-09-30 regression: Finale's per-product demand/consumption fields
+        // flip to zero on component SKUs while stock keeps moving. The resolved
+        // ledger rate is the only positive movement signal, so the suppress
+        // filter must not read the product fields alone.
+        const result = assessPurchasingGroups([
+            {
+                vendorName: "Axiom Print",
+                vendorPartyId: "party-1",
+                urgency: "ok",
+                items: [
+                    {
+                        productId: "GBB07",
+                        productName: 'Label - (BuildASoil - 4.25"x4.5")',
+                        supplierName: "Axiom Print",
+                        supplierPartyId: "party-1",
+                        unitPrice: 1,
+                        stockOnHand: 2569,
+                        stockOnOrder: 0,
+                        purchaseVelocity: 0,
+                        salesVelocity: 0,
+                        demandVelocity: 0,
+                        // Ledger-sourced: the only non-zero movement signal.
+                        dailyRate: 20.56,
+                        dailyRateSource: "ledger",
+                        runwayDays: 125,
+                        adjustedRunwayDays: 125,
+                        leadTimeDays: 15,
+                        leadTimeProvenance: "15d (Finale)",
+                        openPOs: [],
+                        urgency: "ok",
+                        explanation: "90d ledger consumption.",
+                        suggestedQty: 0,
+                        orderIncrementQty: null,
+                        isBulkDelivery: false,
+                        finaleReorderQty: null,
+                        finaleStockoutDays: null,
+                        finaleConsumptionQty: 0,
+                        finaleDemandQty: 0,
+                        reorderMethod: "default",
+                    },
+                ],
+            },
+        ]);
+
+        expect(result.groups[0].items).toHaveLength(1);
+        expect(result.groups[0].items[0].item.productId).toBe("GBB07");
+    });
+
     it("hard-excludes do-not-reorder items from assessed output", () => {
         const result = assessPurchasingGroups([
             {

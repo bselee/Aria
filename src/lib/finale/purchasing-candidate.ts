@@ -15,6 +15,12 @@ export type PurchasingCandidateSignals = {
     finaleDemandPerDay: number | null | undefined;
     finaleStockoutDays?: number | null | undefined;
     ariaPOHistory?: AriaPurchaseHistory;
+    /**
+     * HERMIA(2026-09-30): net consumption from Finale's stock movement ledger.
+     * The physical-consumption signal that does NOT depend on Finale's reorder
+     * configuration. See src/lib/finale/stock-ledger.ts.
+     */
+    ledgerNetConsumption?: number | null | undefined;
 };
 
 function positive(value: number | null | undefined): boolean {
@@ -33,11 +39,16 @@ function positive(value: number | null | undefined): boolean {
  *   Path 1: Finale explicitly recommends reorder (finaleReorderQty > 0)
  *   Path 2: Any measurable demand — Finale's demand signal
  *   Path 3: Our own purchase order history from Supabase
+ *   Path 4: Consumption history reported on the product record
+ *   Path 5: Explicit per-SKU override list
+ *   Path 6: Physical consumption in the stock movement ledger (authoritative;
+ *           independent of Finale's reorder configuration — see
+ *           src/lib/finale/stock-ledger.ts)
  *
  * Safety nets downstream:
  *   - Party resolution drops manufactured/dropship vendors
  *   - isDoNotReorder() skips DNR-flagged SKUs
- *   - `dailyRate === 0` skips zero-velocity SKUs (unless ariaPOHistory provides fallback)
+ *   - `dailyRate === 0` skips zero-velocity SKUs (unless a fallback rate applies)
  *   - `hasDeliverablePO()` skips SKUs with active deliverable orders
  *   - BOM pipeline handles component-only SKUs separately
  */
@@ -59,6 +70,13 @@ export function shouldIncludePurchasingCandidate(candidate: PurchasingCandidateS
     // reports zero for all signals. Manually admit them so the downstream
     // recommender can evaluate based on our own velocity computation.
     if (isOverride(candidate)) return true;
+    // Path 6: Physical consumption in Finale's stock movement ledger.
+    // HERMIA(2026-09-30 — Bill): the admission ticket must NOT be Finale's
+    // reorder configuration. Job supplies and unconfigured SKUs report zero for
+    // reorderQuantityToOrder / demandQuantity / consumptionQuantity while the
+    // ledger shows real burn, so they were silently dropped before any
+    // assessment. Ledger consumption is the physical fact; admit on it.
+    if (positive(candidate.ledgerNetConsumption)) return true;
     return false;
 }
 

@@ -121,7 +121,7 @@ export interface PurchasingItem {
     salesVelocity: number;         // units/day from outbound shipments
     demandVelocity: number;        // units/day from Finale 90-day demand (sales + BOM consumption)
     dailyRate: number;             // best signal: demandVelocity → salesVelocity → purchaseVelocity
-    dailyRateSource?: "demand" | "sales" | "receipts";
+    dailyRateSource?: "demand" | "sales" | "receipts" | "ledger";
     runwayDays: number;            // effectiveStock / dailyRate (effectiveStock = min(stockOnHand, stockAvailable) via recommender)
     adjustedRunwayDays: number;    // (effectiveStock + stockOnOrder - reservedQty) / dailyRate
     leadTimeDays: number;
@@ -848,12 +848,24 @@ export function chooseVelocitySignal(input: {
     salesVelocity: number;
     purchaseVelocity?: number;
     consumptionQty?: number | null;
+    /**
+     * HERMIA(2026-09-30 — Bill): net consumption rate from Finale's stock
+     * movement ledger. This is physical consumption, independent of Finale's
+     * per-product reorder configuration. When present it outranks the
+     * product-level fields, which report zero on job supplies and unconfigured
+     * SKUs and can diverge from the ledger by orders of magnitude.
+     * See src/lib/finale/stock-ledger.ts.
+     */
+    ledgerVelocity?: number;
 }): {
     dailyRate: number;
-    signal: "demand" | "sales" | "receipts" | "none";
+    signal: "demand" | "sales" | "receipts" | "ledger" | "none";
     inflated?: boolean;
     rawRate?: number;
     realityCap?: number;
+    /** Set when the ledger overrode a product-level signal. */
+    replacedRate?: number;
+    replacedSignal?: "demand" | "sales" | "receipts";
 } {
     const reorderMethod = input.reorderMethod ?? "default";
     const demandVelocity = input.demandVelocity > 0 ? input.demandVelocity : 0;
@@ -862,6 +874,9 @@ export function chooseVelocitySignal(input: {
         ? input.purchaseVelocity
         : 0;
     const hasConsumption = (input.consumptionQty ?? 0) > 0;
+    const ledgerVelocity = input.ledgerVelocity != null && input.ledgerVelocity > 0
+        ? input.ledgerVelocity
+        : 0;
 
     const preferredSignals: Array<"demand" | "sales"> =
         reorderMethod === "sales_velocity"
@@ -873,7 +888,7 @@ export function chooseVelocitySignal(input: {
                     : ["sales", "demand"];
 
     let chosenRate = 0;
-    let chosenSignal: "demand" | "sales" | "receipts" | "none" = "none";
+    let chosenSignal: "demand" | "sales" | "receipts" | "ledger" | "none" = "none";
 
     for (const signal of preferredSignals) {
         const rate = signal === "demand" ? demandVelocity : salesVelocity;
@@ -884,6 +899,19 @@ export function chooseVelocitySignal(input: {
         }
     }
 
+    // HERMIA(2026-09-30 — Bill): the ledger is the physical-consumption fact, so
+    // it outranks the receipts fallback. Receipts measure what we BOUGHT, which
+    // is circular for sizing a new buy.
+    if (chosenSignal === "none" && ledgerVelocity > 0) {
+        // Record what the ledger displaced so the log line and provenance say
+        // which signal it overrode. If the receipts fallback would have fired,
+        // that is what it replaced.
+        const wouldHaveUsedReceipts = hasConsumption && purchaseVelocity > 0;
+        return wouldHaveUsedReceipts
+            ? { dailyRate: ledgerVelocity, signal: "ledger", replacedRate: purchaseVelocity, replacedSignal: "receipts" }
+            : { dailyRate: ledgerVelocity, signal: "ledger" };
+    }
+
     if (chosenSignal === "none" && hasConsumption && purchaseVelocity > 0) {
         chosenRate = purchaseVelocity;
         chosenSignal = "receipts";
@@ -891,6 +919,24 @@ export function chooseVelocitySignal(input: {
 
     if (chosenSignal === "none") {
         return { dailyRate: 0, signal: "none" };
+    }
+
+    // HERMIA(2026-09-30 — Bill): when the ledger and the product-level signal
+    // disagree by more than 2.5x, trust the ledger. Observed divergences on live
+    // data ranged from 128x low (STICKER12 0.13/d vs 16.63/d) to 1.7x high
+    // (RAWWORMCASTINGS 2800/d vs 1654/d). A 2.5x gap is a full stop, not a
+    // footnote: it means the product field is not describing consumption.
+    const LEDGER_DIVERGENCE_FACTOR = 2.5;
+    if (ledgerVelocity > 0) {
+        const ratio = chosenRate > 0 ? Math.max(chosenRate, ledgerVelocity) / Math.min(chosenRate, ledgerVelocity) : Infinity;
+        if (ratio > LEDGER_DIVERGENCE_FACTOR) {
+            return {
+                dailyRate: ledgerVelocity,
+                signal: "ledger",
+                replacedRate: chosenRate,
+                replacedSignal: chosenSignal as "demand" | "sales" | "receipts",
+            };
+        }
     }
 
     const reality = Math.max(salesVelocity, purchaseVelocity);
