@@ -31,6 +31,7 @@ import {
 } from "@/lib/purchasing/calibration";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
+import { rawIngredientBoundsFor } from "@/lib/purchasing/raw-ingredient-minimums";
 import { getLedgerSnapshot, ledgerNetFor, ledgerRateFor, type LedgerSnapshot } from "./stock-ledger";
 import {
     enrichOpenPOs,
@@ -2457,7 +2458,39 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         rawSuggestedQty,
                         purchaseQtys: compActivity.purchaseQtys,
                     });
-                    const suggestedQty = rounded.suggestedQty;
+                    const roundedQty = rounded.suggestedQty;
+
+                    // v2.9 (2026-09-30 — Bill): raw-ingredient order BOUNDS on the BOM
+                    // component path. This path derives its own quantity (baseNeed vs
+                    // cappedShortfall) and never calls the qty-recommender, so the bounds
+                    // must be enforced here too. Its omission is why RAWWORMCASTINGS kept
+                    // advertising 126,000 lb (3 loads) after the recommender was capped.
+                    //
+                    // ⚠️ KEYED ON compSku, NOT sku. Inside this component loop `sku` is the
+                    // FINISHED-GOOD loop variable and is NOT in scope here — referencing it
+                    // throws ReferenceError, which the surrounding try/catch swallows,
+                    // silently dropping EVERY component (getBOMDemand then returns zero
+                    // groups). next build skips type validation, so TS does not catch it.
+                    //
+                    // Floor: Bill — raws cannot be ordered below one load (42,000).
+                    // Ceiling: Bill — "err on the conservative side while providing coverage
+                    // for builds in the window. We rarely need more than 1-1.5 loads per
+                    // month." A shortfall capped only at 180d of supply still implies
+                    // multi-month buys on a build-driven burn rate.
+                    // A qty of 0 is left alone: 0 means "do not buy", not "buy the floor".
+                    const rawBounds = rawIngredientBoundsFor(compSku);
+                    let suggestedQty = roundedQty;
+                    if (rawBounds && suggestedQty > 0) {
+                        if (suggestedQty < rawBounds.minOrderQty) {
+                            suggestedQty = rawBounds.minOrderQty;
+                        } else if (suggestedQty > rawBounds.maxOrderQty) {
+                            console.log(
+                                `[purchasing] ${compSku}: BOM component qty ${suggestedQty} exceeds raw ceiling `
+                                + `${rawBounds.maxOrderQty} (1.5 loads) — capping`,
+                            );
+                            suggestedQty = rawBounds.maxOrderQty;
+                        }
+                    }
 
                     const cadenceLabel = medianPOGapDays
                         ? `~${Math.round(medianPOGapDays)}d cadence`
