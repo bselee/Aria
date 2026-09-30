@@ -31,6 +31,7 @@ import {
 } from "@/lib/purchasing/calibration";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
+import { getLedgerSnapshot, ledgerNetFor, ledgerRateFor, type LedgerSnapshot } from "./stock-ledger";
 import {
     enrichOpenPOs,
     hasDeliverablePO,
@@ -2639,6 +2640,19 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         const PAGE_SIZE = 500;
         const normalizedVendorFilter = vendorFilter?.trim().toLowerCase() || "";
 
+        // HERMIA(2026-09-30 — Bill): the Finale stock movement ledger is the physical
+        // consumption fact. Finale's per-product demand fields flip to zero on
+        // component SKUs, which silently dropped genuinely burning SKUs from this board.
+        // Load once per scan (the snapshot is disk-cached; never per SKU) and let
+        // chooseVelocitySignal prefer it. A ledger failure must never break the scan —
+        // degrade to the product-level signals instead.
+        let ledgerSnapshot: LedgerSnapshot | null = null;
+        try {
+            ledgerSnapshot = await getLedgerSnapshot(daysBack);
+        } catch (err) {
+            console.warn(`[purchasing] stock ledger unavailable, falling back to product-level signals: ${(err as Error).message}`);
+        }
+
         // ── Step 1: Page productViewConnection — presence signal only ──
         // v2.7 (2026-06-11): Broadened candidate admission. Previously only
         // Finale-flagged reorder qty admitted a SKU. Now also admits any
@@ -2706,7 +2720,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         finaleDemandQty: demandQty,
                         finaleDemandPerDay: demandPerDay,
                     };
-                    if (shouldIncludePurchasingCandidate(candidate)) {
+                    if (shouldIncludePurchasingCandidate({
+                        ...candidate,
+                        ledgerNetConsumption: ledgerNetFor(ledgerSnapshot, p.productId),
+                    })) {
                         candidates.push(candidate);
                     } else {
                         // Track failures for second-pass ariaPOHistory check
@@ -2939,6 +2956,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         salesVelocity,
                         purchaseVelocity,
                         consumptionQty: candidate.finaleConsumptionQty,
+                        ledgerVelocity: ledgerRateFor(ledgerSnapshot, sku),
                     });
                     let dailyRate = chosenVelocity.dailyRate;
                     let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
