@@ -2681,7 +2681,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // degrade to the product-level signals instead.
         let ledgerSnapshot: LedgerSnapshot | null = null;
         try {
-            ledgerSnapshot = await getLedgerSnapshot(daysBack);
+            // 90-day window (LEDGER_DEFAULT_DAYS), NOT daysBack. daysBack is the
+            // product-pagination window (365) and has nothing to do with how far back
+            // physical consumption should be measured. Passing it here admitted every
+            // SKU with a single movement in the last YEAR (1622 SKUs) instead of the
+            // last 90 days (~850), surfacing stale movers with no sales/BOM demand, and
+            // diluted the daily rate by 4x (net/365 vs net/90).
+            ledgerSnapshot = await getLedgerSnapshot();
         } catch (err) {
             console.warn(`[purchasing] stock ledger unavailable, falling back to product-level signals: ${(err as Error).message}`);
         }
