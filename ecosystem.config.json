@@ -23,6 +23,7 @@
       "name": "aria-dashboard",
       "script": "node_modules/next/dist/bin/next",
       "args": "start -p 3001",
+      "interpreter": "C:/Program Files/nodejs/node.exe",
       "cwd": "C:/Users/BuildASoil/Documents/Projects/aria",
       "windowsHide": true,
       "max_restarts": 5,

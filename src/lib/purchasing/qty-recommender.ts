@@ -59,7 +59,12 @@ export interface RecommenderInput {
     leadTimeDays: number;
     leadTimeProvenance: string;
     leadTimeP90?: number | null;        // when provided (n>=5 vendor history), used instead of point estimate
-    coverBufferDays?: number;           // default 60 — extra cover above lead time
+    /**
+     * Explicit safety-buffer override (days above lead time). When provided
+     * (including 0 = lead-only), it wins; when omitted, safety is velocity-scaled
+     * (see coverBufferFor). Kept for legacy callers and test isolation.
+     */
+    coverBufferDays?: number;
     orderIncrementQty?: number | null;  // pack rounding (Finale "Std reorder in qty of")
 
     /** Phase 2 — vendor calibration multiplier (>1 widens cover; <1 tightens). */
@@ -179,6 +184,33 @@ export interface RecommenderResult {
     roundingAlternatives?: number[];
     /** v2.6 — true when historical pattern or standard_order_qty forced a qty bump. */
     historicalFloorApplied: boolean;
+}
+
+// HERMIA(2026-10-05 — Bill): velocity-scaled safety buffer. Fast movers get long
+// cover (a stockout on a popular item like EBS101 is costly); slow movers floor at
+// 21d (don't park cash in slow goods). safety = clamp(dailyRate × 60, 21, 90).
+// An explicit `coverBufferDays` (including 0 = lead-only) still wins — legacy
+// callers and test isolation rely on it.
+const VELOCITY_SAFETY_DAYS_FACTOR = 60;
+const MIN_VELOCITY_SAFETY_DAYS = 21;
+const MAX_VELOCITY_SAFETY_DAYS = 90;
+
+/**
+ * Velocity-scaled safety buffer (days above lead time). Shared by the resale
+ * recommender and the BOM pipeline so both size cover from the same rule:
+ * fast movers get long cover, slow movers floor at 21d.
+ */
+export function velocityScaledSafetyDays(dailyRate: number): number {
+    const rate = Math.max(0, dailyRate);
+    return Math.round(Math.min(
+        MAX_VELOCITY_SAFETY_DAYS,
+        Math.max(MIN_VELOCITY_SAFETY_DAYS, rate * VELOCITY_SAFETY_DAYS_FACTOR),
+    ));
+}
+
+function coverBufferFor(input: RecommenderInput): number {
+    if (input.coverBufferDays != null) return input.coverBufferDays;
+    return velocityScaledSafetyDays(input.dailyRate);
 }
 
 function urgencyFor(adjustedRunwayDays: number, leadTimeDays: number): Urgency {
@@ -327,7 +359,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     // v2.1 — vendor policy targetCoverDays takes precedence over lead+buffer×multiplier.
     // When targetCoverDays is set, safetyMultiplier is intentionally bypassed: Will
     // set the cover deliberately, calibration shouldn't dampen it.
-    const buffer = input.coverBufferDays ?? 30;
+    const buffer = coverBufferFor(input);
     const safetyMultiplier = Math.max(0.5, Math.min(2.5, input.safetyMultiplier ?? 1));
     const targetCoverDays = input.targetCoverDays ?? null;
     let coverDays: number;
@@ -708,26 +740,10 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         }
     }
 
-    // v2.6c: lastPurchaseQty single-point floor (fallback when no multi-PO history)
-    if (!historicalFloorApplied && suggestedQty > 0) {
-        const lastQty = input.lastPurchaseQty ?? null;
-        const history = input.skuPurchaseHistory ?? [];
-        if (lastQty && lastQty > 0 && suggestedQty < lastQty && history.length === 0) {
-            // Only apply single-point floor if we don't have multi-point history
-            // (avoids double-enforcing when both lastPurchaseQty and history exist)
-            const deviationPct = Math.round(((lastQty - suggestedQty) / lastQty) * 100);
-            if (deviationPct >= 50) {
-                const beforeQty = suggestedQty;
-                suggestedQty = lastQty;
-                historicalFloorApplied = true;
-                trace.push({
-                    step: "last_purchase_floor",
-                    detail: `Bumped from ${beforeQty} to ${lastQty} — last order was ${lastQty} units (${deviationPct}% below)`,
-                    value: lastQty,
-                });
-            }
-        }
-    }
+    // v2.6c retired: a single last PO is a note, not a floor.
+    // One historical qty (STICKER12 2 → 1,500, MTD101 5 → 50) was refilling
+    // the previous order instead of buying the gap. The deviation review
+    // below still tells the operator what the last order was.
 
     // Still log the deviation as a dashboard review reason
     const lastPurchaseQty = input.lastPurchaseQty ?? null;

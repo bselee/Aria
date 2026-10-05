@@ -5,7 +5,7 @@
  * @created 2026-05-26
  */
 
-import { recommendQty } from "@/lib/purchasing/qty-recommender";
+import { recommendQty, velocityScaledSafetyDays } from "@/lib/purchasing/qty-recommender";
 import { applySmartMOQTopUp } from "@/lib/purchasing/moq-topup";
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
 import { DEFAULT_LEAD_TIME_DAYS } from "@/lib/constants";
@@ -1455,11 +1455,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 });
                 const data = await res.json();
                 const groupName: string = data.groupName || data.name || 'Unknown';
-                const isManufactured = groupName.toLowerCase().includes('buildasoil') ||
-                    groupName.toLowerCase().includes('manufacturing') ||
-                    groupName.toLowerCase().includes('soil dept') ||
-                    groupName.toLowerCase().includes('bas soil');
-                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
+                // HERMIA(2026-10-05): the bare `manufacturing` substring false-positives
+                // on external vendors ("Novelty Manufacturing / Earthbox", "Jaybird
+                // Manufacturing Inc.") and drops their SKUs (EBS101/EBS105). Every
+                // internal BuildASoil manufacturing group contains "buildasoil", so the
+                // loose terms (`manufacturing`/`soil dept`/`bas soil`) are dead weight.
+                const isManufactured = groupName.toLowerCase().includes('buildasoil');
+                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|ac.?infinity/i.test(groupName);
                 const result = { groupName, isManufactured, isDropship };
                 if (_partyCacheShared.size >= PARTY_CACHE_MAX) {
                     const oldestKey = _partyCacheShared.keys().next().value;
@@ -2438,7 +2440,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // Default 60d covers most domestic vendors (lead + 30-45d safety).
                     // Long-lead-time overseas vendors (Colorful Packaging — 60d build/ship,
                     // target 4-6 month supply) override via vendor_reorder_policies.target_cover_days.
-                    const coverDays = bomPolicy?.targetCoverDays ?? 60;
+                    // HERMIA(2026-10-05 — Bill): velocity-scaled BOM cover. Mirror the
+                    // resale rule (safety = clamp(dailyBurn × 60, 21, 90)) so a raw
+                    // ingredient's cover grows with its burn rate, instead of a flat 60d.
+                    // An explicit vendor_reorder_policies.target_cover_days still wins.
+                    const coverDays = bomPolicy?.targetCoverDays
+                        ?? effectiveLeadTimeDays + velocityScaledSafetyDays(dailyBurn);
                     const baseNeed = Math.max(
                         0,
                         Math.ceil(dailyBurn * coverDays - effectiveStock)
@@ -2836,8 +2843,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 });
                 const data = await r.json();
                 const groupName: string = data.groupName || data.name || 'Unknown';
-                const isManufactured = /buildasoil|manufacturing|soil dept|bas soil/i.test(groupName);
-                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|evergreen|ac.?infinity/i.test(groupName);
+                // HERMIA(2026-10-05): bare `manufacturing` substring false-positives on
+                // external vendors (Novelty Manufacturing / Earthbox, Jaybird Manufacturing
+                // Inc.) — see the resolveParty comment above. Internal BAS groups all
+                // contain "buildasoil"; drop the loose terms.
+                const isManufactured = /buildasoil/i.test(groupName);
+                const isDropship = /autopot|printful|grand.?master|\bhlg\b|horticulture lighting|ac.?infinity/i.test(groupName);
                 const result = { groupName, isManufactured, isDropship };
                 if (_partyCacheShared.size >= PARTY_CACHE_MAX) {
                     const oldestKey = _partyCacheShared.keys().next().value;
@@ -3182,7 +3193,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         leadTimeDays: effectiveLeadTimeDays,
                         leadTimeProvenance: effectiveLeadTimeProvenance,
                         leadTimeP90: distribution?.p90 ?? null,
-                        coverBufferDays: 30,
+                        // coverBufferDays intentionally omitted — safety is velocity-scaled (2026-10-05)
                         orderIncrementQty,
                         safetyMultiplier: calibration?.safetyMultiplier ?? 1,
                         calibrationSampleCount: calibration?.sampleCount ?? 0,

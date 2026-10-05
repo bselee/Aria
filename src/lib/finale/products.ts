@@ -45,7 +45,10 @@ export const _skuHasNoBomCache = new Set<string>();
 export const __skuHasNoBomCacheForTests = _skuHasNoBomCache;
 
 export const EXCLUDED_VENDOR_PATTERN =
-    /buildasoil|manufacturing|soil dept|bas soil|autopot|printful|grand.?master| hlg |horticulture lighting|evergreen|ac.?infinity/i;
+    // HERMIA(2026-10-05): removed bare `manufacturing`/`soil dept`/`bas soil` terms —
+    // they false-positive on external vendors ("Novelty Manufacturing / Earthbox",
+    // "Jaybird Manufacturing Inc."). Internal BuildASoil groups all contain "buildasoil".
+    /buildasoil|autopot|printful|grand.?master| hlg |horticulture lighting|ac.?infinity/i;
 
 export const _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
 export const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours

@@ -110,7 +110,9 @@ describe("recommendQty — basic math", () => {
         expect(result.suggestedQty).toBe(100);
     });
 
-    it("defaults to lead time plus 30 days when no cover buffer is provided", () => {
+    it("applies velocity-scaled safety (×60) when no explicit buffer is provided", () => {
+        // 2/d → safety = clamp(2 × 60, 21, 90) = 90d → cover = 14 + 90 = 104d
+        // target = 2 × 104 = 208 − 50 on hand = 158 needed
         const result = recommendQty({
             sku: "BOX-101",
             dailyRate: 2,
@@ -124,8 +126,28 @@ describe("recommendQty — basic math", () => {
             orderIncrementQty: null,
         });
 
-        expect(result.coverDays).toBe(44);
-        expect(result.rawNeededEaches).toBe(38);
+        expect(result.coverDays).toBe(104);
+        expect(result.rawNeededEaches).toBe(158);
+    });
+
+    it("velocity-scaled safety: fast mover (1.4/d) gets 84d safety", () => {
+        const result = recommendQty(baseInput({ dailyRate: 1.4, stockOnHand: 0, leadTimeDays: 15, coverBufferDays: undefined }));
+        expect(result.coverDays).toBe(99); // 15 lead + 84 safety
+    });
+
+    it("velocity-scaled safety: slow mover (0.18/d) floors at 21d", () => {
+        const result = recommendQty(baseInput({ dailyRate: 0.18, stockOnHand: 0, leadTimeDays: 15, coverBufferDays: undefined }));
+        expect(result.coverDays).toBe(36); // 15 lead + 21 floor
+    });
+
+    it("velocity-scaled safety: caps at 90d even for very fast movers", () => {
+        const result = recommendQty(baseInput({ dailyRate: 5, stockOnHand: 0, leadTimeDays: 15, coverBufferDays: undefined }));
+        expect(result.coverDays).toBe(105); // 15 lead + 90 cap
+    });
+
+    it("velocity-scaled safety: mid mover (0.74/d) is proportional", () => {
+        const result = recommendQty(baseInput({ dailyRate: 0.74, stockOnHand: 0, leadTimeDays: 15, coverBufferDays: undefined }));
+        expect(result.coverDays).toBe(59); // 15 lead + 44 safety (0.74 × 60 = 44.4 → 44)
     });
 
     it("returns zero when stock + on-order already covers cover window", () => {
@@ -787,15 +809,16 @@ describe("recommendQty — v2.6 historical order floor", () => {
         expect(result.historicalFloorApplied).toBe(false);
     });
 
-    it("uses lastPurchaseQty as fallback floor when no multi-PO history exists", () => {
+    it("notes the last order but does not bump qty to it", () => {
         const result = recommendQty(baseInput({
             ...lowNeedInput,
-            lastPurchaseQty: 20,
+            lastPurchaseQty: 1500,
             skuPurchaseHistory: [],
         }));
-        expect(result.historicalFloorApplied).toBe(true);
-        expect(result.suggestedQty).toBeGreaterThanOrEqual(20);
-        expect(result.provenance.some(s => s.step === "last_purchase_floor")).toBe(true);
+        expect(result.historicalFloorApplied).toBe(false);
+        expect(result.suggestedQty).toBeLessThan(50);
+        expect(result.provenance.some(s => s.step === "last_purchase_floor")).toBe(false);
+        expect(result.reviewReasons.join(" ")).toMatch(/last order/i);
     });
 });
 

@@ -471,6 +471,42 @@ describe('mergeIntoGroups', () => {
         expect(merged[0].items[0].dailyRate).toBe(5);
     });
 
+    it('prefers FG-derived (demand) over ledger for a resale-bom raw ingredient', () => {
+        // 2026-10-05 (Bill): the ledger rate counts pre-loaded builds + receipts,
+        // over-stating a raw ingredient's demand. FG sell-through is the truth.
+        // RAWWORMCASTINGS: ledger 1664.84/d vs FG sell-through 126.43/d + 5.48/d
+        // direct sales → ~132/d, not 1664/d.
+        const resaleGroups = [{
+            vendorName: 'Gary Ambriol', vendorPartyId: 'p1', urgency: 'warning' as const,
+            items: [{
+                productId: 'RAWWORMCASTINGS', supplierPartyId: 'p1', itemType: 'resale' as const,
+                dailyRate: 1664.84, dailyRateSource: 'ledger' as const,
+                salesVelocity: 5.48, stockOnHand: 71392, stockOnOrder: 0,
+                suggestedQty: 63000, urgency: 'warning' as const,
+                explanation: '365d ledger receipts.', feedsFinishedGoods: [],
+                candidate: { directDemand: 0, bomDemand: 0 },
+            } as unknown as GroupItem],
+        }];
+        const bomGroups = [{
+            vendorName: 'Gary Ambriol', vendorPartyId: 'p1', urgency: 'ok' as const,
+            items: [{
+                productId: 'RAWWORMCASTINGS', supplierPartyId: 'p1', itemType: 'bom-component' as const,
+                dailyRate: 126.43, dailyRateSource: 'demand' as const,
+                stockOnHand: 71392, stockOnOrder: 0, suggestedQty: 0, urgency: 'ok' as const,
+                explanation: 'FG sales × BOM.', feedsFinishedGoods: [],
+                candidate: { directDemand: 0, bomDemand: 126.43 },
+            } as unknown as GroupItem],
+        }];
+
+        const merged = mergeIntoGroups(resaleGroups, bomGroups);
+        const mergedItem = merged[0].items[0];
+        expect(mergedItem.itemType).toBe('resale-bom');
+        expect(mergedItem.dailyRate).toBeCloseTo(126.43 + 5.48, 1); // FG sell-through + direct sales, NOT ledger
+        expect(mergedItem.dailyRate).not.toBeCloseTo(1664.84, 1);
+        expect(mergedItem.dailyRateSource).toBe('demand');
+        expect(mergedItem.suggestedQty).toBe(0); // trust the BOM's FG-derived qty
+    });
+
     it('keeps vendor groups separate when different vendors', () => {
         const resaleGroups = [{ vendorName: 'A', vendorPartyId: 'p1', urgency: 'ok' as const, items: [] }];
         const bomGroups = [{ vendorName: 'B', vendorPartyId: 'p2', urgency: 'warning' as const, items: [] }];
