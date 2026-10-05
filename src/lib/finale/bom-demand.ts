@@ -25,35 +25,81 @@ export interface ComponentDemand {
 /**
  * Given FG sales velocities and their BOMs, compute per-component burn rates.
  * This is a pure function — no API calls.
+ *
+ * MULTI-LEVEL (2026-10-05 — Bill): a component's burn traces up through
+ * intermediate sub-recipes ("Mineral Kits" — SMNK124/SMNK324/PNPMNK/
+ * RAWMINERALMIX) to the retail finished good that actually sells. Mineral Kits
+ * are internal build recipes with zero retail sales, so rating a raw amendment
+ * off the Kit's sales gave it zero FG-derived demand and pushed it onto receipt
+ * velocity (RAWRICEBRAN 466/d, RAWGYPSUM 444/d). The single-level version only
+ * exploded one BOM level; this one walks the full tree.
+ *
+ * Only RETAIL FGs (dailySalesRate > 0) seed a demand flow. Sub-assemblies are
+ * expanded transitively — their leaves inherit the parent FG's sell-through ×
+ * the cumulative quantity along the path. Cycle-guarded (BOMs must be acyclic).
  */
 export function computeComponentBurnRates(fgVelocities: FGVelocity[]): Map<string, ComponentDemand> {
+    // Index every SKU that has a BOM (retail FGs and sub-assemblies alike).
+    const bomBySku = new Map<string, Array<{ componentSku: string; quantity: number }>>();
+    for (const fg of fgVelocities) {
+        bomBySku.set(fg.sku, fg.bom);
+    }
+
     const components = new Map<string, ComponentDemand>();
 
-    for (const fg of fgVelocities) {
-        for (const comp of fg.bom) {
-            const existing = components.get(comp.componentSku);
-            const burnContribution = fg.dailySalesRate * comp.quantity;
-
+    /**
+     * Push `flowRate` (units/day of `sku` being consumed) down to leaf raw
+     * ingredients, accumulating their burn. `qtyPerRootUnit` is the cumulative
+     * quantity of `sku` per one root FG (product of BOM qtys along the path).
+     */
+    function distribute(
+        sku: string,
+        flowRate: number,
+        root: FGVelocity,
+        qtyPerRootUnit: number,
+        visiting: Set<string>,
+    ): void {
+        const bom = bomBySku.get(sku);
+        if (!bom || bom.length === 0) {
+            // Leaf raw ingredient — record its burn against the root retail FG.
+            const existing = components.get(sku);
+            const feed = {
+                sku: root.sku,
+                name: root.name,
+                dailySalesRate: root.dailySalesRate,
+                qtyPerUnit: qtyPerRootUnit,
+            };
             if (existing) {
-                existing.totalBurnRate += burnContribution;
-                existing.feedsFinishedGoods.push({
-                    sku: fg.sku,
-                    name: fg.name,
-                    dailySalesRate: fg.dailySalesRate,
-                    qtyPerUnit: comp.quantity,
-                });
+                existing.totalBurnRate += flowRate;
+                existing.feedsFinishedGoods.push(feed);
             } else {
-                components.set(comp.componentSku, {
-                    componentSku: comp.componentSku,
-                    totalBurnRate: burnContribution,
-                    feedsFinishedGoods: [{
-                        sku: fg.sku,
-                        name: fg.name,
-                        dailySalesRate: fg.dailySalesRate,
-                        qtyPerUnit: comp.quantity,
-                    }],
+                components.set(sku, {
+                    componentSku: sku,
+                    totalBurnRate: flowRate,
+                    feedsFinishedGoods: [feed],
                 });
             }
+            return;
+        }
+        if (visiting.has(sku)) return; // cycle guard — BOMs must be acyclic
+        visiting.add(sku);
+        for (const comp of bom) {
+            distribute(
+                comp.componentSku,
+                flowRate * comp.quantity,
+                root,
+                qtyPerRootUnit * comp.quantity,
+                visiting,
+            );
+        }
+        visiting.delete(sku);
+    }
+
+    for (const fg of fgVelocities) {
+        // Seed only retail FGs. Sub-assemblies with sales=0 contribute nothing
+        // on their own — their leaves are reached transitively from retail FGs.
+        if (fg.dailySalesRate > 0) {
+            distribute(fg.sku, fg.dailySalesRate, fg, 1, new Set());
         }
     }
 

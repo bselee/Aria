@@ -28,6 +28,36 @@ describe('computeComponentBurnRates', () => {
         expect(byFg.get('LIGHT-MIX')).toBe(2);
         expect(byFg.get('CRAFT-LITE')).toBe(3);
     });
+
+    it('traces a raw amendment up through a Mineral Kit (sub-assembly) to retail soil', () => {
+        // 2026-10-05 (Bill): Mineral Kits (SMNK124 etc.) are internal build recipes
+        // with zero retail sales. A raw amendment behind one must inherit the retail
+        // soil's sell-through, not the Kit's (zero) sales.
+        const fgVelocities = [
+            { sku: 'LOSOLY3', name: '3.0 Soil', dailySalesRate: 2, bom: [{ componentSku: 'SMNK124', quantity: 1 }] },
+            { sku: 'SMNK124', name: 'Mineral Kit 1-2-4', dailySalesRate: 0, bom: [{ componentSku: 'RAWRICEBRAN', quantity: 40 }, { componentSku: 'RAWGYPSUM', quantity: 200 }] },
+        ];
+        const result = computeComponentBurnRates(fgVelocities);
+        // RAWRICEBRAN: 2 (soil/day) × 1 (kit/soil) × 40 (bran/kit) = 80/day
+        expect(result.get('RAWRICEBRAN')!.totalBurnRate).toBe(80);
+        expect(result.get('RAWGYPSUM')!.totalBurnRate).toBe(400);
+        // feedsFinishedGoods should name the RETAIL root, not the sub-assembly
+        expect(result.get('RAWRICEBRAN')!.feedsFinishedGoods[0].sku).toBe('LOSOLY3');
+        expect(result.get('RAWRICEBRAN')!.feedsFinishedGoods[0].qtyPerUnit).toBe(40);
+        // The Mineral Kit itself is a sub-assembly, not a leaf — it must not appear
+        expect(result.has('SMNK124')).toBe(false);
+    });
+
+    it('sums a leaf reached via two different sub-assemblies (diamond)', () => {
+        const fgVelocities = [
+            { sku: 'A', name: 'Retail A', dailySalesRate: 2, bom: [{ componentSku: 'B', quantity: 2 }, { componentSku: 'C', quantity: 3 }] },
+            { sku: 'B', name: 'Sub B', dailySalesRate: 0, bom: [{ componentSku: 'D', quantity: 4 }] },
+            { sku: 'C', name: 'Sub C', dailySalesRate: 0, bom: [{ componentSku: 'D', quantity: 5 }] },
+        ];
+        const result = computeComponentBurnRates(fgVelocities);
+        // D: 2 × (2×4 + 3×5) = 2 × 23 = 46/day
+        expect(result.get('D')!.totalBurnRate).toBe(46);
+    });
 });
 
 describe('classifyUrgency', () => {
