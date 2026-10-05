@@ -76,15 +76,16 @@ describe('classifyUrgency', () => {
 });
 
 describe('chooseBomVelocity', () => {
-    it('uses finished-goods burn when present, even if receipts are higher', () => {
+    it('takes the larger of receipts vs FG burn (BOM under-lists usage)', () => {
+        // receipts 166.67/d is the actual consumption; FG 0.22/d is the under-listed BOM calc
         expect(chooseBomVelocity({ receiptVelocity: 166.67, bomDerivedVelocity: 0.22 }))
-            .toEqual({ value: 0.22, source: 'demand' });
+            .toEqual({ value: 166.67, source: 'receipts' });
     });
-    it('uses receipts only when finished-goods burn is zero', () => {
+    it('uses receipts when FG burn is zero', () => {
         expect(chooseBomVelocity({ receiptVelocity: 0.42, bomDerivedVelocity: 0 }))
             .toEqual({ value: 0.42, source: 'receipts' });
     });
-    it('falls back to BOM-derived velocity when receipts are zero', () => {
+    it('uses FG-derived velocity when receipts are zero (labels, no purchase history)', () => {
         expect(chooseBomVelocity({ receiptVelocity: 0, bomDerivedVelocity: 0.18 }))
             .toEqual({ value: 0.18, source: 'demand' });
     });

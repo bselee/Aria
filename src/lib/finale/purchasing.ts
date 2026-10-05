@@ -2366,6 +2366,13 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const dailyBurn = chosen.value;
                     if (dailyBurn <= 0) continue; // nothing to order — no receipts AND no FG demand
 
+                    // HERMIA(2026-10-05 — Bill): divergence flag. When actual consumption
+                    // (receipts) runs ≫ the BOM-derived rate, the BOM under-lists this raw's
+                    // usage. Surface it on the board so the gap is visible, not silent.
+                    const bomUsageGap = bomDerivedVelocity > 0 && receiptVelocity > bomDerivedVelocity * 3
+                        ? receiptVelocity / bomDerivedVelocity
+                        : 0;
+
                     const runwayDays = dailyBurn > 0 ? effectiveStock / dailyBurn : 9999;
                     const adjustedRunwayDays = dailyBurn > 0
                         ? (effectiveStock + stockOnOrder) / dailyBurn
@@ -2525,6 +2532,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                                 ? ` Rounded up to median order of ${rounded.commonOrderQty} (raw need ${rounded.rawSuggestedQty}).`
                                 : ` Last order was ${rounded.commonOrderQty}; matched up (raw need ${rounded.rawSuggestedQty}).`
                         : '';
+                    const usageGapLabel = bomUsageGap > 0
+                        ? ` ⚠ BOM under-lists usage: actual ${receiptVelocity.toFixed(0)}/d vs BOM ${bomDerivedVelocity.toFixed(1)}/d (${bomUsageGap.toFixed(0)}×).`
+                        : '';
 
                     items.push({
                         productId: compSku,
@@ -2549,7 +2559,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         urgency,
                         explanation:
                             `BOM component — ${sourceLabel}. ${Math.round(runwayDays)}d runway across ` +
-                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}${forwardLabel}`,
+                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}${forwardLabel}${usageGapLabel}`,
+                        bomUsageGap: bomUsageGap > 0 ? bomUsageGap : undefined,
                         suggestedQty,
                         orderIncrementQty: (prodData.orderIncrementQuantity ?? prodData.stdPackingUnitsPerCase ?? compActivity.orderIncrementQty ?? null),
                         isBulkDelivery: true, // BOM materials route to production facility

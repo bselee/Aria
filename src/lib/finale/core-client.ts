@@ -188,6 +188,8 @@ export interface PurchasingItem {
     triggerReason?: 'build-driven' | 'stockout-padded' | 'runway-short' | 'cadence' | null;
     triggerDetail?: string;
     stockAvailable?: number;
+    /** Ratio of actual consumption (receipts) ÷ BOM-derived rate, set only when >3× (BOM under-lists usage). */
+    bomUsageGap?: number;
     forwardDemandEntry?: {
         requiredQty: number;
         earliestBuildDate: string;

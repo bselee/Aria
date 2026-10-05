@@ -119,15 +119,21 @@ export function classifyUrgency(runwayDays: number, leadTimeDays: number): 'crit
 
 /**
  * Pick a daily-burn signal for a BOM component.
- * Finished-goods burn is the constraint. Receipt velocity is what we already
- * bought. Using it to size the next PO is circular (3.0BAGCP: 166/d receipts
- * vs 0.22/d FG burn). Receipts are the fallback only when FG burn is zero.
+ *
+ * HERMIA(2026-10-05 — Bill): take the LARGER of receipt (actual consumption) and
+ * FG-derived (theoretical) — not prefer-FG. BOMs cannot be adjusted and under-list
+ * raw usage by an order of magnitude, so the FG-derived rate under-counts when it's
+ * lower than what's actually leaving the warehouse (RAWWORMCASTINGS: 133/d BOM vs
+ * ~1,866/d actual). Receipts win when the BOM under-lists; FG wins when there's no
+ * purchase history (labels) or the item is under-building.
  */
 export function chooseBomVelocity(input: { receiptVelocity: number; bomDerivedVelocity: number }):
     { value: number; source: 'receipts' | 'demand' | 'none' } {
-    if (input.bomDerivedVelocity > 0) return { value: input.bomDerivedVelocity, source: 'demand' };
-    if (input.receiptVelocity > 0) return { value: input.receiptVelocity, source: 'receipts' };
-    return { value: 0, source: 'none' };
+    const receipts = input.receiptVelocity;
+    const fg = input.bomDerivedVelocity;
+    const value = Math.max(receipts, fg);
+    if (value <= 0) return { value: 0, source: 'none' };
+    return { value, source: receipts >= fg ? 'receipts' : 'demand' };
 }
 
 /**
@@ -470,6 +476,7 @@ export function mergeIntoGroups(
                             ...(bomItem.feedsFinishedGoods || [])
                         ],
                         totalBurnRate: (resaleItem.totalBurnRate ?? 0) + (bomItem.totalBurnRate ?? 0),
+                        bomUsageGap: Math.max(resaleItem.bomUsageGap ?? 0, bomItem.bomUsageGap ?? 0) || undefined,
                         triggerReason: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.triggerReason : resaleItem.triggerReason,
                         triggerDetail: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.triggerDetail : resaleItem.triggerDetail,
                     };
