@@ -440,21 +440,17 @@ export function mergeIntoGroups(
                     const ledgerInvolved = resaleItem.dailyRateSource === "ledger"
                         || bomItem.dailyRateSource === "ledger";
 
-                    // HERMIA(2026-10-05 — Bill): FG sell-through is the truth for a raw
-                    // ingredient consumed in builds. When the BOM side is FG-derived
-                    // (source 'demand') and the resale side is ledger-sourced, the ledger
-                    // rate over-states demand — it counts pre-loaded builds + receipts.
-                    // RAWWORMCASTINGS: ledger 1664/d vs FG sell-through 126/d drove a
-                    // 63,000 lb order against 565d of on-hand stock. Prefer the FG-derived
-                    // rate, plus the item's direct retail sales.
-                    const bomIsFGDerived = bomItem.dailyRateSource === "demand";
-                    const resaleIsLedger = resaleItem.dailyRateSource === "ledger";
-                    const preferFGDerived = bomIsFGDerived && resaleIsLedger;
-                    const mergedDailyRate = preferFGDerived
-                        ? (bomItem.dailyRate ?? 0) + (resaleItem.salesVelocity ?? 0)
-                        : bothNonZero && ledgerInvolved
-                            ? Math.max(resaleItem.dailyRate ?? 0, bomItem.dailyRate ?? 0)
-                            : (resaleItem.dailyRate ?? 0) + (bomItem.dailyRate ?? 0);
+                    // HERMIA(2026-10-05 — Bill, corrected): never prefer FG sell-through
+                    // over the ledger for a raw ingredient. FG sell-through is only as
+                    // accurate as the BOM data, and the BOMs CANNOT be adjusted — they
+                    // under-list raw usage by an order of magnitude (RAWWORMCASTINGS:
+                    // 168,000 lb bought in 90d = ~1,866/d actual consumption, but the
+                    // BOM calc returns 133/d). Dropping the ledger rate caused ~38 raws
+                    // to under-order to 0. The ledger is the actual physical consumption;
+                    // the FG-derived rate is a theoretical cross-check. Take the larger.
+                    const mergedDailyRate = bothNonZero && ledgerInvolved
+                        ? Math.max(resaleItem.dailyRate ?? 0, bomItem.dailyRate ?? 0)
+                        : (resaleItem.dailyRate ?? 0) + (bomItem.dailyRate ?? 0);
 
                     // DECISION(2026-05-26): Consolidate duplicate products across resale
                     // and BOM pipelines into a single 'resale-bom' item with combined rate,
@@ -463,17 +459,12 @@ export function mergeIntoGroups(
                         ...resaleItem,
                         urgency: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.urgency : resaleItem.urgency,
                         dailyRate: mergedDailyRate,
-                        dailyRateSource: preferFGDerived ? "demand" : resaleItem.dailyRateSource,
                         purchaseVelocity: Math.max(resaleItem.purchaseVelocity ?? 0, bomItem.purchaseVelocity ?? 0),
                         salesVelocity: Math.max(resaleItem.salesVelocity ?? 0, bomItem.salesVelocity ?? 0),
                         demandVelocity: Math.max(resaleItem.demandVelocity ?? 0, bomItem.demandVelocity ?? 0),
                         itemType: 'resale-bom' as const,
-                        explanation: preferFGDerived
-                            ? `${bomItem.explanation || ''} (direct sales ${(resaleItem.salesVelocity ?? 0).toFixed(2)}/d)`
-                            : `${resaleItem.explanation || ''} (BOM: ${bomItem.explanation || ''})`,
-                        suggestedQty: preferFGDerived
-                            ? (bomItem.suggestedQty ?? 0)
-                            : Math.max(resaleItem.suggestedQty ?? 0, bomItem.suggestedQty ?? 0),
+                        explanation: `${resaleItem.explanation || ''} (BOM: ${bomItem.explanation || ''})`,
+                        suggestedQty: Math.max(resaleItem.suggestedQty ?? 0, bomItem.suggestedQty ?? 0),
                         feedsFinishedGoods: [
                             ...(resaleItem.feedsFinishedGoods || []),
                             ...(bomItem.feedsFinishedGoods || [])

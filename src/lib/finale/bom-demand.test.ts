@@ -501,11 +501,11 @@ describe('mergeIntoGroups', () => {
         expect(merged[0].items[0].dailyRate).toBe(5);
     });
 
-    it('prefers FG-derived (demand) over ledger for a resale-bom raw ingredient', () => {
-        // 2026-10-05 (Bill): the ledger rate counts pre-loaded builds + receipts,
-        // over-stating a raw ingredient's demand. FG sell-through is the truth.
-        // RAWWORMCASTINGS: ledger 1664.84/d vs FG sell-through 126.43/d + 5.48/d
-        // direct sales → ~132/d, not 1664/d.
+    it('keeps the ledger rate over FG sell-through for a raw (BOM under-lists usage)', () => {
+        // 2026-10-05 (Bill, corrected): BOMs cannot be adjusted and under-list raw
+        // usage by an order of magnitude. The ledger is the actual physical
+        // consumption; FG sell-through is only a cross-check. Take the larger so a
+        // raw that's physically leaving at 1664/d never drops to 126/d and orders 0.
         const resaleGroups = [{
             vendorName: 'Gary Ambriol', vendorPartyId: 'p1', urgency: 'warning' as const,
             items: [{
@@ -513,7 +513,7 @@ describe('mergeIntoGroups', () => {
                 dailyRate: 1664.84, dailyRateSource: 'ledger' as const,
                 salesVelocity: 5.48, stockOnHand: 71392, stockOnOrder: 0,
                 suggestedQty: 63000, urgency: 'warning' as const,
-                explanation: '365d ledger receipts.', feedsFinishedGoods: [],
+                explanation: '90d ledger receipts.', feedsFinishedGoods: [],
                 candidate: { directDemand: 0, bomDemand: 0 },
             } as unknown as GroupItem],
         }];
@@ -531,10 +531,8 @@ describe('mergeIntoGroups', () => {
         const merged = mergeIntoGroups(resaleGroups, bomGroups);
         const mergedItem = merged[0].items[0];
         expect(mergedItem.itemType).toBe('resale-bom');
-        expect(mergedItem.dailyRate).toBeCloseTo(126.43 + 5.48, 1); // FG sell-through + direct sales, NOT ledger
-        expect(mergedItem.dailyRate).not.toBeCloseTo(1664.84, 1);
-        expect(mergedItem.dailyRateSource).toBe('demand');
-        expect(mergedItem.suggestedQty).toBe(0); // trust the BOM's FG-derived qty
+        expect(mergedItem.dailyRate).toBe(1664.84); // ledger (actual) wins, NOT 126.43
+        expect(mergedItem.suggestedQty).toBe(63000); // ledger-driven qty wins, NOT 0
     });
 
     it('keeps vendor groups separate when different vendors', () => {
