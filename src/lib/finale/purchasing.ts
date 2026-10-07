@@ -17,7 +17,8 @@ import {
 } from "@/lib/purchasing/oag-powder-policy";
 import { getObservedSkuLeadDays, getSkuLeadExclusionNote, setSkuLeadTimeSamples, cardLeadLabel, dropLoneLeadOutlier, type SkuLeadSample } from "@/lib/purchasing/sku-lead-time";
 import {
-    loadActiveReservations,
+    loadActiveReservationRows,
+    releaseReservations,
     loadAllVendorReorderPolicies,
     loadCalibrationStats,
     loadVendorMOQs,
@@ -30,6 +31,7 @@ import {
     type RecommendationSnapshot,
 } from "@/lib/purchasing/calibration";
 import { leadTimeService } from "@/lib/builds/lead-time-service";
+import { reconcileReservations } from "@/lib/purchasing/reservation-reconciler";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
 import { rawIngredientBoundsFor } from "@/lib/purchasing/raw-ingredient-minimums";
 import { getLedgerSnapshot, ledgerNetFor, ledgerRateFor, type LedgerSnapshot } from "./stock-ledger";
@@ -2816,10 +2818,23 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // inside the loop using a memo. Reservations are keyed on productId,
         // which we DO have, so we batch-load them up front.
         const productIds = candidates.map(c => c.productId);
-        const [reservationsMap] = await Promise.all([
-            loadActiveReservations(productIds),
+        const [reservationRows] = await Promise.all([
+            loadActiveReservationRows(productIds),
             leadTimeService.warmCache(),
         ]);
+        // HERMIA(2026-10-07): a reservation is inbound supply only while its PO is still an unsent
+        // draft. Verify against live Finale status and release the dead ones before they can move a
+        // recommendation (a PO cancelled/committed inside Finale used to keep suppressing supply for
+        // up to 72h, doubling quantities and faking 0-day CRITICALs — see reservation-reconciler.ts).
+        const reconciliation = await reconcileReservations(reservationRows, {
+            fetchDraftStatus: async (po) => {
+                const detail = await (this as any).getOrderDetails(po);
+                return detail?.statusId ?? null;
+            },
+            release: releaseReservations,
+            log: (message) => console.log(`[finale] ${message}`),
+        });
+        const reservationsMap = reconciliation.liveByProduct;
         const calibrationCache = new Map<string, Awaited<ReturnType<typeof loadCalibrationStats>> extends Map<string, infer V> ? V : never>();
         const moqCache = new Map<string, Awaited<ReturnType<typeof loadVendorMOQs>> extends Map<string, infer V> ? V : never>();
         const reorderPolicyCache = new Map<string, VendorReorderPolicy>();

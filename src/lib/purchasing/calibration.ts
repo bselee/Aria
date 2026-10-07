@@ -61,16 +61,17 @@ export interface ActiveReservation {
     productId: string;
     qty: number;
     draftPONumbers: string[];
+    /** Per-PO breakdown — a product can sit on several drafts and only some may still be live. */
+    rows: Array<{ draftPONumber: string; qty: number }>;
 }
 
-/** Returns a map of `productId -> total reserved qty` across all unreleased rows. */
-export async function loadActiveReservations(
+/** Flat, unreleased, unexpired reservation rows: one entry per (productId, draft PO). */
+export async function loadActiveReservationRows(
     productIds: string[]
-): Promise<Map<string, ActiveReservation>> {
-    const map = new Map<string, ActiveReservation>();
-    if (productIds.length === 0) return map;
+): Promise<Array<{ productId: string; draftPONumber: string; qty: number }>> {
+    if (productIds.length === 0) return [];
     const db = createClient();
-    if (!db) return map;
+    if (!db) return [];
 
     try {
         const nowIso = new Date().toISOString();
@@ -81,23 +82,40 @@ export async function loadActiveReservations(
             .gt("expires_at", nowIso)
             .in("product_id", productIds);
 
-        for (const row of data ?? []) {
-            const existing = map.get(row.product_id);
-            if (existing) {
-                existing.qty += Number(row.qty) || 0;
-                if (!existing.draftPONumbers.includes(row.draft_po_number)) {
-                    existing.draftPONumbers.push(row.draft_po_number);
-                }
-            } else {
-                map.set(row.product_id, {
-                    productId: row.product_id,
-                    qty: Number(row.qty) || 0,
-                    draftPONumbers: [row.draft_po_number],
-                });
-            }
-        }
+        return (data ?? []).map((row: any) => ({
+            productId: row.product_id,
+            draftPONumber: String(row.draft_po_number),
+            qty: Number(row.qty) || 0,
+        }));
     } catch (err: any) {
-        console.warn(`[calibration] loadActiveReservations failed: ${err.message}`);
+        console.warn(`[calibration] loadActiveReservationRows failed: ${err.message}`);
+        return [];
+    }
+}
+
+/** Returns a map of `productId -> total reserved qty` across all unreleased rows. */
+export async function loadActiveReservations(
+    productIds: string[]
+): Promise<Map<string, ActiveReservation>> {
+    const map = new Map<string, ActiveReservation>();
+    const rows = await loadActiveReservationRows(productIds);
+
+    for (const row of rows) {
+        const existing = map.get(row.productId);
+        if (existing) {
+            existing.qty += row.qty;
+            existing.rows.push({ draftPONumber: row.draftPONumber, qty: row.qty });
+            if (!existing.draftPONumbers.includes(row.draftPONumber)) {
+                existing.draftPONumbers.push(row.draftPONumber);
+            }
+        } else {
+            map.set(row.productId, {
+                productId: row.productId,
+                qty: row.qty,
+                draftPONumbers: [row.draftPONumber],
+                rows: [{ draftPONumber: row.draftPONumber, qty: row.qty }],
+            });
+        }
     }
     return map;
 }

@@ -322,19 +322,35 @@ describe("recommendQty — calibration safety multiplier", () => {
 });
 
 describe("recommendQty — draft PO reservation", () => {
-    it("subtracts reserved qty from supply pool", () => {
-        // 2/d × 74d = 148 target. 50 on hand + 100 on order - 50 reserved = 100 effective.
-        // Need 148 - 100 = 48.
+    // DECISION(2026-10-07): a draft PO's units are INBOUND SUPPLY, never a deduction.
+    // Crediting them is what stops the next scan from re-ordering the same quantity;
+    // deducting them doubled every recommendation and faked 0-day CRITICAL rows.
+    it("credits reserved qty into the supply pool", () => {
+        // 2/d × 74d = 148 target. 50 on hand + 100 on order + 50 on draft = 200 supply → covered.
         const result = recommendQty(baseInput({
             dailyRate: 2, stockOnHand: 50, stockOnOrder: 100, openPOCount: 1,
             reservedQty: 50, reservedDraftPOs: ["DRAFT-9999"],
             leadTimeDays: 14,
         }));
-        expect(result.rawNeededEaches).toBe(48);
+        expect(result.rawNeededEaches).toBe(0);
+        expect(result.suggestedQty).toBe(0);
         expect(result.reservedQty).toBe(50);
     });
 
-    it("emits a reserved provenance step listing draft POs", () => {
+    it("never recommends more because a draft exists (regression: LPE103 2026-10-07)", () => {
+        // Live case: 38 on hand, 1.1/d, lead 13d, draft PO holding 48 of the same SKU.
+        // The scan asked for 96 (2 × 48) because the reservation was subtracted.
+        const without = recommendQty(baseInput({ dailyRate: 1.1, stockOnHand: 38, leadTimeDays: 12, leadTimeP90: 13 }));
+        const withDraft = recommendQty(baseInput({
+            dailyRate: 1.1, stockOnHand: 38, leadTimeDays: 12, leadTimeP90: 13,
+            reservedQty: 48, reservedDraftPOs: ["125391"],
+        }));
+        expect(withDraft.suggestedQty).toBeLessThanOrEqual(without.suggestedQty);
+        expect(withDraft.adjustedRunwayDays).toBeGreaterThanOrEqual(without.adjustedRunwayDays);
+        expect(withDraft.rawNeededEaches).toBeLessThan(without.rawNeededEaches + 1);
+    });
+
+    it("emits a reserved provenance step naming the draft POs", () => {
         const result = recommendQty(baseInput({
             reservedQty: 30, reservedDraftPOs: ["DRAFT-1", "DRAFT-2"],
         }));
@@ -342,12 +358,13 @@ describe("recommendQty — draft PO reservation", () => {
         expect(reservedStep).toBeTruthy();
         expect(reservedStep?.detail).toContain("DRAFT-1");
         expect(reservedStep?.detail).toContain("DRAFT-2");
+        expect(reservedStep?.detail).toContain("credited");
     });
 
-    it("reduces adjusted runway when reservations exist", () => {
+    it("raises adjusted runway when reservations exist", () => {
         const without = recommendQty(baseInput({ stockOnHand: 50, stockOnOrder: 100, openPOCount: 1 }));
         const withReserved = recommendQty(baseInput({ stockOnHand: 50, stockOnOrder: 100, openPOCount: 1, reservedQty: 50 }));
-        expect(withReserved.adjustedRunwayDays).toBeLessThan(without.adjustedRunwayDays);
+        expect(withReserved.adjustedRunwayDays).toBeGreaterThan(without.adjustedRunwayDays);
     });
 });
 

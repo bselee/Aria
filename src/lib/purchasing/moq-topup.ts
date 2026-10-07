@@ -109,7 +109,9 @@ export function applySmartMOQTopUp(
 
             // Enforce maximum cover days guardrail: do not exceed maxCoverDays supply
             if (candidate.dailyRate > 0) {
-                const totalPosition = candidate.stockOnHand + candidate.stockOnOrder - candidate.reservedQty + currentAllocated + increment;
+                // HERMIA(2026-10-07): reservations are live-draft inbound supply, so they add
+                // to the position (they are not a deduction — see qty-recommender DECISION).
+                const totalPosition = candidate.stockOnHand + candidate.stockOnOrder + candidate.reservedQty + currentAllocated + increment;
                 const projectedCoverageDays = totalPosition / candidate.dailyRate;
                 if (projectedCoverageDays > maxCoverDays) {
                     // Skip to prevent overstocking

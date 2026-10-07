@@ -72,7 +72,12 @@ export interface RecommenderInput {
     calibrationSampleCount?: number;
     calibrationMedianErrorPct?: number | null;
 
-    /** Phase 3a — qty already reserved against open draft POs for this SKU. */
+    /**
+     * Qty sitting on a LIVE (unsent) draft PO for this SKU. Finale's open-PO list
+     * cannot see drafts, so this is real inbound supply and is credited as such.
+     * Stale reservations (PO since cancelled / committed / received) must be
+     * filtered out by the caller — see `reservation-reconciler.ts`.
+     */
     reservedQty?: number;
     reservedDraftPOs?: string[];
 
@@ -298,16 +303,21 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
         trace.push({ step: "on_order", detail: "No open POs", value: 0 });
     }
     if (reservedQty > 0) {
-        const draftLabel = (input.reservedDraftPOs ?? []).slice(0, 3).join(", ") || "active drafts";
+        const draftLabel = (input.reservedDraftPOs ?? []).slice(0, 3).join(", ") || "live draft";
         trace.push({
             step: "reserved",
-            detail: `${Math.round(reservedQty)} units already reserved across drafts (${draftLabel}) — subtracted from incoming credit`,
+            detail: `${Math.round(reservedQty)} units on live draft PO(s) (${draftLabel}) — credited as inbound; ` +
+                `Finale does not report unsent drafts in its open-PO list`,
             value: reservedQty,
         });
     }
 
     // ── Step 3: runway ────────────────────────────────────────────────────
-    const supplyForRunway = effectiveStock + stockOnOrder - reservedQty;
+    // DECISION(2026-10-07): reservations are inbound supply, not a deduction.
+    // A draft's units are real cover against the SKU's own demand, so the runway
+    // must include them (a cancelled draft's stale reservation must never fake a
+    // 0-day runway — that produced false CRITICALs).
+    const supplyForRunway = effectiveStock + stockOnOrder + reservedQty;
     const runwayDays = dailyRate > 0 ? effectiveStock / dailyRate : Number.POSITIVE_INFINITY;
     const adjustedRunwayDays = dailyRate > 0
         ? Math.max(0, supplyForRunway) / dailyRate
@@ -409,7 +419,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
     // double-cover recommendations.
     const ORDER_POINT_BUFFER_DAYS = 30;
     const targetUnits = dailyRate * coverDays;
-    const supplyForOrder = effectiveStock + stockOnOrder - reservedQty;
+    const supplyForOrder = effectiveStock + stockOnOrder + reservedQty;
     const bomNeed = input.bomDrivenNeed != null && input.bomDrivenNeed > 0
         ? input.bomDrivenNeed
         : null;
@@ -431,7 +441,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
             detail: `BOM-driven need: ${Math.round(bomNeed)} (30d FG-traceback) ` +
                 `vs smoothed ${Math.round(targetUnits)} (${dailyRate.toFixed(2)}/d × ${coverDays}d) — using max of both, ` +
                 `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order` +
-                (reservedQty > 0 ? ` − ${Math.round(reservedQty)} reserved` : "") +
+                (reservedQty > 0 ? ` − ${Math.round(reservedQty)} on live draft PO(s)` : "") +
                 ` = ${Math.round(rawNeededEaches)} needed`,
             value: Math.round(rawNeededEaches),
         });
@@ -440,7 +450,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
             step: "raw_qty",
             detail: `${dailyRate.toFixed(2)}/d × ${coverDays}d = ${Math.round(targetUnits)} target ` +
                 `− ${Math.round(effectiveStock)} on hand − ${Math.round(stockOnOrder)} on order` +
-                (reservedQty > 0 ? ` − ${Math.round(reservedQty)} reserved` : "") +
+                (reservedQty > 0 ? ` − ${Math.round(reservedQty)} on live draft PO(s)` : "") +
                 ` = ${Math.round(rawNeededEaches)} needed`,
             value: Math.round(rawNeededEaches),
         });
@@ -456,7 +466,7 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
                 `(order-point ${orderPointDays}d = lead ${leadTimeUsed}d + ${ORDER_POINT_BUFFER_DAYS}d ` +
                 `needs ${Math.round(orderPointUnits)}; supply ${Math.round(supplyForOrder)} ` +
                 `= on hand ${Math.round(effectiveStock)} + on order ${Math.round(stockOnOrder)}` +
-                (reservedQty > 0 ? ` − reserved ${Math.round(reservedQty)}` : "") +
+                (reservedQty > 0 ? ` + draft ${Math.round(reservedQty)}` : "") +
                 `). Full cover ${coverDays}d is for clean-slate buys only.`,
             value: Math.round(rawNeededEaches),
         });
