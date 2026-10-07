@@ -28,44 +28,48 @@
  *       # explicit export (always pass when Bill just downloaded)
  *   npx tsx --env-file=.env.local src/cli/reconcile-billcom.ts --days=30
  *       # widen sweep window
+ *   --no-reverse       skip direction 2 (every bill on the page -> AP record?)
+ *   --no-close-stuck   report the stuck-row heal without applying it
  *
- * Exit code: 0 = nothing missing; 1 = items missing/needing review (or error).
+ * Direction 2 (2026-10-07) also closes ledger rows whose invoice is now a bill in
+ * Bill.com, which is what stops the 2-hourly FORWARDING_ESCALATED ping on rows
+ * nobody can otherwise close. See src/lib/purchasing/billcom-ap-audit.ts.
+ *
+ * Exit code: 0 = nothing missing, needing review, or miskeyed; 1 = something does
+ * (or the run errored). By-design "no AP record" classes do NOT set the code.
  */
 
 import { getLocalDb } from "@/lib/storage/local-db";
+import { createClient } from "@/lib/db";
 import { importCsvFile, parseCSV, type ParsedRow } from "./import-billcom-ref";
 import { isStatementDocument } from "@/lib/intelligence/ap-statement-gate";
 import { isFedExExcludedFromBillCom } from "@/lib/intelligence/ap/fedex-billing-packet";
 import { isQuoteOrSpecDocument } from "@/lib/intelligence/ap/quote-spec-gate";
+import {
+  classifyNoRecord,
+  deriveInvoice,
+  findApRecord,
+  invoicesMatch,
+  normInvoice,
+  normVendor,
+  parseDollars,
+  parseSender,
+  selectStuckRowsToClose,
+  vendorsMatch,
+  vendorHaystack,
+  type AuditFacts,
+  type CacheRow,
+  type ForwardRow,
+  type NoRecordVerdict,
+  type RefRow,
+  type VendorInvoiceRow,
+} from "@/lib/purchasing/billcom-ap-audit";
 import fs from "fs";
 import os from "os";
 import path from "path";
 
-interface RefRow {
-  vendor_name: string | null;
-  invoice_number: string | null;
-  invoice_amount: number | null;
-  invoice_date: string | null;
-  due_date: string | null;
-  po_number: string | null;
-  created_at: string | null;
-}
-
-interface ForwardRow {
-  id: number;
-  forwarded_at: string;
-  email_from: string | null;
-  email_subject: string | null;
-  pdf_filename: string | null;
-  ocr_vendor_name: string | null;
-  ocr_invoice_number: string | null;
-  ocr_total: string | null;
-  ocr_raw_text: string | null;
-  verified: number;
-  billcom_processed: number;
-  vendor_routing_action: string | null;
-  reconciliation_notes: string | null;
-}
+/** Statuses the escalation cron pings on until something closes the row. */
+const STUCK_STATUSES = ["ERROR", "CLAIMED", "PENDING_SEND"];
 
 interface Verdict {
   forwarded_at: string;
@@ -88,186 +92,16 @@ interface BillIssue {
   detail: string;
 }
 
-// ── Normalization ────────────────────────────────────────────────────────────
-
-const STOP_WORDS =
-  /\b(inc|llc|l\.l\.c|ltd|co|corp|company|corporation|incorporated|the|usa|us|llc,|group|supply)\b/gi;
-
-function normVendor(s: string | null | undefined): string {
-  return (s || "")
-    .toLowerCase()
-    .replace(STOP_WORDS, " ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normInvoice(s: string | null | undefined): string {
-  return (s || "").replace(/\D/g, "").replace(/^0+/, "");
-}
-
-/**
- * Industry-generic words that must never alone prove two vendors are the same.
- * "Century Equipment Company" and "Welch Equipment" share "equipment" but are
- * unrelated vendors; treating a shared generic token as a match made the
- * Century Equipment invoice (GJ17176-1) report "vendor matches ref" when no
- * Century bill has ever existed in 1300+ Bill.com rows. Only the token-overlap
- * branch of vendorsMatch is filtered — containment and the alias map are not.
- */
-const GENERIC_VENDOR_TOKENS = new Set([
-  "equipment", "supply", "supplies", "company", "inc", "llc", "ltd", "corp",
-  "services", "service", "group", "logistics", "transport", "transportation",
-  "trucking", "packaging", "products", "industries", "solutions", "systems",
-  "distributors", "distribution", "wholesale", "farms", "farm", "ranch",
-  "trading", "enterprises", "holdings", "partners", "manufacturing",
-  "organics", "organic", "soils", "soil", "america", "usa", "national",
-]);
-
-/** Loose vendor compare: containment OR shared meaningful token OR alias map. */
-const VENDOR_ALIASES: Array<string[]> = [
-  ["fedex", "federalexpress"],
-  ["aaacooper", "aaacoopertransportation", "aaacoopertransportation", "aaa cooper", "aaa cooper transportation"],
-  ["autopot", "autopotwateringsystems"],
-  ["loganlabs", "loganlabs"],
-  ["evergreen", "evergreengrowerssupply"],
-  ["marionag", "marionagservice"],
-  ["miles", "milesfilippelli"],
-  ["destination", "destinationtransport"],
-  ["grassroots", "grassrootsfabricpots"],
-  ["fertiorganic", "ferti"],
-  ["crminerals", "crminerals"],
-  ["thriveprobiotics", "thrive"],
-  ["beltpower", "beltpowerllc"],
-  ["aloecorp", "aloe"],
-  ["organicag", "organicagproducts"],
-  ["coloradowormcompany", "coloradoworm"],
-  ["bennymartinez", "bennymartineztrucking"],
-  ["noveltymanufacturing", "noveltymanufacturingcompany"],
-  ["rootwise", "rootwisesoildynamics"],
-  ["clarkemosquito", "clarkeenvironmental"],
-  ["tealab", "tealab"],
-  ["spectrumanalytic", "spectrumanalyticinc"],
-  ["uline", "uline"],
-  ["blackburn", "blackburnpropane"],
-  ["wagner", "wagnerequipment"],
-  ["wwex", "worldwideexpress"],
-  ["loganlabsllc", "loganlabsllc"],
-];
-
-function vendorsMatch(a: string, b: string): boolean {
-  const na = normVendor(a);
-  const nb = normVendor(b);
-  if (!na || !nb) return false;
-  if (na.includes(nb) || nb.includes(na)) return true;
-  const ta = new Set(na.split(" ").filter((t) => t.length >= 4 && !GENERIC_VENDOR_TOKENS.has(t)));
-  const tb = new Set(nb.split(" ").filter((t) => t.length >= 4 && !GENERIC_VENDOR_TOKENS.has(t)));
-  if ([...ta].some((t) => tb.has(t))) return true;
-  for (const group of VENDOR_ALIASES) {
-    if (group.some((g) => na.includes(g)) && group.some((g) => nb.includes(g))) return true;
-  }
-  return false;
-}
-
-/** Digits-only compare; shorter ≥6-digit core may prefix/suffix longer. */
-function invoicesMatch(a: string, b: string): boolean {
-  const da = normInvoice(a);
-  const db = normInvoice(b);
-  if (!da || !db) return false;
-  if (da === db) return true;
-  const [short, long] = da.length <= db.length ? [da, db] : [db, da];
-  return short.length >= 6 && (long.startsWith(short) || long.endsWith(short));
-}
-
-// ── Identity derivation from a forward row ──────────────────────────────────
-
-function parseSender(from: string | null): { display: string; addr: string; domain: string } {
-  const cleaned = (from || "").replace(/^["']|["']$/g, "");
-  const angle = cleaned.match(/^([^<]*)<([^>]+)>$/);
-  if (angle) {
-    const addr = angle[2].trim();
-    const domain = addr.includes("@") ? addr.split("@")[1].replace(/^www\./, "") : "";
-    return { display: angle[1].trim(), addr, domain };
-  }
-  const bare = cleaned.includes("@") ? cleaned.trim() : "";
-  const domain = bare.includes("@") ? bare.split("@")[1].replace(/^www\./, "") : "";
-  return { display: "", addr: bare, domain };
-}
-
-/** Haystack of vendor evidence: OCR vendor, display name, domain root, subject. */
-function vendorHaystack(fwd: ForwardRow): string {
-  const { display, domain } = parseSender(fwd.email_from);
-  const parts: string[] = [];
-  if (fwd.ocr_vendor_name && !/unknown/i.test(fwd.ocr_vendor_name)) parts.push(fwd.ocr_vendor_name);
-  if (display) parts.push(display);
-  if (domain) parts.push(domain.replace(/\..*$/, "")); // ferti-organic.com → ferti-organic
-  if (fwd.email_subject) parts.push(fwd.email_subject);
-  return parts.join(" | ");
-}
-
-function deriveInvoice(fwd: ForwardRow): string {
-  const hay = [
-    fwd.ocr_invoice_number,
-    fwd.pdf_filename,
-    fwd.email_subject,
-    fwd.email_from,
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-  // 0. Subject Pro# FIRST — authoritative for AAA Cooper scans where OCR of the
-  //    PDF grabs the ACCOUNT# (3746570) instead of the Pro# in the subject.
-  //    (2026-09-08: 4 AAA rows false-MISSING because ocr beat the subject Pro#.)
-  const proSubj = (fwd.email_subject || "").match(/\bPro#?:?\s*(\d{6,10})\b/i);
-  if (proSubj) return proSubj[1];
-
-  // 0.5 Subject explicit "Invoice# N" — authoritative when the subject states the
-  //    invoice number ("Concentrates, Inc - Invoice# 3084520") but OCR grabs a
-  //    different number (1081435, the PO#). Mirrors the Pro# rule above; subject
-  //    wins over OCR.
-  const subjInv = (fwd.email_subject || "").match(/\b(?:invoice|inv|facture)\s*[#:._-]*\s*(\d[A-Za-z0-9-]{2,})/i);
-  if (subjInv) return subjInv[1];
-
-  // 1. OCR invoice number second (comma-form ok)
-  const ocr = (fwd.ocr_invoice_number || "").trim().replace(/,/g, "");
-  if (ocr && /[A-Za-z0-9]{4,}/.test(ocr) && !/^unknown$/i.test(ocr)) return ocr;
-
-  // 2. FedEx billing: 9-454-04878 (underscore/dash tolerant boundaries)
-  const fedex = hay.match(/(?<![A-Za-z0-9])\d-\d{3}-\d{5}(?![A-Za-z0-9])/);
-  if (fedex) return fedex[0];
-
-  // 3. "Invoice 135879" / Inv# / Inv_135879 / Facture — capture must start with a digit
-  const kw = hay.match(/\b(?:invoice|inv|facture|n[ºo])\s*[:#._-]*\s*(\d[A-Za-z0-9-]{2,})/i);
-  if (kw) return kw[1];
-
-  // 4. APUS-247215 / INV12928 style alphanumeric ID
-  const alpha = hay.match(/(?<![A-Za-z0-9])[A-Z]{2,6}[-_]?\d{4,8}(?![A-Za-z0-9])/i);
-  if (alpha) return alpha[0];
-
-  // 5. Bare long digit run (destination 9476798, novelty 41131586)
-  const bare = hay.match(/(?<![A-Za-z0-9])\d{5,10}(?![A-Za-z0-9])/);
-  if (bare) return bare[0];
-
-  // 6. Filename digit-strip (BAS invoice 8.27.2026.pdf → 8272026 matches
-  //    Bill.com "8,272,026"). Guarded to 5-12 digits; used as a second
-  //    candidate by the matcher loop, not a primary invoice claim.
-  const filenameDigits = (fwd.pdf_filename || "").replace(/\D/g, "");
-  if (/^\d{5,12}$/.test(filenameDigits)) return filenameDigits;
-
-  return "";
-}
+// ── Normalization, matching and identity helpers ─────────────────────────────
+// Moved to src/lib/purchasing/billcom-ap-audit.ts (2026-10-07) so the rules live
+// in one place and are unit-tested: normVendor, normInvoice, vendorsMatch,
+// invoicesMatch, parseSender, vendorHaystack, deriveInvoice, parseDollars.
 
 // ── Bill-data assurance checks (amount parity / dates / invoice# uniqueness) ──
 
-/** Parse a dollar string ("1,234.56", "$1,234.56", "1234.5") to cents-safe number. */
-function parseDollars(raw: string | null | undefined): number | null {
-  if (!raw) return null;
-  const cleaned = String(raw).replace(/[$£€,\s]/g, "").trim();
-  if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
-  const n = parseFloat(cleaned);
-  return Number.isFinite(n) ? n : null;
-}
-
-/** Days between two ISO dates (b - a); null when either is missing/invalid. */
+/**
+ * Days between two ISO dates (b - a); null when either is missing/invalid.
+ */
 function daysBetween(a: string | null | undefined, b: string | null | undefined): number | null {
   if (!a || !b) return null;
   const ta = Date.parse(`${a}T00:00:00`);
@@ -452,6 +286,10 @@ async function main(): Promise<void> {
   const daysArg = process.argv.find((a) => a.startsWith("--days="));
   const days = daysArg ? parseInt(daysArg.split("=")[1], 10) : 14;
   const lookback = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  /** Direction 2 (bill -> AP record). On by default; --no-reverse disables. */
+  const reverse = !process.argv.includes("--no-reverse");
+  /** Close ledger rows whose bill has since appeared in Bill.com. */
+  const closeStuck = !process.argv.includes("--no-close-stuck");
 
   const csvPath: string | null = csvArg ? csvArg.split("=")[1] : newestDownloadsCsv();
 
@@ -486,6 +324,68 @@ async function main(): Promise<void> {
     .all(lookback) as ForwardRow[];
 
   const refRows = ref; // full loose match over rows (prefix/suffix invoice compare)
+
+  // ── Direction 2 inputs: the page under audit + everything AP has on file ────
+  // The page rows are parsed once here and reused by the bill-data checks below.
+  let pageRows: ParsedRow[] = [];
+  if (csvPath && fs.existsSync(csvPath)) {
+    try {
+      pageRows = parseCSV(csvPath);
+    } catch { /* import already logged the failure */ }
+  }
+
+  // All-time forwards (any status/age): the reverse sweep needs the vendor's whole
+  // forward history to tell "Aria never forwards this vendor" from "Aria tried and
+  // failed", and the heal pass needs rows sitting in non-terminal statuses.
+  const allForwards = db
+    .prepare(
+      `SELECT id, forwarded_at, status, email_from, email_subject, pdf_filename,
+              ocr_vendor_name, ocr_invoice_number, ocr_total, error_message
+       FROM ap_local_forwards
+       ORDER BY forwarded_at DESC`,
+    )
+    .all() as ForwardRow[];
+
+  const cacheRows = db
+    .prepare("SELECT vendor_name, invoice_number, invoice_date, total, source FROM invoice_cache")
+    .all() as CacheRow[];
+
+  // vendor_invoices lives in PostgREST. Best effort, but say so when it is down:
+  // a silently narrowed reverse sweep looks exactly like a clean one.
+  const vendorInvoices: VendorInvoiceRow[] = [];
+  let vendorInvoicesDown = false;
+  let vendorInvoicesPartial = false;
+  if (reverse) {
+    try {
+      const sb = createClient();
+      // PostgREST caps a response at 1000 rows (db-max-rows), so a plain
+      // .limit(5000) returns 1000 and any bill whose only evidence sits on page 2
+      // gets reported as "no AP record". Page until a short page comes back.
+      const PAGE = 1000;
+      for (let page = 0; page < 10; page++) {
+        const { data, error } = await sb
+          .from("vendor_invoices")
+          .select("vendor_name,invoice_number,invoice_date,total,created_at")
+          .order("created_at", { ascending: false })
+          .limit(PAGE)
+          .offset(page * PAGE);
+        if (error) throw new Error(JSON.stringify(error));
+        const rows = (data as VendorInvoiceRow[]) || [];
+        vendorInvoices.push(...rows);
+        if (rows.length < PAGE) break;
+        if (page === 9) vendorInvoicesPartial = true;
+      }
+    } catch (e) {
+      vendorInvoicesDown = true;
+      console.log(`[reconcile-billcom] ⚠ vendor_invoices unavailable (${(e as Error).message}) — reverse sweep ran on forwards + invoice_cache only`);
+    }
+    if (vendorInvoicesPartial) {
+      console.log(
+        `[reconcile-billcom] ⚠ vendor_invoices paged to the 10,000-row cap — older evidence not loaded, ` +
+        `a "no AP record" line here may be coverage, not a gap`,
+      );
+    }
+  }
 
   const verdicts: Verdict[] = [];
   /** Real payables that never become Bill.com bills (vendor collects payment). */
@@ -567,7 +467,12 @@ async function main(): Promise<void> {
         // Tier 2 — large/strange amount vs this vendor's own history. Fires
         // regardless of match: a bill that is 5× the vendor's median (or over
         // an absolute $25k) is worth a human glance before it gets paid.
-        const confidentAmt = fwdAmt ?? rederived ?? billAmt ?? null;
+        // Evaluate the amount that will actually be PAID first. The raw ocr_total
+        // is only a proxy and can capture a line charge instead of the total
+        // (AAA Cooper 64058919, 2026-10-07: ocr_total $2,545.74 = the first line
+        // charge, while the PDF's AMOUNT DUE and the entered bill are $988.71 —
+        // flagging 5.7× the vendor median off the OCR figure was a false positive).
+        const confidentAmt = billAmt ?? rederived ?? fwdAmt ?? null;
         if (confidentAmt !== null && med !== undefined) {
           const rel = confidentAmt > med * 5;
           const abs = confidentAmt > 25_000;
@@ -741,10 +646,8 @@ async function main(): Promise<void> {
   // parseCSV re-reads the raw CSV so duplicate invoice# rows are visible BEFORE
   // the UNIQUE(vendor, invoice#) UPSERT collapses exact dups.
   if (csvPath && fs.existsSync(csvPath)) {
-    let freshRows: ParsedRow[] = [];
-    try {
-      freshRows = parseCSV(csvPath);
-    } catch { /* import already logged the failure */ }
+    // Same rows the reverse sweep used — parsed once, at the top of main().
+    const freshRows: ParsedRow[] = pageRows;
 
     const seen = new Map<string, ParsedRow>(); // normVendor|RAW invoice# → first row
     for (const row of freshRows) {
@@ -843,6 +746,46 @@ async function main(): Promise<void> {
     }
   }
 
+  // ── Direction 2: every bill on this page -> is there an AP record? ──────────
+  // The loop above answers "did Aria's mail become a bill". This answers the other
+  // half: "is every bill on this page backed by a source Aria saw" — and, when it
+  // is not, which of those are this vendor's normal payment path.
+  const noRecord: Array<{ row: ParsedRow; verdict: NoRecordVerdict }> = [];
+  if (reverse && pageRows.length > 0) {
+    const facts: AuditFacts = { forwards: allForwards, cache: cacheRows, vendorInvoices, ref: refRows };
+    for (const row of pageRows) {
+      if (findApRecord(row, facts).length > 0) continue;
+      noRecord.push({ row, verdict: classifyNoRecord(row, facts) });
+    }
+  }
+  const actionableNoRecord = noRecord.filter((x) => x.verdict.actionable);
+
+  // ── Auto-heal: close ledger rows whose bill has arrived ────────────────────
+  // The escalation cron pings on ERROR/CLAIMED/PENDING_SEND rows until something
+  // closes them (Evergreen 150323 pinged daily for 20 days). Bill.com is the
+  // source of truth: an exact vendor + invoice# match there means the row is done.
+  const stuckRows = allForwards.filter((f) => !!f.status && STUCK_STATUSES.includes(f.status));
+  const closeCandidates = selectStuckRowsToClose(stuckRows, refRows);
+  const closedIds = new Set<number>();
+  const closed: Array<{ id: number; invoice: string; vendor: string; amount: number | null }> = [];
+  if (closeStuck) {
+    for (const c of closeCandidates) {
+      const note =
+        `auto-closed ${new Date().toISOString().slice(0, 10)}: bill #${c.bill.invoice_number} ` +
+        `$${c.bill.invoice_amount} present in Bill.com (AllBillsPage audit)`;
+      db.prepare(
+        `UPDATE ap_local_forwards
+         SET status = 'SKIPPED', completed_at = datetime('now'), reconciliation_notes = ?
+         WHERE id = ?`,
+      ).run(note, c.id);
+      closedIds.add(c.id);
+      closed.push({ id: c.id, invoice: c.invoice, vendor: c.bill.vendor_name || "?", amount: c.bill.invoice_amount });
+    }
+  }
+  const stuckRemaining = stuckRows.filter((s) => !closedIds.has(s.id));
+  // BLOCKED rows are deliberate: the PDF was a payment confirmation / paid invoice.
+  const stuckNeedsAttention = stuckRemaining.filter((s) => !/^BLOCKED:/i.test(String(s.error_message || "")));
+
   const kinds = verdicts.reduce<Record<string, number>>((acc, v) => {
     acc[v.kind] = (acc[v.kind] || 0) + 1;
     return acc;
@@ -865,8 +808,26 @@ async function main(): Promise<void> {
     }, {});
     console.log(`[reconcile-billcom] Bill-data issues: ${billIssues.length} (${Object.entries(ikinds).map(([k, v]) => `${v} ${k}`).join(", ")})`);
   }
+  if (reverse && pageRows.length > 0) {
+    console.log(
+      `[reconcile-billcom] Page bills with no AP record: ${noRecord.length} of ${pageRows.length} ` +
+      `(${actionableNoRecord.length} need a look${vendorInvoicesDown ? ", vendor_invoices DOWN" : ""})`,
+    );
+  } else if (reverse) {
+    console.log("[reconcile-billcom] Reverse sweep skipped: no page (pass --csv or drop a fresh export).");
+  }
+  console.log(
+    `[reconcile-billcom] Stuck ledger rows: ${stuckRows.length} ` +
+    `(${closed.length} closed this run${closeStuck ? "" : ", heal disabled"}, ${stuckNeedsAttention.length} need attention)`,
+  );
 
-  if (verdicts.length === 0 && billIssues.length === 0 && directPay.length === 0) {
+  if (
+    verdicts.length === 0
+    && billIssues.length === 0
+    && directPay.length === 0
+    && actionableNoRecord.length === 0
+    && stuckNeedsAttention.length === 0
+  ) {
     console.log("\n✓ Nothing missing, needing review, or miskeyed.");
     process.exit(0);
   }
@@ -904,6 +865,57 @@ async function main(): Promise<void> {
     for (const g of gateFlags) {
       console.log(`[${g.verdict.toUpperCase()}] ${g.date} | ${g.vendor} | #${g.invoice}`);
       console.log(`        ${g.reason}`);
+    }
+  }
+
+  if (noRecord.length > 0) {
+    console.log("\n=== BILLS ON THIS PAGE WITH NO AP RECORD (classified) ===");
+    const byClass = new Map<string, typeof noRecord>();
+    for (const x of noRecord) {
+      const arr = byClass.get(x.verdict.kind) || [];
+      arr.push(x);
+      byClass.set(x.verdict.kind, arr);
+    }
+    const byDesign = [...byClass.entries()].filter(([, v]) => !v[0].verdict.actionable);
+    if (byDesign.length > 0) {
+      const n = byDesign.reduce((acc, [, v]) => acc + v.length, 0);
+      console.log(`  by design — this vendor's normal payment path, no action (${n})`);
+      for (const [kind, rows] of byDesign) {
+        const names = rows.slice(0, 3).map((x) => `${x.row.vendor_name} #${x.row.invoice_number}`).join(", ");
+        console.log(`     ${kind} (${rows.length}): ${names}${rows.length > 3 ? `, +${rows.length - 3} more` : ""}`);
+        console.log(`        ${rows[0].verdict.detail}`);
+      }
+    }
+    if (actionableNoRecord.length > 0) {
+      console.log(`\n  ACTION (${actionableNoRecord.length})`);
+      for (const x of actionableNoRecord) {
+        console.log(
+          `     [${x.verdict.kind}] ${x.row.vendor_name} | #${x.row.invoice_number} | ` +
+          `$${x.row.invoice_amount ?? "?"} | created ${x.row.created_date ?? "?"}`,
+        );
+        console.log(`        ${x.verdict.detail}`);
+      }
+    }
+  }
+
+  if (stuckRows.length > 0 || closed.length > 0) {
+    console.log("\n=== STUCK LEDGER ROWS (ap_local_forwards, any age) ===");
+    for (const c of closed) {
+      console.log(`[CLOSED] row ${c.id} | ${c.vendor} #${c.invoice} | bill $${c.amount} is in Bill.com`);
+    }
+    if (!closeStuck && closeCandidates.length > 0) {
+      console.log(`[WOULD CLOSE] ${closeCandidates.length} row(s) — heal disabled by --no-close-stuck`);
+      for (const c of closeCandidates) {
+        console.log(`     row ${c.id} | #${c.invoice} | ${c.bill.vendor_name} $${c.bill.invoice_amount}`);
+      }
+    }
+    for (const s of stuckRemaining) {
+      const blocked = /^BLOCKED:/i.test(String(s.error_message || ""));
+      console.log(
+        `[${blocked ? "BLOCKED ok" : "ATTENTION"}] row ${s.id} | ${s.status} | ${(s.forwarded_at || "").slice(0, 10)} | ` +
+        `${s.pdf_filename} | "${(s.email_subject || "").slice(0, 55)}"`,
+      );
+      if (!blocked) console.log(`        ${String(s.error_message || "").slice(0, 160)}`);
     }
   }
 

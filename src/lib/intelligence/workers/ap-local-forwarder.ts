@@ -60,6 +60,18 @@ import * as crypto from "crypto";
 import pdfParse from "pdf-parse";
 const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 const MAX_EMAILS_PER_CYCLE = 20;
+/**
+ * Catch-up pass (2026-10-07). The primary fetch requires INBOX **and** UNREAD, so
+ * mail Gmail filed to CATEGORY_UPDATES (no INBOX) or mail read/forwarded by hand
+ * before a poll is invisible to the pipeline forever. That is how three real
+ * invoices were lost: DestiNation 9483171/9482006 (Aug-30 window, both filed to
+ * Updates) and Evergreen 150323. This pass lists recent mail Aria has never
+ * recorded and runs it through the same guards. A 5-day window covers a long
+ * weekend plus a polling outage; the per-cycle cap bounds the work and any
+ * backlog drains over the next cycles (ap-polling runs 3x/day).
+ */
+const CATCHUP_QUERY = "newer_than:5d -in:trash -in:spam -in:sent -in:chats";
+const CATCHUP_MAX_PER_CYCLE = 10;
 const OCR_TIMEOUT_MS = 30_000; // 30s timeout for pdf-parse on corrupted/large PDFs
 
 /**
@@ -162,6 +174,7 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
         "immediate attention required",
     ];
     if (nonInvoiceSubjects.some((s) => subjectLower.includes(s))) {
+        if (subjectLower.includes("packing list") && /\b1\d{5}\b/.test(subject || "")) return false;
         return true;
     }
     // Belt Power no-reply / AR = ship notices + statements/collections (invoices = remitto@)
@@ -1200,9 +1213,80 @@ async function markEmailProcessed(gmail: any, messageId: string): Promise<void> 
     }
 }
 
+/** The typed Gmail client (keeps this file from adding another `any`). */
+type GmailClient = ReturnType<typeof GmailApi>;
+
 /**
- * Main entry point: scan Gmail for unread invoice emails and forward PDFs to Bill.com.
- * Called by the ap-polling cron every 15 minutes.
+ * Pure selector for the catch-up pass: drop ids already returned by the primary
+ * fetch or already recorded in ap_local_forwards, drop null ids, cap the batch.
+ * Exported for unit tests — the Gmail list call around it is not testable here,
+ * but the "never re-enter a decided message" rule is.
+ */
+export function selectCatchupIds(
+    listed: Array<{ id?: string | null }>,
+    primaryIds: string[],
+    recordedIds: Iterable<string>,
+    cap: number = Number.MAX_SAFE_INTEGER,
+): string[] {
+    const primary = new Set(primaryIds);
+    const recorded = new Set(recordedIds);
+    const out: string[] = [];
+    for (const m of listed) {
+        if (!m.id || primary.has(m.id) || recorded.has(m.id)) continue;
+        out.push(m.id);
+        if (out.length >= cap) break;
+    }
+    return out;
+}
+
+/**
+ * Recent mail the pipeline has never recorded, whatever its read state or Gmail
+ * category (see CATCHUP_QUERY). Capped per cycle and filtered on
+ * `ap_local_forwards.gmail_message_id` — every processed message, forwarded or
+ * skipped, is recorded there, so this can never re-enter a message Aria has
+ * already decided on. Returns [] when the list call fails: a catch-up miss must
+ * never abort the primary pass.
+ */
+async function listCatchupMessages(
+    gmail: GmailClient,
+    primaryIds: string[],
+): Promise<Array<{ id?: string | null }>> {
+    const db = getLocalDb();
+    const recorded = (
+        db
+            .prepare("SELECT DISTINCT gmail_message_id FROM ap_local_forwards")
+            .all() as Array<{ gmail_message_id: string }>
+    ).map((r) => r.gmail_message_id);
+
+    let listed: Array<{ id?: string | null }> = [];
+    try {
+        const res = await gmail.users.messages.list({
+            userId: "me",
+            q: CATCHUP_QUERY,
+            maxResults: 100,
+        });
+        listed = res.data.messages || [];
+    } catch (e) {
+        console.warn(`   [AP-Local] Catch-up list failed (non-fatal): ${(e as Error).message}`);
+        return [];
+    }
+
+    const unrecorded = selectCatchupIds(listed, primaryIds, recorded);
+    const taking = unrecorded.slice(0, CATCHUP_MAX_PER_CYCLE);
+    if (unrecorded.length > 0) {
+        console.log(
+            `   [AP-Local] Catch-up: ${unrecorded.length} unrecorded email(s)` +
+            (taking.length < unrecorded.length ? `, processing ${taking.length} this cycle` : ""),
+        );
+    }
+    return taking.map((id) => ({ id }));
+}
+
+/**
+ * Main entry point: scan Gmail for invoice emails and forward PDFs to Bill.com.
+ * Primary pass = INBOX + UNREAD; catch-up pass = recent mail Aria has never
+ * recorded (see CATCHUP_QUERY) so hand-read and category-filed invoices are not
+ * invisible. Called by the ap-polling cron (3x/day).
  *
  * @returns Summary of actions taken this cycle
  */
@@ -1241,13 +1325,21 @@ export async function runLocalApForward(opts?: {
         maxResults: MAX_EMAILS_PER_CYCLE,
     });
 
-    const messages = listRes.data.messages || [];
+    const primaryMessages = listRes.data.messages || [];
+    const catchupMessages = await listCatchupMessages(
+        gmail,
+        primaryMessages.map((m) => String(m.id)),
+    );
+    const messages = [...primaryMessages, ...catchupMessages];
     if (messages.length === 0) {
         return summary;
     }
 
     summary.scanned = messages.length;
-    console.log(`   [AP-Local] Found ${messages.length} unread email(s).`);
+    console.log(
+        `   [AP-Local] Found ${primaryMessages.length} unread in inbox + ` +
+        `${catchupMessages.length} catch-up email(s).`,
+    );
 
     for (const msg of messages) {
         try {
