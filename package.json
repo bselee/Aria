@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "reconcile:axiom": "node --import tsx src/cli/reconcile-axiom.ts",
+    "audit:fedex": "C:/PROGRA~1/nodejs/node.exe --import tsx --env-file=.env.local src/cli/audit-fedex-billcom-rule.ts",
     "typecheck:all": "npm run typecheck && npm run typecheck:cli",
     "typecheck:check": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit --project tsconfig.check.json",
     "check:refs": "bash scripts/check-refs.sh",

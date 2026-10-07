@@ -79,6 +79,32 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
         ).toBe(false);
     });
 
+    // Real mail the 2026-10-07 catch-up pass pulled in (ledger rows 928, 932, 933,
+    // 934). The widened ingest must not create a FedEx path into Bill.com.
+    it("skips FedEx account/reward mail the catch-up pass now sees", () => {
+        const fedex = [
+            { from: "FedEx Rewards <noreply@rewardcatalog.fedex.com>", subject: "Thank you for your order!" },
+            { from: "FedEx Rewards <no-reply-rewardscatalog@fedex.com>", subject: "Your Reward Has Arrived" },
+            { from: "FedEx <FedEx@message.fedex.com>", subject: "Your FedEx Report Is Ready" },
+        ];
+        for (const m of fedex) {
+            expect(isNonInvoiceEmail({ from: m.from, subject: m.subject }), `${m.from} / ${m.subject}`).toBe(true);
+        }
+    });
+
+    // Documents the boundary honestly: a Stripe receipt is NOT gated by the
+    // sender/subject rule. It is stopped later by the no-invoice-attachment check
+    // (ledger row 932: "no PDF/image invoice attachment"). If a future receipt mail
+    // ever carries an invoice PDF, that attachment check no longer protects it.
+    it("does not gate a Stripe receipt on the sender rule (stopped by the attachment check)", () => {
+        expect(
+            isNonInvoiceEmail({
+                from: "The Amazing Doctor Zymes <receipts+acct_1PXRf@stripe.com>",
+                subject: "Your The Amazing Doctor Zymes refund [#3478-6844]",
+            }),
+        ).toBe(false);
+    });
+
     // ── FedEx Freight LTL (billed online, never entered in Bill.com) ──────
     // Bill, 2026-09-21: acct 646135168 bills are paid online. Real rows from
     // ap_local_forwards (ids 782, 783) forwarded 2026-09-21.

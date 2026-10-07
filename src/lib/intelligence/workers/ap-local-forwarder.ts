@@ -58,7 +58,7 @@ import {
 } from "@/lib/pdf/image-to-pdf";
 import * as crypto from "crypto";
 import pdfParse from "pdf-parse";
-const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
+export const BILL_COM_EMAIL = process.env.BILL_COM_FORWARD_EMAIL || "buildasoilap@bill.com";
 const MAX_EMAILS_PER_CYCLE = 20;
 /**
  * Catch-up pass (2026-10-07). The primary fetch requires INBOX **and** UNREAD, so
