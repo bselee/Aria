@@ -324,6 +324,48 @@ describe("FinaleClient draft PO creation guardrails", () => {
         );
         expect(global.fetch).not.toHaveBeenCalled();
     });
+
+    it("stamps the due date from the vendor's historical lead time on a new PO", async () => {
+        const client = new FinaleClient();
+        vi.spyOn(client, "findActiveDraftPOsForVendor").mockResolvedValue([]);
+        vi.spyOn(client as any, "validateProductExists").mockResolvedValue(true);
+        vi.spyOn(client as any, "checkDuplicatePOs").mockResolvedValue([]);
+        vi.spyOn(client as any, "checkPriceChange").mockResolvedValue(null);
+        vi.spyOn(client as any, "getFacilityUrl").mockResolvedValue("/buildasoil/api/facility/shipping");
+        vi.spyOn(client as any, "resolveVendorHistoricalLeadDays").mockResolvedValue(17);
+        vi.spyOn(client as any, "verifyDraftAndExpectedDelivery").mockResolvedValue({
+            expectedDelivery: {} as any,
+            verification: {} as any,
+        });
+        vi.spyOn(client as any, "recordAxiomDraftLifecycleIfApplicable").mockResolvedValue(undefined);
+
+        vi.mocked(global.fetch).mockResolvedValue(jsonResponse({
+            orderId: "125500",
+            orderUrl: "/buildasoil/api/order/125500",
+            orderItemList: [],
+        }) as any);
+
+        await client.createDraftPurchaseOrder(
+            "party-uline",
+            [{ productId: "FJG102", quantity: 10, unitPrice: 1.25, orderIncrementQty: 1 }],
+            "memo",
+        );
+
+        const postCall = vi.mocked(global.fetch).mock.calls.find((c) => {
+            const init = c[1] as RequestInit | undefined;
+            return init?.method === "POST";
+        });
+        expect(postCall).toBeDefined();
+        const body = JSON.parse(String(postCall![1]!.body));
+
+        // dueDate must be today + the vendor's historical lead time (17d), not 14d.
+        const expected = new Date();
+        expected.setDate(expected.getDate() + 17);
+        const expectedDue = expected.toISOString().split("T")[0] + "T00:00:00";
+
+        expect(body.dueDate).toBe(expectedDue);
+        expect(body.statusId).toBe("ORDER_CREATED");
+    });
 });
 
 describe("FinaleClient native PO email", () => {

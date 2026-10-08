@@ -1594,6 +1594,35 @@ export class FinalePurchasingClient extends FinaleProductsClient {
      * @param purchaseDestination Override: "Shipping" | "Soil" (case-insensitive). If omitted, auto-detects.
      * @returns                   { orderId, finaleUrl, facilityName } of the created draft
      */
+    /**
+     * Resolve the vendor's historical lead time (median days from past receipts)
+     * for stamping a PO due date. Returns null when the vendor can't be resolved
+     * or the lead-time service has no data, so the caller falls back to a sane
+     * default.
+     *
+     * Uses lead-time-service's full priority chain: policy override > vendor
+     * median (real history) > global default. No per-SKU hints are passed, so a
+     * multi-line PO resolves at the vendor level.
+     *
+     * @param vendorPartyId Finale partyId (or party URL) of the supplier
+     * @returns lead-time days, or null on any resolution failure
+     */
+    protected async resolveVendorHistoricalLeadDays(vendorPartyId: string): Promise<number | null> {
+        try {
+            const partyId = vendorPartyId.split('/').pop() || vendorPartyId;
+            const partyUrl = `/${this.accountPath}/api/partygroup/${encodeURIComponent(partyId)}`;
+            const vendorName = await this.resolvePartyName(partyUrl);
+            if (!vendorName || vendorName === 'Unknown') return null;
+            const { leadTimeService } = await import('../builds/lead-time-service');
+            const lead = await leadTimeService.getForVendor(vendorName);
+            console.log(`[finale] due date <- lead-time: ${vendorName} -> ${lead.days}d (${lead.provenance})`);
+            return lead.days;
+        } catch (err: any) {
+            console.warn(`[finale] lead-time lookup failed for ${vendorPartyId}: ${err?.message ?? err}`);
+            return null;
+        }
+    }
+
     async createDraftPurchaseOrder(
         vendorPartyId: string,
         items: Array<{
@@ -1761,13 +1790,17 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         }
 
         // ── Step 3: Build PO payload ─────────────────────────────────────────
-        // DECISION(2026-06-23): Compute dueDate from actual vendor lead times
-        // instead of hardcoded 14 days. Uses max lead time across all items.
-        // Falls back to 14 days if no lead time data available.
+        // DECISION(2026-10-08, Bill): Stamp the due date from the vendor's real
+        // historical lead time (median from past receipts), not a hardcoded 14
+        // days. An explicit per-item lead time still wins; a vendor with no
+        // history falls back to the system default via lead-time-service.
         const itemLeadTimes = items
             .map(i => (i as any).leadTimeDays)
             .filter((lt: any) => typeof lt === 'number' && lt > 0);
-        const maxLeadDays = itemLeadTimes.length > 0 ? Math.max(...itemLeadTimes) : 14;
+        const vendorLeadDays = await this.resolveVendorHistoricalLeadDays(vendorPartyId);
+        const maxLeadDays = itemLeadTimes.length > 0
+            ? Math.max(...itemLeadTimes)
+            : (vendorLeadDays ?? 14);
         const dueDate = new Date();
         dueDate.setDate(dueDate.getDate() + maxLeadDays);
         const dueDateStr = dueDate.toISOString().split('T')[0] + 'T00:00:00';
@@ -2211,6 +2244,17 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // fine; the next scan picks up the calendar lift.
         const forwardDemand = readForwardDemand(30);
 
+        // 90-day physical consumption (Bill, 2026-10-06): BOM components now size
+        // off what actually left the building (stock ledger), not what we bought
+        // (receipts — circular). Cache-first; degrades to receipts when the ledger
+        // is unavailable, so the scan never hard-fails on a ledger hiccup.
+        let ledgerSnapshot: LedgerSnapshot | null = null;
+        try {
+            ledgerSnapshot = await getLedgerSnapshot();
+        } catch (err) {
+            console.warn(`[purchasing] BOM stock ledger unavailable, falling back to receipts: ${(err as Error).message}`);
+        }
+
         // Pre-load vendor reorder policies once (small table, <50 rows) so the
         // per-component loop can read in O(1). Fixes the bug where BOM components
         // from long-lead-time vendors (e.g., Colorful Packaging — 60d lead, 180d
@@ -2356,24 +2400,20 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         daysBack,
                     });
                     const receiptVelocity = trend.velocity;
+                    const ledgerVelocity = ledgerRateFor(ledgerSnapshot, compSku);
                     const bomDerivedVelocity = demand.totalBurnRate;
-                    const chosen = chooseBomVelocity({ receiptVelocity, bomDerivedVelocity });
+                    const chosen = chooseBomVelocity({ receiptVelocity, bomDerivedVelocity, ledgerVelocity });
                     const confidence = chosen.source === 'receipts'
                         ? computeReceiptConfidence({
                             purchaseCount: compActivity.purchaseCount,
                             firstPurchaseDate: compActivity.firstPurchaseDate,
                             lastPurchaseDate: compActivity.lastPurchaseDate,
                         })
-                        : 'medium';
+                        : chosen.source === 'ledger'
+                            ? 'high'
+                            : 'medium';
                     const dailyBurn = chosen.value;
                     if (dailyBurn <= 0) continue; // nothing to order — no receipts AND no FG demand
-
-                    // HERMIA(2026-10-05 — Bill): divergence flag. When actual consumption
-                    // (receipts) runs ≫ the BOM-derived rate, the BOM under-lists this raw's
-                    // usage. Surface it on the board so the gap is visible, not silent.
-                    const bomUsageGap = bomDerivedVelocity > 0 && receiptVelocity > bomDerivedVelocity * 3
-                        ? receiptVelocity / bomDerivedVelocity
-                        : 0;
 
                     const runwayDays = dailyBurn > 0 ? effectiveStock / dailyBurn : 9999;
                     const adjustedRunwayDays = dailyBurn > 0
@@ -2526,16 +2566,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             : '';
                     const sourceLabel = chosen.source === 'receipts'
                         ? `${dailyBurn.toFixed(2)}/d from receipts (${cadenceLabel}, ${confidence} confidence)${trendLabel}`
-                        : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`;
+                        : chosen.source === 'ledger'
+                            ? `${dailyBurn.toFixed(2)}/d from stock ledger (actual usage)`
+                            : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`;
                     const roundingLabel = rounded.commonOrderQty != null
                         ? rounded.rationale === 'mode'
                             ? ` Rounded up to your usual order of ${rounded.commonOrderQty} (raw need ${rounded.rawSuggestedQty}).`
                             : rounded.rationale === 'median'
                                 ? ` Rounded up to median order of ${rounded.commonOrderQty} (raw need ${rounded.rawSuggestedQty}).`
                                 : ` Last order was ${rounded.commonOrderQty}; matched up (raw need ${rounded.rawSuggestedQty}).`
-                        : '';
-                    const usageGapLabel = bomUsageGap > 0
-                        ? ` ⚠ BOM under-lists usage: actual ${receiptVelocity.toFixed(0)}/d vs BOM ${bomDerivedVelocity.toFixed(1)}/d (${bomUsageGap.toFixed(0)}×).`
                         : '';
 
                     items.push({
@@ -2561,8 +2600,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         urgency,
                         explanation:
                             `BOM component — ${sourceLabel}. ${Math.round(runwayDays)}d runway across ` +
-                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}${forwardLabel}${usageGapLabel}`,
-                        bomUsageGap: bomUsageGap > 0 ? bomUsageGap : undefined,
+                            `${demand.feedsFinishedGoods.length} FGs.${roundingLabel}${onTimeLabel}${forwardLabel}`,
                         suggestedQty,
                         orderIncrementQty: (prodData.orderIncrementQuantity ?? prodData.stdPackingUnitsPerCase ?? compActivity.orderIncrementQty ?? null),
                         isBulkDelivery: true, // BOM materials route to production facility
@@ -2615,7 +2653,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                                     step: 'Daily burn',
                                     detail: chosen.source === 'receipts'
                                         ? `${dailyBurn.toFixed(2)}/d from receipts · ${compActivity.purchaseCount} POs · ${confidence} confidence${trend.trendingUp ? ' · trending up' : trend.trendingDown ? ' · trending down (using recent half-window rate)' : ''}`
-                                        : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`,
+                                        : chosen.source === 'ledger'
+                                            ? `${dailyBurn.toFixed(2)}/d from stock ledger (actual usage)`
+                                            : `${dailyBurn.toFixed(2)}/d from FG sales × BOM`,
                                     value: dailyBurn,
                                 },
                                 {
@@ -3268,7 +3308,20 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const adjustedRunwayDays = rec.adjustedRunwayDays;
                     let urgency = rec.urgency;
                     const explanation = rec.explanation;
-                    const suggestedQty = rec.suggestedQty;
+                    let suggestedQty = rec.suggestedQty;
+
+                    // Small parts rule (Bill, 2026-10-06): sub-$1 items from
+                    // Sustainable Village and Thirsty Earth always order at 50
+                    // each so we don't fall into tiny PO amounts — no fewer than
+                    // 50, rounded up to the next multiple of 10. 0 stays "don't buy".
+                    if (
+                        suggestedQty > 0
+                        && unitPrice < 1
+                        && (party.groupName.toLowerCase().includes("sustainable village")
+                            || party.groupName.toLowerCase().includes("thirsty earth"))
+                    ) {
+                        suggestedQty = Math.ceil(Math.max(suggestedQty, 50) / 10) * 10;
+                    }
 
                     // Record stockout event if adjusted runway dropped below lead time.
                     // Idempotent per SKU per day via upsert on (product_id, detected_on).

@@ -1226,6 +1226,29 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
 
         try {
             currentPO.orderItemList = this.mergeDraftOrderItems(currentPO.orderItemList || [], items);
+
+            // Stamp the due date from vendor historical lead time when the draft
+            // has none yet (never overwrite a manual date).
+            try {
+                if (!currentPO.dueDate) {
+                    const supplierUrl = (currentPO.orderRoleList || [])
+                        .find((r: any) => r.roleTypeId === "SUPPLIER")?.partyUrl as string | undefined;
+                    if (supplierUrl) {
+                        const vendorPartyId = supplierUrl.split("/").pop() ?? null;
+                        const leadDays = vendorPartyId
+                            ? await this.resolveVendorHistoricalLeadDays(vendorPartyId)
+                            : null;
+                        if (leadDays != null) {
+                            const d = new Date();
+                            d.setDate(d.getDate() + leadDays);
+                            currentPO.dueDate = d.toISOString().split("T")[0] + "T00:00:00";
+                        }
+                    }
+                }
+            } catch (err: any) {
+                console.warn(`[finale] dueDate stamp on reuse failed for PO #${orderId}: ${err?.message ?? err}`);
+            }
+
             const updated = await this.post(`/${this.accountPath}/api/order/${encodeURIComponent(orderId)}`, currentPO);
 
             // Phase C — also stamp recs when reusing an existing draft. Vendor
