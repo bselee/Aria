@@ -13,6 +13,7 @@ import {
   classifyNoRecord,
   deriveInvoice,
   findApRecord,
+  findBillByAmountAndDate,
   invoicesMatch,
   normInvoice,
   normVendor,
@@ -129,6 +130,25 @@ describe("invoicesMatch", () => {
 
   it("does not treat a short shared suffix as a match", () => {
     expect(invoicesMatch("12519", "19")).toBe(false);
+  });
+
+  it("matches an alphanumeric vendor number to its own bill (Diamond K)", () => {
+    expect(invoicesMatch("KM-098970", "KM-098970-01")).toBe(true);
+    expect(invoicesMatch("AQ-098787", "AQ-098787-01")).toBe(true);
+  });
+
+  it("matches a Rootwise dropship number with no separators", () => {
+    expect(invoicesMatch("4764A", "4764A")).toBe(true);
+  });
+
+  it("still rejects unrelated alphanumeric numbers that share no core", () => {
+    expect(invoicesMatch("KM-098970", "GY-098644-01")).toBe(false);
+    expect(invoicesMatch("ID_2406", "64058406")).toBe(false);
+  });
+
+  it("rejects two different alphanumeric invoices of the same form", () => {
+    expect(invoicesMatch("AQ-098787", "GY-098644-01")).toBe(false);
+    expect(invoicesMatch("KM-098970", "KM-099672")).toBe(false);
   });
 });
 
@@ -394,5 +414,53 @@ describe("selectStuckRowsToClose", () => {
     const row = fwd({ id: 1, status: "ERROR", email_subject: "", pdf_filename: "", email_from: "", ocr_invoice_number: "" });
     const ref = [bill({ vendor_name: "Evergreen Growers Supply, LLC", invoice_number: "150323", invoice_amount: 110.35 })];
     expect(selectStuckRowsToClose([row], ref)).toEqual([]);
+  });
+});
+
+// ── findBillByAmountAndDate (2026-10-13 audit triage) ──────────────────────
+
+describe("findBillByAmountAndDate", () => {
+  const rootwiseHay = "Kevin Dirk | gmail | Rootwise Invoice";
+  const rootwiseRef = [
+    bill({ vendor_name: "Rootwise Soil Dynamics", invoice_number: "010/08/26.2", invoice_amount: 4950, invoice_date: "2026-10-08" }),
+    bill({ vendor_name: "Rootwise Soil Dynamics", invoice_number: "010/08/26.1", invoice_amount: 1800, invoice_date: "2026-10-08" }),
+  ];
+
+  it("finds the bill Bill.com renumbered (Rootwise date-style invoice#)", () => {
+    const hit = findBillByAmountAndDate(rootwiseRef, rootwiseHay, 1800, "2026-10-08");
+    expect(hit?.invoice_number).toBe("010/08/26.1");
+  });
+
+  it("returns null when no bill carries that amount", () => {
+    expect(findBillByAmountAndDate(rootwiseRef, rootwiseHay, 1234.56, "2026-10-08")).toBeNull();
+  });
+
+  it("returns null when the same amount is outside the date window", () => {
+    expect(findBillByAmountAndDate(rootwiseRef, rootwiseHay, 1800, "2026-09-01")).toBeNull();
+  });
+
+  it("returns null without an amount (no evidence, no guess)", () => {
+    expect(findBillByAmountAndDate(rootwiseRef, rootwiseHay, null, "2026-10-08")).toBeNull();
+    expect(findBillByAmountAndDate(rootwiseRef, rootwiseHay, 0, "2026-10-08")).toBeNull();
+  });
+
+  it("picks the nearest-dated bill when a vendor re-bills one amount", () => {
+    const molasses = [
+      bill({ vendor_name: "International Molasses, L.L.C.", invoice_number: "0000164999", invoice_amount: 1692.11, invoice_date: "2026-10-07" }),
+      bill({ vendor_name: "International Molasses, L.L.C.", invoice_number: "0000162159", invoice_amount: 1692.11, invoice_date: "2026-06-25" }),
+    ];
+    const hay = "ar@maltproducts.com | maltproducts";
+    expect(findBillByAmountAndDate(molasses, hay, 1692.11, "2026-06-25")?.invoice_number).toBe("0000162159");
+  });
+
+  it("matches Diamond K when the forward names only the AR contact", () => {
+    const ref = [bill({ vendor_name: "Diamond K Gypsum, Inc", invoice_number: "KM-098970-01", invoice_amount: 1224, invoice_date: "2026-06-16" })];
+    const hay = "Mitzi | diamondkgypsum";
+    expect(findBillByAmountAndDate(ref, hay, 1224, "2026-06-16")?.invoice_number).toBe("KM-098970-01");
+  });
+
+  it("does not match a different vendor that happens to share the amount", () => {
+    const ref = [bill({ vendor_name: "Uline", invoice_number: "210208738", invoice_amount: 1800, invoice_date: "2026-10-08" })];
+    expect(findBillByAmountAndDate(ref, rootwiseHay, 1800, "2026-10-08")).toBeNull();
   });
 });

@@ -49,6 +49,7 @@ import {
   classifyNoRecord,
   deriveInvoice,
   findApRecord,
+  findBillByAmountAndDate,
   invoicesMatch,
   normInvoice,
   normVendor,
@@ -79,8 +80,10 @@ interface Verdict {
   vendor: string;
   invoice: string;
   amount: string | null;
-  kind: "MISSING" | "NEEDS_REVIEW" | "NO_IDENTITY" | "OCR_SUSPECT" | "DIRECT_PAY";
+  kind: "MISSING" | "NEEDS_REVIEW" | "NO_IDENTITY" | "OCR_SUSPECT" | "DIRECT_PAY" | "LANDED_OTHER_NUMBER";
   detail: string;
+  /** For LANDED_OTHER_NUMBER: the Bill.com bill that explains this forward. */
+  bill?: string;
 }
 
 /** Bill-data assurance findings (amount parity / date sanity / invoice# uniqueness). */
@@ -390,6 +393,8 @@ async function main(): Promise<void> {
   const verdicts: Verdict[] = [];
   /** Real payables that never become Bill.com bills (vendor collects payment). */
   const directPay: Verdict[] = [];
+  /** Forwards Bill.com filed under a rewritten number (not missing, verify once). */
+  const landedByAmount: Verdict[] = [];
   const billIssues: BillIssue[] = [];
   const gateFlags: Array<{ date: string; vendor: string; invoice: string; verdict: string; reason: string }> = [];
   let matched = 0;
@@ -606,6 +611,36 @@ async function main(): Promise<void> {
       continue;
     }
 
+    // Bill.com may have filed this under a number the forward does not carry:
+    // Rootwise's date-style numbers (010/08/26.1 for the PO125393 forward),
+    // Miles Filippelli's comma-formatted ones, any scan whose printed number OCR
+    // missed. Same vendor + same amount + a bill within 10 days IS that bill, so
+    // reporting it as MISSING would be a false alarm. Reported once as landed.
+    const landedBill = isStatementDocument(
+      f.email_subject || "",
+      f.pdf_filename || "",
+      f.email_from || "",
+    )
+      ? null
+      : findBillByAmountAndDate(
+          refRows,
+          hay,
+          parseDollars(f.ocr_total),
+          (f.forwarded_at || "").slice(0, 10),
+        );
+    if (landedBill) {
+      landedByAmount.push({
+        ...base,
+        kind: "LANDED_OTHER_NUMBER",
+        bill: landedBill.invoice_number || "",
+        detail:
+          `no bill under #${invoice || "?"}, but ${landedBill.vendor_name} has ` +
+          `$${landedBill.invoice_amount} on ${landedBill.invoice_date} as #${landedBill.invoice_number} — ` +
+          `Bill.com rewrote the number; verify once`,
+      });
+      continue;
+    }
+
     // Vendor present but this invoice has no bill
     if (invoiceUsable) {
       const filename = f.pdf_filename || "";
@@ -801,6 +836,9 @@ async function main(): Promise<void> {
     console.log(`[reconcile-billcom] Direct pay (not a Bill.com bill): ${directPay.length}`);
   }
   console.log(`[reconcile-billcom] Action needed: ${verdicts.length} (${Object.entries(kinds).map(([k, v]) => `${v} ${k}`).join(", ") || "none"})`);
+  if (landedByAmount.length > 0) {
+    console.log(`[reconcile-billcom] Landed under a rewritten number: ${landedByAmount.length} (not missing — verify once)`);
+  }
   if (billIssues.length > 0) {
     const ikinds = billIssues.reduce<Record<string, number>>((acc, x) => {
       acc[x.kind] = (acc[x.kind] || 0) + 1;
@@ -827,6 +865,7 @@ async function main(): Promise<void> {
     && directPay.length === 0
     && actionableNoRecord.length === 0
     && stuckNeedsAttention.length === 0
+    && landedByAmount.length === 0
   ) {
     console.log("\n✓ Nothing missing, needing review, or miskeyed.");
     process.exit(0);
@@ -837,6 +876,16 @@ async function main(): Promise<void> {
     for (const v of directPay) {
       console.log(
         `[DIRECT_PAY] ${v.forwarded_at} | ${v.vendor} | #${v.invoice} | $${v.amount ?? "?"} | ${v.pdf_filename}`,
+      );
+      console.log(`        ${v.detail}`);
+    }
+  }
+
+  if (landedByAmount.length > 0) {
+    console.log("\n=== LANDED UNDER A REWRITTEN NUMBER (no action — Bill.com renumbered it) ===");
+    for (const v of landedByAmount) {
+      console.log(
+        `[${v.kind}] ${v.forwarded_at} | ${v.vendor} | #${v.invoice || "?"} | $${v.amount ?? "?"} | ${v.pdf_filename}`,
       );
       console.log(`        ${v.detail}`);
     }

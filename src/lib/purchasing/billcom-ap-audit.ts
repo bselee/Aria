@@ -176,6 +176,13 @@ export const VENDOR_ALIASES: Array<string[]> = [
   ["blackburn", "blackburnpropane"],
   ["wagner", "wagnerequipment"],
   ["wwex", "worldwideexpress"],
+  // Added 2026-10-13 from the 51-item audit triage: the vendor the forward names
+  // is not the vendor Bill.com stores, so these never matched on name or token.
+  // Diamond K's AR contact is "Mitzi" but the Bill.com vendor is "Diamond K
+  // Gypsum, Inc" (the domain root carries the identity); maltproducts.com bills
+  // under "International Molasses, L.L.C.".
+  ["mitzi", "diamondkgypsum", "diamond k gypsum", "diamondk"],
+  ["maltproducts", "internationalmolasses", "international molasses", "molasses"],
 ];
 
 export function vendorsMatch(a: string | null | undefined, b: string | null | undefined): boolean {
@@ -196,10 +203,30 @@ export function vendorsMatch(a: string | null | undefined, b: string | null | un
 export function invoicesMatch(a: string | null | undefined, b: string | null | undefined): boolean {
   const da = normInvoice(a);
   const db = normInvoice(b);
-  if (!da || !db) return false;
-  if (da === db) return true;
-  const [short, long] = da.length <= db.length ? [da, db] : [db, da];
-  return short.length >= 6 && (long.startsWith(short) || long.endsWith(short));
+  if (da && db) {
+    if (da === db) return true;
+    const [short, long] = da.length <= db.length ? [da, db] : [db, da];
+    if (short.length >= 6 && (long.startsWith(short) || long.endsWith(short))) return true;
+  }
+  // Alphanumeric vendor numbers (Diamond K's KM-098970-01 for the forward's
+  // KM-098970, Rootwise's 4764A, AAA Cooper's P26072401-5536047). Reducing these
+  // to digits loses the letters AND the leading zero, so KM-098970 became the
+  // 5-digit 98970 and could never match its own bill. Compare letter+digit cores
+  // with the same prefix/suffix rule, at ≥6 core characters and only when a
+  // letter is present so pure-numeric behaviour above is untouched.
+  const ca = alnumCore(a);
+  const cb = alnumCore(b);
+  if (ca && cb && /[A-Z]/.test(ca + cb)) {
+    if (ca === cb) return true;
+    const [cs, cl] = ca.length <= cb.length ? [ca, cb] : [cb, ca];
+    if (cs.length >= 6 && (cl.startsWith(cs) || cl.endsWith(cs))) return true;
+  }
+  return false;
+}
+
+/** Letters+digits only, uppercased: "KM-098970-01" → "KM09897001". */
+export function alnumCore(s: string | null | undefined): string {
+  return (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 // ── Dates and amounts ────────────────────────────────────────────────────────
@@ -233,6 +260,48 @@ export function parseDollars(raw: string | number | null | undefined): number | 
 export function withinDays(a: number | null, b: number | null, days: number): boolean {
   if (a === null || b === null) return false;
   return Math.abs(a - b) <= days * 86_400_000;
+}
+
+/**
+ * The bill a forward must be, when Bill.com filed it under a number the forward
+ * does not carry.
+ *
+ * Vendors whose invoice numbers Bill.com rewrites cannot ever match on invoice#:
+ * Rootwise's date-style numbers (`010/08/26.1` for the PO125393 forward), Miles
+ * Filippelli's comma-formatted ones (`7,132,026` for the 7.16.2026 forward), and
+ * every photo/scan whose printed number OCR missed. Name match alone then files
+ * a real bill as MISSING. The remaining signal is same vendor + same amount +
+ * a bill dated within `windowDays` of the forward.
+ *
+ * Deliberately narrow: a null/zero amount never matches, and the nearest-dated
+ * candidate wins so a vendor that re-bills one amount (International Molasses
+ * bills $1,692.11 repeatedly) resolves to the right period.
+ *
+ * @returns the ref row that explains the forward, or null when nothing lines up.
+ */
+export function findBillByAmountAndDate(
+  refRows: RefRow[],
+  haystack: string,
+  amount: number | null,
+  forwardDate: string | null,
+  windowDays = 10,
+): RefRow | null {
+  if (amount === null || !Number.isFinite(amount) || amount <= 0) return null;
+  const fwdDay = parseDay(forwardDate);
+  if (fwdDay === null) return null;
+  const tol = Math.max(0.02, amount * 0.005);
+  let best: { row: RefRow; distDays: number } | null = null;
+  for (const r of refRows) {
+    if (!vendorsMatch(haystack, r.vendor_name)) continue;
+    const amt = typeof r.invoice_amount === "number" ? r.invoice_amount : null;
+    if (amt === null || Math.abs(amt - amount) > tol) continue;
+    const day = parseDay(r.invoice_date);
+    if (day === null) continue;
+    const distDays = Math.abs(day - fwdDay) / 86_400_000;
+    if (distDays > windowDays) continue;
+    if (!best || distDays < best.distDays) best = { row: r, distDays };
+  }
+  return best ? best.row : null;
 }
 
 // ── Identity derivation from a forward row ──────────────────────────────────
