@@ -151,16 +151,21 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // ── Dropship: forward to Bill.com, skip PO matching ────────────────
     // These vendors dropship directly to customers — no Finale PO exists.
     // Still forwarded to Bill.com for payment processing.
+    // ⚠️ Ferticell was removed here on 2026-10-13. It was added 2026-06-04 on the
+    //    mistaken premise that it "ships directly to customers". Finale says the
+    //    opposite: 646 Ferticell POs, all shipped to a BuildASoil dock, invoiced
+    //    1:1 against those POs (125040 = inv 8013 $7,615.92). With no rule it now
+    //    falls through to full processing (PO match + reconciliation), which is
+    //    what caught it: as a "dropship", invoice 8013 was forwarded and then
+    //    never PO-matched, never written to vendor_invoices, never seen again.
     { match: { senderContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship)' },
     { match: { senderContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship)' },
     { match: { senderContains: 'evergreen growers' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
     { match: { domain: 'evergreengrowers.com' }, action: 'dropship', label: 'Evergreen Growers (Dropship)' },
-    { match: { senderContains: 'ferticell' }, action: 'dropship', label: 'Ferticell (Dropship)' },
 
     // QuickBooks variants
     { match: { senderContains: 'quickbooks', subjectContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship via QuickBooks)' },
     { match: { senderContains: 'quickbooks', subjectContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship via QuickBooks)' },
-    { match: { senderContains: 'quickbooks', subjectContains: 'fert' }, action: 'dropship', label: 'Ferticell (Dropship via QuickBooks)' },
 ];
 
 /**
@@ -195,6 +200,10 @@ export function matchVendorRouting(
             if (!(email.includes(needle) || name.includes(needle))) continue;
         }
         if (m.subjectContains && !subjectLower.includes(m.subjectContains.toLowerCase())) continue;
+        // A packing list that names a PO is the bill for vendors who invoice that
+        // way (Colorado Worm). The PO number is the link. A packing list with no
+        // PO stays a skip.
+        if (m.subjectContains === "packing list" && /\b1\d{5}\b/.test(subject || "")) continue;
         if (m.filenameContains) {
             // Filename rules require a filename; empty = no match
             if (!filenameLower || !filenameLower.includes(m.filenameContains.toLowerCase())) continue;

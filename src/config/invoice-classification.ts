@@ -79,10 +79,17 @@ const DROPSHIP_RULES: DropshipRule[] = [
     // ── QuickBooks routed dropship (vendor name only in subject) ───────────
     { senderKeyword: 'quickbooks', subjectRequired: 'logan labs',  label: 'Logan Labs (Dropship via QuickBooks)' },
     { senderKeyword: 'quickbooks', subjectRequired: 'autopot',     label: 'AutoPot (Dropship via QuickBooks)' },
-    { senderKeyword: 'quickbooks', subjectRequired: 'fert',        label: 'Ferticell (Dropship via QuickBooks)' },
 
-    // Ferticell is dropship-only in Aria's purview
-    { vendorKeyword: 'ferticell', label: 'Ferticell (Dropship)' },
+    // ── REMOVED 2026-10-13 — Ferticell is NOT a dropship vendor ────────────
+    // Was here (added 2026-06-04, commit ed04b78) as:
+    //   { senderKeyword: 'quickbooks', subjectRequired: 'fert', label: 'Ferticell (Dropship via QuickBooks)' }
+    //   { vendorKeyword: 'ferticell', label: 'Ferticell (Dropship)' }
+    // Wrong: Ferticell has 646 Finale POs (2019-2026), every one shipped to a
+    // BuildASoil dock (5146/5068/5016 N Townsend, Montrose CO) — never to a
+    // customer. Invoices match POs 1:1 by total (125040 = inv 8013 $7,615.92,
+    // 125111 = inv 8044 $88.88, 125182 = inv 8080 $8,625.04, 125211 = inv 8090
+    // $6,063.70). Routing them around reconciliation is what made inv 8013
+    // invisible for 105 days. They belong in REAL_INVOICE_OVERRIDES below.
 ];
 
 // ─── Real Invoice Overrides ───────────────────────────────────────────────────
@@ -95,11 +102,24 @@ interface OverrideRule {
     senderKeyword?: string;
     vendorKeyword?: string;
     senderDomain?: string;
+    /**
+     * Match against the email subject. Needed for QuickBooks-routed vendors,
+     * where the From address is always notification.intuit.com and the vendor
+     * name appears only in the subject line.
+     */
+    subjectContains?: string;
     label: string;
 }
 
 const REAL_INVOICE_OVERRIDES: OverrideRule[] = [
-    // Example: { senderDomain: 'some-dropship-adjacent.com', label: 'Vendor (Invoice Needs Analysis)' },
+    // Ferticell (2026-10-13): misclassified as dropship 2026-06-04, which turned
+    // off PO matching for a real PO vendor — invoice 8013 ($7,615.92 vs Finale
+    // PO 125040) sat unmatched and unpaid for 105 days. All three match routes
+    // are listed because the QuickBooks notification (sender=notification.intuit.com,
+    // sender name "Ferticell", vendor only in the subject) is the normal path.
+    { vendorKeyword: 'ferticell',  label: 'Ferticell (Real Invoice — Finale PO vendor)' },
+    { senderKeyword: 'ferticellusa', label: 'Ferticell (Real Invoice — ferticellusa.com)' },
+    { subjectContains: 'ferticell', label: 'Ferticell (Real Invoice — QuickBooks subject)' },
 ];
 
 // ─── Classification Function ──────────────────────────────────────────────────
@@ -168,6 +188,9 @@ export function classifyInvoice(input: ClassificationInput): ClassificationResul
             return { classification: 'real_invoice', reason: `Override: ${rule.label}`, matchedRule: rule.label };
         }
         if (rule.vendorKeyword && vendor.includes(rule.vendorKeyword.toLowerCase())) {
+            return { classification: 'real_invoice', reason: `Override: ${rule.label}`, matchedRule: rule.label };
+        }
+        if (rule.subjectContains && subject.includes(rule.subjectContains.toLowerCase())) {
             return { classification: 'real_invoice', reason: `Override: ${rule.label}`, matchedRule: rule.label };
         }
     }

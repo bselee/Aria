@@ -123,9 +123,10 @@ describe("vendor-router dropship match", () => {
         expect(r?.action).toBe("dropship");
     });
 
-    it("matches ferticell → dropship", () => {
+    it("matches ferticell → NO dropship (real Finale PO vendor, 2026-10-13)", () => {
         const r = matchVendorRouting("orders@ferticell.com", "Ferticell", "Invoice");
-        expect(r?.action).toBe("dropship");
+        expect(r?.action).not.toBe("dropship");
+        expect(r).toBeNull();
     });
 });
 
@@ -150,14 +151,16 @@ describe("vendor-router QuickBooks AND gate (dropship)", () => {
         expect(r?.label).toContain("AutoPot");
     });
 
-    it("quickbooks sender + 'fert' subject → dropship", () => {
+    it("quickbooks sender + 'fert' subject → NO dropship (Ferticell is a PO vendor)", () => {
+        // Regression: invoice 8013 ($7,615.92 vs Finale PO 125040) was routed
+        // around PO matching for 105 days because this rule called Ferticell a
+        // dropship. Its own subject must fall through to full processing.
         const r = matchVendorRouting(
             "quickbooks@notification.intuit.com",
-            "QuickBooks",
-            "New payment request from Ferticell - invoice FC-123",
+            "Ferticell",
+            "Invoice 8013 from Ferticell",
         );
-        expect(r?.action).toBe("dropship");
-        expect(r?.label).toContain("Ferticell");
+        expect(r).toBeNull();
     });
 
     it("quickbooks sender WITHOUT matching subject → NO match (AND gate)", () => {

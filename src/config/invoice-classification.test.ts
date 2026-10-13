@@ -45,8 +45,8 @@ describe("classifyInvoice — Dropship Vendor Keyword Match", () => {
         { label: "Abel by vendorName",                    input: { vendorName: "Abel" } },
         { label: "Abel by fromEmail does NOT match (no senderKeyword rule)", input: { fromEmail: "abel@aces.com" }, expectDropship: false },
         { label: "AbelsAces short",                       input: { vendorName: "abelsace" } },
-        { label: "Ferticell by vendorName",               input: { vendorName: "Ferticell" } },
-        { label: "Ferticell by fromEmail does NOT match (no senderKeyword rule)", input: { fromEmail: "billing@ferticell.com" }, expectDropship: false },
+        { label: "Ferticell by vendorName → NOT dropship (real PO vendor)", input: { vendorName: "Ferticell" }, expectDropship: false },
+        { label: "Ferticell by fromEmail → NOT dropship", input: { fromEmail: "billing@ferticell.com" }, expectDropship: false },
     ])("$label → $expectDropship", ({ input, expectDropship }) => {
         const result = classifyInvoice(input);
         const isDropship = expectDropship !== false;
@@ -101,12 +101,15 @@ describe("classifyInvoice — QuickBooks AND Gate", () => {
         expect(result.matchedRule).toContain("AutoPot");
     });
 
-    it("QuickBooks sender + subject 'fert' → dropship (Ferticell via QB)", () => {
+    it("QuickBooks sender + 'fert' subject → NO dropship (Ferticell is a PO vendor)", () => {
+        // Regression guard for invoice 8013. The QuickBooks notification for a
+        // Ferticell invoice must classify as a real invoice needing PO matching.
         const result = classifyInvoice({
             fromEmail: "quickbooks@notification.intuit.com",
-            subject: "fert invoice",
+            vendorName: "Ferticell",
+            subject: "Past due Invoice 8013 from Ferticell",
         });
-        expect(result.classification).toBe(dropship);
+        expect(result.classification).toBe(real);
         expect(result.matchedRule).toContain("Ferticell");
     });
 
@@ -119,12 +122,12 @@ describe("classifyInvoice — QuickBooks AND Gate", () => {
         expect(result.classification).toBe(real);
     });
 
-    it("QuickBooks sender + subject 'fert' multiple times still works", () => {
+    it("QuickBooks sender + subject 'fert' generic does NOT dropship", () => {
         const result = classifyInvoice({
             fromEmail: "quickbooks@notification.intuit.com",
             subject: "Your Fert order has shipped (FERT-789)",
         });
-        expect(result.classification).toBe(dropship);
+        expect(result.classification).toBe(real);
     });
 });
 
@@ -142,9 +145,10 @@ describe("classifyInvoice — Ferticell vs 'fert' false-positive guard", () => {
         expect(result.classification).toBe(real);
     });
 
-    it("Vendor 'Ferticell' still matches via full keyword", () => {
+    it("Vendor 'Ferticell' resolves to real_invoice via explicit override", () => {
         const result = classifyInvoice({ vendorName: "Ferticell international" });
-        expect(result.classification).toBe(dropship);
+        expect(result.classification).toBe(real);
+        expect(result.matchedRule).toContain("Ferticell");
     });
 });
 
