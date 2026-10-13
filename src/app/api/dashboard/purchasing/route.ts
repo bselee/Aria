@@ -88,7 +88,7 @@ export async function GET(req: NextRequest) {
     let resaleGroups: PurchasingGroup[] = [];
     if (mode === 'all' || mode === 'resale') {
         try {
-            const r = await readSWR(resaleSlot, () => client.getPurchasingIntelligence(daysBack), bust);
+            const r = await readSWR(resaleSlot, () => client.getPurchasingIntelligence(daysBack), bust, 'resale', { windowKey: String(daysBack) });
             resaleGroups = r.value.map(g => ({
                 ...g,
                 items: g.items.map(item => ({ ...item, itemType: item.itemType || 'resale' as const })),
@@ -128,7 +128,7 @@ export async function GET(req: NextRequest) {
     let bomGroups: PurchasingGroup[] = [];
     if (mode === 'all' || mode === 'bom' || summary === 'bom') {
         try {
-            const r = await readSWR(bomSlot, () => client.getBOMDemand(bomDaysBack), bust);
+            const r = await readSWR(bomSlot, () => client.getBOMDemand(bomDaysBack), bust, 'bom', { windowKey: String(bomDaysBack) });
             bomGroups = r.value;
             refreshing = refreshing || r.refreshing;
         } catch (err: any) {

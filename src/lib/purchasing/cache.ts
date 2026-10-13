@@ -1,14 +1,37 @@
 /**
- * @file    cache.ts
- * @purpose Module-level cache + stale-while-revalidate for the Ordering screen.
+ * @file    src/lib/purchasing/cache.ts
+ * @purpose Durable snapshot + single-writer scan scheduler for the Ordering screen.
  *
- * Both pipelines (resale + BOM) take minutes to scan. SWR serves cached data
- * immediately (even when stale) and refreshes in the background, so the user
- * sees instant data after the first ever scan completes. The exported
- * `prewarmPurchasingCaches()` is called from `src/instrumentation.ts` at
- * dashboard boot and on a 25-min interval — the user never hits a cold scan.
+ *          THE CONTRACT (HERMIA 2026-10-13 — "no need to hammer Finale, MUST be
+ *          a more elegant process"):
+ *
+ *            - The WEB LAYER ONLY READS. A dashboard poll never starts a scan.
+ *            - The SCHEDULER is the only writer. It runs resale and BOM
+ *              SEQUENTIALLY inside one cycle, so the two pipelines never split
+ *              the client's 2 req/s limiter between them.
+ *            - Exactly ONE cycle runs at a time — enforced in-process (a single
+ *              cycle promise) AND across processes (a heartbeat lock file), so
+ *              aria-bot, a CLI, or a second dashboard cannot double up.
+ *            - A cycle is never abandoned mid-flight. The old code raced the
+ *              fetcher against a 25-min timeout that REJECTED WITHOUT ABORTING,
+ *              so the "timed out" scan kept issuing requests while the next one
+ *              started. That is what compounded into Finale's 429 limiter.
+ *            - Cadence is derived from the MEASURED cycle duration, not a fixed
+ *              interval, so a slow cycle delays the next one instead of
+ *              overlapping it.
+ *
+ *          A request that finds the snapshot stale reports `refreshing: true`
+ *          and asks the scheduler for a cycle (expedited, but never sooner than
+ *          EXPEDITE_GAP_MS after the last cycle started). The panel keeps
+ *          painting the last good snapshot throughout.
+ *
+ * @author  Hermia
+ * @created 2026-07-14
+ * @deps    @/lib/finale/client
+ * @env     ARIA_PURCHASING_CACHE_DIR, ARIA_PURCHASING_REFRESH_MIN_MS,
+ *          ARIA_PURCHASING_EXPEDITE_GAP_MS — all optional.
  */
-import { mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { join } from 'path';
 
@@ -18,35 +41,102 @@ export type CacheSlot = {
     value: PurchasingGroup[] | null;
     at: number;
     promise: Promise<PurchasingGroup[]> | null;
+    /** Window this slot's snapshot was produced with, so a non-default
+     *  ?daysBack request is detected instead of being silently answered with
+     *  the scheduled window's data. */
+    windowKey?: string;
 };
 export type CacheKey = 'resale' | 'bom';
 type PersistedSnapshot = {
     at: number;
     value: PurchasingGroup[];
+    windowKey?: string;
+};
+
+type ScanCycleState = {
+    promise: Promise<void> | null;
+    lastStartedAt: number;
+    lastFinishedAt: number;
+    lastDurationMs: number;
+    runs: number;
+    lastReason: string;
+};
+
+type CacheStash = {
+    resale: CacheSlot;
+    bom: CacheSlot;
+    cycle: ScanCycleState;
+    nextTimer: NodeJS.Timeout | null;
+    schedulerStarted: boolean;
+    refreshWanted: boolean;
+    prewarmRunning: boolean;
+    lastPrewarmMs: number; // cold-start cooldown — avoid flooding Finale on rapid restarts
 };
 
 // Pinned to globalThis because Next.js compiles instrumentation.ts and route.ts
 // into separate chunks, each of which would otherwise get its own module-level
 // state — leading to duplicate scans. globalThis is the only state shared
 // across compiled chunks in the same Node process.
-type CacheStash = {
-    resale: CacheSlot;
-    bom: CacheSlot;
-    prewarmTimer: NodeJS.Timeout | null;
-    prewarmRunning: boolean;
-    lastPrewarmMs: number; // cold-start cooldown — avoid flooding Finale on rapid restarts
-};
-const stash: CacheStash = ((globalThis as any).__aria_purchasing_cache ??= {
+const globalStash = globalThis as typeof globalThis & { __aria_purchasing_cache?: CacheStash };
+const stash: CacheStash = (globalStash.__aria_purchasing_cache ??= {
     resale: { value: null, at: 0, promise: null },
     bom: { value: null, at: 0, promise: null },
-    prewarmTimer: null,
+    cycle: { promise: null, lastStartedAt: 0, lastFinishedAt: 0, lastDurationMs: 0, runs: 0, lastReason: '' },
+    nextTimer: null,
+    schedulerStarted: false,
+    refreshWanted: false,
     prewarmRunning: false,
     lastPrewarmMs: 0,
 }) as CacheStash;
 
+// Defensive defaults: a globalThis stash created by an OLDER build of this
+// module carries none of the newer fields, and `??=` only assigns when the whole
+// object is missing. Backfill so a hot reload cannot wedge the scheduler.
+stash.cycle ??= { promise: null, lastStartedAt: 0, lastFinishedAt: 0, lastDurationMs: 0, runs: 0, lastReason: '' };
+if (stash.nextTimer === undefined) stash.nextTimer = null;
+if (stash.schedulerStarted === undefined) stash.schedulerStarted = false;
+if (stash.refreshWanted === undefined) stash.refreshWanted = false;
+
 export const resaleSlot = stash.resale;
 export const bomSlot = stash.bom;
 export const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+/** Windows used by the scheduled cycle. Both pipelines share one cadence. */
+export const SCAN_RESALE_DAYS = 365;
+export const SCAN_BOM_DAYS = 90;
+
+/**
+ * Floor between cycle STARTS. A full cycle is ~35 min of wall clock, so the old
+ * 25-min interval guaranteed overlap. 60 min keeps Ordering at most one cycle
+ * behind without re-deriving a plan that has not changed.
+ * @env ARIA_PURCHASING_REFRESH_MIN_MS
+ */
+function minCycleGapMs(): number {
+    const raw = Number(process.env.ARIA_PURCHASING_REFRESH_MIN_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 60 * 60 * 1000;
+}
+
+/**
+ * Earliest a change-driven (expedited) cycle may start after the previous cycle
+ * STARTED. Bounds how far a burst of PO commits can pull the schedule forward.
+ * @env ARIA_PURCHASING_EXPEDITE_GAP_MS
+ */
+function expediteGapMs(): number {
+    const raw = Number(process.env.ARIA_PURCHASING_EXPEDITE_GAP_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
+}
+
+/** Slack added to a measured cycle duration before scheduling the next start. */
+const CYCLE_SLACK_MS = 2 * 60 * 1000;
+
+/** A lock with no heartbeat for this long is treated as abandoned. */
+const LOCK_STALE_MS = 10 * 60 * 1000;
+const LOCK_HEARTBEAT_MS = 60 * 1000;
+
+/** Message from an unknown thrown value, for structured logging. */
+function errText(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
 
 function cacheDir(): string {
     return process.env.ARIA_PURCHASING_CACHE_DIR || join(process.cwd(), '.aria-cache', 'purchasing');
@@ -54,6 +144,10 @@ function cacheDir(): string {
 
 function cacheFile(key: CacheKey): string {
     return join(cacheDir(), `purchasing-${key}.json`);
+}
+
+function lockFile(): string {
+    return join(cacheDir(), 'scan.lock');
 }
 
 function inferCacheKey(slot: CacheSlot): CacheKey | null {
@@ -66,7 +160,11 @@ export function readPersistedSnapshot(key: CacheKey): PersistedSnapshot | null {
     try {
         const parsed = JSON.parse(readFileSync(cacheFile(key), 'utf8')) as Partial<PersistedSnapshot>;
         if (!Number.isFinite(parsed.at) || !Array.isArray(parsed.value)) return null;
-        return { at: parsed.at, value: parsed.value as PurchasingGroup[] };
+        return {
+            at: parsed.at,
+            value: parsed.value as PurchasingGroup[],
+            windowKey: typeof parsed.windowKey === 'string' ? parsed.windowKey : undefined,
+        };
     } catch {
         return null;
     }
@@ -78,155 +176,404 @@ function hydrateFromDisk(slot: CacheSlot, key: CacheKey): void {
     if (!snapshot) return;
     slot.value = snapshot.value;
     slot.at = snapshot.at;
+    if (snapshot.windowKey) slot.windowKey = snapshot.windowKey;
 }
 
-async function persistSnapshot(key: CacheKey, value: PurchasingGroup[], at: number): Promise<void> {
+async function persistSnapshot(key: CacheKey, value: PurchasingGroup[], at: number, windowKey?: string): Promise<void> {
     try {
         mkdirSync(cacheDir(), { recursive: true });
-        await writeFile(cacheFile(key), JSON.stringify({ at, value }), 'utf8');
-    } catch (err: any) {
-        console.warn('[purchasing/cache] failed to persist snapshot:', err?.message || err);
+        await writeFile(cacheFile(key), JSON.stringify({ at, value, windowKey }), 'utf8');
+    } catch (err: unknown) {
+        console.warn('[purchasing/cache] failed to persist snapshot:', errText(err));
     }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('fetcher timeout')), ms);
-    promise.then(v => { clearTimeout(timer); resolve(v); }).catch(err => { clearTimeout(timer); reject(err); });
-  });
+// ──────────────────────────────────────────────────────────────────────────
+// CROSS-PROCESS SCAN LOCK
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Take the scan lock when it is free or abandoned. The lock carries a HEARTBEAT
+ * timestamp rather than relying on PID liveness, which is unreliable on Windows
+ * (PID reuse) and meaningless across containers.
+ *
+ * @param reason Tag recorded in the lock file for diagnostics.
+ * @returns      true when this process may run a cycle.
+ */
+function acquireCycleLock(reason: string): boolean {
+    try {
+        mkdirSync(cacheDir(), { recursive: true });
+        const existing = JSON.parse(readFileSync(lockFile(), 'utf8')) as { pid?: number; at?: number; reason?: string };
+        if (Number.isFinite(existing.at) && Date.now() - (existing.at as number) < LOCK_STALE_MS) {
+            console.log(
+                `[purchasing/cycle] another scan holds the lock (pid ${existing.pid ?? '?'}, ${existing.reason ?? '?'}, ` +
+                `${Math.round((Date.now() - (existing.at as number)) / 1000)}s old) — skipping this cycle`,
+            );
+            return false;
+        }
+        console.warn('[purchasing/cycle] taking over an abandoned scan lock');
+    } catch {
+        // No lock yet (or unreadable) — fall through and claim it.
+    }
+    try {
+        writeFileSync(lockFile(), JSON.stringify({ pid: process.pid, at: Date.now(), reason }), 'utf8');
+        return true;
+    } catch (err: unknown) {
+        console.warn('[purchasing/cycle] could not write scan lock; running anyway:', errText(err));
+        return true;
+    }
+}
+
+function touchCycleLock(reason: string): void {
+    try {
+        writeFileSync(lockFile(), JSON.stringify({ pid: process.pid, at: Date.now(), reason }), 'utf8');
+    } catch {
+        // Best effort — a missed heartbeat only risks the stale-takeover path.
+    }
+}
+
+function releaseCycleLock(): void {
+    try {
+        unlinkSync(lockFile());
+    } catch {
+        // Already gone (or never created) — nothing to do.
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE CYCLE — the ONLY code path that performs a full scan
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Pipelines a cycle runs, injectable so tests can exercise the scheduler without
+ * touching Finale.
+ */
+export type CycleDeps = {
+    /** Slow caches that must be warm before the scan (day-0 correctness). */
+    before?: () => Promise<void>;
+    /** Resale pipeline. */
+    resale: () => Promise<PurchasingGroup[]>;
+    /** Runs between the two pipelines (forward demand). */
+    between?: () => Promise<void>;
+    /** BOM pipeline. */
+    bom: () => Promise<PurchasingGroup[]>;
+};
+
+/** Production pipelines: the real Finale-backed scans. */
+function defaultCycleDeps(): CycleDeps {
+    const client = new FinaleClient();
+    return {
+        before: async () => {
+            // HERMIA(2026-07-14): Warm the lead-time distribution cache BEFORE the
+            // purchasing scan so P90 data is available on the first pass. Without
+            // this the scan falls back to Finale's native lead time (7-14d) and
+            // urgency/ordering decisions are wrong until the second cycle.
+            const { leadTimeService } = await import('@/lib/builds/lead-time-service');
+            await leadTimeService.warmCache().catch((err: unknown) =>
+                console.warn('[purchasing/cycle] lead-time dist warmup failed (non-fatal):', errText(err)),
+            );
+
+            // KAIZEN(2026-08-04): Populate receiving_cache before the scan so
+            // coverageStockOnOrder can distinguish fully-received single-shipment
+            // POs from partially-received blanket POs.
+            const { refreshReceivingCache } = await import('./receiving-cache');
+            await refreshReceivingCache().catch((err: unknown) =>
+                console.warn('[purchasing/cycle] receiving-cache refresh failed (non-fatal):', errText(err)),
+            );
+        },
+        resale: () => client.getPurchasingIntelligence(SCAN_RESALE_DAYS),
+        between: async () => {
+            const { prewarmForwardDemand } = await import('./forward-demand');
+            await prewarmForwardDemand(30).catch(() => undefined);
+        },
+        bom: () => client.getBOMDemand(SCAN_BOM_DAYS),
+    };
 }
 
 /**
- * Background fetch timeout (ms). Increased from 25s to 180s (3min) for resilience
- * on large scans (7881+ products, BOM + resale pipelines). Prevents premature
- * timeout during peak load while still bounding runaway fetches.
- * @env FETCH_TIMEOUT_MS can be overridden via env if needed (future).
+ * Run one full scan cycle: slow caches first, then resale, then BOM.
+ *
+ * Sequential on purpose. Both pipelines share one process-wide limiter
+ * (2 req/s), so running them concurrently gives each ~1 req/s and stretched a
+ * 15-min scan past the old 25-min timeout — which is what produced the
+ * abandoned-but-still-running scans. One at a time keeps the full budget for
+ * whichever pipeline is running.
+ *
+ * Single-flight: concurrent callers join the in-flight cycle instead of starting
+ * a second one (the first caller's deps win).
+ *
+ * @param reason Short tag recorded in the lock file and the logs.
+ * @param deps   Pipelines to run; defaults to the real Finale-backed scans.
+ * @returns      Resolves when the cycle finishes (never rejects).
  */
-const FETCH_TIMEOUT_MS = 1_500_000; // 25 min — cold scan of 728 candidates needs ~12-15 min
+export function runScanCycle(reason = 'manual', deps: CycleDeps = defaultCycleDeps()): Promise<void> {
+    if (stash.cycle.promise) return stash.cycle.promise;
 
+    stash.cycle.promise = (async () => {
+        if (!acquireCycleLock(reason)) return;
+
+        const startedAt = Date.now();
+        stash.cycle.lastStartedAt = startedAt;
+        stash.cycle.lastReason = reason;
+        const heartbeat = setInterval(() => touchCycleLock(reason), LOCK_HEARTBEAT_MS);
+        heartbeat.unref?.();
+
+        try {
+            await deps.before?.();
+            await runSlotScan(resaleSlot, 'resale', deps.resale, String(SCAN_RESALE_DAYS));
+            touchCycleLock(reason);
+            await deps.between?.();
+            await runSlotScan(bomSlot, 'bom', deps.bom, String(SCAN_BOM_DAYS));
+        } catch (err: unknown) {
+            // Never propagate: the snapshot keeps serving and the next cycle retries.
+            console.error(`[purchasing/cycle] ${reason} cycle failed:`, errText(err));
+        } finally {
+            clearInterval(heartbeat);
+            releaseCycleLock();
+            stash.cycle.lastDurationMs = Date.now() - startedAt;
+            stash.cycle.lastFinishedAt = Date.now();
+            stash.cycle.runs += 1;
+            stash.refreshWanted = false;
+            console.log(
+                `[purchasing/cycle] ${reason} cycle finished in ${Math.round(stash.cycle.lastDurationMs / 1000)}s ` +
+                `(run #${stash.cycle.runs})`,
+            );
+        }
+    })().finally(() => {
+        stash.cycle.promise = null;
+    });
+
+    return stash.cycle.promise;
+}
+
+/**
+ * Refresh one slot inside a cycle, updating memory and the durable snapshot.
+ *
+ * A failure keeps the previous value (continuity) and is logged, never thrown —
+ * one empty pipeline must not blank the other.
+ *
+ * @param slot      Slot to update.
+ * @param key       Persisted snapshot key.
+ * @param fetcher   Pipeline that produces the groups.
+ * @param windowKey Window the scan used, recorded so a deep-dive request is
+ *                  detected as a mismatch rather than served stale data.
+ */
+async function runSlotScan(
+    slot: CacheSlot,
+    key: CacheKey,
+    fetcher: () => Promise<PurchasingGroup[]>,
+    windowKey?: string,
+): Promise<void> {
+    try {
+        const value = await fetcher();
+        slot.value = value;
+        slot.at = Date.now();
+        if (windowKey) slot.windowKey = windowKey;
+        void persistSnapshot(key, value, slot.at, windowKey);
+    } catch (err: unknown) {
+        console.error(`[purchasing/cycle] ${key} scan failed (keeping previous snapshot):`, errText(err));
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// READ PATH — never scans
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Ask the scheduler for a cycle, no sooner than the expedite floor after the
+ * last cycle started. Called by stale reads and by cache invalidation.
+ *
+ * @param reason Tag for the cycle log line.
+ */
+function requestRefresh(reason: string): void {
+    stash.refreshWanted = true;
+    if (stash.cycle.promise) return; // the running cycle picks the flag up when it finishes
+    const sinceStart = Date.now() - stash.cycle.lastStartedAt;
+    if (stash.cycle.lastStartedAt > 0 && sinceStart < expediteGapMs()) return;
+    if (stash.nextTimer) {
+        clearTimeout(stash.nextTimer);
+        stash.nextTimer = null;
+    }
+    void runScanCycle(`refresh:${reason}`);
+}
+
+/**
+ * Read a slot for a dashboard request.
+ *
+ * HERMIA(2026-10-13): this used to scan whenever the snapshot was stale, so a
+ * browser poll could start a 35-minute full-catalog scan AND compete with the
+ * scheduler's own scan for the rate limit. It now ONLY reads: staleness is
+ * reported through `refreshing` and handed to the scheduler.
+ *
+ * `fetcher` is used in exactly two cases — a genuinely cold cache (nothing in
+ * memory and nothing on disk, so the caller has nothing to show) and an explicit
+ * non-default window the scheduler does not produce.
+ *
+ * @param slot          Slot to read.
+ * @param fetcher       Pipeline for the cold and deep-dive paths.
+ * @param force         `?bust=1` — expedite a cycle; still returns cached data.
+ * @param cacheKey      Persisted snapshot backing this slot.
+ * @param opts.windowKey Window the caller asked for, e.g. "730".
+ * @returns             Snapshot plus whether a refresh is in progress.
+ */
 export async function readSWR(
     slot: CacheSlot,
     fetcher: () => Promise<PurchasingGroup[]>,
     force: boolean,
     cacheKey: CacheKey | null = inferCacheKey(slot),
+    opts?: { windowKey?: string },
 ): Promise<{ value: PurchasingGroup[]; refreshing: boolean }> {
     if (cacheKey) hydrateFromDisk(slot, cacheKey);
 
     const stale = force || !slot.value || Date.now() - slot.at > CACHE_TTL;
 
-    if (stale && !slot.promise) {
-        slot.promise = (async () => {
-            try {
-                const v = await withTimeout(fetcher(), FETCH_TIMEOUT_MS);
-                slot.value = v;
-                slot.at = Date.now();
-                if (cacheKey) void persistSnapshot(cacheKey, v, slot.at);
-                return v;
-            } catch (err: any) {
-                // Resilience: log timeout or fetch errors but do not propagate rejection.
-                // Prevents unhandledRejection spam that was causing dashboard instability / ISE.
-                // Keeps previous stale value; next prewarm or bust will retry.
-                console.error(`[purchasing/cache] background ${cacheKey || 'unknown'} fetch failed:`, err?.message || err);
-                // Optionally could set an error flag on slot, but for now graceful degrade.
-            } finally {
-                slot.promise = null;
-            }
-        })();
+    // A window the scheduler does not produce (e.g. ?daysBack=730) still gets a
+    // real scan, serialized behind the cycle lock so it cannot overlap one.
+    if (opts?.windowKey && slot.windowKey && opts.windowKey !== slot.windowKey && cacheKey) {
+        return runDeepDive(slot, fetcher, cacheKey, opts.windowKey);
     }
 
-    // Have cached data — return immediately, refresh runs in background.
-    if (slot.value && !force) {
-        return { value: slot.value, refreshing: stale };
-    }
+    if (!stale) return { value: slot.value ?? [], refreshing: false };
 
-    // Forced bust with prior cache — still return cached value, refresh runs.
-    if (slot.value && force) {
+    if (slot.value) {
+        requestRefresh(cacheKey ?? 'slot');
         return { value: slot.value, refreshing: true };
     }
 
-    // Cold cache — don't block the request. Return empty + refreshing flag so
-    // the page paints instantly; the panel polls until refreshing flips false.
+    // Cold: nothing in memory and nothing on disk. Start a cycle and paint
+    // empty; the panel polls until `refreshing` flips, as before.
+    void runScanCycle('cold-start');
     return { value: [], refreshing: true };
 }
 
 /**
- * Mark caches stale without dropping their current values. SWR detects the
- * stale slot (`at = 0` is older than TTL), kicks a background refresh, and
- * keeps serving the cached groups until the fresh scan lands — so dashboard
- * users keep seeing data with a "Refreshing…" badge instead of an empty list.
+ * Serve a non-default window (deep-dive history search) with a one-off scan.
  *
- * DECISION(2026-05-19): Previously this also nulled slot.value, which made
- * readSWR fall through to the cold-path branch (returns `{ value: [],
- * refreshing: true }`). Right after a PO commit/send invalidation, the
- * dashboard rendered an empty Ordering list — looked like a full reload.
- * Keeping the stale value preserves continuity; the filter-out of newly-
- * committed SKUs happens on the next successful refresh.
+ * Serialized against the scheduled cycle by the same lock, and deliberately NOT
+ * persisted into the shared slot so it cannot poison the panel's snapshot.
+ *
+ * @param slot      Slot holding the last good value.
+ * @param fetcher   Pipeline for the requested window.
+ * @param cacheKey  Snapshot key, for logging only.
+ * @param windowKey Requested window.
+ */
+async function runDeepDive(
+    slot: CacheSlot,
+    fetcher: () => Promise<PurchasingGroup[]>,
+    cacheKey: CacheKey,
+    windowKey: string,
+): Promise<{ value: PurchasingGroup[]; refreshing: boolean }> {
+    if (!acquireCycleLock(`deep-dive:${cacheKey}:${windowKey}`)) {
+        // A cycle already owns Finale — do not add a competing scan.
+        return { value: slot.value ?? [], refreshing: true };
+    }
+    const heartbeat = setInterval(() => touchCycleLock(`deep-dive:${cacheKey}`), LOCK_HEARTBEAT_MS);
+    heartbeat.unref?.();
+    try {
+        const value = await fetcher();
+        return { value, refreshing: false };
+    } catch (err: unknown) {
+        console.error(`[purchasing/cache] deep-dive ${cacheKey} scan failed:`, errText(err));
+        return { value: slot.value ?? [], refreshing: true };
+    } finally {
+        clearInterval(heartbeat);
+        releaseCycleLock();
+    }
+}
+
+/**
+ * Mark caches stale WITHOUT dropping their current values, so dashboard users
+ * keep seeing data instead of an empty list, and ask the scheduler for a cycle.
+ *
+ * DECISION(2026-05-19): nulling slot.value here made readSWR fall through to the
+ * cold path (empty list) right after a PO commit, which looked like a full
+ * reload. Keeping the stale value preserves continuity.
+ *
+ * DECISION(2026-10-13): this is now a REQUEST, not a scan. A commit burst used
+ * to start one scan per burst; now it can pull the next cycle forward at most
+ * once per expedite floor.
  */
 export function invalidatePurchasingCaches(): void {
     resaleSlot.at = 0;
     bomSlot.at = 0;
+    requestRefresh('invalidate');
 }
 
 /**
- * Prewarm both caches. Idempotent — concurrent calls dedupe via readSWR's
- * in-flight promise. Safe to schedule on an interval.
+ * Run a cycle now (bounded by the lock). Public entry point used by
+ * instrumentation and any caller that wants a guaranteed attempt.
  */
 export async function prewarmPurchasingCaches(): Promise<void> {
     if (stash.prewarmRunning) return;
-    // Cold-start cooldown: skip if last prewarm was < 5 minutes ago.
-    // Prevents rapid PM2 restarts from flooding Finale with full scans.
+    // Cold-start cooldown: skip if the last attempt was < 5 minutes ago, so
+    // rapid PM2 restarts don't queue several full scans.
     const COOLDOWN_MS = 5 * 60 * 1000;
     if (Date.now() - stash.lastPrewarmMs < COOLDOWN_MS) return;
     stash.prewarmRunning = true;
     stash.lastPrewarmMs = Date.now();
-    const client = new FinaleClient();
     try {
-        // HERMIA(2026-07-14): Warm lead-time distribution cache BEFORE the
-        // purchasing scan so P90 data is available on the first pass. Without
-        // this, the scan falls back to Finale's native lead time (7-14d) and
-        // urgency/ordering decisions are wrong until the second 25-min cycle.
-        const { leadTimeService } = await import('@/lib/builds/lead-time-service');
-        await leadTimeService.warmCache().catch((err: any) =>
-            console.warn('[purchasing/prewarm] lead-time dist warmup failed (non-fatal):', err?.message || err),
-        );
-
-        // KAIZEN(2026-08-04): Populate receiving_cache before the scan so
-        // coverageStockOnOrder can distinguish fully-received single-shipment
-        // POs from partially-received blanket POs.
-        const { refreshReceivingCache } = await import('./receiving-cache');
-        await refreshReceivingCache().catch((err: any) =>
-            console.warn('[purchasing/prewarm] receiving-cache refresh failed (non-fatal):', err?.message || err),
-        );
-
-        const { prewarmForwardDemand } = await import('./forward-demand');
-        // HERMIA(2026-06-19): Run resale first, then BOM — NOT concurrently.
-        // Both share the same FinaleCoreClient rate limiter (500ms between ALL
-        // requests). When run in parallel, each scan gets ~1 req/sec effective
-        // throughput, pushing a 12-min scan past 24 minutes and exceeding the
-        // fetch timeout. Sequential execution preserves 2 req/sec per scan.
-        const resaleResult = await readSWR(resaleSlot, () => client.getPurchasingIntelligence(365), false);
-        await prewarmForwardDemand(30).catch(() => undefined);
-        const bomResult = await readSWR(bomSlot, () => client.getBOMDemand(90), false);
-        await Promise.allSettled([resaleResult, bomResult]);
+        await runScanCycle('prewarm');
     } finally {
         stash.prewarmRunning = false;
     }
 }
 
 /**
- * Start the prewarm interval. Called once from instrumentation.ts. Kicks off
- * an immediate scan and then refreshes every 25 min (just under the 30-min
- * TTL so the cache is always warm).
+ * Delay before the next scheduled cycle starts.
+ *
+ * Pure over its inputs (plus the two env knobs) so the cadence contract is unit
+ * testable — this math is what decides how stale the Ordering snapshot can get,
+ * and it is easy to get subtly wrong.
+ *
+ * @param opts.lastStartedAt  When the previous cycle STARTED (0 if none yet).
+ * @param opts.refreshWanted  A stale read or an invalidation asked for a refresh.
+ * @param opts.now            Clock override for tests.
+ * @returns                   Milliseconds to wait before the next cycle.
+ */
+export function computeNextCycleDelayMs(opts: {
+    lastStartedAt: number;
+    refreshWanted: boolean;
+    now?: number;
+}): number {
+    const now = opts.now ?? Date.now();
+    const sinceStart = now - opts.lastStartedAt;
+    const expedite = opts.refreshWanted && opts.lastStartedAt > 0 && sinceStart >= expediteGapMs();
+    if (expedite) return 0;
+    // Floor measured between STARTS, so a ~35-min cycle on a 60-min floor still
+    // lands every 60 min. A small minimum idle stops a cycle that overran the
+    // floor from restarting back-to-back.
+    return Math.max(minCycleGapMs() - sinceStart, CYCLE_SLACK_MS);
+}
+
+/**
+ * Start the scan scheduler. Called once from instrumentation.ts.
+ *
+ * Chains the next cycle off the previous one's COMPLETION and MEASURED duration
+ * rather than a fixed interval. The old `setInterval(25min)` fired regardless of
+ * whether the previous ~35-minute cycle had finished, which is how scans ended
+ * up overlapping and competing for Finale's rate limit.
+ *
+ * The gap is measured BETWEEN CYCLE STARTS (see computeNextCycleDelayMs): with a
+ * ~35-min cycle and a 60-min floor, the next scan begins 60 min after the last
+ * one began, so the snapshot is at most about one cycle old.
  */
 export function startPurchasingPrewarm(): void {
-    if (stash.prewarmTimer) return; // already started
-    stash.prewarmTimer = setInterval(() => {
-        prewarmPurchasingCaches().catch(err =>
-            console.error('[purchasing/prewarm] interval error:', err?.message || err),
-        );
-    }, 25 * 60 * 1000);
-    // Fire the first scan immediately, non-blocking.
-    prewarmPurchasingCaches().catch(err =>
-        console.error('[purchasing/prewarm] initial error:', err?.message || err),
-    );
+    if (stash.schedulerStarted) return;
+    stash.schedulerStarted = true;
+
+    const scheduleNext = (): void => {
+        const delay = computeNextCycleDelayMs({
+            lastStartedAt: stash.cycle.lastStartedAt,
+            refreshWanted: stash.refreshWanted,
+        });
+        if (stash.nextTimer) clearTimeout(stash.nextTimer);
+        stash.nextTimer = setTimeout(() => {
+            stash.nextTimer = null;
+            void runScanCycle('scheduler').then(scheduleNext);
+        }, delay);
+        stash.nextTimer.unref?.();
+        console.log(`[purchasing/cycle] next scan in ${Math.round(delay / 1000)}s`);
+    };
+
+    void runScanCycle('startup').then(scheduleNext);
 }
