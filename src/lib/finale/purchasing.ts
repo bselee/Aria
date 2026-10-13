@@ -2400,7 +2400,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         daysBack,
                     });
                     const receiptVelocity = trend.velocity;
-                    const ledgerVelocity = ledgerRateFor(ledgerSnapshot, compSku);
+                    const ledgerVelocity = ledgerRateFor(ledgerSnapshot, compSku, { stockOnHand });
                     const bomDerivedVelocity = demand.totalBurnRate;
                     const chosen = chooseBomVelocity({ receiptVelocity, bomDerivedVelocity, ledgerVelocity });
                     const confidence = chosen.source === 'receipts'
@@ -3072,7 +3072,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         salesVelocity,
                         purchaseVelocity,
                         consumptionQty: candidate.finaleConsumptionQty,
-                        ledgerVelocity: ledgerRateFor(ledgerSnapshot, sku),
+                        ledgerVelocity: ledgerRateFor(ledgerSnapshot, sku, { stockOnHand }),
                     });
                     let dailyRate = chosenVelocity.dailyRate;
                     let rateSource: PurchasingItem["dailyRateSource"] | "none" = chosenVelocity.signal;
