@@ -14,6 +14,7 @@ import {
   deriveInvoice,
   findApRecord,
   findBillByAmountAndDate,
+  findUnbilledForwards,
   invoicesMatch,
   normInvoice,
   normVendor,
@@ -462,5 +463,94 @@ describe("findBillByAmountAndDate", () => {
   it("does not match a different vendor that happens to share the amount", () => {
     const ref = [bill({ vendor_name: "Uline", invoice_number: "210208738", invoice_amount: 1800, invoice_date: "2026-10-08" })];
     expect(findBillByAmountAndDate(ref, rootwiseHay, 1800, "2026-10-08")).toBeNull();
+  });
+});
+
+// ── All-time backlog: forwards that never became a bill ──────────────────────
+
+describe("findUnbilledForwards", () => {
+  const NOW = Date.parse("2026-10-13T12:00:00Z");
+
+  it("flags the Ferticell 2907 forward that aged out of the 14-day window", () => {
+    const forwards = [fwd({
+      id: 77,
+      forwarded_at: "2026-06-18 15:22:32",
+      email_from: "quickbooks@notification.intuit.com",
+      email_subject: "Fwd: Invoice 2907 from Ferticell",
+      ocr_vendor_name: "Ferticell",
+      ocr_invoice_number: "2907",
+      ocr_total: "7243.02",
+    })];
+    const ref = [bill({ vendor_name: "Ferticell", invoice_number: "2880", invoice_amount: 4682.08, invoice_date: "2026-06-02" })];
+
+    const r = findUnbilledForwards(forwards, ref, { nowMs: NOW });
+
+    expect(r.examined).toBe(1);
+    expect(r.confirmed).toHaveLength(0);
+    expect(r.unbilled).toHaveLength(1);
+    expect(r.unbilled[0].ageDays).toBe(116);
+    expect(r.needsAttention).toHaveLength(1);
+    expect(r.needsAttention[0].invoice).toBe("2907");
+  });
+
+  it("confirms a forward whose bill Bill.com filed under another number", () => {
+    const forwards = [fwd({
+      id: 78,
+      forwarded_at: "2026-10-08 13:30:00",
+      email_from: "kevindirk@rootwise.com",
+      email_subject: "Rootwise invoice",
+      ocr_vendor_name: "Rootwise Soil Dynamics",
+      ocr_invoice_number: "010/08/26.1",
+      ocr_total: "1800.00",
+    })];
+    const ref = [bill({ vendor_name: "Rootwise Soil Dynamics", invoice_number: "010/08/26.1", invoice_amount: 1800, invoice_date: "2026-10-08" })];
+
+    const r = findUnbilledForwards(forwards, ref, { nowMs: NOW });
+
+    expect(r.confirmed).toHaveLength(1);
+    expect(r.unbilled).toHaveLength(0);
+  });
+
+  it("confirms on amount + date when the invoice number was rewritten", () => {
+    const forwards = [fwd({
+      id: 79,
+      forwarded_at: "2026-07-16 12:00:00",
+      email_from: "miles@fpe.com",
+      email_subject: "bas iinvoice 7.16.2026",
+      ocr_vendor_name: "Miles Filippelli",
+      ocr_invoice_number: "",
+      ocr_total: "431.00",
+    })];
+    const ref = [bill({ vendor_name: "Miles Filippelli", invoice_number: "7,132,0261", invoice_amount: 431, invoice_date: "2026-07-16" })];
+
+    expect(findUnbilledForwards(forwards, ref, { nowMs: NOW }).unbilled).toHaveLength(0);
+  });
+
+  it("excuses a statement and a FedEx forward, but not a vendor that merely mentions FedEx", () => {
+    const forwards = [
+      fwd({ id: 80, forwarded_at: "2026-06-20 12:00:00", email_from: "ar@marionag.com", email_subject: "Statement", pdf_filename: "Statement_07022026.pdf", ocr_vendor_name: "Marion Ag Service", ocr_invoice_number: "Date_07022026", ocr_total: "0" }),
+      fwd({ id: 81, forwarded_at: "2026-06-20 12:00:00", email_from: "BillingOnline@fedex.com", email_subject: "FedEx Billing Online invoice", ocr_vendor_name: "FedEx", ocr_invoice_number: "9-388-19130", ocr_total: "16589.60" }),
+      fwd({ id: 82, forwarded_at: "2026-06-20 12:00:00", email_from: "orders@uline.com", email_subject: "Uline invoice, ships FedEx", ocr_vendor_name: "Uline", ocr_invoice_number: "210208738", ocr_total: "1800.00" }),
+    ];
+    const r = findUnbilledForwards(forwards, [], {
+      nowMs: NOW,
+      isNonInvoice: (f) => /statement/i.test(String(f.email_subject || "")),
+    });
+
+    expect(r.excused).toBe(2);
+    expect(r.unbilled.map((u) => u.id)).toEqual([82]);
+  });
+
+  it("ignores non-forwarded rows and keeps brand-new forwards below the attention bar", () => {
+    const forwards = [
+      fwd({ id: 83, status: "SKIPPED", forwarded_at: "2026-06-20 12:00:00", email_subject: "Already paid" }),
+      fwd({ id: 84, forwarded_at: "2026-10-12 12:00:00", email_from: "ar@newvendor.com", ocr_vendor_name: "New Vendor", ocr_invoice_number: "A-1", ocr_total: "50.00" }),
+    ];
+    const r = findUnbilledForwards(forwards, [], { nowMs: NOW });
+
+    expect(r.examined).toBe(1);
+    expect(r.unbilled).toHaveLength(1);
+    expect(r.unbilled[0].ageDays).toBe(1);
+    expect(r.needsAttention).toHaveLength(0);
   });
 });

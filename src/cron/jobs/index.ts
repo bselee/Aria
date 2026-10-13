@@ -635,6 +635,28 @@ defineJob({
     budget: { durationMs: 300_000 }, // 5min — fetches getOrderDetails per candidate
 });
 
+// No-freight close. Miles, Thrive, Stock Bag, Colorado Worm, New Moon (and any later
+// override) can complete once committed + received and invoice goods match.
+// Does not use PO_AUTO_COMPLETE_ENABLED. Weekday morning only — Finale
+// rate-limits hard, and this reads order details. Default dry-run.
+defineJob({
+    name: "no-freight-po-complete",
+    schedule: "30 9 * * 1-5",
+    onFail: "log",
+    description: "Complete committed received no-freight POs when amounts align (weekday 9:30; dry-run unless NO_FREIGHT_PO_COMPLETE_ENABLED).",
+    handler: async () => {
+        const { runNoFreightPOComplete } = await import("@/lib/purchasing/no-freight-po-complete");
+        const stats = await runNoFreightPOComplete();
+        if (stats.eligible > 0 || stats.completed > 0 || stats.errors > 0) {
+            console.log(
+                `[no-freight-po-complete] scanned=${stats.scanned} eligible=${stats.eligible} ` +
+                `completed=${stats.completed} skipped=${stats.skipped} errors=${stats.errors} dryRun=${stats.dryRun}`,
+            );
+        }
+    },
+    budget: { durationMs: 180_000 },
+});
+
 // Detect open POs at risk of arriving after stockout and surface them as
 // PO_ARRIVAL_AT_RISK rows in ap_activity_log. Builds panel + Activity feed
 // render them; "Compose ETA draft" and other next-step actions are
@@ -1289,6 +1311,47 @@ defineJob({
 // Bill exports AllBillsPage.csv about once a week. reconcile-billcom.ts
 // imports the newest file under 10 days from Downloads or
 // Downloads/Aria-Ingest/billcom. Do not add the login job back.
+// ─────────────────────────────────────────────────────────────────────────────
+// Bill.com unbilled watchdog — a forward stays an open item until Bill.com
+// shows a bill for it.
+//
+// reconcile-billcom.ts sweeps only the last 14 days of forwards, so a forward
+// that produced no bill stopped being examined the moment it aged out.
+// Ferticell 2907 (8 forwards on 2026-06-18) and 8013 (3 on 2026-06-30) sat
+// unbilled for 117 and 105 days with nothing watching, and nothing ever wrote
+// the ledger's billcom_processed flag back (351 rows unset).
+//
+// Runs daily at 07:40, before the 8:30 AP review, and writes ONE row to
+// ap_activity_log per day, which the dashboard daily-ops and activity summaries
+// already read. No Telegram, no Slack, no email: the open items appear where AP
+// is reviewed. Local SQLite only; this job never touches Finale or Bill.com.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "billcom-unbilled-watchdog",
+    schedule: "40 7 * * *",
+    onFail: "log",
+    description: "Daily: flag invoices Aria forwarded that Bill.com never turned into a bill.",
+    handler: async () => {
+        const { runBillcomUnbilledWatchdog } = await import(
+            "@/lib/purchasing/billcom-unbilled-watchdog"
+        );
+        const outcome = await runBillcomUnbilledWatchdog();
+        const { report, stamped, logged, skippedReason } = outcome;
+        if (!logged) {
+            console.log(
+                `[billcom-unbilled] nothing logged (${skippedReason}); ${report.examined} forwards, ` +
+                `${report.confirmed.length} confirmed, ${report.excused} excused, ${stamped} stamped`,
+            );
+            return;
+        }
+        console.log(
+            `[billcom-unbilled] logged ${report.needsAttention.length} open item(s); ` +
+            `oldest ${report.needsAttention[0].ageDays}d; ${stamped} row(s) stamped`,
+        );
+    },
+    budget: { durationMs: 60_000 },
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Invoice → PO Auto-Matcher — finds unmatched invoices and suggests PO matches.
 // Runs every 30 min. Auto-applies matches scoring ≥80 with exactly one candidate.

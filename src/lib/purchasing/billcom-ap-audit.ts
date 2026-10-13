@@ -564,3 +564,144 @@ export function selectStuckRowsToClose(stuck: ForwardRow[], ref: RefRow[]): Stuc
   }
   return out;
 }
+
+// ── Direction 1, all-time: forwards that never became a bill ────────────────
+
+/**
+ * Epoch ms for a ledger `forwarded_at`.
+ *
+ * SQLite writes them as "YYYY-MM-DD HH:MM:SS" in UTC (datetime('now')), which
+ * `Date.parse` reads as LOCAL time — on this box (UTC-6) an age computed that way
+ * is a fraction of a day short and can even come out negative. Pin the offset.
+ */
+export function ledgerEpochMs(s: string | null | undefined): number | null {
+  const raw = String(s || "").trim();
+  if (!raw) return null;
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw) ? `${raw.replace(" ", "T")}Z` : raw;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** A forward with no bill in the reference: the open item nobody was tracking. */
+export interface UnbilledForward {
+  id: number;
+  forwardedAt: string;
+  ageDays: number;
+  vendor: string;
+  invoice: string;
+  amount: number | null;
+  subject: string;
+  filename: string | null;
+}
+
+export interface LedgerBacklogReport {
+  /** Forwards examined: status FORWARDED, any age. */
+  examined: number;
+  /** Ledger ids whose bill IS in the reference; safe to stamp billcom_processed. */
+  confirmed: Array<{ id: number; bill: RefRow }>;
+  /** Nothing to chase: statement/packing list, or the FedEx no-Bill.com rule. */
+  excused: number;
+  /** No bill found for this forward. */
+  unbilled: UnbilledForward[];
+  /** Unbilled and older than `minAgeDays`: the ones needing attention. */
+  needsAttention: UnbilledForward[];
+}
+
+export interface LedgerBacklogOptions {
+  /** Age (days) before an unbilled forward counts as needing attention. */
+  minAgeDays?: number;
+  /** Clock override for tests. */
+  nowMs?: number;
+  /** Statement / packing-list gate, injected to keep this module dependency-free. */
+  isNonInvoice?: (fwd: ForwardRow) => boolean;
+}
+
+export const DEFAULT_BACKLOG_MIN_AGE_DAYS = 14;
+
+/**
+ * Every forward Aria ever sent, judged against the Bill.com reference.
+ *
+ * The windowed sweep above only sees the last `--days` of forwards, so a forward
+ * that produced no bill stopped being examined as soon as it aged out: Ferticell
+ * 2907 (8 forwards on 2026-06-18) and 8013 (3 on 2026-06-30) were invisible
+ * within a fortnight, and the ledger kept them as `FORWARDED` with
+ * `billcom_processed` unset (351 rows) because nothing ever wrote that column
+ * back. A forward should stay an open item until Bill.com shows a bill for it.
+ *
+ * Matching, in order:
+ *   1. same vendor + same invoice number as a reference row (any amount);
+ *   2. same vendor + same amount + a bill dated within 10 days (`findBillByAmountAndDate`),
+ *      which is how the vendors Bill.com renumbers resolve;
+ *   3. otherwise excused when the document is a statement/packing list, or the
+ *      sender is FedEx (never a Bill.com bill by rule);
+ *   4. otherwise unbilled.
+ *
+ * FedEx is judged on sender/OCR identity only, never the subject, so a vendor
+ * invoice that merely quotes a FedEx tracking number still counts.
+ */
+export function findUnbilledForwards(
+  forwards: ForwardRow[],
+  ref: RefRow[],
+  options: LedgerBacklogOptions = {},
+): LedgerBacklogReport {
+  const minAgeDays = options.minAgeDays ?? DEFAULT_BACKLOG_MIN_AGE_DAYS;
+  const nowMs = options.nowMs ?? Date.now();
+  const confirmed: Array<{ id: number; bill: RefRow }> = [];
+  const unbilled: UnbilledForward[] = [];
+  let examined = 0;
+  let excused = 0;
+
+  for (const fwd of forwards) {
+    if (String(fwd.status || "") !== "FORWARDED") continue;
+    examined++;
+
+    const haystack = vendorIdentityHaystack(fwd);
+    const invoice = deriveInvoice(fwd);
+    const amount = parseDollars(fwd.ocr_total);
+
+    const byNumber = ref.find(
+      (r) => r.invoice_amount !== null
+        && invoicesMatch(invoice, r.invoice_number)
+        && vendorsMatch(haystack, r.vendor_name || ""),
+    );
+    const bill = byNumber ?? findBillByAmountAndDate(ref, haystack, amount, fwd.forwarded_at);
+    if (bill) {
+      confirmed.push({ id: fwd.id, bill });
+      continue;
+    }
+
+    if (options.isNonInvoice?.(fwd)) {
+      excused++;
+      continue;
+    }
+
+    const sender = parseSender(fwd.email_from);
+    const identity = normVendor(`${fwd.ocr_vendor_name || ""} ${sender.display} ${sender.domain}`);
+    if (identity.includes("fedex")) {
+      excused++;
+      continue;
+    }
+
+    const fwdMs = ledgerEpochMs(fwd.forwarded_at);
+    const ageDays = fwdMs === null ? 0 : Math.max(0, Math.floor((nowMs - fwdMs) / 86_400_000));
+    unbilled.push({
+      id: fwd.id,
+      forwardedAt: String(fwd.forwarded_at || ""),
+      ageDays,
+      vendor: (fwd.ocr_vendor_name || sender.display || sender.domain || "?").trim(),
+      invoice,
+      amount,
+      subject: fwd.email_subject || "",
+      filename: fwd.pdf_filename || null,
+    });
+  }
+
+  unbilled.sort((a, b) => b.ageDays - a.ageDays);
+  return {
+    examined,
+    confirmed,
+    excused,
+    unbilled,
+    needsAttention: unbilled.filter((u) => u.ageDays >= minAgeDays),
+  };
+}

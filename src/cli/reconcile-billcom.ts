@@ -55,6 +55,7 @@ import {
   normVendor,
   parseDollars,
   parseSender,
+  findUnbilledForwards,
   selectStuckRowsToClose,
   vendorsMatch,
   vendorHaystack,
@@ -821,6 +822,24 @@ async function main(): Promise<void> {
   // BLOCKED rows are deliberate: the PDF was a payment confirmation / paid invoice.
   const stuckNeedsAttention = stuckRemaining.filter((s) => !/^BLOCKED:/i.test(String(s.error_message || "")));
 
+  // ── All-time backlog: a forward stays open until Bill.com shows a bill ──────
+  // The windowed sweep above forgets a forward once it is older than --days, so a
+  // forward that produced no bill silently became nobody's problem (Ferticell
+  // 2907: 8 forwards on 2026-06-18, no bill, missed for 117 days). This pass
+  // looks at every FORWARDED row ever, stamps billcom_processed on the ones whose
+  // bill is now in the reference, and reports the rest with their age.
+  const backlog = findUnbilledForwards(allForwards, refRows, {
+    minAgeDays: 14,
+    isNonInvoice: (f) => isStatementDocument(f.email_subject || "", f.pdf_filename || "", f.email_from || ""),
+  });
+  let backlogStamped = 0;
+  if (closeStuck && backlog.confirmed.length > 0) {
+    const stamp = db.prepare(
+      "UPDATE ap_local_forwards SET billcom_processed = 1 WHERE id = ? AND COALESCE(billcom_processed, 0) = 0",
+    );
+    for (const c of backlog.confirmed) backlogStamped += stamp.run(c.id).changes;
+  }
+
   const kinds = verdicts.reduce<Record<string, number>>((acc, v) => {
     acc[v.kind] = (acc[v.kind] || 0) + 1;
     return acc;
@@ -858,6 +877,11 @@ async function main(): Promise<void> {
     `[reconcile-billcom] Stuck ledger rows: ${stuckRows.length} ` +
     `(${closed.length} closed this run${closeStuck ? "" : ", heal disabled"}, ${stuckNeedsAttention.length} need attention)`,
   );
+  console.log(
+    `[reconcile-billcom] Forwarded-never-billed backlog: ${backlog.unbilled.length} of ${backlog.examined} forwards ` +
+    `(${backlog.confirmed.length} confirmed in Bill.com${closeStuck ? `, ${backlogStamped} now stamped` : ", stamping disabled"}, ` +
+    `${backlog.excused} excused, ${backlog.needsAttention.length} older than 14d)`,
+  );
 
   if (
     verdicts.length === 0
@@ -866,6 +890,7 @@ async function main(): Promise<void> {
     && actionableNoRecord.length === 0
     && stuckNeedsAttention.length === 0
     && landedByAmount.length === 0
+    && backlog.needsAttention.length === 0
   ) {
     console.log("\n✓ Nothing missing, needing review, or miskeyed.");
     process.exit(0);
@@ -878,6 +903,17 @@ async function main(): Promise<void> {
         `[DIRECT_PAY] ${v.forwarded_at} | ${v.vendor} | #${v.invoice} | $${v.amount ?? "?"} | ${v.pdf_filename}`,
       );
       console.log(`        ${v.detail}`);
+    }
+  }
+
+  if (backlog.needsAttention.length > 0) {
+    console.log("\n=== FORWARDED, NO BILL IN BILL.COM (open items, oldest first) ===");
+    for (const u of backlog.needsAttention) {
+      console.log(
+        `[UNBILLED] ${u.ageDays}d | ${String(u.forwardedAt).slice(0, 10)} | ${u.vendor} | ` +
+        `#${u.invoice || "?"} | $${u.amount ?? "?"} | ${u.filename || ""}`,
+      );
+      console.log(`        ${u.subject}`);
     }
   }
 
