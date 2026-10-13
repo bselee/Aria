@@ -103,8 +103,9 @@ describe("purchasing cache + scan scheduler", () => {
         return { value: null, at: 0, promise: null };
     }
 
-    it("serves a persisted snapshot on a cold slot and reports the refresh, without scanning", async () => {
-        persistSnapshotFile("resale", Date.now() - 31 * 60 * 1000);
+    it("serves a persisted snapshot on a cold slot and reports an overdue refresh, without scanning", async () => {
+        // Past one cadence (60 min) + grace (15 min): the scheduler is behind.
+        persistSnapshotFile("resale", Date.now() - 80 * 60 * 1000);
         holdScanLock();
 
         const { readSWR } = await import("./cache");
@@ -116,6 +117,23 @@ describe("purchasing cache + scan scheduler", () => {
         expect(result.value).toEqual(cachedGroups);
         expect(result.refreshing).toBe(true);
         // THE contract change: a poll must never run a pipeline.
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it("does not mark a snapshot stale while the scheduler is still on time", async () => {
+        // 40 min old on a 60-min cadence is on schedule - the panel must not
+        // claim to be refreshing for most of every hour.
+        persistSnapshotFile("resale", Date.now() - 40 * 60 * 1000);
+        holdScanLock();
+
+        const { readSWR } = await import("./cache");
+        const fetcher = vi.fn(async () => []);
+        const coldSlot = emptySlot();
+
+        const result = await readSWR(coldSlot, fetcher, false, "resale");
+
+        expect(result.value).toEqual(cachedGroups);
+        expect(result.refreshing).toBe(false);
         expect(fetcher).not.toHaveBeenCalled();
     });
 

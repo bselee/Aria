@@ -99,7 +99,20 @@ if (stash.refreshWanted === undefined) stash.refreshWanted = false;
 
 export const resaleSlot = stash.resale;
 export const bomSlot = stash.bom;
-export const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+/**
+ * Extra grace beyond the cadence before a snapshot counts as stale.
+ *
+ * HERMIA(2026-10-13): the freshness check is aligned with the scan CADENCE, not
+ * a fixed 30 min. With a 60-min cycle, a flat 30-min TTL marked every read
+ * stale, so the panel showed "Refreshing..." for most of every hour even though
+ * the scheduler was exactly on time. Stale now means THE SCHEDULER IS BEHIND.
+ */
+export const SNAPSHOT_GRACE_MS = 15 * 60 * 1000;
+
+/** Age at which a snapshot is reported stale: one cadence plus a grace window. */
+export function snapshotTtlMs(): number {
+    return minCycleGapMs() + SNAPSHOT_GRACE_MS;
+}
 
 /** Windows used by the scheduled cycle. Both pipelines share one cadence. */
 export const SCAN_RESALE_DAYS = 365;
@@ -425,7 +438,7 @@ export async function readSWR(
 ): Promise<{ value: PurchasingGroup[]; refreshing: boolean }> {
     if (cacheKey) hydrateFromDisk(slot, cacheKey);
 
-    const stale = force || !slot.value || Date.now() - slot.at > CACHE_TTL;
+    const stale = force || !slot.value || Date.now() - slot.at > snapshotTtlMs();
 
     // A window the scheduler does not produce (e.g. ?daysBack=730) still gets a
     // real scan, serialized behind the cycle lock so it cannot overlap one.
