@@ -483,6 +483,54 @@ describe("findPOCandidates with Tier A auto-match", () => {
         expect(hasConfirmedReason).toBe(true);
     });
 
+    it("does not let a confirmed match take an invoice its PO cannot cover", async () => {
+        // Ferticell invoice 2907 ($7,243.02) against the two Ferticell POs open
+        // that day: 124904 ($7,353.28, ordered 1 day before) and 124857
+        // ($4,682.08, ordered 16 days before, already invoice 2880's PO and
+        // human-confirmed for the vendor from 2880's approval).
+        const invoice: InvoiceToMatch = {
+            id: "inv-2907",
+            invoiceNumber: "2907",
+            vendorName: "Ferticell",
+            invoiceDate: "2026-06-11",
+            subtotal: 6922.96,
+            freight: 320.06,
+            tax: 0,
+            total: 7243.02,
+        };
+
+        stubDbForPoSearch([
+            {
+                po_number: "124904",
+                vendor_name: "Ferticell",
+                issue_date: "2026-06-10",
+                total_amount: 7353.28,
+                total: null,
+                status: "received",
+            },
+            {
+                po_number: "124857",
+                vendor_name: "Ferticell",
+                issue_date: "2026-05-26",
+                total_amount: 4682.08,
+                total: null,
+                status: "received",
+            },
+        ], [{
+            vendor_name: "Ferticell",
+            po_number: "124857",
+        }]);
+
+        const result = await findPOCandidates(invoice);
+
+        expect(result.autoApplyReady).toBe(true);
+        expect(result.bestMatch!.orderId).toBe("124904");
+        const shortPo = result.candidates.find(c => c.orderId === "124857");
+        expect(shortPo).toBeDefined();
+        expect(shortPo!.reasons.some(r => r.includes("previously confirmed"))).toBe(false);
+        expect(shortPo!.score).toBeLessThan(90);
+    });
+
     it("exact OCR match takes priority over confirmed match", async () => {
         const invoice: InvoiceToMatch = {
             id: "inv-priority",

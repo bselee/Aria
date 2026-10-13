@@ -97,6 +97,8 @@ export interface InvoiceToMatch {
     ocrPoCandidate?: string | null;
     /** Raw OCR-extracted order reference (alternative PO source, e.g. "orderRef" or "orderNumber"). */
     ocrOrderCandidate?: string | null;
+    /** Display name from the sending mailbox. OCR vendor names miss (Miles arrives as Fermented Plant Extracts). */
+    senderName?: string | null;
 }
 
 export interface POCandidate {
@@ -122,6 +124,13 @@ export interface MatchResult {
 const DATE_WINDOW_DAYS = 60;
 const AUTO_APPLY_THRESHOLD = 80;
 const MIN_SCORE_FOR_SUGGESTION = 50;
+/**
+ * Headroom allowed when a human-confirmed vendor→PO pair is applied to a later
+ * invoice. Freight and tax can push an invoice past its PO by a few percent, so
+ * the pair may boost a PO up to 25% below the invoice; beyond that the PO
+ * cannot plausibly be this invoice's PO and the boost is withheld.
+ */
+const CONFIRMED_COVER_TOLERANCE = 1.25;
 
 // ── Scoring ────────────────────────────────────────────────────────────────
 
@@ -162,6 +171,13 @@ function scoreDateProximity(invDate: string, poDate: string): { score: number; r
 }
 
 // ── Main matcher ───────────────────────────────────────────────────────────
+
+function senderDisplayName(raw: string | null | undefined): string {
+    if (!raw) return "";
+    const name = String(raw).split("<")[0].replace(/["']/g, "").trim();
+    if (!name || name.includes("@")) return "";
+    return name;
+}
 
 /**
  * Extract significant search terms from a vendor name for fallback matching.
@@ -299,6 +315,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // Normalize vendor name: extract significant words for broader matching.
     // "Miles Filippelli" from OCR should match "Miles Nursery LLC" in purchase_orders.
     const searchTerms = extractSearchTerms(invoice.vendorName);
+    const senderTerms = extractSearchTerms(invoice.senderName || "");
 
     // Search purchase_orders: try exact ilike first, then word-based if no results
     let { data: pos } = await db
@@ -309,8 +326,8 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         .limit(20);
 
     // If no direct match, try each significant search term
-    if ((!pos || pos.length === 0) && searchTerms.length > 0) {
-        for (const term of searchTerms) {
+    if ((!pos || pos.length === 0) && (searchTerms.length > 0 || senderTerms.length > 0)) {
+        for (const term of [...searchTerms, ...senderTerms]) {
             const { data: termResults } = await db
                 .from("purchase_orders")
                 .select("po_number, vendor_name, issue_date, total_amount, total, status")
@@ -320,6 +337,24 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             if (termResults && termResults.length > 0) {
                 pos = termResults;
                 break;
+            }
+        }
+    }
+
+    if (senderTerms.length > 0) {
+        const seen = new Set<string>((pos || []).map((p: any) => p.po_number));
+        for (const term of senderTerms) {
+            const { data: termResults } = await db
+                .from("purchase_orders")
+                .select("po_number, vendor_name, issue_date, total_amount, total, status")
+                .ilike("vendor_name", `%${term}%`)
+                .order("issue_date", { ascending: false })
+                .limit(20);
+            for (const row of termResults || []) {
+                if (row?.po_number && !seen.has(row.po_number)) {
+                    seen.add(row.po_number);
+                    pos = [...(pos || []), row];
+                }
             }
         }
     }
@@ -358,6 +393,12 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
 
     for (const po of (pos || []) as any[]) {
         let vendorScore = scoreVendorName(invoice.vendorName, po.vendor_name || "");
+        if (vendorScore.score < 30 && invoice.senderName) {
+            const fromScore = scoreVendorName(invoice.senderName, po.vendor_name || "");
+            if (fromScore.score > vendorScore.score) {
+                vendorScore = { score: fromScore.score, reason: `sender match: ${invoice.senderName}` };
+            }
+        }
         const dateScore = scoreDateProximity(invoice.invoiceDate, po.issue_date || "");
 
         // ── Alias-match detection ───────────────────────────────────────────
@@ -417,7 +458,25 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
 
         let total = vendorScore.score + dateScore.score;
         if (confirmedMatchReason) {
-            total = 95;
+            // A confirmed pair is vendor→PO learning from a human approving ONE
+            // invoice (confirmed_po_matches), so it says nothing about whether
+            // THIS invoice belongs to that PO. Only let it boost a PO that could
+            // still cover the invoice; otherwise the boost hands the link to the
+            // wrong PO. Ferticell 2907 ($7,243.02) rode Ferticell→124857
+            // ($4,682.08, which invoice 2880 owns) to a 95 and took the link from
+            // the correct PO 124904. Freight and tax routinely push an invoice a
+            // few percent past its PO, so allow that headroom and block only a PO
+            // that cannot come close to covering the amount.
+            const poTotalForConfirm = Number(po.total_amount || po.total || 0);
+            if (
+                invoice.total > 0 &&
+                poTotalForConfirm > 0 &&
+                poTotalForConfirm * CONFIRMED_COVER_TOLERANCE < invoice.total
+            ) {
+                confirmedMatchReason = null;
+            } else {
+                total = 95;
+            }
         }
 
         // When invoice total is $0 (bad OCR), still surface the match on
@@ -556,13 +615,42 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                 "unique vendor+date±14d"
             );
             candidates.sort((a, b) => b.score - a.score);
-            autoApplyReady = !isDropshipPo(tightCandidates[0].orderId);
+            // The tight window is only conclusive if its winner is also the
+            // best-scoring candidate. A higher score from elsewhere means the
+            // evidence conflicts (see the confirmed-match boost), so surface
+            // both for review instead of auto-linking to the wrong PO.
+            autoApplyReady = candidates[0] === tightCandidates[0]
+                && !isDropshipPo(tightCandidates[0].orderId);
         }
     }
 
     // Final guard: never auto-apply a dropship PO
     if (autoApplyReady && candidates[0] && isDropshipPo(candidates[0].orderId)) {
         autoApplyReady = false;
+    }
+
+    // Partial deliveries (Miles, Thrive) must still link. Amount equality is a
+    // close gate, not a link gate. If exactly one open PO for this vendor can
+    // cover the invoice and was ordered on or before the invoice date, that is
+    // the link.
+    if (!autoApplyReady && invoice.total > 0) {
+        const invDay = (invoice.invoiceDate || "").slice(0, 10);
+        const covering = candidates.filter(c => {
+            if (isDropshipPo(c.orderId)) return false;
+            const named = scoreVendorName(invoice.vendorName, c.vendorName).score >= 30
+                || scoreVendorName(invoice.senderName || "", c.vendorName).score >= 30;
+            if (!named) return false;
+            if (c.total + 0.5 < invoice.total) return false;
+            const poDay = (c.orderDate || "").slice(0, 10);
+            if (invDay && poDay && poDay > invDay) return false;
+            return c.isOpen || ["open", "partial", "committed"].includes((c.status || "").toLowerCase());
+        });
+        if (covering.length === 1) {
+            covering[0].score = Math.max(covering[0].score, 90);
+            covering[0].reasons.push("only open PO that can cover this invoice");
+            candidates.sort((a, b) => b.score - a.score);
+            autoApplyReady = !isDropshipPo(covering[0].orderId);
+        }
     }
 
     return { invoice, candidates, bestMatch: candidates[0] || null, autoApplyReady };
@@ -666,6 +754,7 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
             total: Number(inv.total || 0),
             ocrPoCandidate: inv.raw_data?.poNumber || null,
             ocrOrderCandidate: inv.raw_data?.orderRef || inv.raw_data?.orderNumber || null,
+            senderName: senderDisplayName(inv.raw_data?.email_from),
         };
 
         const result = await findPOCandidates(invoice);
