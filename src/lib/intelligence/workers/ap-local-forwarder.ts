@@ -213,6 +213,34 @@ function isNonInvoiceSender(from: string, subject: string): boolean {
 }
 
 /**
+ * AAA Cooper correspondence bundles — statements, reply threads, and the
+ * multi-invoice "Correspondence" PDFs Becky sends on request — are NOT
+ * individual invoices. They bundle invoices that need manual splitting,
+ * customer-number redaction, and forwarding, so the standard single-invoice
+ * treatment would double-forward or mis-redact them (clipping the Pro#).
+ *
+ * Flag these and leave them UNREAD + INBOX so Bill can address them directly
+ * (2026-10-13) until AAA Cooper payments/reconciliation smooth out, instead of
+ * the forwarder silently marking them read and archiving them.
+ *
+ * Individual invoices ("Invoice Stmt - Cust 0001159492 Pro#: N", or a bare
+ * Pro# subject) are NOT correspondence — those still forward normally.
+ *
+ * @param from    raw Gmail From header
+ * @param subject raw Gmail Subject header
+ * @returns true when the email is AAA Cooper correspondence (not an individual invoice)
+ */
+export function isAaaCooperCorrespondence(from: string, subject: string): boolean {
+    const fromLower = (from || "").toLowerCase();
+    const subjectLower = (subject || "").toLowerCase();
+    if (!fromLower.includes("aaacooper")) return false;
+    const isIndividualInvoice =
+        subjectLower.includes("invoice stmt") ||
+        /^\s*\d{5,10}\s*$/.test((subject || "").trim());
+    return !isIndividualInvoice;
+}
+
+/**
  * One-stop junk classifier for the local forwarder's pre-send gate.
  *
  * Exported so the policy is unit-testable (ap-local-forwarder-junk.test.ts)
@@ -1361,6 +1389,26 @@ export async function runLocalApForward(opts?: {
             // leave the email UNREAD so Bill can manually fix the bill number.
             const isAaaCooper = from.toLowerCase().includes("aaacooper");
             const aaaProNumber = isAaaCooper ? extractAaaProNumber(subject) : null;
+
+            // AAA Cooper correspondence bundles (statements, reply threads,
+            // multi-invoice "Correspondence" PDFs) are NOT individual invoices.
+            // Leave them UNREAD + INBOX for manual review (Bill, 2026-10-13)
+            // instead of silently archiving — they need manual split + redaction
+            // before Bill.com entry. Individual "Invoice Stmt ... Pro#: N" emails
+            // are NOT correspondence and still forward below.
+            if (isAaaCooperCorrespondence(from, subject)) {
+                console.log(`   [AP-Local] AAA Cooper correspondence — leaving UNREAD: ${subject.slice(0, 60)}`);
+                recordSkippedForward({
+                    gmailMessageId,
+                    emailFrom: from,
+                    emailSubject: subject,
+                    pdfFilename: "(correspondence-bundle)",
+                    reason: "AAA Cooper correspondence/statement bundle (left unread for manual review)",
+                    vendorRoutingAction: "review",
+                });
+                summary.skipped++;
+                continue; // NOT markEmailProcessed — keep INBOX + UNREAD so Bill sees it.
+            }
 
             // Skip known non-invoice senders (tracking notifications, etc.)
             if (isNonInvoiceSender(from, subject)) {

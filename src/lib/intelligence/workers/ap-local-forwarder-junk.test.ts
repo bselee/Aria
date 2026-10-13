@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 import { isFedExFreightOnlineBill } from "@/lib/intelligence/ap/fedex-billing-packet";
-import { isNonInvoiceEmail } from "./ap-local-forwarder";
+import { isNonInvoiceEmail, isAaaCooperCorrespondence } from "./ap-local-forwarder";
 
 describe("isNonInvoiceEmail — junk pre-send gate", () => {
     // ── AAA Cooper remittance threads (must skip) ─────────────────────────
@@ -207,6 +207,62 @@ describe("isNonInvoiceEmail — junk pre-send gate", () => {
                 from: "accounts.receivable@uline.com",
                 subject: "RE: Uline Invoice 211897049 ID# 16",
             }),
+        ).toBe(false);
+    });
+});
+
+describe("isAaaCooperCorrespondence — correspondence bundle vs individual invoice", () => {
+    it("flags the statement email (Statement for Buildasoil)", () => {
+        expect(
+            isAaaCooperCorrespondence(
+                "Becky Seehaver <BECKY.SEEHAVER@aaacooper.com>",
+                "Statement for Buildasoil",
+            ),
+        ).toBe(true);
+    });
+
+    it("flags the correspondence bundle (Account 1159492 - BUILDASOIL)", () => {
+        expect(
+            isAaaCooperCorrespondence(
+                "AAA Cooper Transportation <correspondence.aaacooper@jas.collectiontoolbox.com>",
+                "Account 1159492 - BUILDASOIL",
+            ),
+        ).toBe(true);
+    });
+
+    it("flags a RE: reply thread", () => {
+        expect(
+            isAaaCooperCorrespondence(
+                "Becky Seehaver <BECKY.SEEHAVER@aaacooper.com>",
+                "RE: Need remittance",
+            ),
+        ).toBe(true);
+    });
+
+    it("flags the aging/statement thread (RE: BUILDASOIL #1159492)", () => {
+        expect(
+            isAaaCooperCorrespondence(
+                "act.statement@aaacooper.com",
+                "RE: BUILDASOIL #1159492",
+            ),
+        ).toBe(true);
+    });
+
+    it("does NOT flag an individual invoice stmt with Pro#", () => {
+        expect(
+            isAaaCooperCorrespondence(
+                "act.statement@aaacooper.com",
+                "Invoice Stmt - Cust 0001159492 Pro#: 35943009",
+            ),
+        ).toBe(false);
+    });
+
+    it("does NOT flag a non-AAA-Cooper sender", () => {
+        expect(
+            isAaaCooperCorrespondence(
+                "accounts.receivable@uline.com",
+                "Statement for Buildasoil",
+            ),
         ).toBe(false);
     });
 });
