@@ -24,6 +24,35 @@ import {
     rawIngredientMaximumLabel,
 } from "./raw-ingredient-minimums";
 
+/**
+ * Human label for the signal driving a product's daily rate.
+ *
+ * HERMIA(2026-10-15): a `ledger` rate comes from stock MOVEMENT (builds, stock
+ * changes and takes, returns) — units that LEFT. Those rates were labelled
+ * "receipts", which reads as inbound and hid that a consumable's rate is driven
+ * by the crew's stock changes. Only a genuine `receipts` rate is inbound, so only
+ * it keeps that word.
+ *
+ * @param source   Signal that produced the rate ("none" when it is only a fallback).
+ * @param daysBack Window in days the rate was measured over.
+ * @returns        Label for the ordering row's explanation.
+ */
+export function dailyRateLabel(
+    source: "demand" | "sales" | "receipts" | "ledger" | "none" | undefined,
+    daysBack: number,
+): string {
+    switch (source) {
+        case "demand":
+            return "90d demand";
+        case "sales":
+            return `${daysBack}d sales`;
+        case "ledger":
+            return `${daysBack}d stock movement`;
+        default:
+            return `${daysBack}d receipts`;
+    }
+}
+
 // Bumped on every behavioral change so the calibration loop can bucket
 // error rates per formula. See .agents/plans/2026-05-05-canonical-recommender.md.
 //   v2.0-calibrated-2026-05-05 — phase 2 calibration baseline

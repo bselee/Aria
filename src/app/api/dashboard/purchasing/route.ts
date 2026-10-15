@@ -11,6 +11,9 @@ import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/pu
 import {
     buildRecentOpenCoverageByProduct,
     mergeOpenPOsWithRecentCoverage,
+    partitionOpenPOsByAnomaly,
+    isAnomalousOpenPo,
+    anomalousCoverNote,
 } from '@/lib/purchasing/ordering-po-coverage';
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
 
@@ -235,25 +238,54 @@ export async function GET(req: NextRequest) {
 
             const needQty = Math.max(1, line.item.suggestedQty ?? 1);
 
+            // HERMIA(2026-10-15, Bill): "POs this old need to be assessed. Items rarely
+            // take this long and should be treated as an anomaly." An open PO only counts
+            // as cover while it is still credible; past its lead-time envelope it is an
+            // anomaly, not supply. DASH101's 125349 sat ORDER_LOCKED for 246d, never
+            // received, and suppressed a reorder the whole time while the shelf drained.
+            // Anomalous POs are dropped from the cover math and named in the row instead.
+            const leadForPoAnomaly = Number.isFinite((line.item as { effectiveLeadTimeDays?: number }).effectiveLeadTimeDays)
+                ? (line.item as { effectiveLeadTimeDays?: number }).effectiveLeadTimeDays
+                : line.item.leadTimeDays;
+            const { credible: credibleOpenPOs, anomalous: anomalousOpenPOs } =
+                partitionOpenPOsByAnomaly(mergedOpenPOs, leadForPoAnomaly);
+            const anomalousQty = anomalousOpenPOs.reduce(
+                (sum: number, po: { quantity?: number }) => sum + Math.max(0, Number(po.quantity) || 0),
+                0,
+            );
+
             // HERMIA(2026-07-08): Draft PO in Finale counts as coverage even though
-            // getProductActivity() only returns Committed/Locked as "open".
+            // getProductActivity() only returns Committed/Locked as "open". An aged
+            // draft is not credible cover either.
             const hasDraftCoverage = draftPOInfo != null
-                && draftPOInfo.quantity >= needQty;
+                && draftPOInfo.quantity >= needQty
+                && !isAnomalousOpenPo(draftPOInfo.orderDate, leadForPoAnomaly);
 
             // HERMIA(2026-07-10 + 2026-08-06): Open (committed/locked/sent) POs suppress
             // re-order when qty covers suggested need OR policy already held. Recent-PO
             // overlay covers the gap between commit and slow SWR rescan.
-            const openPoQty = mergedOpenPOs.reduce(
+            const openPoQty = credibleOpenPOs.reduce(
                 (sum: number, po: { quantity?: number }) => sum + Math.max(0, po.quantity || 0),
                 0,
             );
-            const recentOpenQty = recentCov?.totalQty ?? 0;
+            const recentOpenQty = (recentCov?.allHits ?? [])
+                .filter((h) => !isAnomalousOpenPo(h.orderDate, leadForPoAnomaly))
+                .reduce((sum: number, h) => sum + Math.max(0, h.quantity || 0), 0);
             const effectiveOpenQty = Math.max(openPoQty, recentOpenQty);
             const openPoCoversSuggested = effectiveOpenQty >= needQty;
-            const policyHeldForOnOrder = (line.assessment?.reasonCodes ?? []).includes('on_order_already_covers_need');
+            // The scan's `on_order_already_covers_need` reason is a CLAIM about cover that may
+            // have been made entirely from POs we now consider anomalies. It can only stand
+            // if some credible cover survives, otherwise a row whose only "cover" is a PO
+            // nobody closed stays held off the board forever (the DASH101 / LY102 defect).
+            const coverWasAnomalyOnly = anomalousOpenPOs.length > 0
+                && effectiveOpenQty === 0
+                && credibleOpenPOs.length === 0
+                && !hasDraftCoverage;
+            const policyHeldForOnOrder = !coverWasAnomalyOnly
+                && (line.assessment?.reasonCodes ?? []).includes('on_order_already_covers_need');
             const hasOpenPoCoverage = !hasDraftCoverage
                 && (openPoCoversSuggested || policyHeldForOnOrder)
-                && (mergedOpenPOs.length > 0 || recentOpenQty > 0);
+                && (credibleOpenPOs.length > 0 || recentOpenQty > 0);
 
             let assessment = line.assessment;
             let urgency = line.item.urgency;
@@ -267,7 +299,7 @@ export async function GET(req: NextRequest) {
                 };
                 urgency = 'ok' as const;
             } else if (hasOpenPoCoverage) {
-                const primaryPo = mergedOpenPOs[0]
+                const primaryPo = credibleOpenPOs[0]
                     ?? recentCov?.openHits[0]
                     ?? recentCov?.allHits[0];
                 const primaryId = primaryPo?.orderId ?? '?';
@@ -284,12 +316,30 @@ export async function GET(req: NextRequest) {
                 urgency = 'ok' as const;
             }
 
+            // Anomalous cover is not supply, so drop it from the displayed on-order too:
+            // a row must never show a phantom "320 on order" for goods that shipped in
+            // February. The anomaly is named in the row instead.
+            const scanOnOrderCredible = Math.max(0, (line.item.stockOnOrder ?? 0) - anomalousQty);
+
             // When covered by open/draft PO, surface open qty as stockOnOrder.
             // Any hold decision zeros suggested qty so cards never show "order 1000" while holding.
             const covered = hasDraftCoverage || hasOpenPoCoverage;
             const displayOnOrder = covered
-                ? Math.max(line.item.stockOnOrder ?? 0, effectiveOpenQty, draftPOInfo?.quantity ?? 0)
-                : line.item.stockOnOrder;
+                ? Math.max(scanOnOrderCredible, effectiveOpenQty, draftPOInfo?.quantity ?? 0)
+                : scanOnOrderCredible;
+
+            // HERMIA(2026-10-15): surface the anomaly ON the row, so a PO nobody closed is
+            // assessed rather than quietly holding a SKU off the board (or quietly ordering
+            // against cover that does not exist). Emitted as the row's own explanation too:
+            // `...line.item` below would otherwise re-emit the SCAN's stale text, which still
+            // says "covered" from the very POs we just excluded.
+            const anomalyNote = anomalousOpenPOs.length > 0 ? anomalousCoverNote(anomalousOpenPOs) : '';
+            if (anomalyNote) {
+                assessment = {
+                    ...assessment,
+                    explanation: [assessment.explanation, anomalyNote].filter(Boolean).join(' '),
+                };
+            }
             const isHold = assessment.decision === 'hold' || assessment.decision === 'manual_review';
             const displaySuggested = isHold
                 ? 0
@@ -328,6 +378,11 @@ export async function GET(req: NextRequest) {
                 commitGuard: assessPOCommitGuard(line),
                 draftPO: draftPOInfo,
                 urgency: displayUrgency,
+                // The scan's stale explanation refers to cover we just excluded; when an
+                // anomaly is present the row carries the corrected text instead.
+                explanation: anomalyNote
+                    ? [line.item.explanation, anomalyNote].filter(Boolean).join(' ')
+                    : line.item.explanation,
             };
         });
 

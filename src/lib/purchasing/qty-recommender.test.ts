@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { QTY_FORMULA_VERSION, recommendQty, snapToIncrement, type RecommenderInput } from "./qty-recommender";
+import { QTY_FORMULA_VERSION, recommendQty, snapToIncrement, dailyRateLabel, type RecommenderInput } from "./qty-recommender";
 
 function baseInput(overrides: Partial<RecommenderInput> = {}): RecommenderInput {
     return {
@@ -836,6 +836,27 @@ describe("recommendQty — v2.6 historical order floor", () => {
         expect(result.suggestedQty).toBeLessThan(50);
         expect(result.provenance.some(s => s.step === "last_purchase_floor")).toBe(false);
         expect(result.reviewReasons.join(" ")).toMatch(/last order/i);
+    });
+});
+
+describe("dailyRateLabel", () => {
+    it("names the demand and sales windows", () => {
+        expect(dailyRateLabel("demand", 365)).toBe("90d demand");
+        expect(dailyRateLabel("sales", 365)).toBe("365d sales");
+        expect(dailyRateLabel("sales", 90)).toBe("90d sales");
+    });
+
+    it("does not call stock movement 'receipts'", () => {
+        // DASH101: 2.9/day driven by the crew's stock changes, not by anything inbound.
+        expect(dailyRateLabel("ledger", 365)).toBe("365d stock movement");
+        expect(dailyRateLabel("ledger", 90)).toBe("90d stock movement");
+    });
+
+    it("keeps 'receipts' for a genuine receipts rate only", () => {
+        expect(dailyRateLabel("receipts", 365)).toBe("365d receipts");
+        // Fallback rates keep the previous wording: behaviour preserved.
+        expect(dailyRateLabel("none", 365)).toBe("365d receipts");
+        expect(dailyRateLabel(undefined, 365)).toBe("365d receipts");
     });
 });
 

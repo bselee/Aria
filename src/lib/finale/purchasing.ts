@@ -5,7 +5,7 @@
  * @created 2026-05-26
  */
 
-import { recommendQty, velocityScaledSafetyDays } from "@/lib/purchasing/qty-recommender";
+import { recommendQty, velocityScaledSafetyDays, dailyRateLabel } from "@/lib/purchasing/qty-recommender";
 import { applySmartMOQTopUp } from "@/lib/purchasing/moq-topup";
 import { getPackSizes } from "@/lib/purchasing/pack-size-registry";
 import { DEFAULT_LEAD_TIME_DAYS } from "@/lib/constants";
@@ -3105,12 +3105,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     if (dailyRate === 0) continue; // no actual movement within windows
 
 
-                    // Identify which signal is driving the rate (for explanation)
-                    const rateSourceLabel = rateSource === "demand"
-                        ? "90d demand"
-                        : rateSource === "sales"
-                            ? `${daysBack}d sales`
-                            : `${daysBack}d receipts`;
+                    // Identify which signal is driving the rate (for explanation).
+                    const rateSourceLabel = dailyRateLabel(rateSource, daysBack);
 
                     // HERMIA(2026-06-12): Use Finale's stockAvailable (stockOnHand minus
                     // committed) when it's meaningfully lower than raw stockOnHand. This

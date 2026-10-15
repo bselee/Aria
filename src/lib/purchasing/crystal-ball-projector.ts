@@ -303,7 +303,13 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
         stockOnOrder,
         dailyRate,
         dailyRateSource: item.dailyRateSource || 'sales',
-        dailyRateLabel: item.dailyRateSource === 'demand' ? 'demand burn' : item.dailyRateSource === 'receipts' ? 'receipt velocity' : 'sales rate',
+        // HERMIA(2026-10-15): a `ledger` rate is stock movement (builds, stock changes and
+        // takes), not sales — it was falling through to 'sales rate' and mislabelling
+        // consumables that are only ever moved by the crew's stock changes.
+        dailyRateLabel: item.dailyRateSource === 'demand' ? 'demand burn'
+            : item.dailyRateSource === 'receipts' ? 'receipt velocity'
+                : item.dailyRateSource === 'ledger' ? 'stock movement'
+                    : 'sales rate',
         unitPrice: item.unitPrice ?? 0,
         salesVelocity: item.salesVelocity ?? 0,
         demandVelocity: item.demandVelocity ?? 0,
