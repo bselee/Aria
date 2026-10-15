@@ -55,6 +55,7 @@ import {
 import { isMissingLabelArtworkSku } from "./purchasing-sku-skip";
 import { getFreshCachedSkus, upsertSkuCache, cachedRowToProductDetail } from "./finale-sku-cache";
 import {
+    FinaleCoreClient,
     type FinaleReorderMethod,
     parseFinaleNumber,
     parseISODateOnly,
@@ -2195,14 +2196,24 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         const fgVelocities: FGVelocity[] = [];
         const skuQueue = [...activeSkus];
 
-        await Promise.all(Array.from({ length: 3 }, async () => {
+        await Promise.all(Array.from({ length: 2 }, async () => {
             while (skuQueue.length > 0) {
                 const sku = skuQueue.shift()!;
                 // Skip SKUs we've already proven have no BOM (saves ~80% of
                 // network roundtrips on warm scans).
                 if (_skuHasNoBomCache.has(sku)) continue;
                 try {
+                    const rateLimitHitsBefore = FinaleCoreClient.rateLimitState().hits;
                     const bom = await this.getBillOfMaterials(sku);
+                    // HERMIA(2026-10-15): getBillOfMaterials() swallows a 429 into [] just
+                    // like a genuine "no BOM". Caching that as "no BOM" is what emptied the
+                    // board: _skuHasNoBomCache is in-process with no TTL, so one 429 storm
+                    // marked the catalog BOM-less for the life of the process (live: 0 of
+                    // 304 board rows were bom-component). The 429 counter is monotonic, so
+                    // a bump means this fetch was rate limited, not an answer.
+                    if (bom.length === 0 && FinaleCoreClient.rateLimitState().hits > rateLimitHitsBefore) {
+                        continue;
+                    }
                     if (bom.length === 0) {
                         _skuHasNoBomCache.add(sku);
                         continue; // not an FG
@@ -2227,10 +2238,16 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 } catch (err: any) {
                     console.error(`[bom-demand] FG ${sku} failed:`, err.message);
                 }
-                await new Promise(r => setTimeout(r, 100));
+                await new Promise(r => setTimeout(r, 200));
             }
         }));
 
+        // HERMIA(2026-10-15): note that an empty result here can mean either "no BOMs
+        // exist" (never true for this catalog) or "the BOM fetches failed" — a Finale
+        // rate limit is swallowed by getBillOfMaterials() and returns []. This pass
+        // returns what it has; `runSlotScan` in purchasing/cache.ts refuses to publish
+        // an empty BOM over a good snapshot, which is what actually keeps the BOM group
+        // on the ordering board (live 2026-10-15: 0 of 304 rows were bom-component).
         if (fgVelocities.length === 0) return [];
 
         // ── Step 4: Burn rates ──

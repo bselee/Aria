@@ -379,6 +379,19 @@ async function runSlotScan(
 ): Promise<void> {
     try {
         const value = await fetcher();
+        // HERMIA(2026-10-15): never publish an EMPTY BOM over a good one. A pass that
+        // could not read the BOMs comes back empty (Finale rate-limits the per-SKU BOM
+        // fetch, and getBillOfMaterials() swallows the error into []), and the empty
+        // result then overwrites the snapshot, so every BOM component silently vanishes
+        // from the ordering board. An empty result is indistinguishable from a failed
+        // read here, so keep what is on file and say so. Observed live: 0 of 304 board
+        // rows were bom-component while this was happening.
+        if (key === 'bom' && value.length === 0 && (slot.value?.length ?? 0) > 0) {
+            console.warn(
+                `[purchasing/cycle] bom scan returned nothing while ${(slot.value as PurchasingGroup[]).length} group(s) are on file — keeping the previous BOM snapshot`,
+            );
+            return;
+        }
         slot.value = value;
         slot.at = Date.now();
         if (windowKey) slot.windowKey = windowKey;

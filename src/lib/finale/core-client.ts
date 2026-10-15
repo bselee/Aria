@@ -10,6 +10,8 @@
  * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH, FINALE_BASE_URL
  */
 
+import { MAX_COOLDOWN_MS, nextCooldownMs, parseRetryAfterMs } from "./rate-limit-backoff";
+
 // ──────────────────────────────────────────────────────────────────────────
 // BASE TYPES
 // ──────────────────────────────────────────────────────────────────────────
@@ -315,6 +317,53 @@ export class FinaleCoreClient {
     private static lastRequestTime = 0;
     private static readonly REQUEST_INTERVAL_MS = 500; // Throttle to 2 requests per second (120 requests/minute max recommended by Descartes)
 
+    // HERMIA(2026-10-15): process-wide 429 backpressure. Finale's real limit is
+    // tighter than 120/min and is shared with the bot's cron jobs, so a per-call
+    // "wait 5s and retry" turns ordinary throttling into a storm: every remaining
+    // SKU in a BOM pass burns its retries into the same limit (observed live: a
+    // single 23-minute BOM pass with thousands of failing requests, ending with
+    // zero BOMs read). A cooldown pauses ALL outbound Finale traffic so the limit
+    // can recover instead of being fed.
+    private static cooldownUntil = 0;
+    private static consecutive429 = 0;
+    private static total429 = 0;
+
+    /**
+     * Current 429 state. `hits` is monotonic for the life of the process, so a
+     * caller can tell "this call was rate limited" from "this call found nothing"
+     * by comparing it before and after. Without that, a swallowed 429 is
+     * indistinguishable from a genuine empty answer.
+     *
+     * @returns cooling flag, cooldown expiry, and the monotonic 429 count.
+     */
+    static rateLimitState(): { cooling: boolean; until: number; hits: number } {
+        return {
+            cooling: Date.now() < FinaleCoreClient.cooldownUntil,
+            until: FinaleCoreClient.cooldownUntil,
+            hits: FinaleCoreClient.total429,
+        };
+    }
+
+    /**
+     * Record a 429 and extend the process-wide cooldown.
+     *
+     * @param   retryAfterMs Server Retry-After in ms, if any.
+     * @returns              Milliseconds this cooldown will run for.
+     */
+    private static note429(retryAfterMs: number | null): number {
+        const waitMs = nextCooldownMs(FinaleCoreClient.consecutive429, retryAfterMs);
+        FinaleCoreClient.consecutive429 += 1;
+        FinaleCoreClient.total429 += 1;
+        FinaleCoreClient.cooldownUntil = Math.max(FinaleCoreClient.cooldownUntil, Date.now() + waitMs);
+        return waitMs;
+    }
+
+    /** Clear the cooldown streak after a request succeeds. */
+    private static noteSuccess(): void {
+        FinaleCoreClient.consecutive429 = 0;
+        FinaleCoreClient.cooldownUntil = 0;
+    }
+
     private static async enqueueRequest<T>(fn: () => Promise<T>): Promise<T> {
         return new Promise<T>((resolve, reject) => {
             FinaleCoreClient.requestQueue.push(async () => {
@@ -334,6 +383,13 @@ export class FinaleCoreClient {
         FinaleCoreClient.isProcessingQueue = true;
 
         while (FinaleCoreClient.requestQueue.length > 0) {
+            // A 429 from ANY caller pauses every caller: feeding the limit harder is
+            // what turned ordinary throttling into a storm.
+            const cooldownMs = FinaleCoreClient.cooldownUntil - Date.now();
+            if (cooldownMs > 0) {
+                await new Promise(r => setTimeout(r, Math.min(cooldownMs, MAX_COOLDOWN_MS)));
+            }
+
             const now = Date.now();
             const timeSinceLast = now - FinaleCoreClient.lastRequestTime;
             const waitTime = Math.max(0, FinaleCoreClient.REQUEST_INTERVAL_MS - timeSinceLast);
@@ -388,10 +444,11 @@ export class FinaleCoreClient {
             try {
                 const response = await fn();
 
-                // 429 rate limit: wait 5s and retry
+                // 429 rate limit: cool the WHOLE queue down, then retry.
                 if (response.status === 429 && attempt < maxRetries) {
-                    console.warn(`[FinaleCoreClient] 429 rate-limited on ${label} — waiting 5s (attempt ${attempt + 1}/${maxRetries})`);
-                    await new Promise(r => setTimeout(r, 5000));
+                    const waitMs = FinaleCoreClient.note429(parseRetryAfterMs(response.headers.get("retry-after")));
+                    console.warn(`[FinaleCoreClient] 429 rate-limited on ${label} — cooling down ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(r => setTimeout(r, waitMs));
                     continue;
                 }
 
@@ -405,10 +462,16 @@ export class FinaleCoreClient {
 
                 // Non-retryable error (4xx) or final attempt
                 if (!response.ok) {
+                    // A 429 on the FINAL attempt must still start the cooldown, or the
+                    // very next caller walks straight back into the limit.
+                    if (response.status === 429) {
+                        FinaleCoreClient.note429(parseRetryAfterMs(response.headers.get("retry-after")));
+                    }
                     const errorText = await response.text();
                     throw new Error(`Finale API ${response.status}: ${response.statusText} — ${errorText.substring(0, 200)}`);
                 }
 
+                FinaleCoreClient.noteSuccess();
                 return await response.json() as T;
             } catch (err: any) {
                 lastError = err;

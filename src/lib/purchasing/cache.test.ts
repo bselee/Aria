@@ -241,6 +241,31 @@ describe("purchasing cache + scan scheduler", () => {
         expect(bomSlot.at).toBeGreaterThan(0);
     });
 
+    it("never publishes an empty BOM over a snapshot that still has groups", async () => {
+        const { runScanCycle, bomSlot } = await import("./cache");
+        bomSlot.value = groups;
+        bomSlot.at = 1;
+
+        // A pass that could not read the BOMs (Finale rate limit) comes back empty.
+        await runScanCycle("bom-empty", { resale: async () => [], bom: async () => [] });
+
+        // The good snapshot survives, so BOM components stay on the ordering board.
+        expect(bomSlot.value).toEqual(groups);
+        expect(bomSlot.at).toBe(1);
+    });
+
+    it("accepts an empty BOM when nothing was on file yet", async () => {
+        const { runScanCycle, bomSlot } = await import("./cache");
+        bomSlot.value = null;
+        bomSlot.at = 0;
+
+        await runScanCycle("bom-cold", { resale: async () => [], bom: async () => [] });
+
+        // Cold cache: there is nothing better to serve, so the empty result is taken.
+        expect(bomSlot.value).toEqual([]);
+        expect(bomSlot.at).toBeGreaterThan(0);
+    });
+
     it("marks caches stale on invalidation without dropping the value", async () => {
         holdScanLock();
 
