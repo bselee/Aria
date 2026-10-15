@@ -69,6 +69,8 @@ const POS_FILTER = (argVal("--pos") || "")
     .map((s) => s.trim())
     .filter(Boolean);
 const JSON_OUT = argVal("--json");
+/** Write the invoice's sales tax onto the PO as well as freight. Off by default. */
+const WRITE_TAX = args.includes("--write-tax");
 /** Pause between Finale calls. Finale rate-limits hard; raise this after a 429. */
 const GAP_MS = Number(argVal("--gap") || 400);
 /** POs that carry a carrier bill belonging to a different PO — strip every freight line. */
@@ -218,7 +220,11 @@ async function main(): Promise<void> {
         const unexplained = round2(curFreight - targetFreight);
         const holdNoBill = !STRIP_POS.has(po) && !poBills.length && unexplained > HOUSE_CHARGE_MAX + EPS;
         const needsRewrite =
-            !holdNoBill && (Math.abs(freightGap) > EPS || unallocated > 0 || (STRIP_POS.has(po) && curFreight > EPS));
+            !holdNoBill &&
+            (Math.abs(freightGap) > EPS ||
+                unallocated > 0 ||
+                (STRIP_POS.has(po) && curFreight > EPS) ||
+                (WRITE_TAX && target.tax !== null && Math.abs(taxGap) > EPS));
 
         const line = (s: string) => (QUIET ? undefined : console.log(s));
         const freightDisplay = holdNoBill
@@ -240,7 +246,11 @@ async function main(): Promise<void> {
             );
         }
         if (Math.abs(goodsGap) > EPS) line(`      !! goods differ by ${goodsGap.toFixed(2)} (report only)`);
-        if (Math.abs(taxGap) > EPS) line(`      !! tax differs by ${taxGap.toFixed(2)} (report only)`);
+        if (Math.abs(taxGap) > EPS) {
+            line(
+                `      !! tax differs by ${taxGap.toFixed(2)} (${WRITE_TAX && !holdNoBill ? "written" : "report only"})`,
+            );
+        }
         if (!poInvoices.length) line(`      !! no ULINE invoice matched this PO`);
         if (holdNoBill) {
             line(
@@ -280,13 +290,25 @@ async function main(): Promise<void> {
         const originalStatus = doc.statusId;
         try {
             const allocLines = await client.freightAllocLines(doc.orderItemList);
-            const keep = adjs.filter((a) => !isFreightLine(a));
+            // Tax is written as one bare line with no allocation: that is how every PO
+            // in the system carries it, pre-existing and untouched.
+            const keep = adjs.filter((a) => !isFreightLine(a) && !(WRITE_TAX && isTaxLine(a)));
             // Every freight line is bare `Freight` + ADJ_BY_WEIGHT + a weight allocation
             // sized to the raw item list, or Finale skips the landed-cost roll.
             const built = freightTargets.map((f) =>
                 buildFinaleFreightAdjustment(f.amount, allocate(allocLines, f.amount)),
             );
-            const newAdjs: any[] = [...keep, ...built];
+            const taxLine =
+                WRITE_TAX && target.tax !== null
+                    ? [
+                          {
+                              amount: target.tax,
+                              description: "Tax",
+                              productPromoUrl: `/${ACCOUNT}/api/productpromo/10008`,
+                          },
+                      ]
+                    : [];
+            const newAdjs: any[] = [...keep, ...taxLine, ...built];
 
             await client.unlockForEditing(doc, po);
             await client.post(`/${ACCOUNT}/api/order/${encodeURIComponent(po)}`, {
@@ -300,17 +322,20 @@ async function main(): Promise<void> {
             const afterAdjs: Promo[] = after.orderAdjustmentList || [];
             const afterFreight = afterAdjs.filter(isFreightLine);
             const afterSum = sum(afterFreight.map((a) => Number(a.amount || 0)));
+            const afterTax = sum(afterAdjs.filter(isTaxLine).map((a) => Number(a.amount || 0)));
             const afterBad = afterFreight.filter((a) =>
                 freightLineSkipsLandedCost(a as any, (after.orderItemList || []).length),
             );
             const ok =
                 after.statusId === originalStatus &&
                 Math.abs(afterSum - targetFreight) <= EPS &&
-                afterBad.length === 0;
+                afterBad.length === 0 &&
+                (!WRITE_TAX || target.tax === null || Math.abs(afterTax - target.tax) <= EPS);
             console.log(
                 `      ${ok ? "verified" : "VERIFY FAILED"}: status=${after.statusId} freight=${afterSum.toFixed(2)}` +
                     ` lines=${afterFreight.map((a) => Number(a.amount || 0).toFixed(2)).join("+")}` +
-                    `${afterBad.length ? ` unallocated=${afterBad.length}` : ""}`,
+                    `${afterBad.length ? ` unallocated=${afterBad.length}` : ""}` +
+                    `${WRITE_TAX && target.tax !== null ? ` tax=${afterTax.toFixed(2)}` : ""}`,
             );
             written++;
             report[report.length - 1].written = ok;
