@@ -35,6 +35,7 @@ import { reconcileReservations } from "@/lib/purchasing/reservation-reconciler";
 import { shouldIncludePurchasingCandidate } from "./purchasing-candidate";
 import { rawIngredientBoundsFor } from "@/lib/purchasing/raw-ingredient-minimums";
 import { getLedgerSnapshot, ledgerNetFor, ledgerRateFor, type LedgerSnapshot } from "./stock-ledger";
+import { extractVendorPoLines, type VendorPoLine } from "@/lib/purchasing/vendor-po-units";
 import {
     enrichOpenPOs,
     hasDeliverablePO,
@@ -233,6 +234,104 @@ export class FinalePurchasingClient extends FinaleProductsClient {
     }
 
     /**
+     * List every purchase order a vendor carries inside an order-date window, with lines.
+     *
+     * Why this exists: the Amazon capture counted only the POs the export names plus the POs
+     * the capture tool itself created. A PO keyed by hand has a blank Amazon PO field and no
+     * entry in the capture ledger, so it was invisible and its units were booked a second
+     * time (125349 over 124371, 125353 over 124933). The vendor's own POs are the only
+     * complete record of what has been ordered.
+     *
+     * @param vendorPartyId Finale party url or number, e.g. "10154" for Amazon.
+     * @param beginStr Window start on the PO order date, YYYY-MM-DD.
+     * @param endStr   Window end on the PO order date, YYYY-MM-DD.
+     * @param opts.pageSize Rows per request (default 200; the server caps boundaries at 1000).
+     * @returns Vendor PO lines; cancelled POs are removed.
+     * @throws When Finale cannot be read, because a silently empty list re-books stock.
+     */
+    async listVendorPoLines(
+        vendorPartyId: string,
+        beginStr: string,
+        endStr: string,
+        opts: { pageSize?: number; maxPages?: number } = {},
+    ): Promise<VendorPoLine[]> {
+        const partyId = String(vendorPartyId).split("/").pop() || String(vendorPartyId);
+        const pageSize = Math.min(Math.max(opts.pageSize ?? 200, 1), 1000);
+        const maxPages = opts.maxPages ?? 40;
+        const lines: VendorPoLine[] = [];
+        let after: string | null = null;
+        let pages = 0;
+
+        while (pages < maxPages) {
+            pages += 1;
+            const afterArg: string = after ? `, after: ${JSON.stringify(after)}` : "";
+            const query = `{
+                orderViewConnection(
+                    first: ${pageSize}
+                    type: ["PURCHASE_ORDER"]
+                    supplier: ${JSON.stringify(partyId)}
+                    orderDate: { begin: ${JSON.stringify(beginStr)}, end: ${JSON.stringify(endStr)} }
+                    sort: [{ field: "orderDate", mode: "desc" }]
+                    ${afterArg}
+                ) {
+                    pageInfo { hasNextPage endCursor }
+                    edges { node {
+                        orderUrl orderId status orderDate
+                        supplier { partyUrl name }
+                        itemList(first: 300) {
+                            edges { node { product { productId } quantity } }
+                        }
+                    }}
+                }
+            }`;
+
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: "POST",
+                headers: { Authorization: this.authHeader, "Content-Type": "application/json" },
+                body: JSON.stringify({ query }),
+            });
+            if (!res.ok) {
+                throw new Error(
+                    `[finale] listVendorPoLines ${partyId} ${beginStr}..${endStr} failed: HTTP ${res.status}`,
+                );
+            }
+            const json: unknown = await res.json();
+            const errors = (json as { errors?: unknown }).errors;
+            if (Array.isArray(errors) && errors.length > 0) {
+                throw new Error(
+                    `[finale] listVendorPoLines ${partyId} ${beginStr}..${endStr} failed: ` +
+                        JSON.stringify(errors).slice(0, 220),
+                );
+            }
+
+            lines.push(...extractVendorPoLines(json, partyId));
+
+            const connection = (json as { data?: { orderViewConnection?: unknown } }).data?.orderViewConnection as
+                | { pageInfo?: { hasNextPage?: boolean; endCursor?: string | null } }
+                | undefined;
+            const pageInfo = connection?.pageInfo;
+            if (!pageInfo?.hasNextPage) break;
+            const cursor = pageInfo.endCursor;
+            if (!cursor || cursor === after) {
+                throw new Error(
+                    `[finale] listVendorPoLines ${partyId} ${beginStr}..${endStr} failed: ` +
+                        `paging stalled with hasNextPage but no new cursor`,
+                );
+            }
+            after = cursor;
+            // Stay slow on purpose: Finale rate limits hard and staff are on the same account.
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        if (pages >= maxPages) {
+            throw new Error(
+                `[finale] listVendorPoLines ${partyId} ${beginStr}..${endStr} failed: ` +
+                    `exceeded ${maxPages} pages, refusing to treat a partial list as complete`,
+            );
+        }
+        return lines;
+    }
+
+    /**
      * List recent POs for a vendor by fuzzy supplier-name match.
      *
      * Used by po-resolver.ts as a fallback when the printed PO# doesn't
@@ -283,7 +382,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             status
                             orderDate
                             supplier { partyUrl name }
-                            totalAmount { amount }
+                            total
                             itemList(first: 200) {
                                 edges { node { product { productId } } }
                             }
@@ -298,6 +397,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 body: JSON.stringify(query),
             });
             const json: any = await res.json();
+            if (Array.isArray(json.errors) && json.errors.length > 0) {
+                // A rejected projection used to come back as "no POs", which reads exactly like
+                // "this vendor has none". That is how totalAmount { amount } hid every result.
+                throw new Error(`GraphQL rejected the query: ${JSON.stringify(json.errors).slice(0, 200)}`);
+            }
             const edges: any[] = json.data?.orderViewConnection?.edges || [];
 
             const vendorWords = vendorName
@@ -335,7 +439,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     orderDate: po.orderDate ?? "",
                     supplierName,
                     supplierPartyUrl: po.supplier?.partyUrl ?? null,
-                    total: Number(po.totalAmount?.amount ?? 0),
+                    total: parseFinaleNumber(po.total),
                     skus,
                 });
             }

@@ -44,6 +44,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { FinaleClient } from "../lib/finale/client";
+import { mergeUnits, poNumberOf, sumUnitsBySku, type VendorPoLine } from "../lib/purchasing/vendor-po-units";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -1601,6 +1602,82 @@ function rememberCapturePo(po: string): void {
     fs.writeFileSync(CAPTURE_STATE, JSON.stringify(all, null, 1), "utf8");
 }
 
+/** Amazon export dates are MM/DD/YYYY; anything else is unusable for a window. */
+function parseUsDate(value: string): Date | null {
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(String(value ?? "").trim());
+    if (!m) return null;
+    const d = new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]));
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** YYYY-MM-DD in local time. */
+function isoDay(d: Date): string {
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * Order-date window to read the vendor's POs over, matched to what the export covers.
+ *
+ * The start is pulled back by `slackDays` because a PO is often keyed months after the order
+ * it books (the whole reason this tool exists), and Finale stores the PO's stated order date,
+ * not the day it was keyed.
+ *
+ * @param allOrders Orders in the current export.
+ * @param slackDays Days of lead time to add before the earliest order.
+ * @returns Inclusive YYYY-MM-DD bounds.
+ */
+function vendorPoWindow(allOrders: AmazonOrder[], slackDays = 60): { begin: string; end: string } {
+    const dates = allOrders
+        .map((o) => parseUsDate(o.orderDate))
+        .filter((d): d is Date => d !== null)
+        .sort((a, b) => a.getTime() - b.getTime());
+    const earliest = dates[0] ?? new Date();
+    return { begin: isoDay(new Date(earliest.getTime() - slackDays * 86_400_000)), end: isoDay(new Date()) };
+}
+
+/**
+ * Units already booked on the vendor's own purchase orders.
+ *
+ * This is the third source of "booked" units, and the only complete one: the export's PO
+ * field is blank for anything keyed by hand, and the capture ledger knows only the POs this
+ * tool made. Without it a hand-keyed PO is invisible and its units are booked a second time.
+ *
+ * Throws when Finale cannot be read, on purpose: a run that cannot see what is booked must
+ * never proceed to create POs, so the caller aborts and nothing is written.
+ *
+ * @param writer Any client exposing {@link FinaleClient.listVendorPoLines}.
+ * @param allOrders Orders in the current export, used to size the window.
+ * @returns Booked units per SKU, plus the window and PO count for the log line.
+ */
+async function loadVendorBookedUnits(
+    writer: { listVendorPoLines(vendorPartyId: string, begin: string, end: string): Promise<VendorPoLine[]> },
+    allOrders: AmazonOrder[],
+): Promise<{ lines: VendorPoLine[]; begin: string; end: string }> {
+    const { begin, end } = vendorPoWindow(allOrders);
+    const lines = await writer.listVendorPoLines(AMAZON_PARTY_ID, begin, end);
+    return { lines, begin, end };
+}
+
+/**
+ * Vendor PO units, dropping any PO another source has already counted.
+ *
+ * Booked units now come from three places and they overlap by design: the export names some
+ * POs, the capture ledger remembers POs this tool made, and the vendor listing contains both
+ * plus the ones nobody else can see. Counting the union needs this filter or the same PO is
+ * added two or three times, which over-states what is booked and hides a real shortfall.
+ *
+ * @param lines Lines from {@link loadVendorBookedUnits}.
+ * @param alreadyCounted PO numbers already added to the booked total.
+ * @returns Units per SKU, counted once.
+ */
+function vendorUnitsNotAlreadyCounted(
+    lines: readonly VendorPoLine[],
+    alreadyCounted: ReadonlySet<string>,
+): Map<string, number> {
+    return sumUnitsBySku(lines.filter((line) => !alreadyCounted.has(poNumberOf(line.orderUrl))));
+}
+
 
 function buildCapturePos(
     report: Report,
@@ -1825,8 +1902,32 @@ async function main(): Promise<void> {
         const writer = new FinaleWriter();
         const priorPos = readCapturePoState();
         const priorUnits = await writer.capturePoUnits(priorPos);
-        const cover = skuCoverage(report, map, [...orders.values()], priorUnits);
         if (priorPos.length) console.log(`   counting ${priorPos.length} capture PO(s) from earlier runs: ${priorPos.join(", ")}`);
+
+        // The vendor's own POs are the only complete record of what is booked: a PO keyed by
+        // hand carries a blank Amazon PO field and no capture-ledger entry, so it was invisible
+        // and its units got booked twice. A run that cannot read them must not write anything.
+        let vendor: Awaited<ReturnType<typeof loadVendorBookedUnits>>;
+        try {
+            vendor = await loadVendorBookedUnits(writer, [...orders.values()]);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`\nRefusing to build capture POs: could not read the vendor's POs — ${msg}`);
+            console.error("Nothing was written, because a run that cannot see booked POs creates duplicates.");
+            process.exitCode = 1;
+            return;
+        }
+        // Count each PO once: the export names some, the capture ledger remembers the ones this
+        // tool made, and the vendor listing contains both plus the hand-keyed POs nobody else sees.
+        const alreadyCounted = new Set<string>([...report.findings.map((f) => f.po), ...priorPos]);
+        const vendorUnits = vendorUnitsNotAlreadyCounted(vendor.lines, alreadyCounted);
+        console.log(
+            `   vendor POs ${vendor.begin}..${vendor.end}: ${new Set(vendor.lines.map((l) => poNumberOf(l.orderUrl))).size} PO(s), ` +
+                `${vendorUnits.size} SKU(s) not already counted`,
+        );
+        mergeUnits(priorUnits, vendorUnits);
+
+        const cover = skuCoverage(report, map, [...orders.values()], priorUnits);
         if (argv.includes("--debug-cover")) {
             for (const [sku, c] of cover) {
                 if (sku.startsWith("trace:")) continue;
