@@ -19,6 +19,7 @@ import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
 import { transitionLifecycleState, type POLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence } from '@/lib/purchasing/vendor-freight-learning';
+import { assessFreightEvidence } from '@/lib/purchasing/vendor-freight-pattern';
 import type { InvoiceData } from '@/lib/pdf/invoice-parser';
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -167,8 +168,12 @@ function safeNumber(v: unknown): number {
 }
 
 /**
- * Extract the freight adjustment amount from a Finale PO's orderAdjustmentList.
- * Looks for the FREIGHT product promo. Returns the matching amount or 0.
+ * Sum every freight line on a Finale PO's orderAdjustmentList.
+ *
+ * Must be a SUM, not the first match. A vendor that ships COLLECT carries two
+ * freight lines: its own house charge (Uline $1.50) plus the carrier collect that
+ * was allocated onto the PO. Reading only the first line reports the house charge
+ * and hid a five-figure FedEx collect behind a $1.50 "match".
  */
 function extractFreightFromPO(po: any, accountPath: string): number | null {
     const feeTypeId = FinaleClient.FINALE_FEE_TYPES?.FREIGHT?.id;
@@ -176,8 +181,9 @@ function extractFreightFromPO(po: any, accountPath: string): number | null {
 
     const promoUrl = `/${accountPath}/api/productpromo/${feeTypeId}`;
     const adjustments: any[] = po.orderAdjustmentList || [];
-    const freightAdj = adjustments.find((a: any) => a.productPromoUrl === promoUrl);
-    return freightAdj ? safeNumber(freightAdj.amount) : null;
+    const freightLines = adjustments.filter((a: any) => a.productPromoUrl === promoUrl);
+    if (freightLines.length === 0) return null;
+    return Math.round(freightLines.reduce((sum: number, a: any) => sum + safeNumber(a.amount), 0) * 100) / 100;
 }
 
 /**
@@ -492,17 +498,28 @@ export async function applyInvoiceModification(
         // Re-fetch the PO to get the final freight value after adjustments
         const finalPO = await finale.getOrderDetails(request.orderId);
         const finalAccountPath = getAccountPath(finalPO);
-        const finalFreight = extractFreightFromPO(finalPO, finalAccountPath);
+        const poFreightTotal = extractFreightFromPO(finalPO, finalAccountPath) ?? 0;
+        // A vendor's house charge is not carriage: Uline bills $1.50 on every
+        // invoice while the real carriage arrives on the FedEx Freight COLLECT
+        // bill. assessFreightEvidence strips it from both sides and refuses to
+        // call carriage matched unless there was a source to check it against.
+        const vendorName = currentPO?.supplier?.name || 'Unknown';
+        const assessment = assessFreightEvidence({
+            vendorName,
+            poFreightTotal,
+            vendorInvoiceFreight: freightAfter ?? request.freightAdjustment ?? 0,
+        });
 
         await recordFreightEvidence({
             orderId: request.orderId,
-            vendorName: currentPO?.supplier?.name || 'Unknown',
-            hadFreightOnPO: (freightBefore !== null && freightBefore > 0) || (finalFreight !== null && finalFreight > 0),
-            invoiceFreight: freightAfter ?? (request.freightAdjustment ?? 0),
-            freightMatched: finalFreight !== null && freightAfter !== undefined
-                ? Math.abs(finalFreight - freightAfter) < 0.01
-                : true,
+            vendorName,
+            hadFreightOnPO: (freightBefore !== null && freightBefore > 0) || poFreightTotal > 0,
+            invoiceFreight: assessment.invoiceInboundFreight,
+            freightMatched: assessment.freightMatched,
             completedBy: 'manual',
+            poFreightTotal,
+            houseFreightCharge: assessment.houseFreightCharge,
+            inboundFreight: assessment.inboundFreight,
         });
         result.freightEvidenceRecorded = true;
     } catch (err: any) {

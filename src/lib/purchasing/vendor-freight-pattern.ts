@@ -76,6 +76,15 @@ export const VENDOR_PATTERN_OVERRIDES: Array<{
     { match: "miles",          pattern: "no_freight",     note: "Will-confirmed: never has freight" },
     { match: "thrive",         pattern: "no_freight",     note: "Will-confirmed: never has freight" },
     { match: "colorado worm",  pattern: "no_freight",     note: "Will-confirmed: never has freight" },
+    // Stock Bag Depot (Soestern Packaging) ships FEDEX-GND and absorbs carriage
+    // (Shipping Terms CIP + "Free Freight to match online") — no COLLECT bill.
+    // Vendor rule (Monica Leanos, 2026-10-08): FREE FREIGHT on bag orders
+    // >= $400; below that they prepay and bill it on their invoice (PPD-ADD).
+    // Verified against all 18 invoices on hand: the only two PPD-ADD invoices
+    // were the only two under $400 ($252 goods -> $27.05 and $32.08 freight,
+    // ~11-13% of goods). reconcile-invoice-freight.ts lands the PPD-ADD amount.
+    { match: "stock bag",      pattern: "no_freight",     note: "Free freight on bag orders >= $400 (vendor pays, no COLLECT bill); under $400 the vendor prepays and PPD-ADDs the freight on their invoice -> reconcile-invoice-freight.ts adds it to the PO" },
+    { match: "new moon",       pattern: "no_freight",     note: "Bill 2026-09-28: no freight to attach" },
     { match: "rootwise",       pattern: "bas_freight",    note: "FedEx COLLECT multi-delivery; each receive noted on receiving; one FREIGHT line per PRO/invoice via reconcile-fedex / ltlselect" },
     { match: "uline",          pattern: "bas_freight",    note: "Ship Via MUST be Freight Collect FEDEX FREIGHT (Uline calls FedEx). Bill → general FedEx Billing Online, NOT LTL Select. PO# on FedEx bill → reconcile-fedex. $1.50 = Uline house charge. Any other ship method → on Uline invoice, manual." },
     // Colorful Packaging (China) — DDP shipping included on their invoice as a separate line.
@@ -89,6 +98,98 @@ function findOverride(vendorName: string): typeof VENDOR_PATTERN_OVERRIDES[numbe
         if (lc.includes(o.match)) return o;
     }
     return null;
+}
+
+// ── House charges that are NOT inbound freight ─────────────────────────────
+
+/**
+ * Vendor house charges that ride on the vendor's invoice but are not carriage.
+ *
+ * Uline bills $1.50 on every invoice as its own house charge. The real carriage
+ * arrives on the carrier's COLLECT bill (FedEx Freight) and never appears on the
+ * vendor's invoice. Comparing a PO's freight against the house charge alone
+ * therefore reports a match on a PO that carries no carriage at all, which is how
+ * Uline POs sat at $1.50 for months while a five-figure FedEx collect went
+ * unallocated. Subtract this before calling anything "freight".
+ */
+export const VENDOR_HOUSE_FREIGHT_CHARGES: Array<{ match: string; amount: number; note: string }> = [
+    {
+        match: "uline",
+        amount: 1.5,
+        note: "Uline house charge per invoice; carriage arrives on the FedEx Freight COLLECT bill, never on the Uline invoice",
+    },
+];
+
+/**
+ * House charge the vendor bills per invoice, which must not be read as carriage.
+ *
+ * @param vendorName Vendor name as it appears on the PO.
+ * @returns The house charge in dollars, 0 when the vendor has none.
+ */
+export function houseFreightChargeFor(vendorName: string): number {
+    const lc = (vendorName || "").toLowerCase();
+    for (const h of VENDOR_HOUSE_FREIGHT_CHARGES) {
+        if (lc.includes(h.match)) return h.amount;
+    }
+    return 0;
+}
+
+/**
+ * Carriage on a PO or invoice, with the vendor's house charge removed.
+ *
+ * @param total       Freight lines summed off the PO, or the freight the vendor invoiced.
+ * @param houseCharge The vendor's per-invoice house charge.
+ * @returns Dollars of carriage, never negative.
+ */
+export function carriageExcludingHouseCharge(total: number, houseCharge: number): number {
+    const net = Number(total || 0) - Number(houseCharge || 0);
+    return net > 0 ? Math.round(net * 100) / 100 : 0;
+}
+
+export interface FreightEvidenceAssessment {
+    /** The vendor's per-invoice house charge, which is not carriage. */
+    houseFreightCharge: number;
+    /** Carriage that landed on the PO. 0 means the PO carries no carriage. */
+    inboundFreight: number;
+    /** Carriage the vendor invoiced. 0 for a COLLECT vendor, which bills only its house charge. */
+    invoiceInboundFreight: number;
+    /** True only when carriage was verified against a source. */
+    freightMatched: boolean;
+}
+
+/**
+ * Decide what a PO's freight actually proves.
+ *
+ * A vendor's house charge is not carriage, so it is removed from both sides before
+ * anything is compared. Carriage is verified only when the PO carries some AND the
+ * vendor invoiced some AND the two agree: a COLLECT vendor invoices no carriage, so
+ * its POs stay unmatched until the carrier bill supplies the amount. Reporting a
+ * match with nothing to compare against is what let $1.50 Uline POs read as
+ * reconciled while the FedEx collect went unallocated.
+ *
+ * @param input Vendor, summed PO freight, and the freight the vendor invoiced.
+ * @returns House charge, carriage on each side, and the match verdict.
+ */
+export function assessFreightEvidence(input: {
+    vendorName: string;
+    poFreightTotal: number;
+    vendorInvoiceFreight: number;
+}): FreightEvidenceAssessment {
+    const houseFreightCharge = houseFreightChargeFor(input.vendorName);
+    const inboundFreight = carriageExcludingHouseCharge(input.poFreightTotal, houseFreightCharge);
+    const invoiceInboundFreight = carriageExcludingHouseCharge(
+        input.vendorInvoiceFreight,
+        houseFreightCharge,
+    );
+    return {
+        houseFreightCharge,
+        inboundFreight,
+        invoiceInboundFreight,
+        freightMatched:
+            inboundFreight > 0 &&
+            invoiceInboundFreight > 0 &&
+            Math.abs(inboundFreight - invoiceInboundFreight) < 0.01,
+    };
 }
 
 // ── Pure classifier ────────────────────────────────────────────────────────
@@ -217,4 +318,11 @@ export function classifyVendorFreightPattern(
         breakdown: { vendorFreight, basFreight, noFreight },
         source: "history",
     };
+}
+
+/** Substrings for vendors Will/Bill confirmed never need freight attached. */
+export function noFreightOverrideMatchers(): string[] {
+    return VENDOR_PATTERN_OVERRIDES
+        .filter(o => o.pattern === "no_freight")
+        .map(o => o.match);
 }

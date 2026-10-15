@@ -20,7 +20,6 @@ import {
     classifyVendorFreightPattern,
     VENDOR_PATTERN_OVERRIDES,
     type PatternEvidence,
-    type VendorFreightPatternResult,
     type FreightPattern,
 } from "./vendor-freight-pattern";
 
@@ -30,9 +29,24 @@ export interface FreightEvidenceRecord {
     orderId: string;
     vendorName: string;
     hadFreightOnPO: boolean;
+    /**
+     * Carriage the vendor invoiced, with the vendor's house charge removed.
+     * Uline's $1.50 is a house charge, not carriage, so it records as 0 here.
+     */
     invoiceFreight: number;
+    /**
+     * True only when carriage was verified against a source: the PO carries
+     * carriage AND there is an inbound amount to check it against AND they agree.
+     * Never default this to true — an unverified PO must not read as matched.
+     */
     freightMatched: boolean;
     completedBy: 'manual' | 'auto' | 'dashboard';
+    /** Every freight line on the PO, summed. */
+    poFreightTotal?: number;
+    /** The vendor's per-invoice house charge that is not carriage. */
+    houseFreightCharge?: number;
+    /** Carriage on the PO: poFreightTotal minus the house charge. */
+    inboundFreight?: number;
 }
 
 export interface FreightLearningResult {
@@ -73,6 +87,13 @@ export async function recordFreightEvidence(record: FreightEvidenceRecord): Prom
             invoice_freight: record.invoiceFreight,
             freight_matched: record.freightMatched,
             completed_by: record.completedBy,
+            // Carriage breakdown. Without these, a PO whose only freight line is a
+            // vendor house charge reads exactly like a PO whose carriage was
+            // verified, which is how $1.50 Uline POs passed for months.
+            po_freight_total: record.poFreightTotal ?? record.invoiceFreight,
+            house_freight_charge: record.houseFreightCharge ?? 0,
+            inbound_freight: record.inboundFreight ?? 0,
+            completed_at: new Date().toISOString(),
         }, { onConflict: 'order_id' });
 
     // Check if we should re-classify
