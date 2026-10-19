@@ -160,7 +160,7 @@ interface BilltrustRow {
     DOC_TYPE: string;
 }
 
-interface BilltrustInvoice {
+export interface BilltrustInvoice {
     invoiceNumber: string;
     invoiceDate: string;
     shipDate: string;
@@ -221,7 +221,7 @@ function mapVendorFromAddress(address: string): { vendor: string; matchedBy: "ad
 
 // ── CSV parser ───────────────────────────────────────────────────────────────
 
-function findLatestBilltrustCsv(): string | null {
+export function findLatestBilltrustCsv(): string | null {
     const candidates: string[] = [];
     const dirs = [
         path.join(os.homedir(), "Downloads"),
@@ -280,7 +280,7 @@ function parseCsvLine(line: string): string[] {
     return result;
 }
 
-function parseBilltrustCsv(csvPath: string): BilltrustRow[] {
+export function parseBilltrustCsv(csvPath: string): BilltrustRow[] {
     const text = fs.readFileSync(csvPath, "utf-8");
     const lines = text.split(/\r?\n/).filter((l) => l.trim());
     if (lines.length === 0) return [];
@@ -302,7 +302,7 @@ function parseBilltrustCsv(csvPath: string): BilltrustRow[] {
 
 // ── Dedup & filter inbound ───────────────────────────────────────────────────
 
-function dedupInboundInvoices(rows: BilltrustRow[]): BilltrustInvoice[] {
+export function dedupInboundInvoices(rows: BilltrustRow[]): BilltrustInvoice[] {
     const seen = new Map<string, BilltrustInvoice>();
 
     for (const r of rows) {
@@ -655,14 +655,14 @@ async function main() {
         try {
             for (const inv of invoices) {
                 await upsertVendorInvoice({
-                    vendor: inv.vendorName || "FedEx Freight (unknown)",
+                    vendor_name: inv.vendorName || "FedEx Freight (unknown)",
                     invoice_number: inv.invoiceNumber,
                     invoice_date: inv.invoiceDate,
                     total: inv.amountDue,
                     po_number: inv.poNumber || null,
-                    bol_number: inv.bol || null,
-                    source: "billtrust_csv",
+                    source: "csv_import",
                     source_ref: path.basename(csvPath),
+                    raw_data: { bol: inv.bol || null },
                 }).catch(() => {});
             }
             console.log(`\n🗂  Archived ${invoices.length} to vendor_invoices`);

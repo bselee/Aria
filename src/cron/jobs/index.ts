@@ -1424,7 +1424,14 @@ defineJob({
     name: "ltlselect-freight-reconcile",
     schedule: "0 9 * * 1",
     onFail: "log",
-    description: "Weekly LTL Select COLLECT freight → Finale PO apply (high-confidence only).",
+    // RETIRED 2026-10-19 (Bill decision): LTL Select is NOT a source of truth for
+    // freight. Its quote/scanned amount diverges from the final FedEx invoice
+    // (reweigh + accessorials added after pickup — e.g. Rootwise PRO 300093120787
+    // quoted $300.74, final bill $397.94). Applying the quote caused manual
+    // correction work. The final-invoice reconcile (reconcile-freight-mailbox.ts +
+    // reconcile-billtrust-freight.ts) is now the single source of truth.
+    enabled: false,
+    description: "RETIRED — LTL Select quote is not freight truth; use final-invoice reconcile.",
     handler: async () => {
         const { execFileSync } = await import("child_process");
         console.log("[ltlselect-freight] Running weekly LTL Select reconcile (--live, --days 14)...");
@@ -1456,6 +1463,65 @@ defineJob({
             if (err?.stdout) console.error(err.stdout);
             if (err?.stderr) console.error(err.stderr);
             throw err;
+        }
+    },
+    budget: { durationMs: 300_000 },
+});
+
+// DECISION(2026-10-19): Weekly FedEx Freight Billing Online mailbox reconcile.
+// Reads the freight@ notices (fedex@billtrust.com), the FINAL post-reweigh
+// invoice amount, and reconciles against Finale POs using the same confidence
+// scorer as LTL Select. --live --correct: auto-applies high-confidence NEW
+// freight and positive corrections (final invoice is truth). Negative deltas
+// (FedEx re-rated DOWN) and unmatched bills surface to the task hub for review.
+// No Slack/Telegram.
+defineJob({
+    name: "fedex-freight-mailbox-reconcile",
+    schedule: "10 9 * * 1",
+    onFail: "log",
+    description: "Weekly FedEx Freight mailbox → Finale PO apply (final invoice truth; task-first review).",
+    handler: async () => {
+        const { execFileSync } = await import("child_process");
+        console.log("[fedex-mailbox] Running weekly FedEx Freight mailbox reconcile (--live --correct)...");
+        let stdout = "";
+        try {
+            stdout = execFileSync(
+                process.execPath,
+                [
+                    "--import", "tsx",
+                    `${process.cwd()}/src/cli/reconcile-freight-mailbox.ts`,
+                    "--vendor", "all",
+                    "--live",
+                    "--correct",
+                ],
+                { encoding: "utf8", timeout: 300_000, env: process.env },
+            );
+            console.log(stdout);
+        } catch (err: any) {
+            console.error(`[fedex-mailbox] Failed: ${err?.message ?? err}`);
+            if (err?.stdout) stdout = err.stdout;
+            if (err?.stderr) console.error(err.stderr);
+            throw err;
+        }
+
+        // Review bucket = what did NOT auto-apply: negative corrections
+        // (FedEx re-rated down) and unmatched inbound bills. Positive corrections
+        // and new freight are already written. Surface only the review bucket.
+        const hasNegativeCorrection = /negative delta/i.test(stdout);
+        const hasUnmatched = /unmatched/i.test(stdout) && !/unmatched: 0\b/.test(stdout);
+        if (hasNegativeCorrection || hasUnmatched) {
+            const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
+            const day = new Date().toISOString().slice(0, 10);
+            await notifyViaTask({
+                sourceId: `fedex-mailbox:${day}`,
+                type: "cron_summary",
+                goal: stdout.slice(-4000),
+                inputs: { day, hasNegativeCorrection, hasUnmatched },
+                summaryLabel: "FedEx Freight Booked-vs-Actual Review",
+            });
+            console.log("[fedex-mailbox] Routed review items through agent_task hub.");
+        } else {
+            console.log("[fedex-mailbox] Nothing to review — silent.");
         }
     },
     budget: { durationMs: 300_000 },
