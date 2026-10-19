@@ -1473,8 +1473,8 @@ defineJob({
 // invoice amount, and reconciles against Finale POs using the same confidence
 // scorer as LTL Select. --live --correct: auto-applies high-confidence NEW
 // freight and positive corrections (final invoice is truth). Negative deltas
-// (FedEx re-rated DOWN) and unmatched bills surface to the task hub for review.
-// No Slack/Telegram.
+// (FedEx re-rated DOWN), unmatched bills, and material booked-vs-actual DRIFT
+// (reweigh/accessorial gap) surface to the task hub for review. No Slack/Telegram.
 defineJob({
     name: "fedex-freight-mailbox-reconcile",
     schedule: "10 9 * * 1",
@@ -1482,7 +1482,7 @@ defineJob({
     description: "Weekly FedEx Freight mailbox → Finale PO apply (final invoice truth; task-first review).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
-        console.log("[fedex-mailbox] Running weekly FedEx Freight mailbox reconcile (--live --correct)...");
+        console.log("[fedex-mailbox] Running weekly FedEx Freight mailbox reconcile (--live --correct --drift)...");
         let stdout = "";
         try {
             stdout = execFileSync(
@@ -1493,6 +1493,7 @@ defineJob({
                     "--vendor", "all",
                     "--live",
                     "--correct",
+                    "--drift",
                 ],
                 { encoding: "utf8", timeout: 300_000, env: process.env },
             );
@@ -1505,18 +1506,20 @@ defineJob({
         }
 
         // Review bucket = what did NOT auto-apply: negative corrections
-        // (FedEx re-rated down) and unmatched inbound bills. Positive corrections
-        // and new freight are already written. Surface only the review bucket.
+        // (FedEx re-rated down), unmatched inbound bills, and material
+        // booked-vs-actual drift (|drift| ≥ $5, i.e. a reweigh/accessorial).
+        // Positive corrections and new freight are already written.
         const hasNegativeCorrection = /negative delta/i.test(stdout);
         const hasUnmatched = /unmatched/i.test(stdout) && !/unmatched: 0\b/.test(stdout);
-        if (hasNegativeCorrection || hasUnmatched) {
+        const hasDrift = /material drift: [1-9]/.test(stdout);
+        if (hasNegativeCorrection || hasUnmatched || hasDrift) {
             const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
             const day = new Date().toISOString().slice(0, 10);
             await notifyViaTask({
                 sourceId: `fedex-mailbox:${day}`,
                 type: "cron_summary",
                 goal: stdout.slice(-4000),
-                inputs: { day, hasNegativeCorrection, hasUnmatched },
+                inputs: { day, hasNegativeCorrection, hasUnmatched, hasDrift },
                 summaryLabel: "FedEx Freight Booked-vs-Actual Review",
             });
             console.log("[fedex-mailbox] Routed review items through agent_task hub.");

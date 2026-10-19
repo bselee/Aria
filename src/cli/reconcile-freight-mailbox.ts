@@ -578,8 +578,11 @@ async function main() {
     // 8c. Drift report (--drift): booked (LTL Select quote) vs actual (final
     // invoice), joined on PRO. Read-only. Surfaces only non-trivial drift so an
     // unapplied PO does not read "0 → final" and flood the review.
+    // Materiality gate: |drift| < DRIFT_MIN is rounding/fuel-tier noise, not a
+    // reweigh. Only rows with BOTH a booking and a material delta count.
     if (DRIFT) {
-        console.log("\n─── BOOKED vs ACTUAL (final − LTL Select quote, joined on PRO) ─────────────");
+        const DRIFT_MIN = args.includes("--drift-min") ? Number(args[args.indexOf("--drift-min") + 1]) || 5 : 5;
+        console.log(`\n─── BOOKED vs ACTUAL (final − LTL Select quote, joined on PRO, |drift| ≥ $${DRIFT_MIN.toFixed(2)}) ───`);
         try {
             const env = loadLtlSelectEnv();
             const token = await getLtlSelectToken(env);
@@ -598,15 +601,15 @@ async function main() {
                 bookedByPro.set(e.proNumber, { amount: e.amount, quote: e.quoteAmount, vendor: e.originName || null });
             }
             let driftRows = 0;
+            let noBookingRows = 0;
             for (const inv of inbound) {
                 const booked = bookedByPro.get(inv.freightBillNumber);
                 if (!booked) {
-                    console.log(`  ${(inv.vendor || inv.shipper || "?").padEnd(22)} | PRO ${inv.freightBillNumber} | final $${inv.amountDue.toFixed(2)} | no LTL Select booking`);
-                    driftRows++;
+                    noBookingRows++;
                     continue;
                 }
                 const drift = inv.amountDue - booked.amount;
-                if (Math.abs(drift) < 0.02) continue; // clean match → silent
+                if (Math.abs(drift) < DRIFT_MIN) continue; // sub-threshold → silent
                 const sign = drift >= 0 ? "+" : "";
                 console.log(
                     `  ${(inv.vendor || inv.shipper || "?").padEnd(22)} | PRO ${inv.freightBillNumber} | ` +
@@ -615,7 +618,7 @@ async function main() {
                 );
                 driftRows++;
             }
-            if (driftRows === 0) console.log("  no drift");
+            console.log(`  material drift: ${driftRows}  (${noBookingRows} without LTL Select booking)`);
         } catch (err) {
             console.log(`  drift report failed: ${(err as Error).message}`);
         }
