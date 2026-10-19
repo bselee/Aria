@@ -32,6 +32,7 @@ import {
   shortPriceNote,
   withinDays,
 } from "../src/lib/purchasing/eow-report";
+import { computeFreightDrift } from "../src/lib/freight/freight-drift";
 
 const NUMERIC = /^\d+$/;
 const TO = "bill.selee@buildasoil.com";
@@ -373,6 +374,24 @@ async function main() {
 
   const receivedPo = new Set(received.map((r) => r.po));
   committed = committed.filter((r) => !receivedPo.has(r.po));
+
+  // Freight drift (booked vs actual): annotate the received PO's own line in
+  // place — no separate section. Only POs on the week's received list get the
+  // note, so the reader sees the reweigh delta exactly where the PO already is.
+  try {
+    const { fetchFinalFreightInvoices } = await import("../src/lib/freight/freight-drift");
+    const inbound = await fetchFinalFreightInvoices();
+    const rows = await computeFreightDrift(inbound, 5);
+    const driftByPo = new Map(rows.filter((r) => r.poNumber).map((r) => [r.poNumber, r]));
+    for (const r of received) {
+      const d = driftByPo.get(r.po);
+      if (!d) continue;
+      const sign = d.drift >= 0 ? "+" : "";
+      r.note = `${r.note} · freight ${sign}$${d.drift.toFixed(2)}`;
+    }
+  } catch {
+    /* drift optional — never block the EOW PDF */
+  }
 
   if (committed.length) {
     const meta = await pool.query(

@@ -51,14 +51,9 @@ import {
     isMultiDeliveryVendor,
     isExcludedVendor,
     scoreFreightApplyConfidence,
-    parseCollectEntry,
     type CollectEntry,
 } from "../lib/ltlselect/match";
-import {
-    loadLtlSelectEnv,
-    getLtlSelectToken,
-    fetchLtlSelectInvoices,
-} from "../lib/ltlselect/client";
+import { computeFreightDrift } from "../lib/freight/freight-drift";
 import {
     findLatestBilltrustCsv,
     parseBilltrustCsv,
@@ -576,49 +571,26 @@ async function main() {
     }
 
     // 8c. Drift report (--drift): booked (LTL Select quote) vs actual (final
-    // invoice), joined on PRO. Read-only. Surfaces only non-trivial drift so an
-    // unapplied PO does not read "0 → final" and flood the review.
-    // Materiality gate: |drift| < DRIFT_MIN is rounding/fuel-tier noise, not a
-    // reweigh. Only rows with BOTH a booking and a material delta count.
+    // invoice), joined on PRO. Read-only. Shared with the Friday EOW PDF.
     if (DRIFT) {
         const DRIFT_MIN = args.includes("--drift-min") ? Number(args[args.indexOf("--drift-min") + 1]) || 5 : 5;
         console.log(`\n─── BOOKED vs ACTUAL (final − LTL Select quote, joined on PRO, |drift| ≥ $${DRIFT_MIN.toFixed(2)}) ───`);
         try {
-            const env = loadLtlSelectEnv();
-            const token = await getLtlSelectToken(env);
-            const dateTo = new Date();
-            const dateFrom = new Date(dateTo.getTime() - 90 * 86_400_000);
-            const fmt = (d: Date) => d.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-            const { invoices: ltlInvoices } = await fetchLtlSelectInvoices(token, env, {
-                dateFrom: fmt(dateFrom),
-                dateTo: fmt(dateTo),
-            });
-            // PRO → booked (scanned invoice total, quote fallback) + quote
-            const bookedByPro = new Map<string, { amount: number; quote: number; vendor: string | null }>();
-            for (const li of ltlInvoices) {
-                const e = parseCollectEntry(li);
-                if (!e || !e.proNumber) continue;
-                bookedByPro.set(e.proNumber, { amount: e.amount, quote: e.quoteAmount, vendor: e.originName || null });
-            }
-            let driftRows = 0;
+            const rows = await computeFreightDrift(inbound, DRIFT_MIN);
+            const bookedPro = new Set(rows.map((r) => r.pro));
             let noBookingRows = 0;
             for (const inv of inbound) {
-                const booked = bookedByPro.get(inv.freightBillNumber);
-                if (!booked) {
-                    noBookingRows++;
-                    continue;
-                }
-                const drift = inv.amountDue - booked.amount;
-                if (Math.abs(drift) < DRIFT_MIN) continue; // sub-threshold → silent
-                const sign = drift >= 0 ? "+" : "";
-                console.log(
-                    `  ${(inv.vendor || inv.shipper || "?").padEnd(22)} | PRO ${inv.freightBillNumber} | ` +
-                    `booked $${booked.amount.toFixed(2)} (quote $${booked.quote.toFixed(2)}) → actual $${inv.amountDue.toFixed(2)} | ` +
-                    `drift ${sign}$${drift.toFixed(2)}`,
-                );
-                driftRows++;
+                if (!bookedPro.has(inv.freightBillNumber)) noBookingRows++;
             }
-            console.log(`  material drift: ${driftRows}  (${noBookingRows} without LTL Select booking)`);
+            for (const r of rows) {
+                const sign = r.drift >= 0 ? "+" : "";
+                console.log(
+                    `  ${(r.vendor || "?").padEnd(22)} | PRO ${r.pro} | ` +
+                    `booked $${r.booked.toFixed(2)} (quote $${r.quote.toFixed(2)}) → actual $${r.actual.toFixed(2)} | ` +
+                    `drift ${sign}$${r.drift.toFixed(2)}`,
+                );
+            }
+            console.log(`  material drift: ${rows.length}  (${noBookingRows} without LTL Select booking)`);
         } catch (err) {
             console.log(`  drift report failed: ${(err as Error).message}`);
         }

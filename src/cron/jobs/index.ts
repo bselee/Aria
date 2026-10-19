@@ -1506,21 +1506,21 @@ defineJob({
         }
 
         // Review bucket = what did NOT auto-apply: negative corrections
-        // (FedEx re-rated down), unmatched inbound bills, and material
-        // booked-vs-actual drift (|drift| ≥ $5, i.e. a reweigh/accessorial).
-        // Positive corrections and new freight are already written.
+        // (FedEx re-rated down) and unmatched inbound bills. Positive corrections
+        // and new freight are already written. Booked-vs-actual DRIFT is
+        // informational (reweigh already auto-applied) and lives in the Friday
+        // EOW PDF, not the task hub.
         const hasNegativeCorrection = /negative delta/i.test(stdout);
         const hasUnmatched = /unmatched/i.test(stdout) && !/unmatched: 0\b/.test(stdout);
-        const hasDrift = /material drift: [1-9]/.test(stdout);
-        if (hasNegativeCorrection || hasUnmatched || hasDrift) {
+        if (hasNegativeCorrection || hasUnmatched) {
             const { notifyViaTask } = await import("@/lib/intelligence/notify-via-task");
             const day = new Date().toISOString().slice(0, 10);
             await notifyViaTask({
                 sourceId: `fedex-mailbox:${day}`,
                 type: "cron_summary",
                 goal: stdout.slice(-4000),
-                inputs: { day, hasNegativeCorrection, hasUnmatched, hasDrift },
-                summaryLabel: "FedEx Freight Booked-vs-Actual Review",
+                inputs: { day, hasNegativeCorrection, hasUnmatched },
+                summaryLabel: "FedEx Freight Review",
             });
             console.log("[fedex-mailbox] Routed review items through agent_task hub.");
         } else {
