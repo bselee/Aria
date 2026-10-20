@@ -1577,3 +1577,21 @@ defineJob({
     },
     budget: { durationMs: 120_000 },
 });
+
+defineJob({
+    name: "fedex-freight-finals-feed",
+    schedule: "*/30 * * * *",
+    onFail: "log",
+    description:
+        "Glean the FedEx Freight FINAL invoice triple (account / invoice / amount) from the freight@ 'New Invoices Available' notice body and persist to fedex_freight_finals at arrival — before the ~6-week mailbox retention drops the notice. Idempotent upsert; closes the multi-PO split data gap permanently.",
+    handler: async () => {
+        const { captureFedexFreightFinals } = await import(
+            "@/lib/freight/fedex-freight-final-feed"
+        );
+        const inserted = await captureFedexFreightFinals();
+        if (inserted > 0) {
+            console.log(`[fedex-freight-finals-feed] captured ${inserted} new final invoice(s).`);
+        }
+    },
+    budget: { durationMs: 120_000 },
+});
