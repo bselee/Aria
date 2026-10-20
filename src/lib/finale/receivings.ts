@@ -30,7 +30,7 @@ import {
     type SendPurchaseOrderEmailResult,
     type POInfo,
 } from "./core-client";
-import { freightAdjustmentForPo, weightInPounds } from "./freight-adjustment";
+import { freightAdjustmentForPo, resolveUnitWeightLb } from "./freight-adjustment";
 
 // ── Concurrency-limited async map ────────────────────────────────────────
 /**
@@ -786,6 +786,12 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
     /**
      * PO line weights for ADJ_BY_WEIGHT. Order items often omit `weight`;
      * look up the product master so bag SKUs (50 lb) are not treated as 1 lb.
+     *
+     * DECISION(2026-10-20): use resolveUnitWeightLb (name-first) instead of
+     * reading weight/weightUomId directly — Finale's raw fields are inconsistent
+     * (RWBP102 "8oz" stores weight 0.5 tagged WT_oz; RWBP105 stores 24 oz), so
+     * reading the field alone yields a 16× error. The product NAME carries the
+     * true unit weight ("1lb", "8oz", "(2oz) 12ea Case").
      */
     protected async freightAllocLines(
         orderItemList: Array<{ productId?: string; quantity?: number; weight?: number }> | undefined,
@@ -795,20 +801,21 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
         for (const item of items) {
             const quantity = Number(item.quantity) || 0;
             let weight = Number(item.weight) || 0;
-            let uom: string | undefined;
             if (quantity > 0 && weight <= 0 && item.productId) {
                 try {
                     const product = await this.get(
                         `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
                     );
-                    weight = Number(product?.weight) || 0;
-                    uom = typeof product?.weightUomId === "string" ? product.weightUomId : undefined;
+                    weight = resolveUnitWeightLb({
+                        name: product?.internalName || product?.name,
+                        weight: product?.weight,
+                        weightUomId: product?.weightUomId,
+                    });
                 } catch {
                     weight = 0;
                 }
             }
-            const pounds = weightInPounds(weight, uom);
-            lines.push({ quantity, weight: pounds > 0 ? pounds : undefined });
+            lines.push({ quantity, weight: weight > 0 ? weight : undefined });
         }
         return lines;
     }

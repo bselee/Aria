@@ -42,10 +42,12 @@ import { execFileSync } from "child_process";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { FinaleClient } from "../lib/finale/client";
-import { freightAdjustmentForPo } from "../lib/finale/freight-adjustment";
+import { freightAdjustmentForPo, resolveUnitWeightLb, splitFreightAcrossPos } from "../lib/finale/freight-adjustment";
+import { getShipmentReceiptItems, getShipmentReceiptDateTime } from "../lib/finale/core-client";
 import {
     VENDOR_ORIGIN_MAP,
     pickPoForEntry,
+    pickPosForEntry,
     findBestReception,
     receiveWindowDaysForVendor,
     isMultiDeliveryVendor,
@@ -92,6 +94,7 @@ interface PoDoc {
         orderAdjustmentAllocationList?: number[];
     }>;
     orderItemList?: Array<{ quantity?: number; weight?: number }>;
+    shipmentUrlList?: string[];
     [key: string]: unknown;
 }
 
@@ -104,6 +107,7 @@ interface FinaleWriteSurface {
     freightAllocLines(
         orderItemList: Array<{ productId?: string; quantity?: number; weight?: number }> | undefined,
     ): Promise<Array<{ quantity: number; weight?: number }>>;
+    getShipmentDetails(shipmentUrl: string): Promise<unknown>;
 }
 
 /** One per-shipment FedEx Freight invoice parsed from a notice PDF. */
@@ -133,6 +137,8 @@ interface MailboxResult {
     freightAlreadyOnPO: boolean;
     /** invoice.amountDue − freightOnPo when a DIFFERENT amount is already on the PO. */
     correctionDelta: number | null;
+    /** Multi-PO split (one truck → several POs), when applicable. */
+    split?: Array<{ orderId: string; pounds: number; amount: number }>;
     lagDays: number | null;
     receiveDiffDays: number | null;
     reasons: string[];
@@ -285,6 +291,74 @@ function isDropshipOrderId(orderId: string | null | undefined): boolean {
     return !!orderId && /dropship/i.test(orderId);
 }
 
+// ── Multi-PO split (one truck, several POs) ──────────────────────────────────
+
+/**
+ * Resolve the allocation weight for each PO on a multi-PO truck.
+ *
+ * A multi-delivery vendor (Rootwise) ships several POs on one FedEx Freight
+ * bill. The bill carries no per-PO weight, so the split must come from the
+ * per-shipment items: for each PO, walk its shipments, find the one received in
+ * the bill's pickup window, and sum (received qty × unit weight). Unit weight is
+ * name-derived via resolveUnitWeightLb (the raw weight/weightUomId field is
+ * inconsistent — 16× errors on "8oz" SKUs).
+ *
+ * Returns a map orderId → pounds. POs whose shipments have no items, or whose
+ * SKUs have no weight, contribute 0 (and thus $0 from the split).
+ */
+async function resolveTruckPoWeights(
+    finale: FinaleWriteSurface,
+    poIds: string[],
+    pickupDate: string,
+    windowDays: number,
+): Promise<Map<string, number>> {
+    const weights = new Map<string, number>();
+    const pickupMs = new Date(`${String(pickupDate).slice(0, 10)}T12:00:00`).getTime();
+
+    for (const poId of poIds) {
+        const po = await finale.getOrderDetails(poId);
+        const urls = (po.shipmentUrlList as string[] | undefined) || [];
+        let pounds = 0;
+        for (const url of urls) {
+            const shipment = (await finale.getShipmentDetails(url)) as any;
+            const received = getShipmentReceiptDateTime(shipment);
+            if (!received) continue;
+            const recvMs = new Date(`${String(received).slice(0, 10)}T12:00:00`).getTime();
+            if (Number.isNaN(recvMs)) continue;
+            const diff = Math.abs((recvMs - pickupMs) / 86400000);
+            if (diff > windowDays) continue;
+            const items = getShipmentReceiptItems(shipment);
+            for (const item of items) {
+                const unit = await resolveFinaleUnitWeight(finale, item.productId);
+                pounds += unit * item.quantity;
+            }
+        }
+        weights.set(poId, pounds);
+    }
+    return weights;
+}
+
+/** Name-derived unit weight (lb) for a Finale SKU, cached per run. */
+const _unitWeightCache = new Map<string, number>();
+async function resolveFinaleUnitWeight(finale: FinaleWriteSurface, sku: string): Promise<number> {
+    if (_unitWeightCache.has(sku)) return _unitWeightCache.get(sku)!;
+    let lb = 0;
+    try {
+        const product = (await (finale as unknown as { get(endpoint: string): Promise<unknown> }).get(
+            `/buildasoilorganics/api/product/${encodeURIComponent(sku)}`,
+        )) as any;
+        lb = resolveUnitWeightLb({
+            name: product?.internalName || product?.name,
+            weight: product?.weight,
+            weightUomId: product?.weightUomId,
+        });
+    } catch {
+        lb = 0;
+    }
+    _unitWeightCache.set(sku, lb);
+    return lb;
+}
+
 // ── Small date helpers ───────────────────────────────────────────────────────
 
 function daysBetween(fromIso: string, toIso: string): number | null {
@@ -431,12 +505,50 @@ async function main() {
             }
         } else if (inv.vendor) {
             // Guard 2: vendor + receive-window match.
-            const pick = pickPoForEntry(entry, recentPOs, inv.vendor);
-            if (pick) {
-                r.finalePoId = pick.orderId;
-                r.matchSource = "vendor_window";
+            if (isMultiDeliveryVendor(inv.vendor)) {
+                // Multi-PO-per-truck: one bill can cover several POs. Split by
+                // allocation weight when more than one PO received in the window.
+                const candidates = pickPosForEntry(entry, recentPOs, inv.vendor);
+                if (candidates.length > 1) {
+                    const win = receiveWindowDaysForVendor(inv.vendor);
+                    const weights = await resolveTruckPoWeights(
+                        finale,
+                        candidates.map((p) => p.orderId),
+                        entry.pickupDate,
+                        win.mode === "business" ? win.maxDays + 2 : win.maxDays,
+                    );
+                    const totalLb = [...weights.values()].reduce((s, w) => s + w, 0);
+                    if (totalLb > 0) {
+                        const split = splitFreightAcrossPos(
+                            inv.amountDue,
+                            [...weights.entries()].map(([orderId, pounds]) => ({ orderId, pounds })),
+                        );
+                        r.split = split;
+                        r.matchSource = "vendor_window";
+                        r.finalePoId = split.length ? split[0].orderId : null;
+                        r.reasons.push(
+                            `multi-PO truck: ${split.length} POs, split by weight (${split.map((s) => `${s.orderId} $${s.amount.toFixed(2)}`).join(", ")})`,
+                        );
+                    } else {
+                        r.reasons.push(`multi-PO truck matched ${candidates.length} POs but no weight resolvable`);
+                    }
+                } else {
+                    const pick = candidates[0] || pickPoForEntry(entry, recentPOs, inv.vendor);
+                    if (pick) {
+                        r.finalePoId = pick.orderId;
+                        r.matchSource = "vendor_window";
+                    } else {
+                        r.reasons.push(`no ${inv.vendor} PO in order window`);
+                    }
+                }
             } else {
-                r.reasons.push(`no ${inv.vendor} PO in order window`);
+                const pick = pickPoForEntry(entry, recentPOs, inv.vendor);
+                if (pick) {
+                    r.finalePoId = pick.orderId;
+                    r.matchSource = "vendor_window";
+                } else {
+                    r.reasons.push(`no ${inv.vendor} PO in order window`);
+                }
             }
         } else {
             r.reasons.push("unknown shipper");
@@ -469,6 +581,31 @@ async function main() {
     // 6. Freight-already + correction detection for matched rows.
     for (const r of results) {
         if (!r.finalePoId || r.matchSource === "unmatched" || r.matchSource === "excluded") continue;
+        if (r.split) {
+            // Multi-PO split: per-PO correction detection. Each PO's share vs its
+            // current freight decides add/correct/already — not the whole bill.
+            for (const s of r.split) {
+                try {
+                    const po = await finale.getOrderDetails(s.orderId);
+                    const carrierFreight = (po.orderAdjustmentList ?? []).filter(
+                        (a) => (a.productPromoUrl ?? "").includes("/10007") && Number(a.amount) > 2.5,
+                    );
+                    const carrierTotal = carrierFreight.reduce((sum, a) => sum + (Number(a.amount) || 0), 0);
+                    const delta = s.amount - carrierTotal;
+                    if (Math.abs(delta) < 0.02) {
+                        r.reasons.push(`PO ${s.orderId} already at $${s.amount.toFixed(2)}`);
+                    } else {
+                        r.reasons.push(
+                            `PO ${s.orderId} has $${carrierTotal.toFixed(2)}, split $${s.amount.toFixed(2)} (Δ ${delta >= 0 ? "+" : ""}${delta.toFixed(2)})`,
+                        );
+                    }
+                    await new Promise((res) => setTimeout(res, GAP_MS));
+                } catch (err) {
+                    r.reasons.push(`PO ${s.orderId} load failed: ${(err as Error).message.slice(0, 60)}`);
+                }
+            }
+            continue;
+        }
         try {
             const po = await finale.getOrderDetails(r.finalePoId);
             const freight = (po.orderAdjustmentList ?? []).filter(
@@ -514,6 +651,19 @@ async function main() {
     for (const r of results) {
         const v = r.vendor || r.invoice.shipper || "?";
         const lag = r.lagDays == null ? "—" : `${r.lagDays}d`;
+        if (r.split) {
+            const totalLb = r.split.reduce((s, x) => s + x.pounds, 0);
+            console.log(
+                `  ${r.confidence.toUpperCase().padEnd(6)} | $${r.invoice.amountDue.toFixed(2).padStart(8)} | ` +
+                `${v.padEnd(22)} | SPLIT → ${r.split.length} POs | ship ${r.invoice.shipDate || "?"} → inv ${r.invoice.invoiceDate || "?"} (${lag})`,
+            );
+            for (const s of r.split) {
+                const pct = totalLb > 0 ? ((s.pounds / totalLb) * 100).toFixed(1) : "0.0";
+                console.log(`           ├─ PO ${s.orderId.padEnd(7)} ${s.pounds.toFixed(1).padStart(8)} lb ${pct.padStart(5)}%  →  $${s.amount.toFixed(2)}`);
+            }
+            if (r.reasons.length) console.log(`           └─ ${r.reasons.join("; ")}`);
+            continue;
+        }
         const po = r.finalePoId || r.invoice.poNumber || "-";
         const action = r.freightAlreadyOnPO ? "already"
             : r.correctionDelta !== null ? `CORRECT ${r.correctionDelta >= 0 ? "+" : ""}$${r.correctionDelta.toFixed(2)}`
@@ -528,8 +678,10 @@ async function main() {
     }
     console.log("────────────────────────────────────────────────────────────────────────────");
 
-    // 8. Apply (HIGH + no freight already on PO only).
-    const toApplyNow = results.filter((r) => r.wouldApply && r.confidence === "high" && !r.freightAlreadyOnPO && r.correctionDelta === null);
+    // 8. Apply (HIGH + no freight already on PO only). Split rows are excluded:
+    // a multi-PO correction restates landed cost across several POs, which is
+    // Bill's call — the split is reported, never auto-applied.
+    const toApplyNow = results.filter((r) => r.wouldApply && r.confidence === "high" && !r.freightAlreadyOnPO && r.correctionDelta === null && !r.split);
     if (LIVE && toApplyNow.length > 0) {
         console.log(`\nApplying ${toApplyNow.length} high-confidence NEW freight adjustment(s)\n`);
         for (const r of toApplyNow) {
@@ -598,8 +750,9 @@ async function main() {
     }
 
     // 9. Summary.
-    const toApply = results.filter((r) => r.wouldApply && r.confidence === "high" && !r.freightAlreadyOnPO && r.correctionDelta === null);
+    const toApply = results.filter((r) => r.wouldApply && r.confidence === "high" && !r.freightAlreadyOnPO && r.correctionDelta === null && !r.split);
     const corrections = results.filter((r) => r.correctionDelta !== null);
+    const splits = results.filter((r) => r.split && r.split.length > 0);
     const already = results.filter((r) => r.freightAlreadyOnPO);
     const unmatched = results.filter((r) => r.matchSource === "unmatched");
     console.log("\nSUMMARY");
@@ -607,6 +760,7 @@ async function main() {
     console.log(`  inbound COLLECT: ${inbound.length}  in scope: ${inScope.length}`);
     console.log(`  HIGH (new): ${toApply.length}  $${toApply.reduce((s, r) => s + r.invoice.amountDue, 0).toFixed(2)}`);
     console.log(`  CORRECTIONS: ${corrections.length}  $${corrections.reduce((s, r) => s + (r.correctionDelta || 0), 0).toFixed(2)}`);
+    console.log(`  MULTI-PO SPLITS: ${splits.length}  $${splits.reduce((s, r) => s + r.invoice.amountDue, 0).toFixed(2)}`);
     console.log(`  already on PO: ${already.length}`);
     console.log(`  unmatched: ${unmatched.length}\n`);
 }

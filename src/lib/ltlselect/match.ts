@@ -466,6 +466,62 @@ export function pickPoForEntry(
     return vendorPOs[0] ?? null;
 }
 
+/**
+ * Pick EVERY vendor PO whose shipment received within the freight pickup window.
+ *
+ * `pickPoForEntry` returns the single best PO — correct for single-delivery
+ * vendors, but a multi-PO-per-truck vendor (Rootwise) puts several POs on one
+ * FedEx Freight bill, and those POs all receive on the same date. A split needs
+ * the whole set, not just the closest one.
+ *
+ * Same filters as pickPoForEntry (dropship skip, ±45d order window, receive
+ * within the vendor window), but returns every PO with a receive hit instead of
+ * the single closest. POs with a receive hit sort ahead of no-receive POs, then
+ * by receive proximity.
+ *
+ * Returns [] when no PO matches (callers fall back to pickPoForEntry semantics).
+ */
+export function pickPosForEntry(
+    entry: CollectEntry,
+    recentPOs: PoCandidate[],
+    mappedVendor: string,
+): PoCandidate[] {
+    const vendorKey = mappedVendor.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ")[0];
+    const alias = VENDOR_ORIGIN_MAP.find((row) => row.vendor === mappedVendor)?.alias;
+    const delMs = new Date(entry.pickupDate).getTime();
+    if (Number.isNaN(delMs)) return [];
+    const window = receiveWindowDaysForVendor(mappedVendor);
+
+    const vendorPOs = recentPOs.filter((po) => {
+        if (/dropship/i.test(po.orderId || "")) return false;
+        const name = (po.vendorName || "").toLowerCase();
+        const named = (vendorKey && name.includes(vendorKey)) || (alias ? alias.test(po.vendorName || "") : false);
+        if (!named) return false;
+        const orderMs = new Date(po.orderDate).getTime();
+        if (Number.isNaN(orderMs)) return false;
+        const daysDiff = (delMs - orderMs) / 86400000;
+        if (daysDiff < -3 || daysDiff > 45) return false;
+        return true;
+    });
+
+    if (vendorPOs.length === 0) return [];
+
+    const withReceive = vendorPOs.filter((po) => findBestReception(po, entry.pickupDate, window));
+    if (withReceive.length === 0) {
+        // Bill adds freight before the receive; only a single open PO is a match.
+        return vendorPOs.length === 1 ? vendorPOs : [];
+    }
+
+    return withReceive.sort((a, b) => {
+        const aHit = findBestReception(a, entry.pickupDate, window);
+        const bHit = findBestReception(b, entry.pickupDate, window);
+        if (aHit && bHit) return aHit.diffDays - bHit.diffDays;
+        if (aHit && !bHit) return -1;
+        if (!aHit && bHit) return 1;
+        return 0;
+    });
+}
+
 export type FreightShipmentCandidate = {
     receiveDate: string;
     tracking?: string | null;

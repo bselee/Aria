@@ -22,6 +22,7 @@ import {
     matchVendorFromOrigin,
     parseCollectEntry,
     pickPoForEntry,
+    pickPosForEntry,
     pickShipmentItemsForBill,
     receiveWindowDaysForVendor,
     scoreFreightApplyConfidence,
@@ -401,6 +402,63 @@ describe("pickPoForEntry", () => {
         const pick = pickPoForEntry(entry, withDrop, "Rootwise Soil Dynamics");
         expect(pick?.orderId).toBe("120123");
         expect(pick?.orderId).not.toMatch(/dropship/i);
+    });
+});
+
+describe("pickPosForEntry", () => {
+    const recentPOs = [
+        {
+            orderId: "125393",
+            vendorName: "Rootwise Soil Dynamics",
+            orderDate: "2026-10-07",
+            shipments: [{ shipmentId: "S1", receiveDate: "2026-10-09" }],
+        },
+        {
+            orderId: "125271",
+            vendorName: "Rootwise Soil Dynamics",
+            orderDate: "2026-09-03",
+            shipments: [{ shipmentId: "S2", receiveDate: "2026-10-09" }],
+        },
+        {
+            orderId: "125241",
+            vendorName: "Rootwise Soil Dynamics",
+            orderDate: "2026-08-27",
+            shipments: [
+                { shipmentId: "S3", receiveDate: "2026-09-11" },
+                { shipmentId: "S4", receiveDate: "2026-10-09" },
+            ],
+        },
+    ];
+
+    it("returns every PO that received on the truck (multi-PO split)", () => {
+        const entry = parseCollectEntry(
+            rootwiseCollectInvoice({
+                shipment: {
+                    ...rootwiseCollectInvoice().shipment!,
+                    origin: { ...rootwiseCollectInvoice().shipment!.origin!, date: "2026-10-08" },
+                },
+            }),
+        )!;
+        const pos = pickPosForEntry(entry, recentPOs, "Rootwise Soil Dynamics");
+        expect(pos.map((p) => p.orderId).sort()).toEqual(["125241", "125271", "125393"]);
+    });
+
+    it("returns a single PO when only one received", () => {
+        const entry = parseCollectEntry(
+            rootwiseCollectInvoice({
+                shipment: {
+                    ...rootwiseCollectInvoice().shipment!,
+                    origin: { ...rootwiseCollectInvoice().shipment!.origin!, date: "2026-10-07" },
+                },
+            }),
+        )!;
+        const pos = pickPosForEntry(entry, [recentPOs[0]], "Rootwise Soil Dynamics");
+        expect(pos.map((p) => p.orderId)).toEqual(["125393"]);
+    });
+
+    it("returns [] for no matching vendor", () => {
+        const entry = parseCollectEntry(rootwiseCollectInvoice())!;
+        expect(pickPosForEntry(entry, recentPOs, "SP USA")).toEqual([]);
     });
 });
 
