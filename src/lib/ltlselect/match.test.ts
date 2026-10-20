@@ -184,7 +184,7 @@ describe("matchVendorFromOrigin", () => {
         expect(match).toEqual({ vendor: "Rootwise Soil Dynamics", matchedBy: "name" });
     });
 
-    it("maps an opaque LVC origin to Surepack USA via the name alias", () => {
+    it("maps an opaque LVC origin to SP USA via the name alias", () => {
         const entry = parseCollectEntry(
             rootwiseCollectInvoice({
                 shipment: {
@@ -194,7 +194,7 @@ describe("matchVendorFromOrigin", () => {
             }),
         )!;
         const match = matchVendorFromOrigin(entry);
-        expect(match).toEqual({ vendor: "Surepack USA", matchedBy: "name" });
+        expect(match).toEqual({ vendor: "SP USA", matchedBy: "name" });
     });
 
     it("falls back to city/state when the name is opaque", () => {
@@ -207,10 +207,10 @@ describe("matchVendorFromOrigin", () => {
             }),
         )!;
         const match = matchVendorFromOrigin(entry);
-        expect(match).toEqual({ vendor: "Surepack USA", matchedBy: "city_state" });
+        expect(match).toEqual({ vendor: "SP USA", matchedBy: "city_state" });
     });
 
-    it("maps SPUSA C/O ADVANTAGE WH to Surepack USA by name", () => {
+    it("maps SPUSA C/O ADVANTAGE WH to SP USA by name", () => {
         const entry = parseCollectEntry(
             rootwiseCollectInvoice({
                 identifiers: { ...rootwiseCollectInvoice().identifiers, orderNumber: null },
@@ -221,7 +221,7 @@ describe("matchVendorFromOrigin", () => {
             }),
         )!;
         const match = matchVendorFromOrigin(entry);
-        expect(match).toEqual({ vendor: "Surepack USA", matchedBy: "name" });
+        expect(match).toEqual({ vendor: "SP USA", matchedBy: "name" });
     });
 
     it("maps gro kashi (with space) to Grokashi", () => {
@@ -265,7 +265,7 @@ describe("variance and vendor flags", () => {
     it("flags rootwise and granite as multi-delivery", () => {
         expect(isMultiDeliveryVendor("Rootwise Soil Dynamics")).toBe(true);
         expect(isMultiDeliveryVendor("Granite Mill Farms")).toBe(true);
-        expect(isMultiDeliveryVendor("Surepack USA")).toBe(false);
+        expect(isMultiDeliveryVendor("SP USA")).toBe(false);
     });
 });
 
@@ -376,7 +376,7 @@ describe("pickPoForEntry", () => {
 
     it("does not match POs of other vendors", () => {
         const entry = parseCollectEntry(rootwiseCollectInvoice())!;
-        const pick = pickPoForEntry(entry, recentPOs, "Surepack USA");
+        const pick = pickPoForEntry(entry, recentPOs, "SP USA");
         expect(pick).toBeNull();
     });
 

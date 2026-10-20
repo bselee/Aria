@@ -43,7 +43,7 @@ export const VENDOR_ORIGIN_MAP: ReadonlyArray<{
     { alias: /rootwise/i, vendor: "Rootwise Soil Dynamics" },
     { alias: /granite/i, vendor: "Granite Mill Farms" },
     { alias: /grokashi|gro\s*kashi/i, vendor: "Grokashi" },
-    { alias: /surepack|spusa|advantage\s*wh|\blvc\b|\bsp\s*usa\b/i, vendor: "Surepack USA" },
+    { alias: /surepack|spusa|advantage\s*wh|\blvc\b|\bsp\s*usa\b/i, vendor: "SP USA" },
     { alias: /seaforth/i, vendor: "Seaforth Mineral" },
     { alias: /concentrates/i, vendor: "Concentrates, Inc" },
     { alias: /diamond\s*k/i, vendor: "Diamond K" },
@@ -67,7 +67,7 @@ export const VENDOR_CITY_STATE_MAP: ReadonlyArray<{
     { city: "EVERGREEN", state: "CO", vendor: "Rootwise Soil Dynamics" },
     { city: "MISSOULA", state: "MT", vendor: "Granite Mill Farms" },
     { city: "LAYTONVILLE", state: "CA", vendor: "Grokashi" },
-    { city: "LAS VEGAS", state: "NV", vendor: "Surepack USA" },
+    { city: "LAS VEGAS", state: "NV", vendor: "SP USA" },
 ];
 
 /**

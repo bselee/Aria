@@ -198,7 +198,7 @@ const VENDOR_ADDRESS_MAP: Array<{ pattern: RegExp; vendor: string }> = [
     { pattern: /rootwise/i, vendor: "Rootwise Soil Dynamics" },
     { pattern: /grokashi/i, vendor: "Grokashi" },
     { pattern: /granite\s*mill/i, vendor: "Granite Mill Farms" },
-    { pattern: /spusa|advantage\s*wh|surepack\s*usa/i, vendor: "Surepack USA" },
+    { pattern: /spusa|advantage\s*wh|surepack\s*usa/i, vendor: "SP USA" },
     { pattern: /seaforth/i, vendor: "Seaforth Mineral" },
     { pattern: /concentrates/i, vendor: "Concentrates, Inc" },
     { pattern: /diamond\s*k/i, vendor: "Diamond K" },
