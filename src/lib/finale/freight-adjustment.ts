@@ -28,6 +28,74 @@ export function weightInPounds(weight: number, uom?: string | null): number {
     return n;
 }
 
+/**
+ * Parse a per-unit weight (in pounds) from a Finale product name.
+ *
+ * Finale's `weight` + `weightUomId` fields are inconsistent: some SKUs store
+ * pounds tagged as `WT_oz` (RWBP102 "8oz" → weight 0.5), others store genuine
+ * ounces (RWBP105 "2oz 12ea Case" → weight 24). The name is the reliable
+ * source of truth, so derive from it first and only fall back to the raw field.
+ *
+ * Recognized shapes (case-insensitive):
+ *   - "… : 1lb"          → 1
+ *   - "… : 8oz"          → 0.5   (8 oz ÷ 16)
+ *   - "… : 4oz"          → 0.25
+ *   - "… (2oz) 12ea Case" → 1.5  (2 oz × 12 per case ÷ 16)
+ *   - "… : 16oz/Pint"    → null (fluid volume, not weight; caller falls back)
+ *
+ * Returns null when the name carries no weight, or only a fluid-volume marker
+ * (fl oz, oz/Pint, oz/Quart, oz/Gallon) so callers can fall back to the raw field.
+ */
+export function parseUnitWeightLb(name: string | null | undefined): number | null {
+    const n = (name || "").trim();
+    if (!n) return null;
+
+    // Case multiplier first: "(2oz) 12ea Case" → 2 × 12 oz.
+    const caseMatch = n.match(/\((\d+(?:\.\d+)?)\s*(oz|lb|ozs|lbs)\)\s*(\d+)\s*(?:ea|each|ct|count|pc)\b/i);
+    if (caseMatch) {
+        const base = parseFloat(caseMatch[1]);
+        const unit = caseMatch[2].toLowerCase();
+        const count = parseFloat(caseMatch[3]);
+        if (Number.isFinite(base) && Number.isFinite(count) && base > 0 && count > 0) {
+            return unit.startsWith("oz") ? (base * count) / 16 : base * count;
+        }
+    }
+
+    // Fluid-volume markers are NOT weight: "16oz/Pint", "12 fl oz", "oz per gallon".
+    if (/\d+\s*fl\.?\s*oz|\d+\s*oz\s*\/\s*(pint|pt|qt|quart|gal|gallon)/i.test(n)) {
+        return null;
+    }
+
+    // Single weight: "1lb", "8oz", "1.3 lb", "4 oz".
+    const single = n.match(/(\d+(?:\.\d+)?)\s*(lb|lbs|oz|ozs)\b/i);
+    if (single) {
+        const val = parseFloat(single[1]);
+        const unit = single[2].toLowerCase();
+        if (Number.isFinite(val) && val > 0) {
+            return unit.startsWith("oz") ? val / 16 : val;
+        }
+    }
+    return null;
+}
+
+/**
+ * Resolve a product's per-unit weight in pounds, preferring the name
+ * (ground truth) and falling back to the raw `weight` + `weightUomId` fields.
+ *
+ * @returns pounds, or 0 when the weight is unknown.
+ */
+export function resolveUnitWeightLb(opts: {
+    name?: string | null;
+    weight?: number | null;
+    weightUomId?: string | null;
+}): number {
+    const fromName = parseUnitWeightLb(opts.name);
+    if (fromName !== null && fromName > 0) return fromName;
+    const w = Number(opts.weight) || 0;
+    if (w <= 0) return 0;
+    return weightInPounds(w, opts.weightUomId);
+}
+
 /** Split `amount` across positive masses. Zero-mass slots stay $0. */
 function splitByMass(amount: number, masses: number[]): number[] {
     if (!masses.length) return [round2(amount)];
@@ -46,6 +114,37 @@ function splitByMass(amount: number, masses: number[]): number[] {
         }
     }
     return rounded;
+}
+
+export interface FreightPoWeight {
+    /** Finale order ID (PO number). */
+    orderId: string;
+    /** Total allocation weight for this PO, in pounds (qty × unit weight summed). */
+    pounds: number;
+}
+
+export interface FreightPoSplit {
+    orderId: string;
+    pounds: number;
+    amount: number;
+}
+
+/**
+ * Split one freight bill (one truck, multiple POs) across the POs that rode on
+ * it, proportional to each PO's total allocation weight in pounds.
+ *
+ * This mirrors Finale's ADJ_BY_WEIGHT but at the PO level: the single FedEx
+ * freight bill has no per-PO weight, so the split comes from qty × unit weight
+ * per PO. POs with zero/unknown weight get $0 rather than a fabricated share.
+ *
+ * Rounding: each share is rounded to cents and the residual is dropped on the
+ * last positive-weight PO so the shares sum exactly to `amount`.
+ */
+export function splitFreightAcrossPos(amount: number, pos: FreightPoWeight[]): FreightPoSplit[] {
+    if (!pos.length) return [];
+    const masses = pos.map((p) => (Number.isFinite(Number(p.pounds)) && Number(p.pounds) > 0 ? Number(p.pounds) : 0));
+    const shares = splitByMass(amount, masses);
+    return pos.map((p, i) => ({ orderId: p.orderId, pounds: masses[i], amount: shares[i] }));
 }
 
 /**
