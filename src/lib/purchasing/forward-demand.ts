@@ -34,6 +34,16 @@ const slot: Slot = ((globalThis as any).__aria_forward_demand_slot ??= {
 
 const TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
+/**
+ * Calendar forward floor is OFF by default (Bill, 2026-10-06): the build
+ * calendars (MFG + SOIL) carry too much noise to weigh on every recommendation.
+ * The calendar is used on-demand only — see `src/cli/build-schedule-report.ts`.
+ * Set ENABLE_CALENDAR_FORWARD_FLOOR=true to re-enable the continuous floor.
+ */
+function calendarFloorEnabled(): boolean {
+    return process.env.ENABLE_CALENDAR_FORWARD_FLOOR === "true";
+}
+
 async function runScan(daysOut: number): Promise<ForwardDemandMap> {
     try {
         const { runBuildRiskAnalysis } = await import('@/lib/builds/build-risk');
@@ -60,6 +70,7 @@ async function runScan(daysOut: number): Promise<ForwardDemandMap> {
  * immediately while the refresh runs.
  */
 export function readForwardDemand(daysOut = 30): ForwardDemandMap {
+    if (!calendarFloorEnabled()) return new Map();
     const stale = !slot.value || Date.now() - slot.at > TTL_MS;
     if (stale && !slot.promise) {
         slot.promise = (async () => {
@@ -80,6 +91,7 @@ export function readForwardDemand(daysOut = 30): ForwardDemandMap {
  * Fire-and-forget warm-up. Safe to schedule alongside the purchasing prewarm.
  */
 export async function prewarmForwardDemand(daysOut = 30): Promise<void> {
+    if (!calendarFloorEnabled()) return;
     if (slot.value && Date.now() - slot.at < TTL_MS) return;
     if (slot.promise) {
         await slot.promise.catch(() => undefined);
