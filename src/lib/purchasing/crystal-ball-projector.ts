@@ -261,6 +261,13 @@ export function buildCrystalBallProjection(item: any, historicalPOs?: Array<{
     // A 100% on-time vendor passes through at full credit; a vendor that delivers
     // on time 70% of the time only gets 70% credit for open PO supply. Default 1.0
     // (no discount) when the on-time rate has not been computed yet.
+    //
+    // SIBLING NOTE (Phase 3.3 audit, 2026-10-21): this is a DISPLAY-ONLY path —
+    // the only consumer is /api/dashboard/purchasing/crystal-ball → the panel.
+    // item.stockOnOrder arrives already age-gated by coverageStockOnOrder in
+    // finale/purchasing.ts (stale open POs past lead+grace excluded, RWBP105).
+    // This function must never re-derive cover from openPOs — that would
+    // re-credit the stale POs the ordering path just removed.
     const onTimeRate: number = typeof item.vendorOnTimeRate === 'number' ? Math.min(1, Math.max(0, item.vendorOnTimeRate)) : 1;
     const stockOnOrder = Math.round(rawStockOnOrder * onTimeRate);
     

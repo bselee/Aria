@@ -165,3 +165,20 @@ describe('crystal-ball-projector buildCrystalBallProjection', () => {
         expect(res.vendorOnTimeRate).toBe(1.0);
     });
 });
+
+describe('crystal-ball-projector — no cover re-derivation (Phase 3.3, RWBP105)', () => {
+    it('uses the age-gated stockOnOrder as-is; never re-derives from openPOs', () => {
+        // item.stockOnOrder arrives from finale/purchasing already age-gated:
+        // the stale 10-unit PO 125271 is NOT in the 40. If the projector
+        // re-derived cover from openPOs it would report 50 and re-credit a
+        // PO the ordering path just excluded.
+        const item = {
+            productId: 'RWBP105', productName: 'Rootwise Pro', supplierName: 'Rootwise', supplierPartyId: 'p1',
+            stockOnHand: 100, stockOnOrder: 40, dailyRate: 5, leadTimeDays: 25,
+            openPOs: [{ orderId: '125271', quantity: 10, orderDate: '2026-09-03' }],
+            vendorOnTimeRate: 1.0,
+        };
+        const res = buildCrystalBallProjection(item);
+        expect(res.stockOnOrder).toBe(40);
+    });
+});
