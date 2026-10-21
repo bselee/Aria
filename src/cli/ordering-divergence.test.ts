@@ -96,4 +96,34 @@ describe("analyzeDivergence", () => {
         expect(rows[0].productId).toBe("ZZZ");
         expect(rows[0].flagged).toBe(true);
     });
+
+    it("adjudicates with the ledger: a demand rate the ledger corroborates does not flag (RWBP105)", () => {
+        // Live case 2026-10-21: demand 0.14 vs receipts 0.027 flagged against
+        // receipts; the 90d ledger (0.133/d) proves demand was right.
+        const rows = analyzeDivergence(
+            [resale({ productId: "RWBP105", dailyRate: 0.14, dailyRateSource: "demand", purchaseVelocity: 0.027 })],
+            [],
+            new Map([["RWBP105", 0.133]]),
+        );
+        expect(rows[0].flagged).toBe(false);
+    });
+
+    it("still flags when the ledger itself contradicts the chosen rate", () => {
+        const rows = analyzeDivergence(
+            [resale({ productId: "BAD1", dailyRate: 9, dailyRateSource: "demand", purchaseVelocity: 0.03 })],
+            [],
+            new Map([["BAD1", 0.1]]),
+        );
+        expect(rows[0].flagged).toBe(true);
+        expect(rows[0].resaleCapBreach).toBe(true);
+    });
+
+    it("works without a ledger cache (receipts fallback preserved)", () => {
+        const rows = analyzeDivergence(
+            [resale({ productId: "RAWRICEBRAN", dailyRate: 17224, purchaseVelocity: 173 })],
+            [],
+            undefined,
+        );
+        expect(rows[0].flagged).toBe(true);
+    });
 });

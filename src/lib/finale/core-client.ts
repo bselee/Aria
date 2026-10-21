@@ -1018,7 +1018,14 @@ export function chooseVelocitySignal(input: {
         }
     }
 
-    const reality = Math.max(salesVelocity, purchaseVelocity);
+    // HERMIA(2026-10-21 — Bill): the cap's "reality" must include the ledger.
+    // The 2.5x ledger-divergence check above already trusts the ledger as the
+    // physical-consumption fact; when it CORROBORATES the chosen rate (ratio
+    // <= 2.5x), lumpy receipts from an old bulk buy must not cap it (BLM210:
+    // demand 2.9 corroborated by ledger 2.78 was capped to the 0.685 receipts
+    // of a March purchase). An absent ledger leaves sales/purchase as reality —
+    // the rice-bran protection is unchanged.
+    const reality = Math.max(salesVelocity, purchaseVelocity, ledgerVelocity);
     const capped = capRateToReality(chosenRate, reality);
     if (capped.capped) {
         return {

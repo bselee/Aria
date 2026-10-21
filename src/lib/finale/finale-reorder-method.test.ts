@@ -188,6 +188,48 @@ describe("shared 3x reality cap — one helper, both velocity paths", () => {
     expect(r.source).toBe("ledger");
   });
 
+  it("does not cap a ledger-corroborated demand rate against lumpy receipts (BLM210)", () => {
+    // Ledger 90d = 2.78/d (physical truth, matches the BOM path's 2.80).
+    // Receipts 0.685 = a March buy — lumpy, not consumption. The cap's
+    // reality must include the ledger or it clobbers corroborated demand.
+    const r = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 2.9,
+      salesVelocity: 0,
+      purchaseVelocity: 0.685,
+      ledgerVelocity: 2.78,
+    });
+    expect(r.dailyRate).toBeCloseTo(2.9, 5);
+    expect(r.inflated).toBeUndefined();
+  });
+
+  it("caps unverified demand when the ledger is absent (rice-bran protection intact)", () => {
+    const r = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 17224,
+      salesVelocity: 0,
+      purchaseVelocity: 173,
+      ledgerVelocity: 0,
+    });
+    expect(r.dailyRate).toBe(173);
+    expect(r.inflated).toBe(true);
+  });
+
+  it("keeps the ledger-divergence override ahead of the cap", () => {
+    // Ledger 173 vs demand 17224 diverges >2.5x -> the ledger replaces the
+    // rate outright before the cap is reached.
+    const r = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 17224,
+      salesVelocity: 0,
+      purchaseVelocity: 173,
+      ledgerVelocity: 173,
+    });
+    expect(r.dailyRate).toBe(173);
+    expect(r.signal).toBe("ledger");
+    expect(r.replacedSignal).toBe("demand");
+  });
+
   it("both paths leave a <=3x split uncapped", () => {
     expect(chooseVelocitySignal({
       reorderMethod: "default",

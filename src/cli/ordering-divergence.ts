@@ -67,12 +67,19 @@ function receiptsOf(n: unknown): number | null {
 }
 
 /**
- * Physical signal for a path. When the chosen rate came from the ledger, the
- * rate IS the ledger (not separately persisted) — it cannot breach itself.
- * Otherwise receipts are the physical evidence. A zero-ledger row falls back
- * to receipts; when both are absent there is nothing to breach.
+ * Physical signal for a path. Precedence:
+ *   1. stock ledger (data/stock-ledger-cache-90.json) — physical consumption,
+ *      the same source the engine's velocity chooser trusts (2026-10-21 fix)
+ *   2. when the chosen rate came from the ledger, the rate IS the ledger
+ *   3. receipts — lumpy purchase history, the last resort
+ * A zero-ledger row falls back cleanly; nothing to breach when all absent.
  */
-function physicalSignal(row: DivergenceInputRow, chosen: number | null): number | null {
+function physicalSignal(
+    row: DivergenceInputRow,
+    chosen: number | null,
+    ledgerRate: number | null,
+): number | null {
+    if (ledgerRate != null && ledgerRate > 0) return ledgerRate;
     if (row.dailyRateSource === "ledger") return chosen;
     if (fin(row.purchaseVelocity) != null) return fin(row.purchaseVelocity);
     return chosen;
@@ -90,6 +97,7 @@ function breaches(chosen: number | null, physical: number | null): boolean {
 export function analyzeDivergence(
     resaleRows: DivergenceInputRow[],
     bomRows: DivergenceInputRow[],
+    ledgerBySku?: Map<string, number>,
 ): DivergenceRow[] {
     const bomBySku = new Map(bomRows.map((r) => [r.productId, r]));
     const skus = new Set<string>([...resaleRows.map((r) => r.productId), ...bomRows.map((r) => r.productId)]);
@@ -102,9 +110,10 @@ export function analyzeDivergence(
         const resaleRate = fin(resale?.dailyRate);
         const bomRate = fin(bom?.dailyRate);
         const receipts = receiptsOf(resale?.purchaseVelocity) ?? receiptsOf(bom?.purchaseVelocity);
+        const ledgerRate = ledgerBySku?.get(sku) ?? null;
 
-        const resalePhys = physicalSignal(resale ?? { productId: sku }, resaleRate);
-        const bomPhys = physicalSignal(bom ?? { productId: sku }, bomRate);
+        const resalePhys = physicalSignal(resale ?? { productId: sku }, resaleRate, ledgerRate);
+        const bomPhys = physicalSignal(bom ?? { productId: sku }, bomRate, ledgerRate);
 
         const resaleCapBreach = breaches(resaleRate, resalePhys);
         const bomCapBreach = breaches(bomRate, bomPhys);
@@ -136,6 +145,25 @@ function loadSnapshot(path: string): DivergenceInputRow[] {
     return (parsed.value ?? []).flatMap((g) => g.items ?? []);
 }
 
+/** Stock-ledger snapshot: sku -> 90d physical daily rate. Optional — the CLI
+ *  still works (receipts fallback) when the cache file is absent. */
+function loadLedgerRates(cacheDir: string): Map<string, number> | undefined {
+    const file = join(cacheDir, "..", "..", "data", "stock-ledger-cache-90.json");
+    if (!existsSync(file)) return undefined;
+    try {
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as { bySku?: Record<string, { dailyRate?: number }> };
+        const map = new Map<string, number>();
+        for (const [sku, entry] of Object.entries(parsed.bySku ?? {})) {
+            if (typeof entry?.dailyRate === "number" && Number.isFinite(entry.dailyRate) && entry.dailyRate > 0) {
+                map.set(sku, entry.dailyRate);
+            }
+        }
+        return map.size > 0 ? map : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 function n(v: number | null): string {
     return v == null ? "—" : v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(2);
 }
@@ -150,7 +178,7 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
-    const rows = analyzeDivergence(resale, bom);
+    const rows = analyzeDivergence(resale, bom, loadLedgerRates(cacheDir));
     const flagged = rows.filter((r) => r.flagged);
 
     console.log(`ordering-divergence — resale items ${resale.length}, bom items ${bom.length}, joined SKUs ${rows.length}`);
