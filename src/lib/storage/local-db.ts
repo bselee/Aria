@@ -68,6 +68,30 @@ export function getLocalDb() {
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- KAIZEN(2026-10-20): tracking_number is case-SENSITIVE (plain TEXT PRIMARY KEY), and
+        -- writers disagree on the carrier prefix case — the email ingest writes "ups:::1Z…" and
+        -- "fedex:::383…" while Postgres and the repair tooling use "UPS:::1Z…" / "FedEx:::383…".
+        -- Each writer then missed its own row on lookup and inserted a second one, so the same
+        -- parcel appeared twice in the dashboard (2,185 duplicate rows found 2026-10-20).
+        -- Collapse existing case-duplicates (keep the row carrying PO refs, then the newest) and
+        -- make future ones impossible with a NOCASE unique index.
+        DELETE FROM shipments_cache
+         WHERE rowid NOT IN (
+            SELECT rowid FROM (
+                SELECT rowid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY upper(tracking_number)
+                           ORDER BY (
+                               CASE WHEN po_numbers IS NOT NULL AND po_numbers NOT IN ('', '[]') THEN 0 ELSE 1 END
+                           ), updated_at DESC, rowid DESC
+                       ) AS rn
+                  FROM shipments_cache
+            ) WHERE rn = 1
+         );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_shipments_cache_tn_nocase
+            ON shipments_cache(tracking_number COLLATE NOCASE);
+
         -- KAIZEN(2026-05-29): Browserbase session tracking for free tier usage control.
         -- Free tier = 100 sessions/month. Track usage, warn at 80, block at 95.
         CREATE TABLE IF NOT EXISTS browserbase_sessions (

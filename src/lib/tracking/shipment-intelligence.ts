@@ -642,9 +642,50 @@ export function getShipmentsDueForRefresh(
         .slice(0, limit);
 }
 
-async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
+const MAX_TRACKINGS_PER_PO = 25;
+const CLOSED_PO_STATUSES = new Set(["closed", "cancelled"]);
+
+/**
+ * A purchase_orders row is safe to attach tracking/lifecycle evidence to only
+ * when it is a REAL Finale PO. po-finale-sync is the sole creator of real rows
+ * and enriches every one with a non-null vendor_name (the discriminator
+ * aria-purchasing established: any real Finale PO has non-null vendor_name;
+ * rows that stay null after many sync cycles were never in Finale). A closed
+ * row must also be rejected — a closed phantom still anchors evidence writes
+ * (the AAA Cooper `4764` case).
+ */
+function isRealFinalePO(row: { vendor_name?: string | null; status?: string | null } | null | undefined): boolean {
+    if (!row) return false;
+    if (row.vendor_name == null || String(row.vendor_name).trim() === "") return false;
+    const status = String(row.status || "").toLowerCase();
+    return !CLOSED_PO_STATUSES.has(status);
+}
+
+export async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> {
     const db = createClient();
     if (!db || !poNumber) return;
+
+    // UPDATE-only + Finale-validated guard (2026-09/10): a blind upsert here
+    // fabricated phantom purchase_orders rows (vendor_name null, no line_items,
+    // total 0) for vendor-side / broker / outbound-freight references that are
+    // NOT real Finale POs. Real POs are created by po-finale-sync; this function
+    // may only enrich a row that already exists AND is a real Finale PO — never
+    // insert one, and never attach evidence to a null-vendor or closed row.
+    const { data: existingPO } = await db
+        .from("purchase_orders")
+        .select("po_number, vendor_name, status")
+        .eq("po_number", poNumber)
+        .maybeSingle();
+
+    if (!existingPO) {
+        console.log(`[tracking-sync] PO ${poNumber} not in purchase_orders — skipping tracking write (no blind insert)`);
+        return;
+    }
+
+    if (!isRealFinalePO(existingPO)) {
+        console.log(`[tracking-sync] PO ${poNumber} is not a real Finale PO (null vendor or closed) — skipping tracking write`);
+        return;
+    }
 
     const { data: shipments } = await db
         .from("shipments")
@@ -655,14 +696,23 @@ async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise<void> 
     const trackingNumbers = uniqueStrings((shipments || []).map((s: any) => s.tracking_number));
     const publicUrls = uniqueStrings((shipments || []).map((s: any) => s.public_tracking_url));
 
-    // 1. Sync to local Supabase cache
+    // Guard 4 (magnet containment): a PO that has accumulated hundreds of
+    // trackings is magnet-poisoned (one bulk manifest attached to every PO).
+    // The re-merge happens here in the writer, so no client-side sweep can
+    // hold. Cap the merge: above the cap, leave the field untouched for review.
+    if (trackingNumbers.length > MAX_TRACKINGS_PER_PO) {
+        console.warn(`[tracking-sync] PO ${poNumber} has ${trackingNumbers.length} trackings (>${MAX_TRACKINGS_PER_PO}) — magnet set suspected; skipping merge (keep field for review)`);
+        return;
+    }
+
+    // 1. Update local cache only (row already exists — never insert)
     await db
         .from("purchase_orders")
-        .upsert({
-            po_number: poNumber,
+        .update({
             tracking_numbers: trackingNumbers,
             updated_at: new Date().toISOString(),
-        }, { onConflict: "po_number" });
+        })
+        .eq("po_number", poNumber);
 
     // 2. Sync bidirectional back to Finale custom fields
     if (trackingNumbers.length > 0) {
@@ -731,7 +781,7 @@ async function syncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentR
     }, { skipIfLocked: true });
 }
 
-async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentRecord): Promise<void> {
+export async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: ShipmentRecord): Promise<void> {
     const db = createClient();
     if (!db) return;
 
@@ -744,10 +794,26 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
         .from("purchase_orders")
         .select(
             "tracking_status_summary, lifecycle_stage, vendor_acknowledged_at, " +
-            "shipping_evidence, lifecycle_transitions",
+            "shipping_evidence, lifecycle_transitions, vendor_name, status",
         )
         .eq("po_number", poNumber)
         .maybeSingle();
+
+    // UPDATE-only + Finale-validated guard (2026-09/10): never fabricate a
+    // purchase_orders row from a shipment evidence write. Real POs come from
+    // po-finale-sync; a shipment referencing a non-existent PO number is a
+    // vendor/broker/outbound-freight reference, not a Finale PO. Even an
+    // EXISTING row must be a real (non-null vendor, non-closed) Finale PO —
+    // a closed phantom still anchors evidence (the 4764 case).
+    if (!existingPO) {
+        console.log(`[shipment-lifecycle] PO ${poNumber} not in purchase_orders — skipping lifecycle write (no blind insert)`);
+        return;
+    }
+
+    if (!isRealFinalePO(existingPO)) {
+        console.log(`[shipment-lifecycle] PO ${poNumber} is not a real Finale PO (null vendor or closed) — skipping lifecycle write`);
+        return;
+    }
 
     const prevStatus = existingPO?.tracking_status_summary ?? null;
     const prevLifecycle = existingPO?.lifecycle_stage ?? 'sent';
@@ -815,7 +881,8 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
             transitionEntry,
         ];
     } else if (!existingPO) {
-        // New PO with first tracking — record initial transition
+        // (dead branch — UPDATE-only guard above returns early when existingPO
+        // is null; kept only to avoid touching surrounding control flow)
         const transitionEntry: LifecycleTransitionEntry = {
             at: now,
             from: null,
@@ -827,7 +894,10 @@ async function _doSyncPOLifecycleFromShipment(poNumber: string, shipment: Shipme
     }
     // If no meaningful change, still update tracking evidence timestamp without cluttering history
 
-    await db.from("purchase_orders").upsert(update, { onConflict: "po_number" });
+    await db
+        .from("purchase_orders")
+        .update(update)
+        .eq("po_number", poNumber);
 
     // Also record transition via append-only column update when status changed
     if (statusChanged) {

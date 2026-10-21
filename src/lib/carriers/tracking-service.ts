@@ -226,6 +226,16 @@ export function extractTrackingNumbers(text: string): Array<{ carrier: string; t
             if (!trackingNumber || trackingNumber.length < 8) continue;
 
             const index = match.index ?? 0;
+
+            // Exclusion (2026-09): "ESTIMATE NUMBER: 269303167-1" is a billing
+            // estimate reference, not an LTL PRO. The ltlPro lookbehind falsely
+            // treats "Estimate Number:" as a carrier-name prefix. Drop any hit
+            // whose immediately-preceding text carries an "estimate number" label.
+            const prefix = text.slice(0, index);
+            if (/\bestimate\s*(?:number|no\.?|#)?\s*[:：\-]?\s*$/i.test(prefix)) {
+                continue;
+            }
+
             let score = CARRIER_BASE[carrier] ?? 40;
 
             // Context window boosts / penalties

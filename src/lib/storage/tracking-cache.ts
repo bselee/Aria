@@ -59,9 +59,11 @@ export function upsertTrackingLocal(input: TrackingUpsertInput): CachedShipment 
     const db = getLocalDb();
     const now = new Date().toISOString();
 
-    // Load existing to merge
+    // Load existing to merge. Case-INSENSITIVE on purpose: callers pass "ups:::1Z…" while the
+    // table may hold "UPS:::1Z…", and an exact match would insert a duplicate row (the table has
+    // a NOCASE unique index, so that insert would now throw instead of duplicating).
     const existing = db.prepare(
-        `SELECT * FROM shipments_cache WHERE tracking_number = ?`
+        `SELECT * FROM shipments_cache WHERE upper(tracking_number) = upper(?)`
     ).get(input.trackingNumber) as CachedShipment | undefined;
 
     const mergedPoNumbers = [
@@ -72,7 +74,8 @@ export function upsertTrackingLocal(input: TrackingUpsertInput): CachedShipment 
     ];
 
     const record: CachedShipment = {
-        tracking_number: input.trackingNumber,
+        // Reuse the stored spelling when the row already exists so the UPSERT targets it.
+        tracking_number: existing?.tracking_number ?? input.trackingNumber,
         po_numbers: JSON.stringify(mergedPoNumbers),
         status_category: input.statusCategory ?? existing?.status_category ?? null,
         status_display: input.statusDisplay ?? existing?.status_display ?? null,
@@ -104,7 +107,8 @@ export function upsertTrackingLocal(input: TrackingUpsertInput): CachedShipment 
 export function getTrackingLocal(trackingNumber: string): CachedShipment | null {
     const db = getLocalDb();
     const row = db.prepare(
-        `SELECT * FROM shipments_cache WHERE tracking_number = ?`
+        // Case-insensitive: the cache may store "UPS:::1Z…" while the caller passes "ups:::1Z…".
+        `SELECT * FROM shipments_cache WHERE upper(tracking_number) = upper(?)`
     ).get(trackingNumber) as CachedShipment | undefined;
     return row ?? null;
 }

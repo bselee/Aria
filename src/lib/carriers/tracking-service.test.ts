@@ -441,6 +441,15 @@ Shipper: BuildASoil
         expect(results.some((r) => r.carrier === 'ltlPro' && r.trackingNumber === '71473626-1')).toBe(true);
     });
 
+    it('does NOT treat "ESTIMATE NUMBER" as an LTL PRO (billing estimate ref)', () => {
+        const results = extractTrackingNumbers(
+            'ESTIMATE NUMBER: 269303167-1\nPRO NUMBER: 64058915',
+        );
+        expect(results.some((r) => r.trackingNumber === '269303167-1')).toBe(false);
+        // The real PRO on the same BOL must still be captured.
+        expect(results.some((r) => r.trackingNumber === '64058915')).toBe(true);
+    });
+
     it('extracts PRO# after an LTL carrier name (Estes)', () => {
         const results = extractTrackingNumbers('Shipped via Estes PRO# 1234567890, 4 pallets, freight collect');
         expect(results.some((r) => r.trackingNumber === '1234567890' && r.carrier === 'pro')).toBe(true);
