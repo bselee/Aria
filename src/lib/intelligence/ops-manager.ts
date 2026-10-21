@@ -13,7 +13,6 @@ import { CommsService } from "./services/comms-service";
 import { POService } from "./services/po-service";
 import { APService } from "./services/ap-service";
 import { EmailIngestionWorker } from "./workers/email-ingestion";
-import { TrackingAgent } from "./tracking-agent";
 import { AcknowledgementAgent } from "./acknowledgement-agent";
 import * as agentTask from "./agent-task";
 import { closeFinishedTasks } from "./agent-task-closure";
@@ -96,7 +95,6 @@ export class OpsManager {
     private scheduledTasks: ScheduledTask[] = [];
     private emailIngestionDefault: EmailIngestionWorker;
     private emailIngestionAP: EmailIngestionWorker;
-    private trackingAgent: TrackingAgent;
     private ackAgent: AcknowledgementAgent;
     private supervisor: SupervisorAgent;
     private oversightAgent: OversightAgent;
@@ -132,7 +130,6 @@ export class OpsManager {
         // Initialize dedicated AP agents
         this.emailIngestionDefault = new EmailIngestionWorker("default");
         this.emailIngestionAP = new EmailIngestionWorker("ap");
-        this.trackingAgent = new TrackingAgent();
         this.ackAgent = new AcknowledgementAgent("default");
         this.supervisor = new SupervisorAgent(bot);
 
