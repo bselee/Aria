@@ -5,6 +5,7 @@ import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
 import { mergeIntoGroups, shelfDidNotTakeBomBurn } from '@/lib/finale/bom-demand';
 import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 import { readForwardDemand } from '@/lib/purchasing/forward-demand';
+import { readLedgerRateMap } from '@/lib/finale/stock-ledger';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 import { evaluateOpenPoDuplicateGuard } from '@/lib/purchasing/po-duplicate-guard';
 import { sanityFlagQty } from '@/lib/purchasing/order-sanity';
@@ -173,7 +174,7 @@ export async function GET(req: NextRequest) {
     // ── Merge & filter ──
     let groups: PurchasingGroup[];
     if (mode === 'all') {
-        groups = mergeIntoGroups(resaleGroups, bomGroups);
+        groups = mergeIntoGroups(resaleGroups, bomGroups, readLedgerRateMap());
     } else if (mode === 'bom') {
         groups = bomGroups;
     } else {
@@ -504,7 +505,7 @@ export async function POST(req: NextRequest) {
 
         const client = new FinaleClient();
         const cachedGroups = (resaleSlot.value || bomSlot.value)
-            ? mergeIntoGroups(resaleSlot.value ?? [], bomSlot.value ?? [])
+            ? mergeIntoGroups(resaleSlot.value ?? [], bomSlot.value ?? [], readLedgerRateMap())
             : null;
         let groups = cachedGroups ?? await client.getPurchasingIntelligence(365);
         let vendorGroup = groups.find(group => group.vendorPartyId === vendorPartyId);

@@ -149,6 +149,29 @@ function cachePath(days: number): string {
     return join(process.cwd(), "data", `stock-ledger-cache-${days}.json`);
 }
 
+/**
+ * Read-only sku -> daily-rate map from the on-disk ledger snapshot, for
+ * call sites that must stay cheap (dashboard render, divergence CLI).
+ * Returns undefined when no snapshot file exists — callers fail open.
+ * Never triggers a Finale fetch.
+ */
+export function readLedgerRateMap(days: number = LEDGER_DEFAULT_DAYS): Map<string, number> | undefined {
+    const file = cachePath(days);
+    if (!existsSync(file)) return undefined;
+    try {
+        const parsed = JSON.parse(readFileSync(file, "utf-8")) as { bySku?: Record<string, { dailyRate?: number }> };
+        const map = new Map<string, number>();
+        for (const [sku, entry] of Object.entries(parsed.bySku ?? {})) {
+            if (typeof entry?.dailyRate === "number" && Number.isFinite(entry.dailyRate) && entry.dailyRate > 0) {
+                map.set(sku, entry.dailyRate);
+            }
+        }
+        return map.size > 0 ? map : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 interface LedgerGqlResponse {
     errors?: Array<{ message?: string }>;
     data?: {

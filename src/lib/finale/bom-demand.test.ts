@@ -911,3 +911,51 @@ describe('getBOMDemand perf optimisations', () => {
         expect(bomSpy.mock.calls.length).toBe(callsAfterFirst); // no new BOM lookups
     });
 });
+
+describe('mergeIntoGroups — ledger-arbitrated same-movement merge (Phase 3 review find)', () => {
+    type GroupItem = Parameters<typeof mergeIntoGroups>[0][number]['items'][number];
+
+    function fixture(resaleRate: number, bomRate: number) {
+        return [
+            [{
+                vendorName: 'Blumat', vendorPartyId: 'p1', urgency: 'ok' as const,
+                items: [{
+                    productId: 'BLM210', supplierPartyId: 'p1', itemType: 'resale' as const,
+                    dailyRate: resaleRate, dailyRateSource: 'demand' as const,
+                    stockOnHand: 290, stockOnOrder: 0, suggestedQty: 0, urgency: 'ok' as const,
+                    explanation: 'resale', feedsFinishedGoods: [],
+                } as any],
+            }],
+            [{
+                vendorName: 'Blumat', vendorPartyId: 'p1', urgency: 'watch' as const,
+                items: [{
+                    productId: 'BLM210', supplierPartyId: 'p1', itemType: 'bom-component' as const,
+                    dailyRate: bomRate, dailyRateSource: 'demand' as const,
+                    stockOnHand: 290, stockOnOrder: 0, suggestedQty: 61, urgency: 'watch' as const,
+                    explanation: 'bom', feedsFinishedGoods: [],
+                } as any],
+            }],
+        ] as Parameters<typeof mergeIntoGroups>;
+    }
+
+    it('BLM210 live case: both demand-labelled rates corroborated by the ledger are ONE movement — take the larger, never sum', () => {
+        const [resale, bom] = fixture(2.89, 2.80);
+        const merged = mergeIntoGroups(resale, bom, new Map([['BLM210', 2.78]]));
+        expect(merged[0].items[0].itemType).toBe('resale-bom');
+        expect(merged[0].items[0].dailyRate).toBe(2.89); // NOT 5.69
+    });
+
+    it('without a ledger map the historical sum behavior is preserved', () => {
+        const [resale, bom] = fixture(2.89, 2.80);
+        const merged = mergeIntoGroups(resale, bom);
+        expect(merged[0].items[0].dailyRate).toBeCloseTo(5.69, 5);
+    });
+
+    it('rates outside the ledger band are independent streams — still summed', () => {
+        // BOM path measures a small build pull while the ledger corroborates
+        // the resale rate: 0.2 is NOT a second measurement of 2.78.
+        const [resale, bom] = fixture(2.89, 0.2);
+        const merged = mergeIntoGroups(resale, bom, new Map([['BLM210', 2.78]]));
+        expect(merged[0].items[0].dailyRate).toBeCloseTo(3.09, 5);
+    });
+});

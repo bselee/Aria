@@ -429,7 +429,8 @@ export function projectNextOrderDate(input: {
  */
 export function mergeIntoGroups(
     resaleGroups: PurchasingGroup[],
-    bomGroups: PurchasingGroup[]
+    bomGroups: PurchasingGroup[],
+    ledgerBySku?: Map<string, number>
 ): PurchasingGroup[] {
     const urgencyRank = { critical: 0, warning: 1, watch: 2, ok: 3 } as const;
     const merged = new Map<string, PurchasingGroup>();
@@ -464,6 +465,19 @@ export function mergeIntoGroups(
                     const ledgerInvolved = resaleItem.dailyRateSource === "ledger"
                         || bomItem.dailyRateSource === "ledger";
 
+                    // HERMIA(2026-10-21): the label check above misses the case where
+                    // the ledger CORROBORATED a demand-sourced rate — the row keeps its
+                    // 'demand' label but the number is the same physical movement the
+                    // BOM path derived (BLM210: resale 2.89 + BOM 2.80 = 5.69 summed,
+                    // but the 90d ledger says 2.78/d total). When a ledger rate exists
+                    // and BOTH paths sit within the 2.5x ledger band, they are two
+                    // measurements of one movement -> take the larger, never sum.
+                    const ledgerRate = ledgerBySku?.get(bomItem.productId) ?? null;
+                    const withinLedgerBand = ledgerRate != null && ledgerRate > 0 && bothNonZero
+                        && Math.max(resaleItem.dailyRate ?? 0, bomItem.dailyRate ?? 0, ledgerRate)
+                            / Math.min(resaleItem.dailyRate ?? 0, bomItem.dailyRate ?? 0, ledgerRate) <= 2.5;
+                    const sameMovement = bothNonZero && (ledgerInvolved || withinLedgerBand);
+
                     // HERMIA(2026-10-05 — Bill, corrected): never prefer FG sell-through
                     // over the ledger for a raw ingredient. FG sell-through is only as
                     // accurate as the BOM data, and the BOMs CANNOT be adjusted — they
@@ -472,7 +486,7 @@ export function mergeIntoGroups(
                     // BOM calc returns 133/d). Dropping the ledger rate caused ~38 raws
                     // to under-order to 0. The ledger is the actual physical consumption;
                     // the FG-derived rate is a theoretical cross-check. Take the larger.
-                    const mergedDailyRate = bothNonZero && ledgerInvolved
+                    const mergedDailyRate = sameMovement
                         ? Math.max(resaleItem.dailyRate ?? 0, bomItem.dailyRate ?? 0)
                         : (resaleItem.dailyRate ?? 0) + (bomItem.dailyRate ?? 0);
 
