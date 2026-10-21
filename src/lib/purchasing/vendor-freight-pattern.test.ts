@@ -40,6 +40,20 @@ describe("classifyVendorFreightPattern — Will-known overrides", () => {
         expect(r.pattern).toBe("no_freight");
     });
 
+    it("Stock Bag Depot → no_freight", () => {
+        const r = classifyVendorFreightPattern("Stock Bag Depot", []);
+        expect(r.pattern).toBe("no_freight");
+        expect(r.confidence).toBe("high");
+        expect(r.source).toBe("override");
+    });
+
+    it("New Moon Development → no_freight", () => {
+        const r = classifyVendorFreightPattern("New Moon Development", []);
+        expect(r.pattern).toBe("no_freight");
+        expect(r.confidence).toBe("high");
+        expect(r.source).toBe("override");
+    });
+
     it("Rootwise → bas_freight (we schedule FedEx)", () => {
         const r = classifyVendorFreightPattern("Rootwise Soil Dynamics", []);
         expect(r.pattern).toBe("bas_freight");
