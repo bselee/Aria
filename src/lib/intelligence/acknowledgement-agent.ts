@@ -545,7 +545,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
 
                             // Guardrail 2: REGEX FAST-PATH — skip LLM entirely for noreply/marketplace senders
                             // These are always PROMOTIONAL or routine status updates. No human action needed.
-                            if (this.isNoReply(senderEmail)) {
+                            if (this.isNoReply(senderEmail) && !/\binvoice\b/i.test(subject)) {
                                 console.log(`     -> Fast-path PROMOTIONAL (noreply sender: ${senderEmail})`);
                                 try {
                                     await gmail.users.messages.modify({

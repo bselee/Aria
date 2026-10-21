@@ -20,6 +20,7 @@
     "include": [
         "src/lib/db.ts",
         "src/lib/purchasing/vendor-freight-pattern.ts",
+        "src/lib/purchasing/no-freight-po-complete.ts",
         "src/lib/purchasing/vendor-freight-learning.ts",
         "src/lib/purchasing/invoice-po-matcher.ts",
         "src/lib/purchasing/po-lifecycle.ts",
