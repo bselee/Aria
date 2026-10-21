@@ -2892,6 +2892,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // hasDeliverablePO) prune noise. Catches SKUs like RMC103 that
         // Finale's native engine silently drops on low-volume items.
         const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
+        // REST slug per SKU for renamed products (see rename fingerprint note below).
+        const restSlugBySku = new Map<string, string>();
         const failedProductIds: string[] = [];
 
         if (normalizedVendorFilter) {
@@ -2921,7 +2923,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     query: `{
                         productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
                             pageInfo { hasNextPage endCursor }
-                            edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays demandQuantity demandPerDay } }
+                            edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays demandQuantity demandPerDay productUrl } }
                         }
                     }`
                 };
@@ -2951,6 +2953,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         finaleDemandQty: demandQty,
                         finaleDemandPerDay: demandPerDay,
                     };
+                    // Rename fingerprint (2026-10-21): a renamed product keeps its OLD
+                    // id as the REST url slug only — REST /api/product/<NEW> 404s while
+                    // GraphQL resolves the NEW productId (BLV101: slug BLV00). Remember
+                    // the slug so the per-SKU REST fetch can retry on 404.
+                    const productUrl: string | undefined = p.productUrl;
+                    if (typeof productUrl === 'string' && productUrl.length > 0) {
+                        const slug = productUrl.split('/').filter(Boolean).pop();
+                        if (slug && slug !== p.productId) restSlugBySku.set(p.productId, slug);
+                    }
                     if (shouldIncludePurchasingCandidate({
                         ...candidate,
                         ledgerNetConsumption: ledgerNetFor(ledgerSnapshot, p.productId),
@@ -3116,7 +3127,20 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     if (!prodData) {
                         // Live fallback — also warms the cache for next cycle
-                        prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
+                        try {
+                            prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(sku)}`);
+                        } catch (err: any) {
+                            // Renamed product: REST 404s on the NEW productId while the
+                            // record is served at the OLD slug (BLV101 -> BLV00). Retry
+                            // once with the slug; prodData.productId carries the NEW sku,
+                            // so every downstream field stays keyed on the canonical id.
+                            const slug = restSlugBySku.get(sku);
+                            if (slug && slug !== sku && /404/.test(String(err?.message ?? ''))) {
+                                prodData = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(slug)}`);
+                            } else {
+                                throw err;
+                            }
+                        }
                         // Fire-and-forget cache write (typed columns + raw_detail)
                         const detail = await this.parseProductDetail(prodData).catch(() => null);
                         if (detail) void upsertSkuCache(sku, detail);
