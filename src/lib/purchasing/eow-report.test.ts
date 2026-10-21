@@ -20,6 +20,13 @@ import {
   priceVendorName,
   researchHit,
   shortPriceNote,
+  keepSilentVendorDelay,
+  isPartialReceived,
+  isPartialFromFinaleReceive,
+  minRunway,
+  parseVendorDueFromText,
+  delayedVendorNote,
+  daysBetween,
   withinDays,
 } from "./eow-report";
 
@@ -104,5 +111,54 @@ describe("eow-report", () => {
     ).toContain("$1.74/lb");
     expect(researchHit("HVH <info@hvhindustrial.com>", "vacuum pumps", "DVP distributor")).toBeNull();
     expect(researchHit("Landon <landon@drivensol.com>", "soil bags quote", "MOQ bags")).toBeNull();
+  });
+
+  it("Rootwise delayed only when a SKU is close to out of stock", () => {
+    expect(keepSilentVendorDelay("Rootwise Soil Dynamics", 137)).toBe(false);
+    expect(keepSilentVendorDelay("Rootwise Soil Dynamics", 63)).toBe(false);
+    expect(keepSilentVendorDelay("Rootwise Soil Dynamics", 21)).toBe(true);
+    expect(keepSilentVendorDelay("Rootwise Soil Dynamics", null)).toBe(false);
+    expect(keepSilentVendorDelay("Certis USA", 142)).toBe(true);
+    expect(minRunway([137, 63])).toBe(63);
+  });
+
+  it("drops partial receipts from delayed", () => {
+    expect(isPartialReceived(400, 560)).toBe(true);
+    expect(isPartialReceived(0, 960)).toBe(false);
+    expect(
+      isPartialFromFinaleReceive(null, "2026-05-19", "2026-10-19")
+    ).toBe(true);
+    expect(
+      isPartialFromFinaleReceive("2026-08-19", "2026-05-19", "2026-10-19")
+    ).toBe(false);
+  });
+
+  it("reads Certis backorder month and North Mason silence from email", () => {
+    expect(
+      parseVendorDueFromText("I am sorry to say but we are now on backorder until January, 2027.\n\nLee")
+    ).toBe("2027-01-01");
+    expect(
+      parseVendorDueFromText(
+        "We are trying to get it done. There have been staffing issues we are working through. I’ll know by Friday when it can be done."
+      )
+    ).toBeNull();
+    expect(
+      delayedVendorNote({
+        emailDueIso: "2027-01-01",
+        pgEtaIso: "2026-08-19",
+        lastVendorReplyIso: "2026-08-12",
+        todayIso: "2026-10-19",
+        backorder: true,
+      })
+    ).toBe("Backorder Jan 2027");
+    expect(
+      delayedVendorNote({
+        emailDueIso: null,
+        pgEtaIso: "2026-06-25",
+        lastVendorReplyIso: "2026-07-23",
+        todayIso: "2026-10-19",
+      })
+    ).toBe("No reply since 7/23");
+    expect(daysBetween("2026-04-29", "2026-10-19")).toBe(173);
   });
 });

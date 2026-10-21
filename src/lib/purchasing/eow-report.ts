@@ -75,6 +75,121 @@ export function money(n: number): string {
   });
 }
 
+/** Vendors that never reply. Delayed only if a line SKU is close to out of stock. */
+export const SILENT_DELAY_VENDOR = /rootwise/i;
+export const CLOSE_TO_OOS_DAYS = 21;
+
+export function minRunway(days: Array<number | null | undefined>): number | null {
+  const nums = days.filter((d): d is number => typeof d === "number" && Number.isFinite(d));
+  return nums.length ? Math.min(...nums) : null;
+}
+
+export function keepSilentVendorDelay(vendor: string, minRunwayDays: number | null): boolean {
+  if (!SILENT_DELAY_VENDOR.test(vendor || "")) return true;
+  return minRunwayDays != null && minRunwayDays <= CLOSE_TO_OOS_DAYS;
+}
+
+/** Any receipt against an open PO is a partial, not a silent delay. */
+export function isPartialReceived(received: number | null, remaining: number | null): boolean {
+  return (received ?? 0) > 0 && (remaining == null || remaining > 0);
+}
+
+/**
+ * No vendor ETA + Finale already stamped a receive date = goods have moved.
+ * Do not use PG receive_date (North Mason / Certis stay delayed).
+ */
+export function isPartialFromFinaleReceive(
+  vendorEtaIso: string | null,
+  finaleReceiveIso: string | null,
+  todayIso: string
+): boolean {
+  if (vendorEtaIso) return false;
+  if (!finaleReceiveIso || finaleReceiveIso.length < 10) return false;
+  return finaleReceiveIso.slice(0, 10) <= todayIso;
+}
+
+const MONTHS: Record<string, string> = {
+  january: "01",
+  february: "02",
+  march: "03",
+  april: "04",
+  may: "05",
+  june: "06",
+  july: "07",
+  august: "08",
+  september: "09",
+  october: "10",
+  november: "11",
+  december: "12",
+};
+
+/** Strip quoted history so we parse the vendor's own words. */
+export function vendorReplyOwnText(body: string): string {
+  const cut = body.search(/\nFrom: |\nOn [A-Z][a-z]{2}, |\n_{5,}/);
+  return (cut > 0 ? body.slice(0, cut) : body).replace(/\s+/g, " ").trim();
+}
+
+function mdSlashToIso(s: string): string | null {
+  const p = s.split(/[/-]/).map(Number);
+  if (p.length < 2 || !p[0] || !p[1]) return null;
+  let y = p[2] || new Date().getUTCFullYear();
+  if (y < 100) y += 2000;
+  return `${y}-${String(p[0]).padStart(2, "0")}-${String(p[1]).padStart(2, "0")}`;
+}
+
+/** Due / ship date from the vendor's own reply. Null if they only stalled. */
+export function parseVendorDueFromText(text: string): string | null {
+  const own = vendorReplyOwnText(text);
+  if (!own) return null;
+  if (/know by friday|trying to get it done|staffing issues/i.test(own) && !/\buntil\b|\bETA\b|\bdue\b/i.test(own)) {
+    return null;
+  }
+  const monthYear = own.match(
+    /\buntil\s+(January|February|March|April|May|June|July|August|September|October|November|December),?\s+(\d{4})/i
+  );
+  if (monthYear) {
+    const mm = MONTHS[monthYear[1].toLowerCase()];
+    if (mm) return `${monthYear[2]}-${mm}-01`;
+  }
+  const eta = own.match(/\bETA[:\s]+(?:[A-Za-z]+,?\s+)?(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i);
+  if (eta) return mdSlashToIso(eta[1]);
+  const due = own.match(
+    /\b(?:due|ship(?:ping)?|delivery)\s+(?:date\s+)?(?:by\s+|on\s+)?(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i
+  );
+  if (due) return mdSlashToIso(due[1]);
+  return null;
+}
+
+export function daysBetween(fromIso: string, toIso: string): number {
+  const a = Date.parse(`${fromIso.slice(0, 10)}T00:00:00Z`);
+  const b = Date.parse(`${toIso.slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.round((b - a) / 86400000);
+}
+
+export function delayedVendorNote(input: {
+  emailDueIso: string | null;
+  pgEtaIso: string | null;
+  lastVendorReplyIso: string | null;
+  todayIso: string;
+  backorder?: boolean;
+}): string {
+  if (input.emailDueIso) {
+    const label = input.backorder ? "Backorder" : "Vendor ETA";
+    const iso = input.emailDueIso;
+    if (iso.endsWith("-01") && input.backorder) {
+      const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      return `${label} ${months[Number(iso.slice(5, 7)) - 1]} ${iso.slice(0, 4)}`;
+    }
+    return `${label} ${mdFromIso(iso)}`;
+  }
+  if (input.lastVendorReplyIso && daysBetween(input.lastVendorReplyIso, input.todayIso) >= 21) {
+    return `No reply since ${mdFromIso(input.lastVendorReplyIso)}`;
+  }
+  if (input.pgEtaIso) return `Vendor ETA ${mdFromIso(input.pgEtaIso)}`;
+  return "No update from vendor";
+}
+
 export function shortPriceNote(vendor: string, subject: string, snippet: string): string {
   const blob = `${vendor} ${subject} ${snippet}`.toLowerCase();
   if (/fish meal|fm104|concentrates/.test(blob)) return "FM104 raised. Cut to 1 pallet.";

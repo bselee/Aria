@@ -22,14 +22,20 @@ import { gmail as GmailApi } from "@googleapis/gmail";
 import {
   addDays,
   excludeManualVendor,
+  isPartialFromFinaleReceive,
   isStatement,
+  keepSilentVendorDelay,
   mdFromIso,
+  minRunway,
   mondayOf,
   money,
   needByIso,
+  parseVendorDueFromText,
+  delayedVendorNote,
   priceVendorName,
   researchHit,
   shortPriceNote,
+  vendorReplyOwnText,
   withinDays,
 } from "../src/lib/purchasing/eow-report";
 import { computeFreightDrift } from "../src/lib/freight/freight-drift";
@@ -60,7 +66,7 @@ function esc(s: unknown): string {
     .replace(/>/g, "&gt;");
 }
 
-type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string };
+type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string };
 
 function skuList(items: unknown): string {
   let arr: unknown = items;
@@ -99,6 +105,8 @@ function table(headers: string[], rows: string[][], total?: string[]): string {
   const cols =
     headers.includes("ETA")
       ? `<col class="po"><col class="vendor"><col class="sku"><col class="amt"><col class="note"><col class="eta"><col class="stat">`
+      : headers.includes("Placed")
+      ? `<col class="po"><col class="vendor"><col class="sku"><col class="amt"><col class="note"><col class="eta">`
       : headers.length === 5
       ? `<col class="po"><col class="vendor"><col class="sku"><col class="amt"><col class="note">`
       : `<col class="po"><col class="vendor"><col class="amt"><col class="note">`;
@@ -183,7 +191,7 @@ ${table(["PO", "Vendor", "Amount", "Sent"], toCells(p.unacked))}
 <div class="keep">
 <h2>POs Delayed</h2>
 <p class="summary">${p.delayed.length} POs · ${money(sum(p.delayed))}</p>
-${table(["PO", "Vendor", "SKU", "Amount", "Vendor Response"], toPoCells(p.delayed))}
+${table(["PO", "Vendor", "SKU", "Amount", "Placed", "Vendor Response"], p.delayed.map((r) => [r.po, r.vendor, r.sku || "", r.amount ? money(r.amount) : "", r.placed || "", r.note]))}
 </div>
 <div class="keep">
 <h2>Invoices to Bill.com</h2>
@@ -234,6 +242,71 @@ async function gmailVendorReplied(
     maxResults: 4,
   });
   return (list.data.messages || []).length > 0;
+}
+
+const FROM_US = /bill\.selee|buildasoil|noreply@mail\.finale|google calendar|calendar-notification/i;
+
+function gmailPlain(payload: unknown): string {
+  const out: string[] = [];
+  const walk = (p: unknown) => {
+    if (!p || typeof p !== "object") return;
+    const rec = p as { body?: { data?: string }; mimeType?: string; parts?: unknown[] };
+    if (rec.body?.data) {
+      const decoded = Buffer.from(rec.body.data, "base64url").toString("utf8");
+      if (rec.mimeType === "text/plain") out.push(decoded);
+      else if (rec.mimeType === "text/html") {
+        out.push(
+          decoded
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+            .replace(/<br\s*\/?>/gi, "\n")
+            .replace(/<\/p>/gi, "\n")
+            .replace(/<[^>]+>/g, " ")
+        );
+      }
+    }
+    for (const part of rec.parts || []) walk(part);
+  };
+  walk(payload);
+  return out.join("\n");
+}
+
+async function gmailDelayThread(
+  gmail: Awaited<ReturnType<typeof gmailClient>>,
+  po: string
+): Promise<{ lastVendorIso: string | null; emailDueIso: string | null; backorder: boolean }> {
+  const list = await gmail.users.messages.list({
+    userId: "me",
+    q: `"${po}" -subject:"Purchasing week" -from:calendar-notification`,
+    maxResults: 12,
+  });
+  let lastVendorIso: string | null = null;
+  let lastVendorId: string | null = null;
+  for (const m of list.data.messages || []) {
+    const d = await gmail.users.messages.get({
+      userId: "me",
+      id: m.id!,
+      format: "metadata",
+      metadataHeaders: ["From", "Date"],
+    });
+    const from = hdr(d.data.payload?.headers, "From");
+    const dateIso = iso(hdr(d.data.payload?.headers, "Date"));
+    if (FROM_US.test(from) || !dateIso) continue;
+    if (!lastVendorIso || dateIso > lastVendorIso) {
+      lastVendorIso = dateIso;
+      lastVendorId = m.id || null;
+    }
+  }
+  let body = "";
+  if (lastVendorId) {
+    const full = await gmail.users.messages.get({ userId: "me", id: lastVendorId, format: "full" });
+    body = gmailPlain(full.data.payload);
+  }
+  const own = vendorReplyOwnText(body);
+  return {
+    lastVendorIso,
+    emailDueIso: parseVendorDueFromText(body),
+    backorder: /backorder/i.test(own),
+  };
 }
 
 async function gmailDigest(
@@ -444,32 +517,76 @@ async function main() {
 
   const delayedQ = await pool.query(`
     SELECT po_number, vendor_name, COALESCE(total_amount,total,0)::float AS amount,
-           required_date, receive_date, status, lifecycle_stage, line_items, vendor_stated_eta
+           required_date, receive_date, status, lifecycle_stage, line_items, vendor_stated_eta, issue_date
     FROM purchase_orders
     WHERE po_number ~ '^[0-9]+$'
       AND COALESCE(status,'') = 'open'
-      AND COALESCE(vendor_name,'') !~* 'amazon|autopot|printful|dropship|evergreen'
+      AND COALESCE(vendor_name,'') !~* 'amazon|autopot|printful|dropship|evergreen|uline|axiom'
       AND COALESCE(lifecycle_stage,'') NOT ILIKE '%cancel%'
       AND COALESCE(lifecycle_stage,'') NOT IN ('COMPLETED','INVOICED')
       AND (
         (receive_date IS NULL AND required_date IS NOT NULL AND required_date::date < CURRENT_DATE)
         OR (vendor_stated_eta IS NOT NULL AND vendor_stated_eta::date < CURRENT_DATE)
+        OR (issue_date IS NOT NULL AND issue_date::date < CURRENT_DATE - 45)
       )
     ORDER BY COALESCE(vendor_stated_eta, required_date) ASC
     LIMIT 20
   `);
-  const delayed: Row[] = delayedQ.rows
-    .filter((r) => !receivedPo.has(String(r.po_number)))
-    .map((r) => {
-      const eta = iso(r.vendor_stated_eta);
-      return {
-        po: r.po_number,
-        vendor: r.vendor_name || "",
-        sku: skuList(r.line_items),
-        amount: Number(r.amount) || 0,
-        note: eta ? `Vendor ETA ${mdFromIso(eta)}` : "No update from vendor",
+  const skuRunway = new Map<string, number>();
+  try {
+    for (const name of ["api-bust.json", "purchasing-resale.json", "purchasing-bom.json"]) {
+      const p = path.join(ARIA, ".aria-cache", "purchasing", name);
+      if (!fs.existsSync(p)) continue;
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      const walk = (x: unknown) => {
+        if (!x) return;
+        if (Array.isArray(x)) {
+          x.forEach(walk);
+          return;
+        }
+        if (typeof x === "object") {
+          const o = x as Record<string, unknown>;
+          const id = String(o.productId || o.sku || "");
+          const rw = o.adjustedRunwayDays ?? o.runwayDays;
+          if (id && typeof rw === "number" && Number.isFinite(rw) && !skuRunway.has(id)) {
+            skuRunway.set(id, rw);
+          }
+          for (const k of ["value", "items", "groups"]) walk(o[k]);
+        }
       };
+      walk(raw);
+    }
+  } catch {
+    /* cache optional */
+  }
+  const delayedRows = delayedQ.rows.filter((r) => !receivedPo.has(String(r.po_number)));
+  const delayed: Row[] = [];
+  for (const r of delayedRows) {
+    const eta = iso(r.vendor_stated_eta);
+    const skus = skuList(r.line_items);
+    const rw = minRunway(
+      skus.split(",").map((s) => skuRunway.get(s.trim()))
+    );
+    if (!keepSilentVendorDelay(r.vendor_name || "", rw)) continue;
+    if (!eta) {
+      try {
+        const d = await finale.getOrderDetails(String(r.po_number));
+        const recv = iso((d as { receiveDate?: unknown }).receiveDate);
+        if (isPartialFromFinaleReceive(null, recv || null, today)) continue;
+      } catch {
+        /* Finale optional */
+      }
+    }
+    delayed.push({
+      po: r.po_number,
+      vendor: r.vendor_name || "",
+      sku: skus,
+      amount: Number(r.amount) || 0,
+      note: eta ? `Vendor ETA ${mdFromIso(eta)}` : "No update from vendor",
+      eta,
+      placed: mdFromIso(iso(r.issue_date)),
     });
+  }
 
   // Invoice issues intentionally empty this week; section header stays.
   const issues: Row[] = [];
@@ -619,15 +736,6 @@ async function main() {
   } catch {
     /* cache optional */
   }
-  for (const r of delayed) {
-    const skus = (r.sku || "").split(",").map((s) => s.trim()).filter(Boolean);
-    const uses = skus.map((s) => skuUse.get(s) || "resale");
-    const hasB = uses.includes("build");
-    const hasR = uses.includes("resale");
-    const hasC = uses.includes("combo");
-    const use = hasC || (hasB && hasR) ? "Combo" : hasB ? "Build" : "Resale";
-    r.note = `${use} · ${r.note}`;
-  }
 
   let priceUpdates: Row[] = [];
   let research: Row[] = [];
@@ -639,11 +747,47 @@ async function main() {
       kept.push(r);
     }
     unacked = kept;
+    for (const r of delayed) {
+      const thread = await gmailDelayThread(gmail, r.po);
+      r.note = delayedVendorNote({
+        emailDueIso: thread.emailDueIso,
+        pgEtaIso: r.eta || null,
+        lastVendorReplyIso: thread.lastVendorIso,
+        todayIso: today,
+        backorder: thread.backorder,
+      });
+      if (thread.emailDueIso && thread.emailDueIso !== r.eta) {
+        try {
+          await pool.query(
+            `UPDATE purchase_orders
+             SET vendor_stated_eta = $1::date,
+                 vendor_stated_eta_confidence = 'high',
+                 vendor_stated_eta_extracted_at = NOW(),
+                 vendor_stated_eta_rationale = $2
+             WHERE po_number = $3
+               AND (vendor_stated_eta IS NULL OR vendor_stated_eta::date IS DISTINCT FROM $1::date)`,
+            [thread.emailDueIso, `Gmail delayed assess: ${r.note}`, r.po]
+          );
+        } catch (e) {
+          console.error("delayed eta persist", r.po, e instanceof Error ? e.message : e);
+        }
+        r.eta = thread.emailDueIso;
+      }
+    }
     const digest = await gmailDigest(gmail, addDays(today, -14));
     priceUpdates = digest.priceUpdates;
     research = digest.research;
   } catch {
     /* gmail optional */
+  }
+  for (const r of delayed) {
+    const skus = (r.sku || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const uses = skus.map((s) => skuUse.get(s) || "resale");
+    const hasB = uses.includes("build");
+    const hasR = uses.includes("resale");
+    const hasC = uses.includes("combo");
+    const use = hasC || (hasB && hasR) ? "Combo" : hasB ? "Build" : "Resale";
+    r.note = `${use} · ${r.note}`;
   }
 
   const html = renderHtml({
