@@ -14,8 +14,13 @@
  *          Targets are passed on the CLI as PO:amount pairs. Report-only by
  *          default; --live writes.
  *
+ *          `--promo <id>` operates on a non-freight fee lane (default 10007 =
+ *          carrier freight). E.g. `--promo 10015` services the Kashi toll
+ *          "Alan to BAS" line; the existing line's description is preserved
+ *          instead of forcing bare `Freight`.
+ *
  * @usage   node --import tsx --env-file=.env.local src/cli/reconcile-freight-split-correction.ts \
- *            125393:117.04 125271:187.27 125241:523.62 125008:514.35 [--live] [--gap 800]
+ *            125393:117.04 125271:187.27 125241:523.62 125008:514.35 [--live] [--gap 800] [--promo 10015]
  *
  * @author  Hermia
  * @created 2026-10-20
@@ -26,12 +31,41 @@ import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
 import { FinaleClient } from "../lib/finale/client";
-import { freightAdjustmentForPo, FINALE_FREIGHT_PROMO_URL } from "../lib/finale/freight-adjustment";
+import { freightAdjustmentForPo, FINALE_FREIGHT_PROMO_URL, FINALE_FREIGHT_DESCRIPTION } from "../lib/finale/freight-adjustment";
 import { getShipmentReceiptItems } from "../lib/finale/core-client";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+
+/**
+ * Durable ledger of every live freight/fee correction, one JSON object per line.
+ * Lives under $LOCALAPPDATA/aria (durable, not committed — business data).
+ * Totals must always be computed by summing this ledger, never tallied in prose.
+ */
+const LEDGER_PATH = path.join(
+    process.env.LOCALAPPDATA || os.homedir(),
+    "aria",
+    "freight-corrections-ledger.jsonl",
+);
+function appendLedgerEntry(entry: Record<string, unknown>): void {
+    try {
+        fs.mkdirSync(path.dirname(LEDGER_PATH), { recursive: true });
+        fs.appendFileSync(LEDGER_PATH, JSON.stringify(entry) + "\n");
+        console.log(`  ledger: ${LEDGER_PATH}`);
+    } catch (e: any) {
+        console.warn(`  ledger append FAILED (${e.message}) — correction still applied`);
+    }
+}
 
 const LIVE = process.argv.includes("--live");
 const gapIdx = process.argv.indexOf("--gap");
 const GAP = gapIdx >= 0 ? (Number(process.argv[gapIdx + 1]) || 800) : 800;
+// Promo id to operate on. Default 10007 = carrier freight. The Kashi toll-production
+// fee lanes ("Ship BOM to Alan" /10007, "Alan to BAS" /10015, Labor /10016) need
+// --promo 10015 etc.; the description is preserved from the existing line in that case.
+const promoIdx = process.argv.indexOf("--promo");
+const PROMO_ID = promoIdx >= 0 ? (process.argv[promoIdx + 1] || "10007") : "10007";
+const PROMO_URL = `/buildasoilorganics/api/productpromo/${PROMO_ID}`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -51,8 +85,13 @@ interface FinaleWriteSurface {
 /** Parse PO:amount targets from argv, e.g. "125393:117.04". */
 function parseTargets(argv: string[]): Record<string, number> {
     const out: Record<string, number> = {};
-    for (const a of argv) {
-        if (a.startsWith("--")) continue;
+    const FLAG_WITH_VALUE = new Set(["--gap", "--promo"]);
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i];
+        if (a.startsWith("--")) {
+            if (FLAG_WITH_VALUE.has(a)) i++; // skip the flag's value too
+            continue;
+        }
         const m = a.match(/^(\d{6}):([0-9]+(?:\.[0-9]+)?)$/);
         if (!m) throw new Error(`bad target "${a}" — expected PO:amount (e.g. 125393:117.04)`);
         out[m[1]] = Number(m[2]);
@@ -90,20 +129,40 @@ async function applyOne(finale: FinaleWriteSurface, poId: string, target: number
     // Fresh allocation — pass null so a stale allocation list is NOT reused.
     const replacement = freightAdjustmentForPo(target, items, null);
 
-    const adjustments = (po.orderAdjustmentList || []).filter(
-        (a: any) => a.productPromoUrl !== FINALE_FREIGHT_PROMO_URL,
-    );
+    const isDefaultPromo = PROMO_ID === "10007";
+    let existingDescription: string | null = null;
+    let adjustments: any[];
+    if (isDefaultPromo) {
+        // Carrier freight: replace every /10007 line with one consolidated bare `Freight`.
+        adjustments = (po.orderAdjustmentList || []).filter(
+            (a: any) => a.productPromoUrl !== FINALE_FREIGHT_PROMO_URL,
+        );
+    } else {
+        // Fee lane (e.g. Kashi "Alan to BAS" /10015): replace the lane's lines and
+        // PRESERVE the existing description — these are labeled fee lines, not "Freight".
+        const existing = (po.orderAdjustmentList || []).filter(
+            (a: any) => (a.productPromoUrl || "").endsWith(`/${PROMO_ID}`),
+        );
+        existingDescription = existing[0]?.description || null;
+        adjustments = (po.orderAdjustmentList || []).filter(
+            (a: any) => !(a.productPromoUrl || "").endsWith(`/${PROMO_ID}`),
+        );
+    }
+    if (PROMO_ID !== "10007") {
+        replacement.productPromoUrl = PROMO_URL;
+        replacement.description = existingDescription || FINALE_FREIGHT_DESCRIPTION;
+    }
     adjustments.push(replacement);
 
     const postBody = { ...po, orderAdjustmentList: adjustments };
     const currentFreight = (po.orderAdjustmentList || [])
-        .filter((a: any) => (a.productPromoUrl || "").includes("/10007") && Number(a.amount) > 2.5)
+        .filter((a: any) => (a.productPromoUrl || "").endsWith(`/${PROMO_ID}`) && Number(a.amount) > 2.5)
         .reduce((s: number, a: any) => s + (Number(a.amount) || 0), 0);
 
     const received = await fullyReceived(finale, poId);
     const alloc = replacement.orderAdjustmentAllocationList || [];
     console.log(
-        `PO ${poId}: freight $${currentFreight.toFixed(2)} → $${target.toFixed(2)}  ` +
+        `PO ${poId}: promo /${PROMO_ID}${existingDescription ? ` (${existingDescription})` : ""} $${currentFreight.toFixed(2)} → $${target.toFixed(2)}  ` +
         `(status ${originalStatus}, fullyReceived=${received})  alloc=[${alloc.join(", ")}]`,
     );
 
@@ -119,6 +178,18 @@ async function applyOne(finale: FinaleWriteSurface, poId: string, target: number
         await finale.completeOrder(poId);
     }
     await sleep(GAP);
+    appendLedgerEntry({
+        ts: new Date().toISOString(),
+        po: poId,
+        promo: PROMO_ID,
+        description: replacement.description,
+        before: Math.round(currentFreight * 100) / 100,
+        after: Math.round(target * 100) / 100,
+        delta: Math.round((target - currentFreight) * 100) / 100,
+        status: originalStatus,
+        fullyReceived: received,
+        alloc,
+    });
 }
 
 async function main() {

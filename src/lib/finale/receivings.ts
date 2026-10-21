@@ -1748,6 +1748,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                             orderDate: { begin: "${beginStr}", end: "${endStr}" }
                             sort: [{ field: "orderDate", mode: "desc" }]
                         ) {
+                            pageInfo { hasNextPage }
                             edges {
                                 node {
                                     orderId
@@ -1783,7 +1784,13 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
 
             const data = await this.graphql(query, 'Recent POs');
             const edges = data?.orderViewConnection?.edges || [];
-            console.log(`[finale] getRecentPurchaseOrders: ${edges.length} POs (${beginStr}..${endStr})`);
+            const truncated = data?.orderViewConnection?.pageInfo?.hasNextPage === true;
+            if (truncated) {
+                // Silent truncation made POs vanish from audits (Gro Kashi returned 0 with
+                // limit=1000/2000/3000 because the window had more POs than the page size).
+                console.warn(`[finale] getRecentPurchaseOrders TRUNCATED: window ${beginStr}..${endStr} has more than ${limit} POs; older POs were dropped. Raise the limit or narrow the window before treating the result as complete.`);
+            }
+            console.log(`[finale] getRecentPurchaseOrders: ${edges.length} POs (${beginStr}..${endStr})${truncated ? ' [TRUNCATED]' : ''}`);
             return edges.map((edge: any) => {
                 const po = edge.node;
                 const items = (po.itemList?.edges || [])
