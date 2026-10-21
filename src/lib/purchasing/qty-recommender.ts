@@ -329,7 +329,10 @@ export function recommendQty(input: RecommenderInput): RecommenderResult {
             value: stockOnOrder,
         });
     } else {
-        trace.push({ step: "on_order", detail: "No open POs", value: 0 });
+        // Zero credited cover: either no open POs at all, or every open PO was
+        // excluded (stale past lead+grace, or delivered-and-received). The row's
+        // on-order value is 0 either way — say that, not "No open POs".
+        trace.push({ step: "on_order", detail: "No open-PO cover credited (0 units on order)", value: 0 });
     }
     if (reservedQty > 0) {
         const draftLabel = (input.reservedDraftPOs ?? []).slice(0, 3).join(", ") || "live draft";

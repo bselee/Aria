@@ -82,7 +82,7 @@ describe("evaluateOpenPoDuplicateGuard", () => {
 });
 
 // coverageStockOnOrder is demand-side; tested alongside failsafe in this suite for locality
-import { coverageStockOnOrder } from "./po-reliability-scorer";
+import { coverageStockOnOrder, creditedOpenPOCount } from "./po-reliability-scorer";
 
 describe("coverageStockOnOrder", () => {
     it("credits full Finale open PO qty even when enriched marks stuck", () => {
@@ -144,5 +144,50 @@ describe("coverageStockOnOrder", () => {
             ageDays: 47,
         }];
         expect(coverageStockOnOrder(open, enriched, { staleAfterDays: 46 })).toBe(0);
+    });
+});
+
+describe("creditedOpenPOCount — provenance agreement (Phase 2.3, RWBP105)", () => {
+    const stale = {
+        orderId: "125271",
+        quantity: 10,
+        orderDate: "2026-09-03",
+        isDeliverable: true,
+        stuckReason: "" as const,
+        ageDays: 47,
+    };
+    const fresh = {
+        orderId: "125300",
+        quantity: 40,
+        orderDate: "2026-10-15",
+        isDeliverable: true,
+        stuckReason: "" as const,
+        ageDays: 6,
+    };
+
+    it("counts only POs that receive cover credit — a stale PO is not counted", () => {
+        expect(creditedOpenPOCount([stale, fresh], { staleAfterDays: 46 })).toBe(1);
+    });
+
+    it("provenance claim == displayed on-order: credited count x credit matches qty", () => {
+        // RWBP105 shape: 2 open POs, one stale. The row must show 1 open PO
+        // (+40), not 2 open POs against the age-gated +40 on-order value.
+        const creditedQty = coverageStockOnOrder(
+            [{ quantity: 10 }, { quantity: 40 }],
+            [stale, fresh],
+            { staleAfterDays: 46 },
+        );
+        const count = creditedOpenPOCount([stale, fresh], { staleAfterDays: 46 });
+        expect(count).toBe(1);
+        expect(creditedQty).toBe(40);
+    });
+
+    it("no staleAfterDays → every enriched PO counts (default preserved)", () => {
+        expect(creditedOpenPOCount([stale, fresh])).toBe(2);
+    });
+
+    it("no enriched rows → 0 credited", () => {
+        expect(creditedOpenPOCount(undefined)).toBe(0);
+        expect(creditedOpenPOCount([])).toBe(0);
     });
 });

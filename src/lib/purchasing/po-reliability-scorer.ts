@@ -401,47 +401,59 @@ export function coverageStockOnOrder(
 
     const staleAfterDays = options?.staleAfterDays ?? null;
 
-    // Determine which delivered POs to subtract.
-    // A PO is "delivered and fully received" when:
-    //   a) Enrichment says it's delivered (stuckReason === "delivered"), AND
-    //   b) receiving_cache confirms fully_received, OR we have no cache data
-    //      but it's NOT a blanket vendor (conservative: assume single-shipment).
-    // Partially-received blanket POs are NOT subtracted.
-    let deliveredQty = 0;
-    let staleQty = 0;
+    let subtractQty = 0;
     for (const po of enriched) {
-        // Age-gate: an undelivered PO open longer than (lead time + grace) is no
-        // longer real cover — crediting it hides the shortfall (RWBP105/125271).
-        // Delivered POs skip this; they are handled by the delivered branch below.
-        if (po.stuckReason !== "delivered" && staleAfterDays != null && po.ageDays > staleAfterDays) {
-            staleQty += Math.max(0, po.quantity || 0);
-            continue;
-        }
-        if (po.stuckReason !== "delivered") continue;
-
-        // Check receiving_cache for full-receipt confirmation
-        const orderId = po.orderId;
-        let fullyReceived: boolean | null = null;
-        try {
-            const { isPOFullyReceived } = require("./receiving-cache");
-            fullyReceived = isPOFullyReceived(orderId);
-        } catch { /* receiving_cache module may not be loaded yet */ }
-
-        if (fullyReceived === true) {
-            // Confirmed fully received — subtract
-            deliveredQty += Math.max(0, po.quantity || 0);
-        } else if (fullyReceived === false) {
-            // Confirmed partially received (blanket PO) — keep on-order
-            continue;
-        } else {
-            // No receiving_cache data — fall back to blanket vendor check
-            if (!BLANKET_VENDOR_PARTY_IDS.has(po.vendorPartyId ?? "")) {
-                deliveredQty += Math.max(0, po.quantity || 0);
-            }
+        if (classifyCoverPO(po, staleAfterDays) !== "credited") {
+            subtractQty += Math.max(0, po.quantity || 0);
         }
     }
 
-    return Math.max(0, finaleTotal - deliveredQty - staleQty);
+    return Math.max(0, finaleTotal - subtractQty);
+}
+
+/**
+ * Number of open POs that actually receive cover credit under the SAME rules
+ * coverageStockOnOrder applies. The row's provenance claim ("N open PO (+qty)")
+ * must agree with the on-order value displayed — after age-gating, a stale
+ * undelivered PO is neither credited nor counted (RWBP105).
+ */
+export function creditedOpenPOCount(
+    enriched?: OpenPOReliable[],
+    options?: { staleAfterDays?: number },
+): number {
+    if (!enriched || enriched.length === 0) return 0;
+    const staleAfterDays = options?.staleAfterDays ?? null;
+    return enriched.filter(po => classifyCoverPO(po, staleAfterDays) === "credited").length;
+}
+
+/** Where a single enriched open PO lands under the cover-credit rules. */
+function classifyCoverPO(po: OpenPOReliable, staleAfterDays: number | null): "credited" | "delivered" | "stale" {
+    // Age-gate: an undelivered PO open longer than (lead time + grace) is no
+    // longer real cover — crediting it hides the shortfall (RWBP105/125271).
+    // Delivered POs skip this; they are handled by the delivered branch below.
+    if (po.stuckReason !== "delivered") {
+        return staleAfterDays != null && po.ageDays > staleAfterDays ? "stale" : "credited";
+    }
+
+    // Check receiving_cache for full-receipt confirmation
+    const orderId = po.orderId;
+    let fullyReceived: boolean | null = null;
+    try {
+        const { isPOFullyReceived } = require("./receiving-cache");
+        fullyReceived = isPOFullyReceived(orderId);
+    } catch { /* receiving_cache module may not be loaded yet */ }
+
+    if (fullyReceived === true) {
+        // Confirmed fully received — subtract
+        return "delivered";
+    }
+    if (fullyReceived === false) {
+        // Confirmed partially received (blanket PO) — keep on-order
+        return "credited";
+    }
+    // No receiving_cache data — fall back to blanket vendor check
+    // (non-blanket: conservative, assume single-shipment → subtract)
+    return BLANKET_VENDOR_PARTY_IDS.has(po.vendorPartyId ?? "") ? "credited" : "delivered";
 }
 
 /** True when at least one open PO lacks deliverability evidence (chase needed). */

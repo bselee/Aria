@@ -41,6 +41,7 @@ import {
     hasDeliverablePO,
     deliverableStockOnOrder,
     coverageStockOnOrder,
+    creditedOpenPOCount,
     hasStuckOpenPO,
     STALE_COVER_GRACE_DAYS,
     type OpenPOReliable,
@@ -3346,6 +3347,8 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const horizonDate = new Date(Date.now() + horizonDays * 86400000).toISOString().slice(0, 10);
                     const vendorPoLegs = vendorLegsCache.get(partyId);
 
+                    const staleAfterDays = effectiveLeadTimeDays + STALE_COVER_GRACE_DAYS;
+                    const creditedPOCount = creditedOpenPOCount(enrichedOpenPOs, { staleAfterDays });
                     const stockOnOrder = (() => {
                         if (!reorderPolicy?.isBulkVendor) {
                             // KAIZEN(2026-10-20): age-gate the standard path — an
@@ -3353,11 +3356,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             // cover. Recompute here (not at line ~3160) because lead time
                             // is only resolved now. RWBP105: PO 125271 open 47d vs 25d
                             // lead was credited +10 units, masking a stockout.
-                            return coverageStockOnOrder(
-                                activity.openPOs,
-                                enrichedOpenPOs,
-                                { staleAfterDays: effectiveLeadTimeDays + STALE_COVER_GRACE_DAYS },
-                            );
+                            return coverageStockOnOrder(activity.openPOs, enrichedOpenPOs, { staleAfterDays });
                         }
                         // Bulk path: credit received qty + pending legs landing inside horizon.
                         // Fall back to full PO qty for any PO that has no leg records yet
@@ -3394,7 +3393,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         velocityRealityCap: chosenVelocity.realityCap,
                         stockOnHand: effectiveStock,
                         stockOnOrder,
-                        openPOCount: activity.openPOs.length,
+                        // Provenance agreement (Phase 2.3, RWBP105): the count in the
+                        // "N open PO (+qty)" claim must be the POs that actually
+                        // receive cover credit — not the raw open count.
+                        openPOCount: reorderPolicy?.isBulkVendor ? activity.openPOs.length : creditedPOCount,
                         leadTimeDays: effectiveLeadTimeDays,
                         leadTimeProvenance: effectiveLeadTimeProvenance,
                         leadTimeP90: distribution?.p90 ?? null,
