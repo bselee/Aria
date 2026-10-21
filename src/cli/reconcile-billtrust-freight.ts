@@ -196,7 +196,6 @@ interface FreightApplyResult {
 
 const VENDOR_ADDRESS_MAP: Array<{ pattern: RegExp; vendor: string }> = [
     { pattern: /rootwise/i, vendor: "Rootwise Soil Dynamics" },
-    { pattern: /grokashi/i, vendor: "Grokashi" },
     { pattern: /granite\s*mill/i, vendor: "Granite Mill Farms" },
     { pattern: /spusa|advantage\s*wh|surepack\s*usa/i, vendor: "SP USA" },
     { pattern: /seaforth/i, vendor: "Seaforth Mineral" },
@@ -208,6 +207,8 @@ const VENDOR_ADDRESS_MAP: Array<{ pattern: RegExp; vendor: string }> = [
     { pattern: /uline/i, vendor: "Uline" },
     { pattern: /thorvin/i, vendor: "Thorvin" },
     { pattern: /riceland/i, vendor: "Riceland" },
+    { pattern: /malibu|redi.?gro/i, vendor: "Malibu Compost" },
+    { pattern: /gro.?kashi|alan\s*adkinson|kashi\s*alan/i, vendor: "Grokashi" },
 ];
 
 function mapVendorFromAddress(address: string): { vendor: string; matchedBy: "address" } | null {
