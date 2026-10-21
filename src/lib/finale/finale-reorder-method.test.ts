@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { chooseVelocitySignal, normalizeFinaleReorderMethod } from "./client";
+import { chooseBomVelocity } from "./bom-demand";
 
 describe("normalizeFinaleReorderMethod", () => {
   it("detects do-not-reorder from guideline ids", () => {
@@ -157,5 +158,43 @@ describe("chooseVelocitySignal — stock ledger precedence (2026-09-30)", () => 
       consumptionQty: 20,
       ledgerVelocity: 0,
     })).toEqual({ dailyRate: 3, signal: "demand" });
+  });
+});
+
+describe("shared 3x reality cap — one helper, both velocity paths", () => {
+  const REALITY = 173;
+  const INFLATED = 17224; // the rice-bran case
+
+  it("resale path caps at exactly 3x reality via capRateToReality", () => {
+    const r = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: INFLATED,
+      salesVelocity: 0,
+      purchaseVelocity: REALITY,
+    });
+    expect(r.dailyRate).toBe(REALITY);
+    expect(r.inflated).toBe(true);
+    expect(r.rawRate).toBe(INFLATED);
+    expect(r.realityCap).toBe(REALITY);
+  });
+
+  it("BOM path caps at the same factor via the same helper (rice-bran case)", () => {
+    const r = chooseBomVelocity({
+      receiptVelocity: REALITY,
+      bomDerivedVelocity: INFLATED,
+      ledgerVelocity: REALITY,
+    });
+    expect(r.value).toBe(REALITY);
+    expect(r.source).toBe("ledger");
+  });
+
+  it("both paths leave a <=3x split uncapped", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 3 * 173 - 1,
+      salesVelocity: 0,
+      purchaseVelocity: 173,
+    }).dailyRate).toBe(3 * 173 - 1);
+    expect(chooseBomVelocity({ receiptVelocity: 173, bomDerivedVelocity: 3 * 173 - 1 }).value).toBe(3 * 173 - 1);
   });
 });

@@ -1,4 +1,5 @@
 import { PurchasingGroup } from './client';
+import { capRateToReality } from './core-client';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -142,11 +143,11 @@ export function chooseBomVelocity(input: {
     // as accurate as the BOM data, and BOM lines over-list as often as they
     // under-list. RAWRICEBRAN's BOM has a 47,614-unit-per-bag line that inflated
     // its burn to 17,224/d vs a ledger of 173/d — driving a 1.8M-unit "critical"
-    // order for a SKU the ledger says is covered 171 days. Mirror the resale
-    // path's 3x reality cap: the rate may not exceed 3x the physical signal
-    // (ledger when present, else receipts).
-    if (primary > 0 && value > 3 * primary) {
-        return { value: primary, source: ledger > 0 ? 'ledger' : 'receipts' };
+    // order for a SKU the ledger says is covered 171 days. Shared 3x reality cap
+    // (capRateToReality) — the same one the resale path applies.
+    const capped = capRateToReality(value, primary);
+    if (capped.capped) {
+        return { value: capped.value, source: ledger > 0 ? 'ledger' : 'receipts' };
     }
 
     if (ledger > 0 && ledger >= fg) return { value, source: 'ledger' };

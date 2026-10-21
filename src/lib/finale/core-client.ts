@@ -908,6 +908,19 @@ export function normalizeFinaleReorderMethod(productData: any): FinaleReorderMet
     return "default";
 }
 
+/** Reality cap shared by BOTH velocity paths (resale chooseVelocitySignal and
+ *  BOM chooseBomVelocity): a chosen rate may not exceed 3x the physical signal
+ *  (ledger / receipts / sales). One definition — the rice-bran bug was two
+ *  paths disagreeing on the same arithmetic. */
+export const REALITY_CAP_FACTOR = 3;
+
+export function capRateToReality(chosenRate: number, realityRate: number): { value: number; capped: boolean } {
+    if (realityRate > 0 && chosenRate > REALITY_CAP_FACTOR * realityRate) {
+        return { value: realityRate, capped: true };
+    }
+    return { value: chosenRate, capped: false };
+}
+
 export function chooseVelocitySignal(input: {
     reorderMethod?: FinaleReorderMethod;
     demandVelocity: number;
@@ -1006,9 +1019,10 @@ export function chooseVelocitySignal(input: {
     }
 
     const reality = Math.max(salesVelocity, purchaseVelocity);
-    if (reality > 0 && chosenRate > 3 * reality) {
+    const capped = capRateToReality(chosenRate, reality);
+    if (capped.capped) {
         return {
-            dailyRate: reality,
+            dailyRate: capped.value,
             signal: chosenSignal,
             inflated: true,
             rawRate: chosenRate,
