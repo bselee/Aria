@@ -63,6 +63,8 @@ import {
     parseISODateOnly,
     chooseVelocitySignal,
     normalizeFinaleReorderMethod,
+    type FinaleProductDetail,
+    type SupplierInfo,
     type ExternalReorderItem,
     type ExternalReorderGroup,
     type PurchasingItem,
@@ -3637,7 +3639,10 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         dailyRate: item.dailyRate,
                         stockOnHand: item.stockOnHand,
                         stockOnOrder: item.stockOnOrder,
-                        reservedQty: item.recommendation?.reservedQty ?? 0,
+                        // Reservations live in reservationsMap (reconciled live draft-PO
+                        // supply), not on recommendation — the BOM raw path's
+                        // recommendation shape carries no reservedQty.
+                        reservedQty: reservationsMap.get(item.productId)?.qty ?? 0,
                         adjustedRunwayDays: item.adjustedRunwayDays,
                         urgency: item.urgency,
                         productName: item.productName,

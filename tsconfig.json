@@ -12,7 +12,8 @@
     "lib": [
       "dom",
       "es2015.collection",
-      "es2015.promise"
+      "es2015.promise",
+      "es2021"
     ],
     "strict": false,
     "paths": {
@@ -39,6 +40,12 @@
     ".next/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "tmp",
+    ".tmp",
+    ".scripts",
+    "scripts/_*",
+    "supabase/functions",
+    "warm-cache-temp.ts"
   ]
 }
