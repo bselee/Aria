@@ -28,8 +28,7 @@ import { assessPurchasingGroups, type AssessedPurchasingGroup } from './assessme
 import { buildDraftPOItemsFromAssessment } from './draft-po-policy';
 import { assessPOCommitGuardsForLines } from './po-commit-guard';
 import {
-    classifyVendorOrderCycle,
-    mapRecentPOsToVendorCyclePOs,
+    buildVendorCycleMapForGroups,
     type VendorCycleResult,
 } from './vendor-order-cycle';
 import { getVendorAutonomyLevel } from './po-sender';
@@ -120,13 +119,32 @@ export async function runDrafterAgent(context: DrafterContext = {}): Promise<Dra
         itemContexts: context.itemContexts,
     });
 
+    // ── Vendor cycle lock ──────────────────────────────────────────────
+    // Gate 4 needs a per-vendor cycle decision. The cron calls runDrafterAgent()
+    // with no context, so build the cycle map here from recent Finale POs
+    // instead of relying on the caller. Without this, a vendor that just had a
+    // draft committed gets a fresh 1-line draft every 2-3 days (fragmentation —
+    // Bill 2026-10-20: Sustainable Village + Grassroots spooling singles).
+    let vendorCycles: Record<string, VendorCycleResult> = context.vendorCycles ?? {};
+    try {
+        const recentPOs = await client.getRecentPurchaseOrders(45, 500);
+        vendorCycles = buildVendorCycleMapForGroups(groups, recentPOs);
+    } catch (err: any) {
+        console.warn('[drafter] Failed to build vendor cycle map (Gate 4 disabled):', err.message);
+    }
+
+    const effectiveContext: DrafterContext = {
+        ...context,
+        vendorCycles,
+    };
+
     console.log(`[drafter] Assessed ${assessment.groups.length} groups: ` +
         `${assessment.actionableLines.length} actionable lines, ` +
         `${assessment.blockedLines.length} blocked lines`);
 
     // Process each vendor group
     for (const group of assessment.groups) {
-        const detail = await processVendorGroup(group, client, db, context);
+        const detail = await processVendorGroup(group, client, db, effectiveContext);
         result.details.push(detail);
 
         switch (detail.action) {
