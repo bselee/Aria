@@ -434,7 +434,7 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
         expect(thirtyBtn?.textContent).toMatch(/1/);
     });
 
-    it("shows same-vendor 30-day add-ons when Order Now triggers that vendor", async () => {
+    it("does not pull a same-vendor 30-day line onto TODAY", async () => {
         stubLocalStorage();
         localStorage.setItem("aria-dash-purchasing-focus", "order_now");
 
@@ -488,10 +488,10 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
         render(<PurchasingPanel />);
         await waitFor(() => expect(fetch).toHaveBeenCalled());
 
-        fireEvent.click(await screen.findByText("▾")); // 5f1de32: expand via ▾, not vendor name
+        fireEvent.click(await screen.findByText("▾"));
 
         expect(await screen.findByText(/Blumat Digital Moisture Meter/i)).toBeTruthy();
-        expect(await screen.findByText(/Blumat 9 inch Pre-set Carrot/i)).toBeTruthy();
+        expect(screen.queryByText(/Blumat 9 inch Pre-set Carrot/i)).toBeNull();
     });
 
     it("migrates legacy localStorage 'today' to order_now (active = red tint)", async () => {

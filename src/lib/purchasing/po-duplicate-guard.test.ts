@@ -101,4 +101,48 @@ describe("coverageStockOnOrder", () => {
     it("returns 0 when no open POs", () => {
         expect(coverageStockOnOrder([], [])).toBe(0);
     });
+
+    it("age-gates an undelivered PO open past (lead + grace) as not real cover (RWBP105/125271)", () => {
+        const open = [{ quantity: 10 }];
+        const enriched = [{
+            orderId: "125271",
+            quantity: 10,
+            orderDate: "2026-09-03",
+            isDeliverable: true,
+            stuckReason: "" as const,
+            ageDays: 47,
+        }];
+        // lead ~25d + grace 21d = 46d; PO at 47d is stale → no cover.
+        expect(coverageStockOnOrder(open, enriched, { staleAfterDays: 46 })).toBe(0);
+        // A younger PO still within the window is credited.
+        expect(coverageStockOnOrder(open, [{ ...enriched[0], ageDays: 30 }], { staleAfterDays: 46 })).toBe(10);
+    });
+
+    it("does not age-gate when staleAfterDays is not provided (preserves default)", () => {
+        const open = [{ quantity: 10 }];
+        const enriched = [{
+            orderId: "125271",
+            quantity: 10,
+            orderDate: "2026-09-03",
+            isDeliverable: true,
+            stuckReason: "" as const,
+            ageDays: 47,
+        }];
+        expect(coverageStockOnOrder(open, enriched)).toBe(10);
+    });
+
+    it("age-gate does not zero a delivered PO that is already handled as delivered", () => {
+        // A delivered PO past the window is subtracted via the delivered branch,
+        // not double-counted in staleQty. Quantity net 0 either way.
+        const open = [{ quantity: 10 }];
+        const enriched = [{
+            orderId: "125271",
+            quantity: 10,
+            orderDate: "2026-09-03",
+            isDeliverable: false,
+            stuckReason: "delivered" as const,
+            ageDays: 47,
+        }];
+        expect(coverageStockOnOrder(open, enriched, { staleAfterDays: 46 })).toBe(0);
+    });
 });

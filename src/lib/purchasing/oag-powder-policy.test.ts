@@ -45,6 +45,18 @@ describe("oag-powder-policy", () => {
         expect(r.provenance).toMatch(/powder MTO/i);
     });
 
+    it("does not give FPF finished the powder 120-day vendor lead", () => {
+        const r = resolveLeadTimeDays({
+            productId: "OAG219",
+            vendorPolicyLeadDays: 120,
+            skuObservedLeadDays: 16,
+            skuObservedSampleCount: 1,
+            baseLeadDays: 16,
+        });
+        expect(r.days).not.toBe(120);
+        expect(r.days).toBe(16);
+    });
+
     it("resolveLeadTimeDays: non-powder uses vendor policy then base", () => {
         expect(
             resolveLeadTimeDays({
@@ -60,6 +72,39 @@ describe("oag-powder-policy", () => {
                 baseLeadDays: 21,
             }).days,
         ).toBe(21);
+    });
+
+    it("resolveLeadTimeDays: vendor P90 floors the base when Finale leadTime is null (RWBP105 regression)", () => {
+        // Finale product leadTime = null → base 21; Rootwise p90=25 must win.
+        const r = resolveLeadTimeDays({
+            productId: "RWBP105",
+            vendorPolicyLeadDays: null,
+            skuObservedLeadDays: null,
+            vendorP90LeadDays: 25,
+            baseLeadDays: 21,
+        });
+        expect(r.days).toBe(25);
+        expect(r.provenance).toMatch(/p90/);
+    });
+
+    it("resolveLeadTimeDays: vendor P90 never overrides an explicit policy", () => {
+        const r = resolveLeadTimeDays({
+            productId: "OAG226",
+            vendorPolicyLeadDays: 30,
+            vendorP90LeadDays: 25,
+            baseLeadDays: 21,
+        });
+        expect(r.days).toBe(30);
+    });
+
+    it("resolveLeadTimeDays: vendor P90 does not lower an already-higher base", () => {
+        const r = resolveLeadTimeDays({
+            productId: "X",
+            vendorPolicyLeadDays: null,
+            vendorP90LeadDays: 18,
+            baseLeadDays: 21,
+        });
+        expect(r.days).toBe(21);
     });
 });
 

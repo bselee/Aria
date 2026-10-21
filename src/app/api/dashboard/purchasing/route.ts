@@ -2,7 +2,7 @@ import { createClient } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient, PurchasingGroup } from '@/lib/finale/client';
 import { assessPurchasingGroups } from '@/lib/purchasing/assessment-service';
-import { mergeIntoGroups } from '@/lib/finale/bom-demand';
+import { mergeIntoGroups, shelfDidNotTakeBomBurn } from '@/lib/finale/bom-demand';
 import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/purchasing/cache';
 import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
@@ -177,6 +177,31 @@ export async function GET(req: NextRequest) {
     } else {
         groups = resaleGroups;
     }
+
+    // Stale BOM cache can still say "order" after a shelf that never moved.
+    // GRIP101: 60 bought 08/11, 60 still on hand, BOM rate 2.88/d. Hold it here
+    // so the board does not wait on the next Finale scan.
+    groups = groups.map(group => ({
+        ...group,
+        items: group.items.map(item => {
+            if (item.itemType !== 'bom-component') return item;
+            const lookback = 90;
+            const impliedBuy = (item.purchaseVelocity ?? 0) * lookback;
+            const hold = shelfDidNotTakeBomBurn({
+                stockOnHand: item.stockOnHand ?? 0,
+                bomDailyRate: item.dailyRate ?? 0,
+                lastPurchaseQty: impliedBuy > 0 ? impliedBuy : null,
+                daysSinceLastPurchase: 45,
+            });
+            if (!hold.hold) return item;
+            return {
+                ...item,
+                suggestedQty: 0,
+                urgency: 'ok' as const,
+                explanation: `Hold: ${hold.detail} Do not order off the BOM rate.`,
+            };
+        }),
+    }));
 
     if (urgency) {
         const allowed = urgency.split(',') as Array<'critical' | 'warning' | 'watch' | 'ok'>;

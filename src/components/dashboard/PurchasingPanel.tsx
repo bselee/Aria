@@ -37,7 +37,7 @@ type PurchasingItem = {
         supplierName: string;
         finaleUrl: string;
     } | null;
-    dailyRateSource?: "demand" | "sales" | "receipts";
+    dailyRateSource?: "demand" | "sales" | "receipts" | "ledger";
     runwayDays: number; adjustedRunwayDays: number; leadTimeDays: number; leadTimeProvenance: string;
     openPOs: Array<{ orderId: string; quantity: number; orderDate: string }>;
     urgency: UrgencyTier;
@@ -689,19 +689,6 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
         return "Selected items need PO handling";
     }
     function itemMatchesFocus(item: PurchasingItem): boolean {
-        if (focusFilter === "order_now") {
-            if (itemMatchesOrderingFocus(item, "order_now")) {
-                return true;
-            }
-            if (itemMatchesOrderingFocus(item, "30")) {
-                const group = data?.groups.find(g => g.vendorPartyId === item.supplierPartyId);
-                const hasOrderNow = group?.items.some(i => itemMatchesOrderingFocus(i, "order_now"));
-                if (hasOrderNow) {
-                    return true;
-                }
-            }
-            return false;
-        }
         return itemMatchesOrderingFocus(item, focusFilter);
     }
     function itemMatchesMode(item: PurchasingItem): boolean {
@@ -2806,7 +2793,9 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                 // "Order by" = today + (runwayDays - leadTimeDays).
                                                                                 // Positive = days until we MUST place the order.
                                                                                 // Zero/negative = already past the order window.
-                                                                                const orderByDays = Math.round(item.runwayDays - item.leadTimeDays);
+                                                                                const runwayForOrderBy = item.adjustedRunwayDays ?? item.runwayDays;
+                                                                                const leadForOrderBy = item.effectiveLeadTimeDays ?? item.leadTimeDays;
+                                                                                const orderByDays = Math.round(runwayForOrderBy - leadForOrderBy);
                                                                                 const orderByDate = orderByDays > -90
                                                                                     ? new Date(Date.now() + orderByDays * 86400000)
                                                                                         .toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
@@ -2836,7 +2825,7 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                     orderByDays <= 14 ? 'text-amber-400' :
                                                                                                     'text-zinc-400'
                                                                                                 }`}
-                                                                                                title={`Place order by ${orderByDate} so it arrives before stockout (runway ${Math.round(item.runwayDays)}d − lead ${item.leadTimeDays}d = ${orderByDays}d remaining)`}
+                                                                                                title={`Place order by ${orderByDate} so it arrives before stockout (runway ${Math.round(runwayForOrderBy)}d − lead ${leadForOrderBy}d = ${orderByDays}d remaining)`}
                                                                                             >
                                                                                                 {orderByDays <= 0 ? '⚠ TODAY — window closed' : `order by ${orderByDate}`}
                                                                                             </span>

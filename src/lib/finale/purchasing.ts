@@ -42,6 +42,7 @@ import {
     deliverableStockOnOrder,
     coverageStockOnOrder,
     hasStuckOpenPO,
+    STALE_COVER_GRACE_DAYS,
     type OpenPOReliable,
 } from "../purchasing/po-reliability-scorer";
 import {
@@ -2475,7 +2476,6 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const onTimeRate = this.getVendorOnTimeRate(groupName);
                     // Floor at 50% so chronic late vendors still get partial credit; never 0 from stuck.
                     const trustedRate = Math.max(0.5, Math.min(1, onTimeRate || 1));
-                    const stockOnOrder = rawStockOnOrder * trustedRate;
 
                     const lt = await leadTimeService.getForVendor(groupName, compSku);
                     const baseLeadTimeDays = lt.days;
@@ -2497,6 +2497,14 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         baseLeadDays: leadTimeDays,
                     });
                     const effectiveLeadTimeDays = resolvedLead.days;
+                    // KAIZEN(2026-10-20): age-gate BOM open-PO cover the same way as the
+                    // resale path — an undelivered PO open longer than (lead + grace) is
+                    // no longer real cover (RWBP105/125271 masked a stockout).
+                    const stockOnOrder = coverageStockOnOrder(
+                        compActivity.openPOs,
+                        bomEnrichedPOs,
+                        { staleAfterDays: effectiveLeadTimeDays + STALE_COVER_GRACE_DAYS },
+                    ) * trustedRate;
                     const baseBomProvenance = priorStockouts > 0
                         ? `${leadTimeDays}d (${lt.label.replace(/^\d+d /, '')} × ${stockoutMultiplier.toFixed(1)} for ${priorStockouts} prior stockout${priorStockouts === 1 ? '' : 's'})`
                         : lt.label;
@@ -3306,11 +3314,15 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // v2.1 — vendor policy lead-time override; powder MTO SKU wins (120d).
                     const skuObs = getObservedSkuLeadDays(sku);
                     const exclusionNote = getSkuLeadExclusionNote(sku);
+                    // Vendor P90 (persisted stats, ≥5 samples) floors the base so a null
+                    // Finale product leadTime no longer falls back to the flat 21 default.
+                    const vendorP90 = distribution?.p90 ?? null;
                     const resolvedLead = resolveLeadTimeDays({
                         productId: sku,
                         vendorPolicyLeadDays: reorderPolicy?.leadTimeOverrideDays,
                         skuObservedLeadDays: skuObs?.days ?? null,
                         skuObservedProvenance: skuObs?.provenance ?? null,
+                        vendorP90LeadDays: vendorP90,
                         baseLeadDays: leadTimeDays,
                     });
                     const effectiveLeadTimeDays = resolvedLead.days;
@@ -3334,8 +3346,16 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
                     const stockOnOrder = (() => {
                         if (!reorderPolicy?.isBulkVendor) {
-                            // Standard path: full PO qty credited immediately — unchanged.
-                            return rawStockOnOrder;
+                            // KAIZEN(2026-10-20): age-gate the standard path — an
+                            // undelivered PO open longer than (lead + grace) is not real
+                            // cover. Recompute here (not at line ~3160) because lead time
+                            // is only resolved now. RWBP105: PO 125271 open 47d vs 25d
+                            // lead was credited +10 units, masking a stockout.
+                            return coverageStockOnOrder(
+                                activity.openPOs,
+                                enrichedOpenPOs,
+                                { staleAfterDays: effectiveLeadTimeDays + STALE_COVER_GRACE_DAYS },
+                            );
                         }
                         // Bulk path: credit received qty + pending legs landing inside horizon.
                         // Fall back to full PO qty for any PO that has no leg records yet

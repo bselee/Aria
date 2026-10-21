@@ -210,6 +210,25 @@ describe("assessPurchasingCandidate", () => {
         expect(assessment.reasonCodes).toContain("order_economics_unclear");
     });
 
+    it("does not invent an order from pack size when the recommender gap is zero", () => {
+        const assessment = assessPurchasingCandidate(makeCandidate({
+            vendorName: "Grassroots Fabric Pots",
+            productId: "GLB207",
+            directDemand: 1.03,
+            stockOnHand: 40,
+            adjustedRunwayDays: 39,
+            leadTimeDays: 20,
+            suggestedQty: 0,
+            orderIncrementQty: 50,
+            minimumOrderQty: 50,
+            unitPrice: 25,
+        }));
+
+        expect(assessment.decision).toBe("hold");
+        expect(assessment.recommendedQty).toBe(0);
+        expect(assessment.reasonCodes).toContain("no_order_quantity_recommended");
+    });
+
     it("holds with precise explanation when computed order quantity is zero", () => {
         const assessment = assessPurchasingCandidate(makeCandidate({
             vendorName: "Miles Filippelli",

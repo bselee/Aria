@@ -926,9 +926,19 @@ export class FinaleProductsClient extends FinaleCoreClient {
             const cached = await getFreshCachedSkus([trimmedSku]);
             const row = cached.get(trimmedSku);
             if (row) {
-                // bom_components is null for confirmed-no-BOM SKUs (cached as
-                // such) vs. undefined/missing row = never checked.
-                return row.bom_components ?? [];
+                // A positive BOM result is stable and safe to cache for the full
+                // 24h TTL. A NEGATIVE "no BOM" result (bom_components === null)
+                // is only valid until a BOM is added in Finale, so it re-verifies
+                // against live data after a short window. (2026-10-05: stale
+                // negative cache made CRAFT8/UCS104/etc. look BOM-less and
+                // produced a bogus ~10x "BOM gap".)
+                const isNegative = row.bom_components === null;
+                const negativeAgeMs = Date.now() - Date.parse(row.cached_at);
+                const NEGATIVE_REVERIFY_MS = 2 * 60 * 60 * 1000; // 2h
+                if (!isNegative || negativeAgeMs < NEGATIVE_REVERIFY_MS) {
+                    return row.bom_components ?? [];
+                }
+                // Negative too old — fall through to live re-fetch below.
             }
         } catch (cacheErr: any) {
             console.warn(`[finale] getBillOfMaterials: cache read failed for ${trimmedSku}, falling through to live fetch:`, cacheErr?.message || cacheErr);

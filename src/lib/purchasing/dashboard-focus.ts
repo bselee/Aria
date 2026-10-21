@@ -30,18 +30,16 @@ type FocusItem = {
 };
 
 /**
- * Effective shortage = "when does this SKU actually run out, given everything we
- * know?" Replaces raw `runwayDays` as the primary ordering score because
- * raw runway shows scary `0d` even when an open PO covers the gap. Precedence:
+ * Effective shortage for the ordering window. Aria's adjusted runway is the
+ * clock. Finale stockout days stay on the row as a reference and do not
+ * hide a late MTO buy or pull a short-lead item forward.
  *
- *   1. finaleStockoutDays (Finale's own projection — most authoritative)
- *   2. adjustedRunwayDays (on-hand + on-order)
- *   3. runwayDays (on-hand only)
- *   4. Infinity (no signal)
+ *   1. adjustedRunwayDays (on-hand + on-order)
+ *   2. runwayDays (on-hand only)
+ *   3. Infinity (no signal)
  */
 export function getEffectiveShortageDays(item: FocusItem): number {
   const candidates = [
-    item.finaleStockoutDays,
     item.adjustedRunwayDays,
     item.runwayDays,
   ];

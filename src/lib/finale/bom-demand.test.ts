@@ -93,6 +93,37 @@ describe('chooseBomVelocity', () => {
         expect(chooseBomVelocity({ receiptVelocity: 0, bomDerivedVelocity: 0 }))
             .toEqual({ value: 0, source: 'none' });
     });
+    it('uses the ledger (actual usage) over receipts when present', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 466.67, bomDerivedVelocity: 43.3, ledgerVelocity: 203.4 }))
+            .toEqual({ value: 203.4, source: 'ledger' });
+    });
+    it('uses the ledger when it exceeds receipts too', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 100, bomDerivedVelocity: 50, ledgerVelocity: 150 }))
+            .toEqual({ value: 150, source: 'ledger' });
+    });
+    it('keeps FG-derived demand as the floor when the ledger under-states it', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 500, bomDerivedVelocity: 300, ledgerVelocity: 100 }))
+            .toEqual({ value: 300, source: 'demand' });
+    });
+    it('falls back to receipts when the ledger is absent (labels)', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 0.42, bomDerivedVelocity: 0.1 }))
+            .toEqual({ value: 0.42, source: 'receipts' });
+    });
+    it('reality-caps a wildly inflated FG BOM rate at 3x the ledger (RAWRICEBRAN)', () => {
+        // BOM line over-lists rice bran to 17,224/d vs ledger 173/d. The cap must
+        // pin it to the ledger, not let the 1.8M-unit order through.
+        expect(chooseBomVelocity({ receiptVelocity: 186, bomDerivedVelocity: 17224, ledgerVelocity: 173 }))
+            .toEqual({ value: 173, source: 'ledger' });
+    });
+    it('reality-caps against receipts when no ledger exists', () => {
+        expect(chooseBomVelocity({ receiptVelocity: 100, bomDerivedVelocity: 900 }))
+            .toEqual({ value: 100, source: 'receipts' });
+    });
+    it('does not cap a FG rate within 3x of the physical signal', () => {
+        // 300 vs ledger 100 = 3x, boundary — not capped (strict >).
+        expect(chooseBomVelocity({ receiptVelocity: 500, bomDerivedVelocity: 300, ledgerVelocity: 100 }))
+            .toEqual({ value: 300, source: 'demand' });
+    });
 });
 
 describe('shelfDidNotTakeBomBurn', () => {

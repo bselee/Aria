@@ -63,6 +63,11 @@ const NO_ACK_NO_TRACKING_DAYS = 7;
 /** Days since last tracking movement before tracking is considered stale. */
 const STALE_TRACKING_DAYS = 10;
 
+/** Days past a vendor's lead time before an undelivered open PO stops counting
+ *  as cover. A PO this far overdue is hiding a real shortfall (RWBP105: PO 125271
+ *  open 47d vs Rootwise lead ~25d was credited +10 units, masking a stockout). */
+export const STALE_COVER_GRACE_DAYS = 21;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function daysSince(dateStr: string | null | undefined): number | null {
@@ -388,10 +393,13 @@ const BLANKET_VENDOR_PARTY_IDS = new Set(["10024", "10745"]);
 export function coverageStockOnOrder(
     openPOs: Array<{ quantity: number; vendorPartyId?: string | null }>,
     enriched?: OpenPOReliable[],
+    options?: { staleAfterDays?: number },
 ): number {
     // Base: all open PO quantities (conservative — assume all will arrive)
     const finaleTotal = openPOs.reduce((sum, po) => sum + Math.max(0, po.quantity || 0), 0);
     if (!enriched || enriched.length === 0) return finaleTotal;
+
+    const staleAfterDays = options?.staleAfterDays ?? null;
 
     // Determine which delivered POs to subtract.
     // A PO is "delivered and fully received" when:
@@ -400,7 +408,15 @@ export function coverageStockOnOrder(
     //      but it's NOT a blanket vendor (conservative: assume single-shipment).
     // Partially-received blanket POs are NOT subtracted.
     let deliveredQty = 0;
+    let staleQty = 0;
     for (const po of enriched) {
+        // Age-gate: an undelivered PO open longer than (lead time + grace) is no
+        // longer real cover — crediting it hides the shortfall (RWBP105/125271).
+        // Delivered POs skip this; they are handled by the delivered branch below.
+        if (po.stuckReason !== "delivered" && staleAfterDays != null && po.ageDays > staleAfterDays) {
+            staleQty += Math.max(0, po.quantity || 0);
+            continue;
+        }
         if (po.stuckReason !== "delivered") continue;
 
         // Check receiving_cache for full-receipt confirmation
@@ -425,7 +441,7 @@ export function coverageStockOnOrder(
         }
     }
 
-    return Math.max(0, finaleTotal - deliveredQty);
+    return Math.max(0, finaleTotal - deliveredQty - staleQty);
 }
 
 /** True when at least one open PO lacks deliverability evidence (chase needed). */

@@ -204,12 +204,29 @@ function buildOrderExplanation(input: PurchasingCandidateInput, effectiveQty: nu
 }
 
 export function assessPurchasingCandidate(input: PurchasingCandidateInput): PurchasingAssessment {
-    const effectiveQty = deriveEffectiveOrderQty(input);
     const directDemand = Math.max(input.directDemand, 0);
     const bomDemand = Math.max(input.bomDemand, 0);
     const sharedDemand = directDemand + bomDemand;
-    const healthyFgCoverage = hasHealthyFinishedGoodsCoverage(input.finishedGoodsCoverageDays);
     const m = () => metricsOf(input, directDemand, bomDemand);
+
+    // A pack size or MOQ is a constraint on a real gap. It is not a reason to open a PO.
+    if ((input.suggestedQty ?? 0) <= 0) {
+        return createPurchasingAssessment({
+            vendorName: input.vendorName,
+            productId: input.productId,
+            decision: "hold",
+            recommendedQty: 0,
+            confidence: "high",
+            reasonCodes: ["no_order_quantity_recommended"],
+            explanation:
+                `Hold: cover math needs 0. On hand ${fmtQty(input.stockOnHand)}, ` +
+                `on order ${fmtQty(input.stockOnOrder)}. Pack size does not create a buy.`,
+            metrics: m(),
+        });
+    }
+
+    const effectiveQty = deriveEffectiveOrderQty(input);
+    const healthyFgCoverage = hasHealthyFinishedGoodsCoverage(input.finishedGoodsCoverageDays);
 
     if (isPackOverbuy(input, effectiveQty)) {
         return createPurchasingAssessment({

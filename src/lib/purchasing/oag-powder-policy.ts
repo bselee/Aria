@@ -102,7 +102,9 @@ export function isFpfCycOnlyPo(productIds: Array<string | null | undefined> | nu
 
 /**
  * Resolve effective lead days for ordering.
- * Priority: powder MTO policy → SKU observed receipts → vendor policy → base.
+ * Priority: powder MTO policy → SKU plan (n≥3) → vendor policy → base.
+ * A one-receipt "plan" is Finale reference, not the clock.
+ * FPF finished does not inherit the powder 120-day vendor override.
  */
 export function resolveLeadTimeDays(params: {
     productId: string | null | undefined;
@@ -110,6 +112,11 @@ export function resolveLeadTimeDays(params: {
     /** Observed planning lead from Finale send→receive samples for this SKU. */
     skuObservedLeadDays?: number | null;
     skuObservedProvenance?: string | null;
+    /** Sample count behind skuObservedLeadDays. Below 3, the sample is not a plan. */
+    skuObservedSampleCount?: number | null;
+    /** Vendor-level observed P90 (>=5 samples). Floors the base so a null Finale
+     *  product leadTime no longer falls back to the flat 21-day default. */
+    vendorP90LeadDays?: number | null;
     baseLeadDays: number;
 }): { days: number; provenance: string } {
     const skuLead = getOagPowderLeadOverrideDays(params.productId);
@@ -119,21 +126,38 @@ export function resolveLeadTimeDays(params: {
             provenance: `${skuLead}d OAG powder MTO policy (Martin/124788)`,
         };
     }
-    if (params.skuObservedLeadDays != null && params.skuObservedLeadDays > 0) {
+    const observedN = params.skuObservedSampleCount ?? null;
+    const observedUsable = params.skuObservedLeadDays != null
+        && params.skuObservedLeadDays > 0
+        && (observedN == null || observedN >= 3);
+    if (observedUsable) {
         return {
-            days: params.skuObservedLeadDays,
+            days: params.skuObservedLeadDays!,
             provenance: params.skuObservedProvenance
                 ?? `${params.skuObservedLeadDays}d SKU observed`,
         };
     }
-    if (params.vendorPolicyLeadDays != null && params.vendorPolicyLeadDays > 0) {
+    const vendorLead = params.vendorPolicyLeadDays ?? null;
+    const powderVendorOnFpf = isOagFpfCycFinishedSku(params.productId)
+        && vendorLead === OAG_POWDER_LEAD_DAYS;
+    if (vendorLead != null && vendorLead > 0 && !powderVendorOnFpf) {
         return {
-            days: params.vendorPolicyLeadDays,
-            provenance: `${params.vendorPolicyLeadDays}d vendor policy override`,
+            days: vendorLead,
+            provenance: `${vendorLead}d vendor policy override`,
         };
     }
+    // Vendor P90 floors the base only when more informed than Finale's raw
+    // leadTime (or the flat default). Never overrides a policy/SKU value above.
+    const p90 = params.vendorP90LeadDays ?? null;
+    const effectiveBase = p90 != null && p90 > params.baseLeadDays
+        ? p90
+        : params.baseLeadDays;
+    const p90Note = effectiveBase === p90 ? "p90" : "";
+    const thin = observedN != null && observedN > 0 && observedN < 3
+        ? ` · n=${observedN} receipt not used as lead`
+        : "";
     return {
-        days: params.baseLeadDays,
-        provenance: `${params.baseLeadDays}d base`,
+        days: effectiveBase,
+        provenance: `${effectiveBase}d ${p90Note ? `vendor ${p90Note}` : "base"}${thin}`,
     };
 }

@@ -191,7 +191,8 @@ export class LeadTimeService {
         if (!result && this.cache && vendorName) {
             const key = vendorName.trim().toLowerCase();
             for (const [cacheKey, days] of this.cache.entries()) {
-                if (cacheKey === key || cacheKey.includes(key) || key.includes(cacheKey)) {
+                const ck = cacheKey.toLowerCase();
+                if (ck === key || ck.includes(key) || key.includes(ck)) {
                     result = {
                         days,
                         provenance: 'vendor_median',
@@ -250,14 +251,40 @@ export class LeadTimeService {
         if (!this.cache) await this.warmCache();
         if (!vendorName) return null;
         const distMap = finaleClient.getVendorLeadTimeDistribution();
-        if (distMap.size === 0) return null;
         const key = vendorName.trim().toLowerCase();
+
+        // In-memory 90-day window (requires ≥5 samples).
         for (const [cacheKey, dist] of distMap.entries()) {
-            if (cacheKey.toLowerCase() === key
-                || cacheKey.toLowerCase().includes(key)
-                || key.includes(cacheKey.toLowerCase())) {
-                return dist.sampleCount >= 5 ? dist : null;
+            const ck = cacheKey.toLowerCase();
+            if (ck === key || ck.includes(key) || key.includes(ck)) {
+                if (dist.sampleCount >= 5) return dist;
             }
+        }
+
+        // Fall back to persisted vendor_lead_time_stats (nightly tracker, full history).
+        // The 90-day in-memory window can under-sample monthly-cadence vendors
+        // (Rootwise showed n=4 in-memory but 16 samples persisted → p90=25 vs the
+        // flat 21 default). Bug surfaced 2026-10-20 on RWBP105.
+        try {
+            const db = createClient();
+            if (db) {
+                const { data } = await db
+                    .from('vendor_lead_time_stats')
+                    .select('vendor_name, sample_count, p50_days, p90_days')
+                    .not('p90_days', 'is', null)
+                    .gte('sample_count', 5);
+                if (data && Array.isArray(data)) {
+                    for (const row of data as Array<{ vendor_name: string | null; sample_count: number; p50_days: number | null; p90_days: number | null }>) {
+                        if (!row.vendor_name || row.p50_days == null || row.p90_days == null) continue;
+                        const ck = row.vendor_name.trim().toLowerCase();
+                        if (ck === key || ck.includes(key) || key.includes(ck)) {
+                            return { p50: row.p50_days, p90: row.p90_days, sampleCount: row.sample_count };
+                        }
+                    }
+                }
+            }
+        } catch {
+            // non-fatal — fall through to null (caller uses median + buffer)
         }
         return null;
     }

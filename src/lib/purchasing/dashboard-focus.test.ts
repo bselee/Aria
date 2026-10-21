@@ -20,13 +20,13 @@ const baseItem = {
 };
 
 describe("getEffectiveShortageDays", () => {
-  it("prefers finaleStockoutDays when finite and non-negative", () => {
+  it("uses Aria adjusted runway, not Finale stockout days, for the ordering window", () => {
     expect(getEffectiveShortageDays({
       ...baseItem,
-      finaleStockoutDays: 7,
-      adjustedRunwayDays: 80,
-      runwayDays: 0,
-    })).toBe(7);
+      finaleStockoutDays: 203,
+      adjustedRunwayDays: 81,
+      runwayDays: 81,
+    })).toBe(81);
   });
 
   it("falls back to adjustedRunwayDays when finaleStockoutDays is null", () => {
@@ -149,7 +149,7 @@ describe("getOrderingFocusBucket — buckets by effective shortage", () => {
     })).toBe("60");
   });
 
-  it("uses finale stockout days ahead of adjusted runway", () => {
+  it("does not let Finale stockout days override Aria runway", () => {
     expect(getOrderingFocusBucket({
       ...baseItem,
       urgency: "warning",
@@ -157,7 +157,7 @@ describe("getOrderingFocusBucket — buckets by effective shortage", () => {
       adjustedRunwayDays: 80,
       finaleStockoutDays: 21,
       leadTimeDays: 14,
-    })).toBe("30");
+    })).toBe("90");
   });
 
   it("returns later for non-actionable items even when shortage is critical", () => {

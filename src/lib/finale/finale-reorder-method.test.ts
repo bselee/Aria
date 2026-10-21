@@ -78,3 +78,84 @@ describe("normalizeFinaleReorderMethod", () => {
     })).toEqual({ dailyRate: 3, signal: "demand" });
   });
 });
+
+describe("chooseVelocitySignal — stock ledger precedence (2026-09-30)", () => {
+  it("uses the ledger when every product-level signal is zero", () => {
+    // The job-supply / unconfigured-SKU shape.
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 0,
+      salesVelocity: 0,
+      purchaseVelocity: 0,
+      consumptionQty: 0,
+      ledgerVelocity: 27.09,
+    })).toEqual({ dailyRate: 27.09, signal: "ledger" });
+  });
+
+  it("prefers the ledger over the receipts fallback", () => {
+    // Receipts measure what we bought; the ledger measures what we consumed.
+    const result = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 0,
+      salesVelocity: 0,
+      purchaseVelocity: 5,
+      consumptionQty: 20,
+      ledgerVelocity: 22.27,
+    });
+    expect(result.dailyRate).toBe(22.27);
+    expect(result.signal).toBe("ledger");
+    expect(result.replacedRate).toBe(5);
+    expect(result.replacedSignal).toBe("receipts");
+  });
+
+  it("overrides a demand signal that understates the ledger by more than 2.5x", () => {
+    // STICKER12 live: Aria demand 0.13/d vs ledger 16.63/d.
+    const result = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 0.13,
+      salesVelocity: 0,
+      consumptionQty: 0,
+      ledgerVelocity: 16.63,
+    });
+    expect(result.dailyRate).toBe(16.63);
+    expect(result.signal).toBe("ledger");
+    expect(result.replacedRate).toBe(0.13);
+    expect(result.replacedSignal).toBe("demand");
+  });
+
+  it("overrides a receipt signal that overstates the ledger by more than 2.5x", () => {
+    // RAWWORMCASTINGS live: Aria receipts 2800/d vs ledger 1654/d.
+    const result = chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 0,
+      salesVelocity: 0,
+      purchaseVelocity: 2800,
+      consumptionQty: 50,
+      ledgerVelocity: 1654,
+    });
+    expect(result.dailyRate).toBe(1654);
+    expect(result.signal).toBe("ledger");
+    expect(result.replacedSignal).toBe("receipts");
+  });
+
+  it("keeps the product signal when it is within 2.5x of the ledger", () => {
+    // THC103 live: demand 1.04/d vs ledger 1.06/d — genuine agreement.
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 1.04,
+      salesVelocity: 0,
+      consumptionQty: 94,
+      ledgerVelocity: 1.056,
+    })).toEqual({ dailyRate: 1.04, signal: "demand" });
+  });
+
+  it("ignores a zero or negative ledger rate", () => {
+    expect(chooseVelocitySignal({
+      reorderMethod: "default",
+      demandVelocity: 3,
+      salesVelocity: 0,
+      consumptionQty: 20,
+      ledgerVelocity: 0,
+    })).toEqual({ dailyRate: 3, signal: "demand" });
+  });
+});

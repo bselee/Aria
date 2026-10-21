@@ -120,20 +120,37 @@ export function classifyUrgency(runwayDays: number, leadTimeDays: number): 'crit
 /**
  * Pick a daily-burn signal for a BOM component.
  *
- * HERMIA(2026-10-05 — Bill): take the LARGER of receipt (actual consumption) and
- * FG-derived (theoretical) — not prefer-FG. BOMs cannot be adjusted and under-list
- * raw usage by an order of magnitude, so the FG-derived rate under-counts when it's
- * lower than what's actually leaving the warehouse (RAWWORMCASTINGS: 133/d BOM vs
- * ~1,866/d actual). Receipts win when the BOM under-lists; FG wins when there's no
- * purchase history (labels) or the item is under-building.
+ * HERMIA(2026-10-06 — Bill): the stock ledger (what actually left the building)
+ * is the primary signal. It outranks receipts (what we bought — circular for
+ * sizing a new buy), and keeps FG-derived demand as the floor for raws with no
+ * ledger history (labels) or where the BOM over-lists usage (under-building).
  */
-export function chooseBomVelocity(input: { receiptVelocity: number; bomDerivedVelocity: number }):
-    { value: number; source: 'receipts' | 'demand' | 'none' } {
+export function chooseBomVelocity(input: {
+    receiptVelocity: number;
+    bomDerivedVelocity: number;
+    ledgerVelocity?: number;
+}): { value: number; source: 'receipts' | 'demand' | 'ledger' | 'none' } {
     const receipts = input.receiptVelocity;
     const fg = input.bomDerivedVelocity;
-    const value = Math.max(receipts, fg);
+    const ledger = input.ledgerVelocity != null && input.ledgerVelocity > 0 ? input.ledgerVelocity : 0;
+    // Usage wins over buying; FG-derived demand is always the floor.
+    const primary = ledger > 0 ? ledger : receipts;
+    const value = Math.max(primary, fg);
     if (value <= 0) return { value: 0, source: 'none' };
-    return { value, source: receipts >= fg ? 'receipts' : 'demand' };
+
+    // HERMIA(2026-10-20 — Bill): reality cap. The FG-derived BOM velocity is only
+    // as accurate as the BOM data, and BOM lines over-list as often as they
+    // under-list. RAWRICEBRAN's BOM has a 47,614-unit-per-bag line that inflated
+    // its burn to 17,224/d vs a ledger of 173/d — driving a 1.8M-unit "critical"
+    // order for a SKU the ledger says is covered 171 days. Mirror the resale
+    // path's 3x reality cap: the rate may not exceed 3x the physical signal
+    // (ledger when present, else receipts).
+    if (primary > 0 && value > 3 * primary) {
+        return { value: primary, source: ledger > 0 ? 'ledger' : 'receipts' };
+    }
+
+    if (ledger > 0 && ledger >= fg) return { value, source: 'ledger' };
+    return { value, source: primary >= fg ? 'receipts' : 'demand' };
 }
 
 /**
@@ -476,7 +493,6 @@ export function mergeIntoGroups(
                             ...(bomItem.feedsFinishedGoods || [])
                         ],
                         totalBurnRate: (resaleItem.totalBurnRate ?? 0) + (bomItem.totalBurnRate ?? 0),
-                        bomUsageGap: Math.max(resaleItem.bomUsageGap ?? 0, bomItem.bomUsageGap ?? 0) || undefined,
                         triggerReason: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.triggerReason : resaleItem.triggerReason,
                         triggerDetail: urgencyRank[bomItem.urgency] < urgencyRank[resaleItem.urgency] ? bomItem.triggerDetail : resaleItem.triggerDetail,
                     };
