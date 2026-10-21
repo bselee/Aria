@@ -144,6 +144,9 @@ export interface PurchasingItem {
     urgency: 'critical' | 'warning' | 'watch' | 'ok';
     explanation: string;           // natural language, computed server-side
     suggestedQty: number;
+    /** Advisory sanity flag (Phase 2.2): recommendedQty > 3x the median of the
+     *  SKU's last few actual orders. Flag only — never suppresses the qty. */
+    sanityFlag?: { flag: boolean; detail: string };
     orderIncrementQty: number | null;  // "Std reorder in qty of" — snap order quantities to this multiple
     isBulkDelivery: boolean;           // true → route to Soil facility
     finaleReorderQty: number | null;

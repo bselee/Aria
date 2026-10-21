@@ -2959,6 +2959,14 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                                                                         ⚠ {Math.abs(item.qtyDivergencePct)}% diff
                                                                                                     </span>
                                                                                                 )}
+                                                                                                {item.sanityFlag?.flag && (
+                                                                                                    <span
+                                                                                                        className="text-[9px] font-mono text-orange-400 border border-orange-500/30 rounded px-1"
+                                                                                                        title={item.sanityFlag.detail}
+                                                                                                    >
+                                                                                                        ⚠ vs history
+                                                                                                    </span>
+                                                                                                )}
                                                                                             </div>
                                                                                         )}
                                                                                     </div>

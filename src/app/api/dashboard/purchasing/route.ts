@@ -7,7 +7,9 @@ import { resaleSlot, bomSlot, readSWR, invalidatePurchasingCaches } from '@/lib/
 import { readForwardDemand } from '@/lib/purchasing/forward-demand';
 import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 import { evaluateOpenPoDuplicateGuard } from '@/lib/purchasing/po-duplicate-guard';
+import { sanityFlagQty } from '@/lib/purchasing/order-sanity';
 import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
+
 import {
     buildRecentOpenCoverageByProduct,
     mergeOpenPOsWithRecentCoverage,
@@ -232,6 +234,31 @@ export async function GET(req: NextRequest) {
     } catch (err: any) {
         console.error('[purchasing/route] Failed to fetch recent purchase orders:', err.message);
     }
+
+    // Phase 2.2 — sanity flag (FLAG ONLY, NEVER SUPPRESS): recommendedQty > 3x
+    // the median of the SKU's last few ACTUAL order quantities (rice-bran
+    // class bug: 1.8M-unit recommendation against a 42K order history).
+    // Computed at render from the recent-PO overlay already fetched above —
+    // deliberately no watcher cron. A deliberate buy-up still shows its
+    // quantity; the flag is advisory context for the human.
+    const qtysBySku = new Map<string, number[]>();
+    for (const po of recentPOs) {
+        const li = (po as { items?: Array<{ productId?: string | null; quantity?: number | null }> }).items;
+        for (const item of li ?? []) {
+            const sku = item.productId;
+            const q = Number(item.quantity);
+            if (!sku || !Number.isFinite(q) || q <= 0) continue;
+            if (!qtysBySku.has(sku)) qtysBySku.set(sku, []);
+            qtysBySku.get(sku)!.push(q);
+        }
+    }
+    groups = groups.map(group => ({
+        ...group,
+        items: group.items.map(item => {
+            const flag = sanityFlagQty(item.suggestedQty, qtysBySku.get(item.productId) ?? []);
+            return flag.flag ? { ...item, sanityFlag: flag } : item;
+        }),
+    }));
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);

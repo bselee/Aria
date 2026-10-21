@@ -494,6 +494,62 @@ describe("PurchasingPanel - v2 ordering filter (planning windows)", () => {
         expect(screen.queryByText(/Blumat 9 inch Pre-set Carrot/i)).toBeNull();
     });
 
+    it("renders the sanity flag badge and keeps the recommended quantity visible (flag never suppresses)", async () => {
+        stubLocalStorage();
+        localStorage.setItem("aria-dash-purchasing-focus", "order_now");
+        const flagged = makeWatchItem({
+            productId: "RBTEST",
+            productName: "Rice Bran Sanity Case",
+            supplierName: "Nano Supplies",
+            supplierPartyId: "10999",
+            urgency: "critical",
+            runwayDays: 5,
+            adjustedRunwayDays: 5,
+            finaleStockoutDays: 5,
+            leadTimeDays: 14,
+            suggestedQty: 1_800_000,
+            finaleReorderQty: 1_800_000,
+            sanityFlag: {
+                flag: true,
+                detail: "Recommended 1,800,000 is 42.9x the median of the last 3 orders (42,000). Verify before committing.",
+            },
+        });
+        const payload = {
+            groups: [
+                {
+                    vendorName: "Nano Supplies",
+                    vendorPartyId: "10999",
+                    urgency: "critical",
+                    items: [flagged],
+                },
+            ],
+            cachedAt: "2026-10-21T12:00:00.000Z",
+            vendorSummaries: [],
+        };
+        const emptyPayload = { groups: [], cachedAt: "2026-10-21T12:00:00.000Z", vendorSummaries: [] };
+        vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+            const url = String(input);
+            let body: any = emptyPayload;
+            if (url.includes("/api/dashboard/purchasing") && (url.includes("urgency=critical") || url.includes("mode=all"))) {
+                body = payload;
+            } else if (url.includes("/api/dashboard/active-purchases")) {
+                body = { activePurchases: [], asOf: "2026-10-21T12:00:00.000Z" };
+            }
+            return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+        }));
+
+        render(<PurchasingPanel />);
+        await waitFor(() => expect(fetch).toHaveBeenCalled());
+
+        fireEvent.click(await screen.findByText("▾"));
+
+        expect(await screen.findByText(/Rice Bran Sanity Case/i)).toBeTruthy();
+        // The badge renders...
+        expect(await screen.findByText(/vs history/)).toBeTruthy();
+        // ...and the recommended quantity is still shown — flag only, never suppress.
+        expect(screen.getByText(/Aria: 1800000|Aria: 1,800,000/)).toBeTruthy();
+    });
+
     it("migrates legacy localStorage 'today' to order_now (active = red tint)", async () => {
         stubLocalStorage();
         localStorage.setItem("aria-dash-purchasing-focus", "today");
