@@ -22,7 +22,6 @@ import PurchasingCalendarPanel from "@/components/dashboard/PurchasingCalendarPa
 import PurchasingPanel from "@/components/dashboard/PurchasingPanel";
 import ReceivedItemsPanel from "@/components/dashboard/ReceivedItemsPanel";
 import StatementReconciliationPanel from "@/components/dashboard/StatementReconciliationPanel";
-import TrackingBoardPanel from "@/components/dashboard/TrackingBoardPanel";
 import VendorScorecardPanel from "@/components/dashboard/VendorScorecardPanel";
 import DailyOpsSummaryPanel from "@/components/dashboard/DailyOpsSummaryPanel";
 import POLifecyclePanel from "@/components/dashboard/POLifecyclePanel";
@@ -93,12 +92,6 @@ export const PANEL_DEFINITIONS: PanelDefinition[] = [
         label: "Active Purchases",
         short: "Active Purchases",
         render: () => <ActivePurchasesPanel />,
-    },
-    {
-        id: "tracking-board",
-        label: "Tracking",
-        short: "Tracking",
-        render: () => <TrackingBoardPanel />,
     },
     {
         id: "purchasing-calendar",

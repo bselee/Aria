@@ -27,7 +27,6 @@ export const ALL_PANEL_IDS = [
     "purchasing",
     "build-schedule",
     "active-purchases",
-    "tracking-board",
     "purchasing-calendar",
     "oversight",
     "recent-runs",
@@ -62,7 +61,6 @@ const RETIRED_PANELS: ReadonlySet<string> = new Set([
     "deposit-match",
     "basauto-requests",
     "statement-reconciliation",
-    "tracking-board",
 ]);
 
 export type ColumnId = "left" | "midLeft" | "midRight" | "right";

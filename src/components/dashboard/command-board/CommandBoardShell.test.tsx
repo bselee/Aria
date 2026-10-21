@@ -275,7 +275,6 @@ describe("OpsModuleDock", () => {
             "Active Purchases",
             "Build Risk",
             "Build Schedule",
-            "Tracking",
             "Statement Recon",
         ];
         for (const label of expected) {

@@ -26,7 +26,6 @@ const DOCK_TAB_IDS: PanelId[] = [
     "active-purchases",
     "build-risk",
     "build-schedule",
-    "tracking-board",
     "statement-reconciliation",
     "purchasing-calendar",
     "oversight",
