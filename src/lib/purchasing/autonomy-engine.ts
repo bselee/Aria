@@ -184,7 +184,8 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                                 `*Total*: $${review.total.toFixed(2)}\n\n` +
                                 `☝️ _Aria auto-generated this draft. Tap below to review details and confirm sending:_`;
 
-                    if (isBusinessHours()) {
+                    const inHours = isBusinessHours();
+                    if (inHours) {
                         await bot.telegram.sendMessage(chatId, msg, {
                             parse_mode: 'Markdown',
                             reply_markup: {
@@ -199,7 +200,7 @@ export async function autoProcessAutonomyDrafts(bot: Telegraf<any>): Promise<{ p
                     }
 
                     processed++;
-                    console.log(`[autonomy] Level 1 enqueued and Telegram review sent for PO #${draft.orderId}`);
+                    console.log(`[autonomy] Level 1 enqueued and Telegram review ${inHours ? "sent" : "held until business hours"} for PO #${draft.orderId}`);
 
                 } else if (autonomyLevel === 2) {
                     // Level 2: Auto-Review (trust building — no auto-send until trust is earned)
