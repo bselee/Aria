@@ -66,7 +66,7 @@ function esc(s: unknown): string {
     .replace(/>/g, "&gt;");
 }
 
-type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string };
+type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string; desc?: string };
 
 function skuList(items: unknown): string {
   let arr: unknown = items;
@@ -88,6 +88,33 @@ function skuList(items: unknown): string {
   return [...new Set(ids)].join(", ");
 }
 
+/** Shorten a Finale product name for the report. Keeps the product identity
+ *  and pack size, drops long brand prefixes and redundant suffix punctuation. */
+function abbrevDesc(name: string): string {
+  let s = (name || "").trim();
+  if (!s) return "";
+  s = s.replace(/^BuildASoil\s+/i, "");
+  s = s.replace(/^Organics Alive\s+/i, "OA ");
+  s = s.replace(/\s*-\s*\(([^)]+)\)\s*$/i, " $1");
+  s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*Cubic\s+Foot\b/gi, " $1cf");
+  s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*Cubic\s+Yard\b/gi, " $1cy");
+  s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*Quarts?\s*$/i, " $1qt");
+  s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*(lb|lbs|gal|oz)\s*$/i, " $1$2");
+  if (s.length > 40) s = s.slice(0, 39).trimEnd() + "…";
+  return s;
+}
+
+/** Map a comma-joined SKU list to abbreviated Finale names (same order). */
+function descOf(skus: string, map: Map<string, string>): string {
+  return (skus || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => map.get(s) || "")
+    .filter(Boolean)
+    .join(", ");
+}
+
 function table(headers: string[], rows: string[][], total?: string[]): string {
   const amtIdx = headers.findIndex((h) => h === "Amount");
   const cell = (c: string, i: number, th = false) => {
@@ -102,14 +129,13 @@ function table(headers: string[], rows: string[][], total?: string[]): string {
   const tot = total
     ? `<tr class="total-row">${total.map((c, i) => cell(c, i)).join("")}</tr>`
     : "";
-  const cols =
-    headers.includes("ETA")
-      ? `<col class="po"><col class="vendor"><col class="sku"><col class="amt"><col class="note"><col class="eta"><col class="stat">`
-      : headers.includes("Placed")
-      ? `<col class="po"><col class="vendor"><col class="sku"><col class="amt"><col class="note"><col class="eta">`
-      : headers.length === 5
-      ? `<col class="po"><col class="vendor"><col class="sku"><col class="amt"><col class="note">`
-      : `<col class="po"><col class="vendor"><col class="amt"><col class="note">`;
+  const WIDTHS: Record<string, string> = {
+    PO: "po", Vendor: "vendor", SKU: "sku", Description: "desc", Amount: "amt",
+    Placed: "note", ETA: "eta", Status: "stat", Received: "note",
+    "Vendor Response": "note", "Needed by": "note", Note: "note",
+    Sent: "note", Issue: "note",
+  };
+  const cols = headers.map((h) => `<col class="${WIDTHS[h] || "note"}">`).join("");
   return `<table>
   ${cols}
   <thead><tr>${head}</tr></thead>
@@ -144,8 +170,6 @@ function renderHtml(p: {
   };
   const toCells = (rows: Row[]) =>
     rows.map((r) => [r.po, r.vendor, r.amount ? money(r.amount) : "", r.note]);
-  const toPoCells = (rows: Row[]) =>
-    rows.map((r) => [r.po, r.vendor, r.sku || "", r.amount ? money(r.amount) : "", r.note]);
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -161,8 +185,8 @@ function renderHtml(p: {
   th { background: #555; color: #fff; text-align: left; padding: 2px 5px; font-weight: 600; }
   td { padding: 1px 5px; border-bottom: 1px solid #e5e5e5; vertical-align: top; word-wrap: break-word; }
   tr:nth-child(even) td { background: #f8f8f8; }
-  .po { width: 10%; } .vendor { width: 16%; } .sku { width: 20%; } .amt { width: 12%; text-align: right; white-space: nowrap; }
-  th.amt { text-align: right; color: #fff; } .note { width: 10%; } .eta { width: 10%; } .stat { width: 12%; }
+  .po { width: 8%; } .vendor { width: 14%; } .sku { width: 8%; } .desc { width: 24%; } .amt { width: 10%; text-align: right; white-space: nowrap; }
+  th.amt { text-align: right; color: #fff; } .note { width: 9%; } .eta { width: 8%; } .stat { width: 12%; }
   .total-row td { font-weight: 600; background: #eee !important; }
   .keep { page-break-inside: avoid; }
   .foot { font-size: 8pt; color: #666; margin-top: 10px; }
@@ -176,12 +200,12 @@ function renderHtml(p: {
 <div class="keep">
 <h2>POs Committed</h2>
 <p class="summary">${p.committed.length} POs · ${money(sum(p.committed))}</p>
-${table(["PO", "Vendor", "SKU", "Amount", "Placed", "ETA", "Status"], p.committed.map((r) => [r.po, r.vendor, r.sku || "", r.amount ? money(r.amount) : "", r.note, r.eta || "", r.status || ""]), ["", "Total", "", money(sum(p.committed)), `${p.committed.length} POs`, "", ""])}
+${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "ETA", "Status"], p.committed.map((r) => [r.po, r.vendor, r.sku || "", r.desc || "", r.amount ? money(r.amount) : "", r.note, r.eta || "", r.status || ""]), ["", "Total", "", "", money(sum(p.committed)), `${p.committed.length} POs`, "", ""])}
 </div>
 <div class="keep">
 <h2>POs Received</h2>
 <p class="summary">${p.received.length} POs · ${money(sum(p.received))}</p>
-${table(["PO", "Vendor", "SKU", "Amount", "Received"], toPoCells(p.received), ["", "Total", "", money(sum(p.received)), `${p.received.length} POs`])}
+${table(["PO", "Vendor", "SKU", "Description", "Amount", "Received"], p.received.map((r) => [r.po, r.vendor, r.sku || "", r.desc || "", r.amount ? money(r.amount) : "", r.note]), ["", "Total", "", "", money(sum(p.received)), `${p.received.length} POs`])}
 </div>
 <div class="keep">
 <h2>POs Not Confirmed</h2>
@@ -191,7 +215,7 @@ ${table(["PO", "Vendor", "Amount", "Sent"], toCells(p.unacked))}
 <div class="keep">
 <h2>POs Delayed</h2>
 <p class="summary">${p.delayed.length} POs · ${money(sum(p.delayed))}</p>
-${table(["PO", "Vendor", "SKU", "Amount", "Placed", "Vendor Response"], p.delayed.map((r) => [r.po, r.vendor, r.sku || "", r.amount ? money(r.amount) : "", r.placed || "", r.note]))}
+${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "Vendor Response"], p.delayed.map((r) => [r.po, r.vendor, r.sku || "", r.desc || "", r.amount ? money(r.amount) : "", r.placed || "", r.note]))}
 </div>
 <div class="keep">
 <h2>Invoices to Bill.com</h2>
@@ -203,16 +227,16 @@ ${table(["Vendor", "Issue"], p.issues.map((r) => [r.vendor, r.note]))}
 </div>
 <div class="keep">
 <h2>Vendor Price Updates</h2>
-${table(["SKU", "Vendor", "Note"], p.priceUpdates.map((r) => [r.sku || r.po, r.vendor, r.note]))}
+${table(["SKU", "Description", "Vendor", "Note"], p.priceUpdates.map((r) => [r.sku || r.po, r.desc || "", r.vendor, r.note]))}
 </div>
 <div class="keep">
 <h2>Upcoming Purchases (Estimated)</h2>
 <p class="summary">Next 30 days · ${money(sum(p.upcoming))}</p>
-${table(["SKU", "Vendor", "Needed by", "Amount"], p.upcoming.map((r) => [r.sku || r.po, r.vendor, r.note, r.amount ? money(r.amount) : ""]))}
+${table(["SKU", "Description", "Vendor", "Needed by", "Amount"], p.upcoming.map((r) => [r.sku || r.po, r.desc || "", r.vendor, r.note, r.amount ? money(r.amount) : ""]))}
 </div>
 <div class="keep">
 <h2>Research</h2>
-${table(["SKU", "Vendor", "Note"], p.research.map((r) => [r.sku || "", r.vendor, r.note]))}
+${table(["SKU", "Description", "Vendor", "Note"], p.research.map((r) => [r.sku || "", r.desc || "", r.vendor, r.note]))}
 </div>
 </body></html>`;
 }
@@ -386,7 +410,7 @@ async function main() {
 
   const finale = new FinaleClient();
   const pos = await finale.getRecentPurchaseOrders(14, 500);
-  let committed = pos
+  let committed: Row[] = pos
     .filter((p) => {
       const d = iso(p.orderDate);
       return d >= start && d <= end && NUMERIC.test(p.orderId) && !/cancel/i.test(p.status || "");
@@ -420,14 +444,28 @@ async function main() {
 
   const pool = new Pool({
     connectionString:
-      process.env.DATABASE_URL || "postgresql://aria:arialocal@localhost:5432/aria",
+      process.env.DATABASE_URL || "postgresql://aria:***@localhost:5432/aria",
   });
+
+  // SKU -> abbreviated Finale product name, for the Description column.
+  const skuDesc = new Map<string, string>();
+  try {
+    const q = await pool.query(
+      `SELECT sku, raw_detail->>'name' AS name FROM finale_sku_cache`
+    );
+    for (const r of q.rows) {
+      const n = abbrevDesc(String(r.name || ""));
+      if (r.sku && n) skuDesc.set(String(r.sku), n);
+    }
+  } catch {
+    /* desc optional */
+  }
 
   const recvLookup = await pool.query(
     `SELECT po_number, vendor_name, line_items FROM purchase_orders WHERE po_number = ANY($1)`,
     [receivedIds.map((r) => r.po)]
   );
-  const recvByPo = new Map(recvLookup.rows.map((r) => [r.po_number, r]));
+  const recvByPo = new Map<string, any>(recvLookup.rows.map((r: any) => [r.po_number, r]));
   receivedIds.sort((a, b) => {
     if (a.receiveDate !== b.receiveDate) return a.receiveDate.localeCompare(b.receiveDate);
     return Number(a.po) - Number(b.po);
@@ -473,7 +511,7 @@ async function main() {
        FROM purchase_orders WHERE po_number = ANY($1)`,
       [committed.map((r) => r.po)]
     );
-    const byPo = new Map(meta.rows.map((row) => [row.po_number, row]));
+    const byPo = new Map<string, any>(meta.rows.map((row: any) => [row.po_number, row]));
     for (const r of committed) {
       const m = byPo.get(r.po);
       const life = String(m?.lifecycle_stage || "").toUpperCase();
@@ -599,7 +637,6 @@ async function main() {
     ORDER BY created_at DESC
     LIMIT 80
   `, [`${start}T00:00:00-06:00`, end]);
-  await pool.end();
 
   const invByNum = new Map<string, { vendor: string; total: number; po: string }>();
   for (const r of invWeekQ.rows) {
@@ -789,6 +826,10 @@ async function main() {
     const use = hasC || (hasB && hasR) ? "Combo" : hasB ? "Build" : "Resale";
     r.note = `${use} · ${r.note}`;
   }
+  for (const r of [...committed, ...received, ...delayed, ...upcoming, ...priceUpdates, ...research]) {
+    r.desc = descOf(r.sku || "", skuDesc);
+  }
+  await pool.end();
 
   const html = renderHtml({
     start,
