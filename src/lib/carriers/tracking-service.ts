@@ -190,6 +190,86 @@ export function detectCarrier(trackingNumber: string): string | null {
     return null;
 }
 
+// Fixed-length, letter-prefixed parcel carriers. A token that starts with the
+// prefix but is longer than the carrier's exact length has had column-glue fused
+// onto its tail (e.g. "1Z999AA101234567841ea56" → "1Z999AA10123456784").
+const FIXED_PREFIX_FAMILIES: ReadonlyArray<{ prefix: RegExp; totalLength: number }> = [
+    { prefix: /^1Z/i, totalLength: 18 }, // UPS: 1Z + 16 alphanumerics
+    { prefix: /^JD/i, totalLength: 20 }, // DHL eCommerce: JD + 18 digits
+];
+
+// Numeric parcel-carrier families, longest-first. When PDF column-glue fuses a
+// tracking number with the adjacent Qty/Unit/Price columns, the real number is
+// recovered by matching the leading digit run against these exact lengths (with
+// the family prefix where a shorter number could otherwise shadow a longer one).
+const NUMERIC_CARRIER_FAMILIES: ReadonlyArray<{ length: number; prefix?: RegExp }> = [
+    { length: 22, prefix: /^(?:94|92|93|95)/ }, // USPS
+    { length: 20, prefix: /^96/ },              // FedEx SmartPost
+    { length: 15 },                             // FedEx Ground
+    { length: 12 },                             // FedEx Express
+];
+
+/**
+ * Recover a clean tracking number from a token that PDF/OCR column-glue fused
+ * with adjacent Qty/Unit/Price text.
+ *
+ * Example (2026-10-21, Evergreen Growers Supply invoice 151119): the invoice
+ * prints "FedEx Tracking # 520484908553   1   ea   56.16" but the extracted text
+ * loses the column whitespace, so the generic/TRK pattern captures the fused token
+ * "5204849085531ea56" (real FedEx number "520484908553" + qty "1" + unit "ea" +
+ * price "56"). That fake token then reaches the ledger as a tracking number no
+ * carrier recognizes, silently hiding a live parcel that was out for delivery.
+ *
+ * Recovery is carrier-length-bounded, so a clean number is never truncated:
+ *  - Letter-prefixed fixed-length carriers (UPS 1Z+16, DHL JD+18) are truncated
+ *    only when the token is longer than the carrier's exact length.
+ *  - Numeric carriers (FedEx 12/15/20, USPS 22) are recovered by matching the
+ *    leading digit run against those exact lengths, longest-first.
+ *  - Anything else (LTL PROs, generic alphanumeric refs, pure-digit tokens) is
+ *    left untouched and the function returns null.
+ *
+ * Known undecidable shapes (numeric-only glue, no unit letter) — documented, not
+ * guessed; the leading digit run is split at the first valid family length:
+ *  - "1234567890123ea56"        → "123456789012" (13-digit run has no carrier
+ *                                 family; a glued qty digit is the likelier read)
+ *  - "123456789012345678ea56"   → "123456789012345" (Ground-15, drops 3 digits)
+ *  - "94001112062123456789012345ea" → "9400111206212345678901" (USPS-22, drops 4
+ *                                 real digits — the only shape that can lose a
+ *                                 live parcel, and only if a 26-digit IMpb ever
+ *                                 arrives glued to a unit letter. Rare enough not
+ *                                 to justify a 26-length family, which would break
+ *                                 the common 22-digit-plus-qty case; pure-digit 26
+ *                                 still hits the `null` fast-path.)
+ */
+export function recoverTrackingNumber(token: string): string | null {
+    const t = (token || "").trim();
+    if (!t) return null;
+    // Pure-numeric tokens are already a clean carrier number (or PRO/BOL) — no
+    // letter tail to strip.
+    if (/^\d+$/.test(t)) return null;
+
+    // Letter-prefixed fixed-length carriers: strip a fused tail longer than the
+    // carrier's exact length.
+    for (const { prefix, totalLength } of FIXED_PREFIX_FAMILIES) {
+        if (prefix.test(t)) {
+            return t.length > totalLength ? t.slice(0, totalLength) : null;
+        }
+    }
+
+    const digitRun = (t.match(/^\d+/) || [""])[0];
+    if (!digitRun) return null; // no leading digits → not a numeric carrier
+
+    for (const { length, prefix } of NUMERIC_CARRIER_FAMILIES) {
+        if (digitRun.length < length) continue;
+        const head = digitRun.slice(0, length);
+        if (prefix && !prefix.test(head)) continue;
+        // `head` is a valid numeric carrier number; everything after it (glued
+        // qty/unit/price, or a bare unit label) is column text.
+        return head;
+    }
+    return null;
+}
+
 /**
  * Extract tracking numbers from free text using all known patterns.
  * Returns an array of { carrier, trackingNumber } objects, ranked best-first.
@@ -222,8 +302,13 @@ export function extractTrackingNumbers(text: string): Array<{ carrier: string; t
     for (const [carrier, regex] of Object.entries(TRACKING_PATTERNS)) {
         const re = new RegExp(regex.source, regex.flags.includes("g") ? regex.flags : `${regex.flags}g`);
         for (const match of text.matchAll(re)) {
-            const trackingNumber = (match[1] || match[0] || "").trim();
-            if (!trackingNumber || trackingNumber.length < 8) continue;
+            const rawTrackingNumber = (match[1] || match[0] || "").trim();
+            if (!rawTrackingNumber || rawTrackingNumber.length < 8) continue;
+
+            // Guard: strip PDF column-glue from alphanumeric tokens so a fused
+            // "5204849085531ea56" recovers to the real "520484908553" instead of
+            // minting a fake tracking number no carrier recognizes.
+            const trackingNumber = recoverTrackingNumber(rawTrackingNumber) ?? rawTrackingNumber;
 
             const index = match.index ?? 0;
 

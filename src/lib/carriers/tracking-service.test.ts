@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import {
     detectCarrier,
     extractTrackingNumbers,
+    recoverTrackingNumber,
     carrierUrl,
     parseTrackingContent,
     detectLTLCarrier,
@@ -494,6 +495,76 @@ Qty 10 Unit price 40.00
 
         expect(upsResults.some((result) => result.trackingNumber === '1ZJ74F69YW54289607')).toBe(true);
         expect(fedexResults.some((result) => result.trackingNumber === '8051904063')).toBe(true);
+    });
+
+    it('recovers a real FedEx number fused with Qty/Unit/Price columns (invoice column glue)', () => {
+        // Evergreen Growers Supply invoice 151119 printed:
+        //   "Shipping-FedEx S/H - FedEx Tracking # 520484908553   1   ea   56.16"
+        // and the PDF text extraction dropped the column whitespace.
+        const results = extractTrackingNumbers('FedEx Tracking # 5204849085531ea56');
+        expect(results.some((r) => r.trackingNumber === '520484908553')).toBe(true);
+        expect(results.some((r) => r.trackingNumber === '5204849085531ea56')).toBe(false);
+    });
+
+    it('does not fuse a tracking number that is cleanly separated from a qty column', () => {
+        const results = extractTrackingNumbers('Tracking # 123456789012 (2 ea)');
+        expect(results.some((r) => r.trackingNumber === '123456789012')).toBe(true);
+        expect(results.every((r) => r.trackingNumber !== '1234567890122ea')).toBe(true);
+    });
+});
+
+// ──────────────────────────────────────────────────
+// recoverTrackingNumber
+// ──────────────────────────────────────────────────
+
+describe('recoverTrackingNumber', () => {
+    it('recovers a 12-digit FedEx number fused with qty/unit/price (reported case)', () => {
+        expect(recoverTrackingNumber('5204849085531ea56')).toBe('520484908553');
+    });
+
+    it('returns null for a clean 12-digit number (no letter tail)', () => {
+        expect(recoverTrackingNumber('520484908553')).toBeNull();
+    });
+
+    it('returns null for a clean 15-digit FedEx Ground number (not truncated to 12)', () => {
+        expect(recoverTrackingNumber('123456789012345')).toBeNull();
+    });
+
+    it('recovers a 15-digit FedEx number fused with a unit label', () => {
+        expect(recoverTrackingNumber('123456789012345ea')).toBe('123456789012345');
+    });
+
+    it('recovers a 20-digit FedEx SmartPost number fused with qty', () => {
+        expect(recoverTrackingNumber('961234567890123456781ea')).toBe('96123456789012345678');
+    });
+
+    it('recovers a 22-digit USPS number fused with qty', () => {
+        expect(recoverTrackingNumber('94001118992234567890121ea56')).toBe('9400111899223456789012');
+    });
+
+    it('returns null for UPS (1Z prefix is alphanumeric by design)', () => {
+        expect(recoverTrackingNumber('1Z999AA10123456784')).toBeNull();
+    });
+
+    it('recovers a UPS number fused with a qty/unit column', () => {
+        expect(recoverTrackingNumber('1Z999AA101234567841ea56')).toBe('1Z999AA10123456784');
+    });
+
+    it('returns null for DHL (JD prefix is alphanumeric by design)', () => {
+        expect(recoverTrackingNumber('JD012345678901234567')).toBeNull();
+    });
+
+    it('recovers a DHL number fused with a qty/unit column', () => {
+        expect(recoverTrackingNumber('JD0123456789012345671ea56')).toBe('JD012345678901234567');
+    });
+
+    it('returns null for an LTL PRO with account suffix', () => {
+        expect(recoverTrackingNumber('71473626-1')).toBeNull();
+    });
+
+    it('returns null for empty or whitespace input', () => {
+        expect(recoverTrackingNumber('')).toBeNull();
+        expect(recoverTrackingNumber('   ')).toBeNull();
     });
 });
 
