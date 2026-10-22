@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { extractPONumbersFromText, inferPONumberFromRecentPOs, detectDocumentaryDelivery, vendorDeliveryAnnotationAllowed } from "./tracking/email-tracking-ingest";
+import { extractPONumbersFromText, inferPONumberFromRecentPOs, detectDocumentaryDelivery, vendorDeliveryAnnotationAllowed, vendorNameForUpsert } from "./tracking/email-tracking-ingest";
 
 type RecentPO = {
     po_number: string;
@@ -434,5 +434,33 @@ describe("vendorDeliveryAnnotationAllowed (Guard 11 #5 — sender→vendor gate)
         expect(
             vendorDeliveryAnnotationAllowed("Certis USA", ["Liberty Natural Products"]),
         ).toBe(false);
+    });
+});
+
+describe("vendorNameForUpsert (Guard 11 #6 — vendor-name hygiene)", () => {
+    it("returns null for PO-attributed rows (vendor comes from the PO)", () => {
+        expect(vendorNameForUpsert("125333", "Certis USA", [])).toBeNull();
+    });
+
+    it("returns null when no vendor is resolved", () => {
+        expect(vendorNameForUpsert(null, null, [])).toBeNull();
+        expect(vendorNameForUpsert(null, "", [])).toBeNull();
+    });
+
+    it("keeps resolvedVendor as provenance for a brand-new row", () => {
+        expect(vendorNameForUpsert(null, "Certis USA", [])).toBe("Certis USA");
+    });
+
+    it("keeps resolvedVendor when it matches an existing vendor name", () => {
+        expect(vendorNameForUpsert(null, "Certis USA", ["Certis USA"])).toBe("Certis USA");
+        expect(
+            vendorNameForUpsert(null, "New Moon Development Co", ["New Moon Development Company"]),
+        ).toBe("New Moon Development Co");
+    });
+
+    it("returns null when the resolved vendor conflicts with an existing row (no append)", () => {
+        expect(
+            vendorNameForUpsert(null, "Certis USA", ["Liberty Natural Products"]),
+        ).toBeNull();
     });
 });

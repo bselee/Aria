@@ -440,44 +440,45 @@ async function processMessage(
             primaryCarrier = finalCarrier;
         }
 
+        // Resolve the shipment's already-recorded vendor names once per hit, for
+        // both the delivery-annotation gate (Guard 11 #5) and vendor-name hygiene
+        // (Guard 11 #6) below.
+        let existingVendors: string[] = [];
+        if (resolvedVendor || (docDelivery && !docDelivery.terminal)) {
+            const vendorDb = createClient();
+            const norm = shipmentIntelligence.normalizeTrackingIdentity(encodedTracking);
+            if (vendorDb) {
+                try {
+                    const { data: existingRow } = await vendorDb
+                        .from("shipments")
+                        .select("vendor_names")
+                        .eq("tracking_key", norm.trackingKey)
+                        .maybeSingle();
+                    if (Array.isArray(existingRow?.vendor_names)) {
+                        existingVendors = existingRow.vendor_names;
+                    }
+                } catch (err: any) {
+                    console.warn(`[email-tracking-ingest] existing vendor lookup failed: ${err.message}`);
+                }
+            }
+        }
+
         // Guard 11 #5 (sender→vendor gate): the vendor "delivered on" email is
         // the weakest signal in the detector. Its annotation only lands when the
         // sender resolves to a known vendor, and — for an existing row — when
         // that vendor matches a recorded vendor name. Terminal POD/BOL docs and
         // normal emails are unaffected.
-        let deliveryDocForHit: DocumentaryDelivery | null = docDelivery;
-        if (docDelivery && !docDelivery.terminal) {
-            deliveryDocForHit = null;
-            if (resolvedVendor) {
-                const vendorDb = createClient();
-                const norm = shipmentIntelligence.normalizeTrackingIdentity(encodedTracking);
-                let existingVendors: string[] = [];
-                if (vendorDb) {
-                    try {
-                        const { data: existingRow } = await vendorDb
-                            .from("shipments")
-                            .select("vendor_names")
-                            .eq("tracking_key", norm.trackingKey)
-                            .maybeSingle();
-                        if (Array.isArray(existingRow?.vendor_names)) {
-                            existingVendors = existingRow.vendor_names;
-                        }
-                    } catch (err: any) {
-                        console.warn(`[email-tracking-ingest] existing vendor lookup failed: ${err.message}`);
-                    }
-                }
-                if (vendorDeliveryAnnotationAllowed(resolvedVendor, existingVendors)) {
-                    deliveryDocForHit = docDelivery;
-                }
-            }
-        }
+        const deliveryDocForHit: DocumentaryDelivery | null =
+            docDelivery && !docDelivery.terminal
+                ? (vendorDeliveryAnnotationAllowed(resolvedVendor, existingVendors) ? docDelivery : null)
+                : docDelivery;
 
         for (const { po: poNum, inferred } of upsertPOs) {
             try {
                 await shipmentIntelligence.upsertShipmentEvidence({
                     trackingNumber: encodedTracking,
                     poNumber: poNum,
-                    vendorName: poNum ? null : resolvedVendor,
+                    vendorName: vendorNameForUpsert(poNum, resolvedVendor, existingVendors),
                     source: deliveryDocForHit
                         ? (deliveryDocForHit.terminal ? "documentary_delivery" : "vendor_delivered_email")
                         : inferred
@@ -1029,6 +1030,32 @@ export function vendorDeliveryAnnotationAllowed(
     if (!resolvedVendor) return false;
     if (existingVendorNames.length === 0) return true;
     return existingVendorNames.some((v) => sameVendor(v, resolvedVendor));
+}
+
+/**
+ * Guard 11 #6 (vendor-name hygiene): what vendor name should a shipment upsert
+ * record for this hit?
+ *
+ * A mismatched sender must not append its vendor name onto a row that already
+ * records a vendor — that is how a parcel ends up credited to the wrong vendor.
+ * Rules:
+ *   - PO-attributed rows derive their vendor from the PO, so return null.
+ *   - No resolved vendor → null.
+ *   - Brand-new row (no recorded vendor) → keep resolvedVendor as provenance.
+ *   - Existing row → keep resolvedVendor only if it matches a recorded name,
+ *     otherwise null (do not append the mismatched vendor).
+ *
+ * @exportedForTesting
+ */
+export function vendorNameForUpsert(
+    poNum: string | null,
+    resolvedVendor: string | null,
+    existingVendorNames: string[],
+): string | null {
+    if (poNum) return null;
+    if (!resolvedVendor) return null;
+    if (existingVendorNames.length === 0) return resolvedVendor;
+    return existingVendorNames.some((v) => sameVendor(v, resolvedVendor)) ? resolvedVendor : null;
 }
 
 /**
