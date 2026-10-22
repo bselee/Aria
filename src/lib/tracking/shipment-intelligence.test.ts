@@ -7,6 +7,7 @@ import {
     getShipmentBoardBuckets,
     getShipmentsDueForRefresh,
     mergeShipmentEvidence,
+    mergeTrackingStatus,
     normalizeTrackingIdentity,
     type ShipmentRecord,
 } from "./shipment-intelligence";
@@ -104,6 +105,115 @@ describe("mergeShipmentEvidence", () => {
             { source: "email_tracking", sourceRef: "gmail:abc", seenAt: "2026-04-02T13:00:00.000Z" },
             { source: "invoice_reconciliation", sourceRef: "inv:9001", seenAt: expect.any(String), confidence: 0.7 },
         ]);
+    });
+
+    it("supersedes a weak inferred PO ref with a strong manual confirmation (merge→supersede)", () => {
+        const existing = makeShipment({
+            po_numbers: ["125423"],
+            source_confidence: 0.6,
+            source_refs: [
+                {
+                    source: "email_ingest_inferred",
+                    sourceRef: "gmail:weak",
+                    seenAt: "2026-04-02T13:00:00.000Z",
+                    confidence: 0.6,
+                },
+            ],
+        });
+        const merged = mergeShipmentEvidence(existing, {
+            poNumber: "125377",
+            vendorName: "New Moon Development Co",
+            source: "manual_confirmation",
+            sourceRef: "operator:bill",
+            confidence: 0.95,
+        });
+        expect(merged.po_numbers).toEqual(["125377"]);
+    });
+
+    it("appends (does not supersede) when the incoming ref is weak", () => {
+        const existing = makeShipment({ po_numbers: ["125423"], source_confidence: 0.6 });
+        const merged = mergeShipmentEvidence(existing, {
+            poNumber: "125400",
+            source: "email_ingest_inferred",
+            sourceRef: "gmail:weak2",
+            confidence: 0.6,
+        });
+        expect(merged.po_numbers).toEqual(["125423", "125400"]);
+    });
+
+    it("appends when both refs are strong (preserves legit multi-PO shipments)", () => {
+        const existing = makeShipment({ po_numbers: ["125212"], source_confidence: 0.9 });
+        const merged = mergeShipmentEvidence(existing, {
+            poNumber: "125213",
+            source: "ap_invoice",
+            sourceRef: "inv:1",
+            confidence: 0.9,
+        });
+        expect(merged.po_numbers).toEqual(["125212", "125213"]);
+    });
+
+    it("never downgrades delivered → in_transit (monotonic delivery, Guard 11 #2)", () => {
+        const existing = makeShipment({
+            status_category: "delivered",
+            status_display: "Delivered Sep 25, 2026 (pod delivery status)",
+            delivered_at: "2026-09-25T12:00:00.000Z",
+        });
+        const merged = mergeShipmentEvidence(existing, {
+            poNumber: "125333",
+            source: "carrier_poll",
+            sourceRef: "poll:stale",
+            confidence: 0.9,
+            statusCategory: "in_transit",
+            statusDisplay: "In transit",
+        });
+        expect(merged.status_category).toBe("delivered");
+        expect(merged.status_display).toBe("Delivered Sep 25, 2026 (pod delivery status)");
+        expect(merged.delivered_at).toBe("2026-09-25T12:00:00.000Z");
+    });
+
+    it("promotes an in_transit row to delivered on documentary evidence", () => {
+        const existing = makeShipment({ status_category: "in_transit", delivered_at: null });
+        const merged = mergeShipmentEvidence(existing, {
+            poNumber: "125333",
+            source: "documentary_delivery",
+            sourceRef: "gmail:pod",
+            confidence: 0.95,
+            statusCategory: "delivered",
+            statusDisplay: "Delivered Sep 25, 2026 (pod delivery status)",
+            deliveredAt: "2026-09-25T12:00:00.000Z",
+        });
+        expect(merged.status_category).toBe("delivered");
+        expect(merged.delivered_at).toBe("2026-09-25T12:00:00.000Z");
+    });
+});
+
+describe("mergeTrackingStatus (carrier-poll monotonic delivery guard)", () => {
+    it("never downgrades a delivered row to in_transit on a stale carrier read", () => {
+        const record = makeShipment({
+            status_category: "delivered",
+            status_display: "Delivered Sep 25, 2026 (pod delivery status)",
+            delivered_at: "2026-09-25T12:00:00.000Z",
+        });
+        const updated = mergeTrackingStatus(record, { category: "in_transit", display: "In transit" });
+        expect(updated.status_category).toBe("delivered");
+        expect(updated.status_display).toBe("Delivered Sep 25, 2026 (pod delivery status)");
+        expect(updated.delivered_at).toBe("2026-09-25T12:00:00.000Z");
+    });
+
+    it("promotes an in_transit row to delivered when the carrier reports delivery", () => {
+        const record = makeShipment({ status_category: "in_transit", delivered_at: null });
+        const updated = mergeTrackingStatus(record, {
+            category: "delivered",
+            display: "Delivered",
+            delivered_at: "2026-09-25T12:00:00.000Z",
+        });
+        expect(updated.status_category).toBe("delivered");
+        expect(updated.delivered_at).toBe("2026-09-25T12:00:00.000Z");
+    });
+
+    it("returns the record unchanged when the carrier returns no status", () => {
+        const record = makeShipment({ status_category: "in_transit" });
+        expect(mergeTrackingStatus(record, null)).toBe(record);
     });
 });
 

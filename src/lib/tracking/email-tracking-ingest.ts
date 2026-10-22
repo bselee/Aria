@@ -320,8 +320,20 @@ async function processMessage(
     // Combine subject + body + PDF text for extraction
     const fullText = `${subject}\n${body}\n${pdfText}`;
 
+    // --- Documentary delivery reconciliation (Guard 11) ---
+    // A POD/BOL delivery status or a vendor "delivered on" email proves delivery
+    // even when the carrier poll never saw it. Delivery documents supply ZERO PO
+    // refs — the PO link must come from the shipped/invoice path, never a POD.
+    const docDelivery = detectDocumentaryDelivery(fullText);
+
     // --- PO number extraction ---
-    const poNumbers = extractPONumbersFromText(fullText);
+    // Terminal delivery documents (POD/BOL) never re-attach a PO from their
+    // body text — SKU#/PRO/SO# lines live there. Their PO must come only from
+    // the label-bounded subject/body ("PO # 125333"). Non-terminal signals
+    // (vendor email, no delivery) extract from the full text as before.
+    const poNumbers = docDelivery?.terminal
+        ? extractPONumbersFromText(`${subject}\n${body}`)
+        : extractPONumbersFromText(fullText);
 
     // --- Tracking number extraction (canonical patterns, ranked) ---
     const extracted = extractTrackingNumbers(fullText);
@@ -354,9 +366,19 @@ async function processMessage(
         };
     }
 
+    // --- Sender → vendor resolution (Guard 10) ---
+    // Resolve the sender to a canonical vendor before inference, so inference
+    // scopes to that vendor's POs and unlinked rows still carry the vendor name.
+    let resolvedVendor: string | null = null;
+    try {
+        resolvedVendor = await resolveSenderVendor(fromEmail);
+    } catch (err: any) {
+        console.warn(`[email-tracking-ingest] Sender→vendor resolution failed: ${err.message}`);
+    }
+
     // --- PO number inference fallback ---
     let inferredPO: string | null = null;
-    if (poNumbers.length === 0) {
+    if (poNumbers.length === 0 && !docDelivery) {
         try {
             const db = createClient();
             if (db) {
@@ -370,12 +392,18 @@ async function processMessage(
                 inferredPO = inferPONumberFromRecentPOs(
                     { subject, bodySnippet: body, fromEmail },
                     (recentPOs || []) as RecentPurchaseOrder[],
+                    resolvedVendor,
                 );
 
                 if (inferredPO) {
                     console.log(
                         `[email-tracking-ingest] Inferred PO #${inferredPO} for tracking ` +
                         `(no explicit PO in email/PDF text)`,
+                    );
+                } else if (resolvedVendor) {
+                    console.log(
+                        `[email-tracking-ingest] No PO inferred for ${fromEmail} ` +
+                        `(vendor=${resolvedVendor}) — leaving unlinked`,
                     );
                 }
             }
@@ -390,6 +418,7 @@ async function processMessage(
     } else if (inferredPO) {
         upsertPOs.push({ po: inferredPO, inferred: true });
     } else {
+        // No PO anywhere — record vendor provenance only (unlinked row).
         upsertPOs.push({ po: null, inferred: false });
     }
 
@@ -411,29 +440,68 @@ async function processMessage(
             primaryCarrier = finalCarrier;
         }
 
+        // Guard 11 #5 (sender→vendor gate): the vendor "delivered on" email is
+        // the weakest signal in the detector. Its annotation only lands when the
+        // sender resolves to a known vendor, and — for an existing row — when
+        // that vendor matches a recorded vendor name. Terminal POD/BOL docs and
+        // normal emails are unaffected.
+        let deliveryDocForHit: DocumentaryDelivery | null = docDelivery;
+        if (docDelivery && !docDelivery.terminal) {
+            deliveryDocForHit = null;
+            if (resolvedVendor) {
+                const vendorDb = createClient();
+                const norm = shipmentIntelligence.normalizeTrackingIdentity(encodedTracking);
+                let existingVendors: string[] = [];
+                if (vendorDb) {
+                    try {
+                        const { data: existingRow } = await vendorDb
+                            .from("shipments")
+                            .select("vendor_names")
+                            .eq("tracking_key", norm.trackingKey)
+                            .maybeSingle();
+                        if (Array.isArray(existingRow?.vendor_names)) {
+                            existingVendors = existingRow.vendor_names;
+                        }
+                    } catch (err: any) {
+                        console.warn(`[email-tracking-ingest] existing vendor lookup failed: ${err.message}`);
+                    }
+                }
+                if (vendorDeliveryAnnotationAllowed(resolvedVendor, existingVendors)) {
+                    deliveryDocForHit = docDelivery;
+                }
+            }
+        }
+
         for (const { po: poNum, inferred } of upsertPOs) {
             try {
                 await shipmentIntelligence.upsertShipmentEvidence({
                     trackingNumber: encodedTracking,
                     poNumber: poNum,
-                    vendorName: null,
-                    source: inferred
-                        ? "email_ingest_inferred"
-                        : pdfResult.visionUsed
-                            ? "email_ingest_bol_vision"
-                            : pdfText
-                                ? "email_ingest_pdf"
-                                : "email_ingest",
+                    vendorName: poNum ? null : resolvedVendor,
+                    source: deliveryDocForHit
+                        ? (deliveryDocForHit.terminal ? "documentary_delivery" : "vendor_delivered_email")
+                        : inferred
+                            ? "email_ingest_inferred"
+                            : pdfResult.visionUsed
+                                ? "email_ingest_bol_vision"
+                                : pdfText
+                                    ? "email_ingest_pdf"
+                                    : "email_ingest",
                     sourceRef: `gmail:${accountId}:${messageId}`,
-                    confidence: inferred ? 0.60 : (poNum ? 0.90 : 0.80),
-                    statusCategory: "in_transit",
-                    statusDisplay: inferred
-                        ? "Tracking from email/PDF (PO inferred)"
-                        : pdfResult.visionUsed
-                            ? "Tracking from scanned BOL (vision OCR)"
-                            : poNum
-                                ? (pdfText ? "Tracking from email/PDF attachment" : "Tracking extracted from email")
-                                : "Tracking extracted (no PO found)",
+                    confidence: deliveryDocForHit
+                        ? (deliveryDocForHit.terminal ? 0.95 : 0.70)
+                        : (inferred ? 0.60 : (poNum ? 0.90 : 0.80)),
+                    statusCategory: deliveryDocForHit && deliveryDocForHit.terminal ? "delivered" : "in_transit",
+                    statusDisplay: deliveryDocForHit
+                        ? deliveryDocForHit.note
+                        : inferred
+                            ? "Tracking from email/PDF (PO inferred)"
+                            : pdfResult.visionUsed
+                                ? "Tracking from scanned BOL (vision OCR)"
+                                : poNum
+                                    ? (pdfText ? "Tracking from email/PDF attachment" : "Tracking extracted from email")
+                                    : "Tracking extracted (no PO found)",
+                    deliveredAt: deliveryDocForHit && deliveryDocForHit.terminal ? deliveryDocForHit.deliveredAt : undefined,
                     publicTrackingUrl: trackingUrl,
                     active: true,
                 });
@@ -623,38 +691,262 @@ function htmlToPlainText(html: string): string {
 }
 
 /**
- * Extract PO numbers from text. Reuses the same patterns as
- * po-correlator / Slack request-detector. Handles:
- *   "PO #124833", "PO-124833", "PO 124833", "order 124833",
- *   "71473626-1124833" (Finale vendor-ref format)
+ * Extract PO numbers from text using label-bounded matching (Guard 9).
+ *
+ * A number is a PO candidate ONLY when an explicit PO / P.O. / Purchase Order
+ * label introduces it. Numbers introduced by any other label — SKU# / SO# /
+ * Sales Order / Order # / Cust. Ref. / ESTIMATE / BOL / invoice / PRO — are the
+ * counterparty's own numbering (SKU, sales order, customer reference, freight
+ * estimate) and must NEVER become a PO. The earlier bare `#` and `order <n>`
+ * branches were removed: they promoted SKU# 154250, SO# 80720, Order # 21909
+ * and invoice #130648 to PO refs (the phantom/dangling-ref defect family).
+ *
+ * Handles:
+ *   "PO #124833", "PO-124833", "PO 124833", "P.O.#: 125213",
+ *   "Purchase Order # 125376", "71473626-1124833" (Finale vendor-ref format)
+ *
+ * @exportedForTesting
  */
-function extractPONumbersFromText(text: string): string[] {
+export function extractPONumbersFromText(text: string): string[] {
     const seen = new Set<string>();
 
-    // Standard PO references
-    const poRefMatches = text.match(/(?:PO|#)\s*[-#:]*\s*(\d{5,7})\b/gi) || [];
-    for (const m of poRefMatches) {
-        const num = m.replace(/\D/g, "");
-        if (num.length >= 5 && num.length <= 7) seen.add(num);
+    // PO label forms: "PO", "P.O.", "purchase order" (+ optional "number"/"no").
+    // Separator between the label and the digits is any run of spaces/#/:/. /-.
+    // The bare `#` and `order <n>` branches are intentionally gone.
+    const poLabel = "(?:P\\.O\\.|\\bPO\\b|\\bpurchase\\s+order\\b)";
+    const poPattern = new RegExp(
+        `${poLabel}[\\s#:.\\-]*(?:number|no\\.?)?[\\s#:.\\-]*(\\d{5,7})\\b`,
+        "gi",
+    );
+    for (const m of text.matchAll(poPattern)) {
+        seen.add(m[1]);
     }
-    // "order 124833"
-    const orderMatches = text.match(/\border\s+[-#:]*(\d{5,7})\b/gi) || [];
-    for (const m of orderMatches) {
-        const num = m.replace(/\D/g, "");
-        if (num.length >= 5 && num.length <= 7) seen.add(num);
-    }
+
     // Finale vendor-ref format: "71473626-1124833" → PO 124833
     // The last 6 digits after the dash are the PO number
     const vendorRefMatches = text.match(/\b\d{7,10}-(\d{6})\b/g) || [];
     for (const m of vendorRefMatches) {
         const parts = m.split("-");
         if (parts.length === 2) {
-            const poNum = parts[1]; // last 6 digits = PO number
-            seen.add(poNum);
+            seen.add(parts[1]); // last 6 digits = PO number
         }
     }
 
     return Array.from(seen);
+}
+
+// ── Documentary delivery reconciliation (Guard 11) ─────────────────────────
+//
+// A carrier POD / BOL ("DELIVERY STATUS: Good Order", signature lines) or a
+// vendor "delivered on <date>" email can prove a shipment was delivered even
+// when the carrier poll never saw the delivery — the Certis POD case: the PDF
+// printed "Good Order" + a 9/25 date but the row sat at in_transit for weeks.
+//
+// Hard-earned constraints (aria-purchasing review, 2026-10-21):
+//   1. NEVER read future-shipping language as a delivery. "will be delivered
+//      on 10/23" / "scheduled to be delivered" / "estimated delivery" is the
+//      opposite of delivered and appears in every carrier ETA notice.
+//   2. Delivered is terminal in the write path, so a false "delivered" here is
+//      permanent. Only strong document-class signals (POD status / BOL
+//      signature) may write terminal `delivered`; a vendor "delivered on"
+//      email is ANNOTATION-ONLY (reduced confidence, no terminal write).
+//   3. Vetoes are LOCAL (per-claim), never whole-document — a real POD that
+//      also prints "returns to be shipped via RMA" must still be accepted.
+
+export interface DocumentaryDelivery {
+    deliveredAt: string; // ISO timestamp (12:00 UTC on the delivery date)
+    signal: string;      // "pod_delivery_status" | "bol_signature" | "vendor_delivered_email"
+    note: string;        // provenance note appended to status_display
+    terminal: boolean;   // false for vendor_delivered_email (annotation-only)
+}
+
+// Terms that negate a nearby "delivered on" claim — the carrier-ETA vocabulary.
+const FUTURE_NEGATION_TERMS_RE =
+    /\b(will|scheduled|estimated|expected|likely|attempt|attempted|due|to\s+be|not\s+yet|should)\b/i;
+
+const POD_DELIVERY_STATUS_RE =
+    /\bdelivery\s+status\s*:?\s*(good\s+order|delivered|complete|received)\b/i;
+
+// Carrier receipt-of-goods phrases ONLY. Bare "received by" is dropped: it
+// matches ordinary inbound language ("your order was received by our team").
+const BOL_SIGNATURE_RE =
+    /\b(received\s+in\s+(?:good\s+order|full)|signed\s+for\s+by|signature\s+on\s+file)\b/i;
+
+const DELIVERED_ON_RE = /\bdelivered\s+on\b/gi;
+
+// Labels that introduce a delivery date. We only trust a date in one of these
+// contexts — never a bare "ship date" that also happens to appear on the page.
+const DELIVERY_DATE_CONTEXT_RE =
+    /\b(delivered\s+on|delivery\s+date|date\s+of\s+delivery|date\s+delivered|delivered|received\s+on|date\s+received|received\s+by|received|signed\s+on|signature\s+date|signed|pod\s+date)\b/gi;
+
+const MONTH_INDEX: Record<string, number> = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+function dateAtNoonUtc(year: number, month: number, day: number): string {
+    return new Date(Date.UTC(year, month, day, 12, 0, 0)).toISOString();
+}
+
+/** Parse the first plausible delivery date in `str`, or null. */
+function parseFirstDate(str: string): string | null {
+    // ISO: 2026-09-25
+    let m = str.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+    if (m) return dateAtNoonUtc(+m[1], +m[2] - 1, +m[3]);
+
+    // US slash: 09/25/2026 or 9/25/26
+    m = str.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+    if (m) {
+        const year = +m[3] < 100 ? 2000 + +m[3] : +m[3];
+        return dateAtNoonUtc(year, +m[1] - 1, +m[2]);
+    }
+
+    // Named month (US order): Sep 25, 2026 / September 25 2026
+    m = str.match(/\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})\b/);
+    if (m) {
+        const month = MONTH_INDEX[m[1].slice(0, 3).toLowerCase()];
+        if (month != null) return dateAtNoonUtc(+m[3], month, +m[2]);
+    }
+
+    // Named month (UK order): 25 Sep 2026
+    m = str.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b/);
+    if (m) {
+        const month = MONTH_INDEX[m[2].slice(0, 3).toLowerCase()];
+        if (month != null) return dateAtNoonUtc(+m[3], month, +m[1]);
+    }
+
+    return null;
+}
+
+/** Parse a date anchored at the START of `s` (no scanning ahead). */
+function parseLeadingDate(s: string): string | null {
+    // ISO: 2026-09-25
+    let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+    if (m) return dateAtNoonUtc(+m[1], +m[2] - 1, +m[3]);
+
+    // US slash: 09/25/2026 or 9/25/26
+    m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+    if (m) {
+        const year = +m[3] < 100 ? 2000 + +m[3] : +m[3];
+        return dateAtNoonUtc(year, +m[1] - 1, +m[2]);
+    }
+
+    // Named month (US order): Sep 25, 2026 / September 25 2026
+    m = s.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/);
+    if (m) {
+        const month = MONTH_INDEX[m[1].slice(0, 3).toLowerCase()];
+        if (month != null) return dateAtNoonUtc(+m[3], month, +m[2]);
+    }
+
+    // Named month (UK order): 25 Sep 2026
+    m = s.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})\b/);
+    if (m) {
+        const month = MONTH_INDEX[m[2].slice(0, 3).toLowerCase()];
+        if (month != null) return dateAtNoonUtc(+m[3], month, +m[1]);
+    }
+
+    return null;
+}
+
+/** True when `iso` is a future delivery date (tomorrow or later, UTC). */
+function isFutureDeliveryDate(iso: string, now: Date): boolean {
+    const d = new Date(iso).getTime();
+    const todayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    const tomorrowStart = todayStart + 24 * 3600 * 1000;
+    return d >= tomorrowStart;
+}
+
+/** Find a delivery date in a delivery-context window at/after `fromIndex`. */
+function findDeliveryDateFrom(text: string, fromIndex: number): string | null {
+    const re = new RegExp(DELIVERY_DATE_CONTEXT_RE.source, "gi");
+    for (const match of text.matchAll(re)) {
+        const idx = match.index ?? 0;
+        if (idx < fromIndex) continue;
+        const window = text.slice(idx, idx + 120);
+        const parsed = parseFirstDate(window);
+        if (parsed) return parsed;
+    }
+    return null;
+}
+
+/**
+ * Validate a vendor "delivered on <date>" claim.
+ *
+ * Rejects when a future/ETA term sits within ~40 chars before "delivered on"
+ * ("will be delivered", "scheduled to be delivered"), and requires the date to
+ * IMMEDIATELY follow "delivered on" (rejecting "Delivered on time, every time"
+ * and "delivered on the second attempt").
+ */
+function findVendorDeliveryClaim(text: string): string | null {
+    for (const m of text.matchAll(DELIVERED_ON_RE)) {
+        const idx = m.index ?? 0;
+
+        const before = text.slice(Math.max(0, idx - 40), idx);
+        if (FUTURE_NEGATION_TERMS_RE.test(before)) continue;
+
+        const after = text.slice(idx + m[0].length, idx + m[0].length + 60);
+        let s = after.replace(/^\s+/, "");
+        s = s.replace(/^the\s+/i, "");
+        s = s.replace(/^(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+/i, "");
+        const dateIso = parseLeadingDate(s);
+        if (!dateIso) continue;
+
+        return dateIso;
+    }
+    return null;
+}
+
+function buildDelivery(
+    deliveredAt: string,
+    signal: string,
+    terminal: boolean,
+): DocumentaryDelivery {
+    const dateLabel = new Date(deliveredAt).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        timeZone: "UTC",
+    });
+    const note = `Delivered ${dateLabel} (${signal.replace(/_/g, " ")})`;
+    return { deliveredAt, signal, note, terminal };
+}
+
+/**
+ * Detect documentary proof of delivery and return its date + signal.
+ *
+ * Strong signals (POD status, BOL signature) are terminal; the vendor
+ * "delivered on" email is annotation-only (`terminal: false`).
+ *
+ * @exportedForTesting
+ */
+export function detectDocumentaryDelivery(text: string): DocumentaryDelivery | null {
+    if (!text) return null;
+
+    const now = new Date();
+
+    // Evidence precedence: POD status > BOL signature > vendor email.
+    const pod = text.match(POD_DELIVERY_STATUS_RE);
+    if (pod && pod.index != null) {
+        const deliveredAt = findDeliveryDateFrom(text, pod.index);
+        if (deliveredAt && !isFutureDeliveryDate(deliveredAt, now)) {
+            return buildDelivery(deliveredAt, "pod_delivery_status", true);
+        }
+    }
+
+    const bol = text.match(BOL_SIGNATURE_RE);
+    if (bol && bol.index != null) {
+        const deliveredAt = findDeliveryDateFrom(text, bol.index);
+        if (deliveredAt && !isFutureDeliveryDate(deliveredAt, now)) {
+            return buildDelivery(deliveredAt, "bol_signature", true);
+        }
+    }
+
+    const vendorDate = findVendorDeliveryClaim(text);
+    if (vendorDate && !isFutureDeliveryDate(vendorDate, now)) {
+        return buildDelivery(vendorDate, "vendor_delivered_email", false);
+    }
+
+    return null;
 }
 
 // ── PO Inference Helpers (ported from src/lib/intelligence/tracking-agent.ts) ──
@@ -700,14 +992,135 @@ function vendorNameTokens(vendorName: string | null | undefined): string[] {
         .filter((token) => token.length >= 3 && !VENDOR_NAME_STOP_WORDS.has(token));
 }
 
+/**
+ * Guard 10 helper: do two vendor-name strings refer to the same vendor?
+ * Normalized token-overlap match — ignores case/punctuation and stop words so
+ * "New Moon Development Co" matches "New Moon Development Company" but
+ * "Green Earth Organics" does not match "Earth Box".
+ */
+function sameVendor(a: string | null | undefined, b: string | null | undefined): boolean {
+    const na = normalizeComparisonText(a);
+    const nb = normalizeComparisonText(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const ta = vendorNameTokens(a);
+    const tb = vendorNameTokens(b);
+    if (!ta.length || !tb.length) return false;
+    const shared = ta.filter((token) => tb.includes(token)).length;
+    return shared >= Math.min(ta.length, tb.length);
+}
+
+/**
+ * Guard 11 #5 (sender→vendor gate): decide whether a vendor "delivered on"
+ * email annotation may land on a shipment row.
+ *
+ * The vendor email is the weakest signal in the detector — any marketing or
+ * 3PL body with "delivered on <date>" trips it. The annotation only lands when
+ * the sender resolves to a KNOWN vendor, and — for an existing row — when that
+ * vendor matches a vendor name already recorded on the shipment. A brand-new
+ * row (no recorded vendor) accepts any resolved vendor.
+ *
+ * @exportedForTesting
+ */
+export function vendorDeliveryAnnotationAllowed(
+    resolvedVendor: string | null | undefined,
+    existingVendorNames: string[],
+): boolean {
+    if (!resolvedVendor) return false;
+    if (existingVendorNames.length === 0) return true;
+    return existingVendorNames.some((v) => sameVendor(v, resolvedVendor));
+}
+
+/**
+ * Generic shipping-platform / 3PL senders whose notices name no vendor. Their
+ * text carries only the destination (our own "Build A Soil") which weakly
+ * cross-matches unrelated vendors — so a full vendor-name match is required
+ * before a PO is inferred from one of these senders.
+ */
+const GENERIC_3PL_SENDER_DOMAINS = new Set([
+    "pirateship.com",
+    "shipstation.com",
+    "shopify.com",
+    "easypost.com",
+    "shippo.com",
+    "goshippo.com",
+    "shipbob.com",
+    "stamps.com",
+    "endicia.com",
+    "parcel2go.com",
+    "sendcloud.com",
+]);
+
 function extractNumericHints(text: string): string[] {
     return Array.from(new Set((text.match(/\b\d{6,}\b/g) || []).map((value) => value.trim())));
+}
+
+/**
+ * Guard 10: resolve a sender email to a canonical vendor name via vendor_profiles.
+ * Matches the exact address against orders_email / vendor_emails[], then the
+ * sender's domain against vendor_domains[]. Returns null when no deterministic
+ * match exists — the caller then leaves the shipment unlinked rather than
+ * guessing across vendors (never a 0.6 inference against an unrelated vendor).
+ */
+async function resolveSenderVendor(fromEmail: string): Promise<string | null> {
+    const email = String(fromEmail || "").toLowerCase().trim();
+    if (!email || !email.includes("@")) return null;
+    const domain = email.split("@")[1] || "";
+
+    const db = createClient();
+    if (!db) return null;
+
+    try {
+        // 1. Trusted orders_email match (normalized lowercase on write).
+        const { data: byOrdersEmail } = await db
+            .from("vendor_profiles")
+            .select("vendor_name")
+            .eq("orders_email", email)
+            .limit(1);
+        if (Array.isArray(byOrdersEmail) && byOrdersEmail.length > 0 && byOrdersEmail[0]?.vendor_name) {
+            return byOrdersEmail[0].vendor_name;
+        }
+
+        // 2. vendor_emails[] contains the address.
+        const { data: byVendorEmail } = await db
+            .from("vendor_profiles")
+            .select("vendor_name")
+            .contains("vendor_emails", [email])
+            .limit(1);
+        if (Array.isArray(byVendorEmail) && byVendorEmail.length > 0 && byVendorEmail[0]?.vendor_name) {
+            return byVendorEmail[0].vendor_name;
+        }
+
+        // 3. vendor_domains[] contains the sender's domain.
+        if (domain) {
+            const { data: byDomain } = await db
+                .from("vendor_profiles")
+                .select("vendor_name")
+                .contains("vendor_domains", [domain])
+                .limit(1);
+            if (Array.isArray(byDomain) && byDomain.length > 0 && byDomain[0]?.vendor_name) {
+                return byDomain[0].vendor_name;
+            }
+        }
+    } catch (err: any) {
+        console.warn(`[email-tracking-ingest] vendor_profiles sender lookup failed: ${err.message}`);
+    }
+
+    return null;
 }
 
 /**
  * Attempt to infer the PO number for a carrier notification email by scoring
  * recent purchase orders against the email's subject, body, and sender address.
  * Returns the best-matching PO number or null if no confident match exists.
+ *
+ * Guard 10 — vendor-scoped inference: when `senderVendorName` is resolved (from
+ * the sender address via `resolveSenderVendor`), only that vendor's POs are
+ * candidates — an unrelated vendor's PO is never reachable. A generic 3PL
+ * sender (PirateShip / ShipStation / Shopify) names no vendor, so a full
+ * vendor-name match is required before a PO is inferred from it (its text
+ * carries only destination text like "Build A Soil", which weakly cross-matches
+ * unrelated vendors such as "Rootwise Soil Dynamics").
  *
  * Scoring logic:
  * 1. Direct numeric-hint match against po_number (returns immediately if
@@ -722,6 +1135,7 @@ function extractNumericHints(text: string): string[] {
 export function inferPONumberFromRecentPOs(
     message: { subject?: string | null; bodySnippet?: string | null; fromEmail?: string | null },
     recentPOs: RecentPurchaseOrder[],
+    senderVendorName?: string | null,
 ): string | null {
     if (!recentPOs.length) return null;
 
@@ -732,8 +1146,23 @@ export function inferPONumberFromRecentPOs(
     const normalizedCombined = normalizeComparisonText(combinedText);
     const numericHints = extractNumericHints(combinedText);
 
+    // Guard 10: scope candidates to the resolved sender vendor. If the sender
+    // resolves to a vendor that has no open PO, stop — never cross-match.
+    let candidates = recentPOs;
+    if (senderVendorName) {
+        candidates = recentPOs.filter((po) => sameVendor(po.vendor_name, senderVendorName));
+        if (!candidates.length) return null;
+
+        // A single open PO for the resolved vendor is unambiguous (the vendor's
+        // only outstanding order) — infer it directly without requiring the
+        // vendor name to also appear in the email text.
+        if (candidates.length === 1) {
+            return candidates[0].po_number;
+        }
+    }
+
     // Step 1: Direct numeric-hint match against po_number
-    const directOrderMatch = recentPOs.filter((po) =>
+    const directOrderMatch = candidates.filter((po) =>
         numericHints.some((hint) => String(po.po_number || "").toLowerCase().startsWith(hint.toLowerCase()))
     );
     if (directOrderMatch.length === 1) {
@@ -741,7 +1170,7 @@ export function inferPONumberFromRecentPOs(
     }
 
     // Step 2: Vendor-name token overlap scoring
-    const scored = recentPOs
+    const scored = candidates
         .map((po) => {
             const tokens = vendorNameTokens(po.vendor_name);
             if (!tokens.length) return { po, score: 0 };
@@ -755,6 +1184,13 @@ export function inferPONumberFromRecentPOs(
         .sort((a, b) => b.score - a.score);
 
     if (!scored.length) return null;
+
+    // Guard 10 (unresolved generic 3PL sender): require a full vendor-name match.
+    const senderDomain = fromEmail.includes("@") ? fromEmail.split("@")[1].toLowerCase() : "";
+    const isGeneric3PL = GENERIC_3PL_SENDER_DOMAINS.has(senderDomain);
+    if (isGeneric3PL && !senderVendorName && scored[0].score < 10) {
+        return null;
+    }
 
     // Step 3: Tie-breaking — prefer non-dropship POs
     const topScore = scored[0].score;

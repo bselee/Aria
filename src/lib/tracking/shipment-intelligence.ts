@@ -270,12 +270,37 @@ export function mergeShipmentEvidence(
         }
     }
 
+    // Merge→supersede (Guard 10): a strong confirmation (>= 0.85, e.g. an
+    // operator's manual link at 0.95) supersedes weak PO refs (a 0.6 inference)
+    // instead of appending — so a confirmed PO replaces the inferred one in one
+    // step rather than leaving {125423, 125377} for a manual remove pass.
+    const incomingConfidence = update.confidence ?? 0;
+    const existingConfidence = existing.source_confidence ?? 0;
+    const supersedeWeakRefs =
+        update.poNumber != null &&
+        incomingConfidence >= 0.85 &&
+        existingConfidence < 0.85;
+
+    // Monotonic delivery (Guard 11 #2): delivered is terminal. A later
+    // extraction or a stale carrier-poll read must never downgrade delivered →
+    // in_transit. Assert here in the write path, alongside the closed-PO guard.
+    const existingDelivered =
+        existing.status_category === "delivered" || existing.delivered_at != null;
+    const incomingDelivered =
+        update.statusCategory === "delivered" || update.deliveredAt != null;
+
     return {
         ...existing,
-        po_numbers: uniqueStrings([...existing.po_numbers, update.poNumber]),
+        po_numbers: supersedeWeakRefs
+            ? uniqueStrings([update.poNumber])
+            : uniqueStrings([...existing.po_numbers, update.poNumber]),
         vendor_names: uniqueStrings([...existing.vendor_names, update.vendorName]),
-        status_category: update.statusCategory ?? existing.status_category,
-        status_display: update.statusDisplay ?? existing.status_display,
+        status_category: existingDelivered && !incomingDelivered
+            ? existing.status_category
+            : update.statusCategory ?? existing.status_category,
+        status_display: existingDelivered && !incomingDelivered
+            ? existing.status_display
+            : update.statusDisplay ?? existing.status_display,
         estimated_delivery_at: toIsoOrNull(update.estimatedDeliveryAt) ?? existing.estimated_delivery_at,
         delivered_at: toIsoOrNull(update.deliveredAt) ?? existing.delivered_at,
         public_tracking_url: update.publicTrackingUrl ?? existing.public_tracking_url,
@@ -314,7 +339,7 @@ export function classifyShipmentEvidence(record: ShipmentRecord): ShipmentEviden
     // Document sources produced by internal pipelines that already matched the
     // PO (invoice OCR, BOL PDF, carrier API, reconciliation) — solid on their own.
     const hasExplicitDocumentSource = sourceRefs.some((ref) =>
-        ["ap_invoice", "invoice_reconciliation", "bol_pdf", "carrier_api", "po_thread_sync"].includes(ref.source),
+        ["ap_invoice", "invoice_reconciliation", "bol_pdf", "carrier_api", "po_thread_sync", "documentary_delivery"].includes(ref.source),
     );
 
     // Email ingest PDF/vision sources are solid only when the tracking is
@@ -324,7 +349,7 @@ export function classifyShipmentEvidence(record: ShipmentRecord): ShipmentEviden
     );
 
     const hasCarrierOrDocumentSource = sourceRefs.some((ref) =>
-        ["carrier_poll", "carrier_api", "ap_invoice", "invoice_reconciliation", "bol_pdf", "po_thread_sync"].includes(ref.source),
+        ["carrier_poll", "carrier_api", "ap_invoice", "invoice_reconciliation", "bol_pdf", "po_thread_sync", "documentary_delivery"].includes(ref.source),
     );
 
     if (hasExplicitDocumentSource) {
@@ -991,14 +1016,28 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
     return data as ShipmentRecord;
 }
 
-function mergeTrackingStatus(record: ShipmentRecord, status: TrackingStatus | null): ShipmentRecord {
+export function mergeTrackingStatus(record: ShipmentRecord, status: TrackingStatus | null): ShipmentRecord {
     if (!status) return record;
 
     const parsedDates = parseDisplayDates(status.display);
+
+    // Monotonic delivery (Guard 11 #2): the carrier poll must never downgrade a
+    // delivered row to in_transit on a stale cache read. `delivered` is terminal.
+    const existingDelivered =
+        record.status_category === "delivered" || record.delivered_at != null;
+    const incomingDelivered =
+        status.category === "delivered" ||
+        status.delivered_at != null ||
+        parsedDates.deliveredAt != null;
+
     return {
         ...record,
-        status_category: status.category,
-        status_display: status.display,
+        status_category: existingDelivered && !incomingDelivered
+            ? record.status_category
+            : status.category,
+        status_display: existingDelivered && !incomingDelivered
+            ? record.status_display
+            : status.display,
         public_tracking_url: status.public_url || record.public_tracking_url,
         estimated_delivery_at: status.estimated_delivery_at || parsedDates.estimatedDeliveryAt || record.estimated_delivery_at,
         delivered_at: status.delivered_at || parsedDates.deliveredAt || record.delivered_at,
@@ -1054,6 +1093,56 @@ export async function listShipmentsForPurchaseOrders(poNumbers: string[]): Promi
         console.warn(`[shipments] load failed: ${e?.message || e}`);
         return [];
     }
+}
+
+/**
+ * PO-side receipt eligibility signal (Guard 11 #6).
+ *
+ * A delivery — carrier API or documentary (POD/BOL) — must NOT itself transition
+ * a PO to "received": one delivered parcel can cover only part of a PO. This
+ * exposes the TRACKING half of the receipt-eligibility test: whether every
+ * active shipment for the PO has reached `delivered`. Quantity coverage
+ * (line-item qty vs received qty) is AP/Finale's half; the caller combines both
+ * before the lifecycle may transition the PO.
+ */
+export interface POReceiptEligibility {
+    poNumber: string;
+    /** Tracking-side eligibility only: all active shipments delivered. Combine with qty coverage before receipt. */
+    allTrackingsDelivered: boolean;
+    deliveredCount: number;
+    totalCount: number;
+    /** False when the PO has no active shipments at all. */
+    hasShipments: boolean;
+}
+
+export async function computePOReceiptEligibility(poNumber: string): Promise<POReceiptEligibility | null> {
+    if (!poNumber) return null;
+
+    const shipments = await listShipmentsForPurchaseOrders([poNumber]);
+    const active = shipments.filter((s) => s.active !== false);
+
+    if (active.length === 0) {
+        return {
+            poNumber,
+            allTrackingsDelivered: false,
+            deliveredCount: 0,
+            totalCount: 0,
+            hasShipments: false,
+        };
+    }
+
+    const deliveredCount = active.filter(
+        (s) => s.status_category === "delivered" || s.delivered_at != null,
+    ).length;
+    const totalCount = active.length;
+
+    return {
+        poNumber,
+        allTrackingsDelivered: deliveredCount === totalCount,
+        deliveredCount,
+        totalCount,
+        hasShipments: true,
+    };
 }
 
 async function getReceivedPoNumbers(poNumbers: string[]): Promise<Set<string>> {

@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { inferPONumberFromRecentPOs } from "./tracking/email-tracking-ingest";
+import { extractPONumbersFromText, inferPONumberFromRecentPOs, detectDocumentaryDelivery, vendorDeliveryAnnotationAllowed } from "./tracking/email-tracking-ingest";
 
 type RecentPO = {
     po_number: string;
@@ -216,5 +216,223 @@ describe("inferPONumberFromRecentPOs (ported from tracking-agent.ts)", () => {
             ambiguous,
         );
         expect(result).toBe("124503");
+    });
+});
+
+describe("inferPONumberFromRecentPOs (Guard 10 — vendor-scoped inference)", () => {
+    const mixedPOs: RecentPO[] = [
+        { po_number: "125377", vendor_name: "New Moon Development Co", created_at: "2026-10-19T00:00:00.000Z" },
+        { po_number: "125423", vendor_name: "Rootwise Soil Dynamics", created_at: "2026-10-20T00:00:00.000Z" },
+    ];
+
+    it("scopes inference to the resolved sender vendor (single open PO)", () => {
+        const result = inferPONumberFromRecentPOs(
+            {
+                subject: "Your shipment is on its way!",
+                bodySnippet: "Build A Soil order shipped.",
+                fromEmail: "ship@pirateship.com",
+            },
+            mixedPOs,
+            "New Moon Development Co",
+        );
+        expect(result).toBe("125377");
+    });
+
+    it("never surfaces an unrelated vendor's PO when sender resolves to another vendor", () => {
+        // "soil" in "Build A Soil" weakly matches Rootwise Soil Dynamics, but
+        // scoping to New Moon must not reach Rootwise's PO.
+        const result = inferPONumberFromRecentPOs(
+            { subject: "Your shipment is on its way!", bodySnippet: "", fromEmail: "ship@pirateship.com" },
+            mixedPOs,
+            "New Moon Development Co",
+        );
+        expect(result).toBe("125377");
+    });
+
+    it("returns null when the resolved sender vendor has no open PO", () => {
+        const result = inferPONumberFromRecentPOs(
+            { subject: "Your shipment is on its way!", bodySnippet: "", fromEmail: "ship@pirateship.com" },
+            mixedPOs,
+            "Liberty Natural Products",
+        );
+        expect(result).toBeNull();
+    });
+
+    it("requires text match when the resolved vendor has multiple open POs", () => {
+        const twoNewMoon: RecentPO[] = [
+            { po_number: "125377", vendor_name: "New Moon Development Co", created_at: "2026-10-19T00:00:00.000Z" },
+            { po_number: "125399", vendor_name: "New Moon Development Co", created_at: "2026-10-20T00:00:00.000Z" },
+        ];
+        const result = inferPONumberFromRecentPOs(
+            { subject: "Your shipment is on its way!", bodySnippet: "", fromEmail: "ship@pirateship.com" },
+            twoNewMoon,
+            "New Moon Development Co",
+        );
+        expect(result).toBeNull();
+    });
+
+    it("leaves unresolved 3PL senders unlinked instead of guessing via a weak token (PirateShip → Rootwise)", () => {
+        // No resolved vendor, generic 3PL sender, only a weak "soil" token match
+        // against "Rootwise Soil Dynamics" → must NOT infer 125423.
+        const result = inferPONumberFromRecentPOs(
+            { subject: "Your shipment is on its way!", bodySnippet: "Build A Soil", fromEmail: "ship@pirateship.com" },
+            mixedPOs,
+        );
+        expect(result).toBeNull();
+    });
+
+    it("still infers a named vendor from a 3PL sender (full name match)", () => {
+        const result = inferPONumberFromRecentPOs(
+            {
+                subject: "Your shipment is on its way!",
+                bodySnippet: "Your order from Rootwise Soil Dynamics shipped.",
+                fromEmail: "ship@pirateship.com",
+            },
+            mixedPOs,
+        );
+        expect(result).toBe("125423");
+    });
+});
+
+describe("extractPONumbersFromText (label-bounded, Guard 9)", () => {
+    it("extracts a number adjacent to a PO / P.O. / Purchase Order label", () => {
+        expect(extractPONumbersFromText("PO-125333")).toEqual(["125333"]);
+        expect(extractPONumbersFromText("PO #124833")).toEqual(["124833"]);
+        expect(extractPONumbersFromText("PO 125376")).toEqual(["125376"]);
+        expect(extractPONumbersFromText("P.O.#: 125213")).toEqual(["125213"]);
+        expect(extractPONumbersFromText("Purchase Order # 125376")).toEqual(["125376"]);
+        expect(extractPONumbersFromText("PO NUMBER: 125224")).toEqual(["125224"]);
+    });
+
+    it("Certis POD: keeps PO-125333, rejects the SKU# line", () => {
+        const pdf = "4     DR     PO-125333     2,530\n             SKU# 154250";
+        expect(extractPONumbersFromText(pdf)).toEqual(["125333"]);
+    });
+
+    it("rejects counterparty labels (SKU#, SO#, Sales Order, Order #, order, Cust. Ref., ESTIMATE)", () => {
+        expect(extractPONumbersFromText("SKU# 154250")).toEqual([]);
+        expect(extractPONumbersFromText("SO# 80720")).toEqual([]);
+        expect(extractPONumbersFromText("Sales Order # 80720")).toEqual([]);
+        expect(extractPONumbersFromText("Order # 21909")).toEqual([]);
+        expect(extractPONumbersFromText("order 80263")).toEqual([]);
+        expect(extractPONumbersFromText("Cust. Ref.: 478712")).toEqual([]);
+        expect(extractPONumbersFromText("ESTIMATE NUMBER: 269303167-1")).toEqual([]);
+    });
+
+    it("FedEx billing block: keeps P.O.# but not Cust. Ref.", () => {
+        const block = "Ship Date: Aug 26, 2026   Cust. Ref.: 478712        P.O.#: 125213";
+        expect(extractPONumbersFromText(block)).toEqual(["125213"]);
+    });
+
+    it("rejects bare invoice/order numbers that carry no PO label", () => {
+        expect(extractPONumbersFromText("invoice #130648")).toEqual([]);
+        expect(extractPONumbersFromText("Invoice 149915")).toEqual([]);
+    });
+});
+
+describe("detectDocumentaryDelivery (Guard 11 — POD/BOL delivery reconciliation)", () => {
+    it("Certis POD: DELIVERY STATUS Good Order + delivered date", () => {
+        const pdf = "DELIVERY STATUS: Good Order\nDelivered: 09/25/2026";
+        const result = detectDocumentaryDelivery(pdf);
+        expect(result?.signal).toBe("pod_delivery_status");
+        expect(result?.terminal).toBe(true);
+        expect(result?.deliveredAt).toMatch(/^2026-09-25T/);
+        expect(result?.note).toContain("Sep 25, 2026");
+    });
+
+    it("BOL signature line proves delivery", () => {
+        const pdf = "Received in good order by M. Smith on 10/12/2026";
+        const result = detectDocumentaryDelivery(pdf);
+        expect(result?.signal).toBe("bol_signature");
+        expect(result?.terminal).toBe(true);
+        expect(result?.deliveredAt).toMatch(/^2026-10-12T/);
+    });
+
+    it("vendor 'delivered on' email is annotation-only (not terminal)", () => {
+        const body = "Your order was delivered on September 25, 2026.";
+        const result = detectDocumentaryDelivery(body);
+        expect(result?.signal).toBe("vendor_delivered_email");
+        expect(result?.terminal).toBe(false);
+        expect(result?.deliveredAt).toMatch(/^2026-09-25T/);
+    });
+
+    it("accepts a real POD even when it prints an RMA return note (local veto, not whole-doc)", () => {
+        const pdf = "DELIVERY STATUS: Good Order / Delivered 9/25/26 / Note: returns to be shipped back via RMA 4412";
+        const result = detectDocumentaryDelivery(pdf);
+        expect(result?.signal).toBe("pod_delivery_status");
+        expect(result?.terminal).toBe(true);
+        expect(result?.deliveredAt).toMatch(/^2026-09-25T/);
+    });
+
+    it("rejects a future delivery date even with no future/negation term (requirement a)", () => {
+        const tomorrow = new Date(Date.now() + 24 * 3600 * 1000);
+        const iso = [
+            tomorrow.getUTCFullYear(),
+            String(tomorrow.getUTCMonth() + 1).padStart(2, "0"),
+            String(tomorrow.getUTCDate()).padStart(2, "0"),
+        ].join("-");
+        expect(detectDocumentaryDelivery(`Delivered on ${iso}`)).toBeNull();
+    });
+
+    it("rejects the adversarial in-flight strings (aria-purchasing battery)", () => {
+        const negatives = [
+            "Your order was received by our team on 10/20/2026 and is being prepared.",
+            "Your order has been received by our production team on 10/20/26.",
+            "Thanks, we received by phone on 10/20/2026 and will follow up.",
+            "Your package will be delivered on 10/23/2026 between 9am and 12pm.",
+            "Your UPS package is scheduled to be delivered on Friday, October 23, 2026.",
+            "Delivered on time, every time — shipped 10/21/2026.",
+            "Estimated delivery: delivered on the second attempt, 10/21/2026",
+        ];
+        for (const text of negatives) {
+            expect(detectDocumentaryDelivery(text)).toBeNull();
+        }
+    });
+
+    it("NEVER reads future-shipping language as a delivery", () => {
+        expect(detectDocumentaryDelivery("Your order will ship on 10/21")).toBeNull();
+        expect(detectDocumentaryDelivery("Shipping on 10/21 — tracking to follow")).toBeNull();
+        expect(detectDocumentaryDelivery("will be shipped next week")).toBeNull();
+    });
+
+    it("plain shipping notice is not a delivery", () => {
+        expect(detectDocumentaryDelivery("Your shipment is on its way!")).toBeNull();
+        expect(detectDocumentaryDelivery("Your order has shipped")).toBeNull();
+    });
+
+    it("returns null when a delivery signal has no date", () => {
+        expect(detectDocumentaryDelivery("DELIVERY STATUS: Good Order")).toBeNull();
+    });
+
+    it("ignores a bare ship date that is not a delivery date", () => {
+        expect(detectDocumentaryDelivery("Ship Date: Aug 26, 2026\nDELIVERY STATUS: Good Order")).toBeNull();
+    });
+});
+
+describe("vendorDeliveryAnnotationAllowed (Guard 11 #5 — sender→vendor gate)", () => {
+    it("rejects an unresolvable sender (no vendor)", () => {
+        expect(vendorDeliveryAnnotationAllowed(null, [])).toBe(false);
+        expect(vendorDeliveryAnnotationAllowed(undefined, [])).toBe(false);
+        expect(vendorDeliveryAnnotationAllowed("", [])).toBe(false);
+    });
+
+    it("accepts any resolved vendor for a brand-new row", () => {
+        expect(vendorDeliveryAnnotationAllowed("Certis USA", [])).toBe(true);
+    });
+
+    it("accepts when the resolved vendor matches an existing vendor name", () => {
+        expect(vendorDeliveryAnnotationAllowed("Certis USA", ["Certis USA"])).toBe(true);
+    });
+
+    it("accepts a normalized token-overlap match", () => {
+        expect(
+            vendorDeliveryAnnotationAllowed("New Moon Development Co", ["New Moon Development Company"]),
+        ).toBe(true);
+    });
+
+    it("rejects when the resolved vendor conflicts with an existing vendor name", () => {
+        expect(
+            vendorDeliveryAnnotationAllowed("Certis USA", ["Liberty Natural Products"]),
+        ).toBe(false);
     });
 });
