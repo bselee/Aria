@@ -17,6 +17,15 @@ const mockCommitDraftPO = vi.fn();
 const mockGmailList = vi.fn();
 const mockGmailGet = vi.fn();
 
+// Time-of-day must not decide whether this suite passes: the engine gates every
+// Telegram send on isBusinessHours(), so an unmocked gate makes these assertions
+// fail after 17:00 Denver and pass during the day. Default to open, and test the
+// closed window explicitly.
+const { mockIsBusinessHours } = vi.hoisted(() => ({
+    mockIsBusinessHours: vi.fn(() => true),
+}));
+
+
 // Mock dependencies
 vi.mock('../db', () => ({
     createClient: vi.fn(() => ({
@@ -70,11 +79,17 @@ vi.mock('./po-sender', () => ({
     lookupVendorOrderEmail: vi.fn(),
 }));
 
+vi.mock('../intelligence/alert-gate', () => ({
+    isBusinessHours: mockIsBusinessHours,
+}));
+
+
 describe('autoProcessAutonomyDrafts', () => {
     let mockBot: any;
 
     beforeEach(() => {
         vi.clearAllMocks();
+        mockIsBusinessHours.mockReturnValue(true);
         process.env.TELEGRAM_CHAT_ID = '12345';
         mockBot = {
             telegram: {
@@ -224,5 +239,19 @@ describe('autoProcessAutonomyDrafts', () => {
             expect.stringContaining('Already manually sent'),
             expect.any(Object)
         );
+    });
+
+    it('stays silent outside business hours but still holds the send for review', async () => {
+        mockIsBusinessHours.mockReturnValue(false);
+        vi.mocked(poSender.getVendorAutonomyLevel).mockResolvedValue(1);
+
+        const result = await autoProcessAutonomyDrafts(mockBot);
+
+        // The review hold is the safety mechanism, not the message: the pending
+        // send must exist even when we deliberately stay quiet.
+        expect(result.processed).toBe(2);
+        expect(poSender.storePendingPOSend).toHaveBeenCalledTimes(2);
+        expect(poSender.commitAndSendPO).not.toHaveBeenCalled();
+        expect(mockBot.telegram.sendMessage).not.toHaveBeenCalled();
     });
 });
