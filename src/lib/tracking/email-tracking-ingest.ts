@@ -29,6 +29,7 @@ import {
     carrierUrl,
     TRACKING_PATTERNS,
     extractTrackingNumbers,
+    isRatingEstimateRef,
 } from "@/lib/carriers/tracking-service";
 import * as shipmentIntelligence from '@/lib/tracking/shipment-intelligence';
 import { extractBolText } from "./bol-ocr";
@@ -344,7 +345,10 @@ async function processMessage(
     ));
     for (const match of ltlProMatches) {
         const num = match[1] || match[0];
-        if (num && !extracted.some(e => e.trackingNumber === num)) {
+        // Reject rating-estimate refs (9 digits + "-1") here too: the canonical
+        // extractor drops them, and this suffix pass must not re-add what it
+        // deliberately removed.
+        if (num && !isRatingEstimateRef(num) && !extracted.some(e => e.trackingNumber === num)) {
             extracted.push({ carrier: "ltl_pro_suffix", trackingNumber: num });
         }
     }

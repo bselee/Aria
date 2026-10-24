@@ -12,6 +12,7 @@ import {
     detectCarrier,
     extractTrackingNumbers,
     recoverTrackingNumber,
+    isRatingEstimateRef,
     carrierUrl,
     parseTrackingContent,
     detectLTLCarrier,
@@ -451,6 +452,29 @@ Shipper: BuildASoil
         expect(results.some((r) => r.trackingNumber === '64058915')).toBe(true);
     });
 
+    it('rejects a 9-digit "-1" estimate by shape even without the ESTIMATE label adjacent', () => {
+        // OCR can reflow the "ESTIMATE NUMBER" label away from the number, so a
+        // 9-digit+"-1" next to any carrier-ish label must still be rejected by
+        // shape (278411572-1 is AAA Cooper's rating estimate, never a PRO).
+        const results = extractTrackingNumbers('Reference Number: 278411572-1');
+        expect(results.some((r) => r.trackingNumber === '278411572-1')).toBe(false);
+    });
+
+    it('extracts only the real PRO from an AAA Cooper statement (PRO + estimate)', () => {
+        const statement = 'PRO NUMBER      64058931\nESTIMATE NUMBER: 278411572-1';
+        const results = extractTrackingNumbers(statement);
+        expect(results.some((r) => r.trackingNumber === '64058931')).toBe(true);
+        expect(results.some((r) => r.trackingNumber === '278411572-1')).toBe(false);
+    });
+
+    it('keeps an 8-digit PRO with "-1" suffix but drops a 9-digit "-1" estimate', () => {
+        const results = extractTrackingNumbers(
+            'AAA Cooper-71473626-1\nAAA Cooper-278411572-1',
+        );
+        expect(results.some((r) => r.trackingNumber === '71473626-1')).toBe(true);
+        expect(results.some((r) => r.trackingNumber === '278411572-1')).toBe(false);
+    });
+
     it('extracts PRO# after an LTL carrier name (Estes)', () => {
         const results = extractTrackingNumbers('Shipped via Estes PRO# 1234567890, 4 pallets, freight collect');
         expect(results.some((r) => r.trackingNumber === '1234567890' && r.carrier === 'pro')).toBe(true);
@@ -565,6 +589,31 @@ describe('recoverTrackingNumber', () => {
     it('returns null for empty or whitespace input', () => {
         expect(recoverTrackingNumber('')).toBeNull();
         expect(recoverTrackingNumber('   ')).toBeNull();
+    });
+});
+
+describe('isRatingEstimateRef', () => {
+    it('flags 9-digit "-1" rating-estimate references', () => {
+        for (const ref of [
+            '278411572-1',
+            '276170239-1',
+            '268244264-1',
+            '269178799-1',
+            '270404873-1',
+            '275691812-1',
+        ]) {
+            expect(isRatingEstimateRef(ref)).toBe(true);
+        }
+    });
+
+    it('does NOT flag real PROs, parcel numbers, or other suffix lengths', () => {
+        expect(isRatingEstimateRef('71473626-1')).toBe(false);    // 8-digit PRO + "-1"
+        expect(isRatingEstimateRef('64058928')).toBe(false);      // 8-digit PRO
+        expect(isRatingEstimateRef('64058931')).toBe(false);      // 8-digit PRO
+        expect(isRatingEstimateRef('2130919952')).toBe(false);    // 10-digit Estes PRO
+        expect(isRatingEstimateRef('278411572')).toBe(false);     // 9-digit, no suffix
+        expect(isRatingEstimateRef('1234567890-1')).toBe(false);  // 10-digit + "-1"
+        expect(isRatingEstimateRef('520484908553')).toBe(false);  // 12-digit FedEx
     });
 });
 

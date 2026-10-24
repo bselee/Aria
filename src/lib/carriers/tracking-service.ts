@@ -190,6 +190,21 @@ export function detectCarrier(trackingNumber: string): string | null {
     return null;
 }
 
+/**
+ * True when a candidate is an AAA Cooper rating-estimate reference, never a
+ * trackable LTL PRO.
+ *
+ * AAA Cooper statements print a rating estimate as "ESTIMATE NUMBER: 278411572-1"
+ * (9 digits + "-1"). Real AAA Cooper PROs are 8 digits — 64058928, 64058931, and
+ * the "PRO + account suffix" form 71473626-1 (8 digits + "-1"). The 9-digit+"-1"
+ * shape is unique to the estimate and must be rejected by shape, not label
+ * adjacency, because OCR can reflow the "ESTIMATE NUMBER" label away from the
+ * number and leave it indistinguishable-by-position from a real PRO.
+ */
+export function isRatingEstimateRef(trackingNumber: string): boolean {
+    return /^\d{9}-1$/.test(String(trackingNumber || ""));
+}
+
 // Fixed-length, letter-prefixed parcel carriers. A token that starts with the
 // prefix but is longer than the carrier's exact length has had column-glue fused
 // onto its tail (e.g. "1Z999AA101234567841ea56" → "1Z999AA10123456784").
@@ -318,6 +333,15 @@ export function extractTrackingNumbers(text: string): Array<{ carrier: string; t
             // whose immediately-preceding text carries an "estimate number" label.
             const prefix = text.slice(0, index);
             if (/\bestimate\s*(?:number|no\.?|#)?\s*[:：\-]?\s*$/i.test(prefix)) {
+                continue;
+            }
+
+            // Exclusion (2026-10-23): an AAA Cooper rating-estimate reference is
+            // 9 digits + "-1" ("ESTIMATE NUMBER: 278411572-1"), never trackable.
+            // OCR can reflow the label away from the number, leaving it
+            // indistinguishable-by-position from a real PRO, so reject by SHAPE
+            // here (independent of the label-adjacency check above).
+            if (isRatingEstimateRef(trackingNumber)) {
                 continue;
             }
 
