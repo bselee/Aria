@@ -42,13 +42,17 @@ const NOTE =
   const est = await c.query(
     `select id, tracking_key, tracking_number, po_numbers::text pos, active, source_refs::text src
        from shipments where tracking_number ~ '^AAA Cooper:::[0-9]{9}-1$' order by tracking_key`);
-  console.log(`[aaa] estimate-shaped rows in shipments: ${est.rows.length}`);
+  const already = est.rows.filter((r: any) => !r.active).length;
+  console.log(`[aaa] estimate-shaped rows in shipments: ${est.rows.length} (${already} already inactive)`);
 
   let targets = est.rows;
   if (!ALL) {
     const want = new Set(keys.map((k) => k.replace(/^aaa cooper:/, "")));
     targets = est.rows.filter((r: any) => want.has(r.tracking_number.replace("AAA Cooper:::", "")) || want.has(r.tracking_key.replace("aaa cooper:", "")));
   }
+  // Only ACTIVE rows are work. Without this filter a re-run reports the whole repaired class as
+  // targets and re-appends the same source_refs entry to every row (seen at 5 duplicates per row).
+  targets = targets.filter((r: any) => r.active);
   console.log(`[aaa] targets: ${targets.length}${ALL ? " (all unlinked)" : ""}`);
 
   const blockers = targets.filter((r: any) => r.pos !== "{}");
