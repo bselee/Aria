@@ -134,11 +134,19 @@ function getPm2SupervisedPids(): number[] | null {
 }
 
 /**
- * Enumerates every live aria-bot process on Windows by matching the PM2
- * fork-wrapper command line: `node --import tsx ... ProcessContainerFork.js`.
- * `--import tsx` is unique to aria-bot in this repo's ecosystem config (every
- * other app runs plain `next` or a `.js` script), so this is a precise
- * fingerprint. Returns [] on any failure — fail-safe.
+ * Enumerates every live aria-bot process on Windows by matching its actual
+ * command line: `node --import tsx ...\src\cli\start-bot.ts`.
+ *
+ * aria-bot uses a CUSTOM interpreter (`node.exe` + `node_args: --import tsx`),
+ * so PM2 execs it directly and does NOT wrap it in `ProcessContainerFork.js` —
+ * that wrapper only appears for the default-interpreter apps (postgrest,
+ * pg-health, logrotate). A fingerprint keyed on `ProcessContainerFork` matches
+ * nothing and silently disables orphan reaping (observed 2026-10-24: two
+ * orphaned aria-bots survived 5+ days and held the cron lock).
+ *
+ * `--import tsx` + `start-bot.ts` is unique to aria-bot in this repo (every
+ * other `--import tsx` use is a transient one-off CLI script), so this is a
+ * precise fingerprint. Returns [] on any failure — fail-safe.
  *
  * @returns Process IDs of all aria-bot processes, or [] when enumeration fails.
  */
@@ -148,7 +156,7 @@ function enumerateAriaBotPids(): number[] {
     const cmd =
       `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ` +
       `$_.Name -eq 'node.exe' -and $_.CommandLine -like '*--import tsx*' ` +
-      `-and $_.CommandLine -like '*ProcessContainerFork*' } | Select-Object -ExpandProperty ProcessId"`;
+      `-and $_.CommandLine -like '*start-bot.ts*' } | Select-Object -ExpandProperty ProcessId"`;
     const raw = execSync(cmd, {
       encoding: "utf-8",
       timeout: 15_000,
@@ -216,6 +224,13 @@ export function reapOrphanedAriaBots(): void {
   }
 
   const candidates = enumerateAriaBotPids();
+  if (candidates.length > 0) {
+    const orphaned = candidates.filter((p) => p !== process.pid && !supervised.includes(p));
+    console.log(
+      `[pid-guard] ${candidates.length} live aria-bot process(es): ${candidates.join(", ")} ` +
+      `(PM2-supervised: ${supervised.join(", ") || "none"}; ${orphaned.length} orphaned).`,
+    );
+  }
   for (const pid of candidates) {
     if (pid === process.pid) continue;
     if (supervised.includes(pid)) continue;
