@@ -426,6 +426,32 @@ async function processMessage(
         upsertPOs.push({ po: null, inferred: false });
     }
 
+    // ── Guard 12 (magnet containment, 2026-09-30) ──────────────────────────
+    // The loop below is a CARTESIAN PRODUCT: every tracking number in the
+    // email/PDF is attached to EVERY PO number extracted from the same
+    // document. A carrier manifest listing 678 FedEx numbers alongside four
+    // PO references therefore wrote 678×4 rows — each PO reported the full
+    // manifest as its own tracking set (125213 ∩ 670549 = 678), every PO
+    // looked fully tracked, and nothing distinguished the real PO from the
+    // three wrong ones. There is no per-line PO mapping in these documents,
+    // so the honest outcome is UNLINKED: record the numbers, refuse to
+    // attribute them. Better a PO with no tracking than a PO with someone
+    // else's manifest.
+    //
+    // The decision itself lives in applyManifestContainment() so the boundary
+    // (>50 vs exactly 50) is unit-tested rather than implied by a ternary.
+    const containment = applyManifestContainment(extracted.length, upsertPOs);
+    if (containment.refused) {
+        console.warn(
+            `[email-tracking-ingest] ${extracted.length} trackings in one message ` +
+            `(>${MAX_TRACKINGS_PER_INGEST}) — manifest-sized; refusing PO attribution ` +
+            `(would have attached to ${containment.refusedPOs.length || 0} PO(s): ${containment.refusedPOs.slice(0, 8).join(", ") || "none"}). ` +
+            `Recording ${extracted.length} tracking(s) UNLINKED.`,
+        );
+        upsertPOs.length = 0;
+        upsertPOs.push(...containment.poUpserts);
+    }
+
     // Upsert EVERY high-confidence tracking hit (multi-package shipments)
     let anyUpserted = false;
     let primaryUrl: string | null = null;
@@ -693,6 +719,45 @@ function htmlToPlainText(html: string): string {
         .replace(/\n\s*\n\s*\n/g, "\n\n")
         .replace(/\s+/g, " ")
         .trim();
+}
+
+/**
+ * Guard 12 — manifest containment (ingest side). The PO-attribution loop is a
+ * cartesian product: every extracted tracking is attached to every PO found in the
+ * same document. A carrier manifest (678 FedEx numbers beside four PO refs) therefore
+ * poisoned all four POs with the full manifest, and nothing distinguished the real PO.
+ * These documents carry no per-line PO mapping, so above the threshold the honest
+ * outcome is UNLINKED: record the trackings, attribute none of them.
+ *
+ * The failure modes are asymmetric, which is why the default is unlink rather than
+ * best-guess: an unlinked parcel is visible and repairable; a wrongly attributed one
+ * is indistinguishable from a correct link once written.
+ *
+ * @exportedForTesting
+ */
+export const MAX_TRACKINGS_PER_INGEST = 50;
+
+/**
+ * Decide whether a message is manifest-sized and, if so, replace its PO attribution
+ * with a single unlinked entry. Pure: returns the caller's array untouched when the
+ * message is under the threshold, so a normal shipment keeps its attribution exactly.
+ *
+ * @exportedForTesting
+ */
+export function applyManifestContainment<T extends { po: string | null; inferred: boolean }>(
+    trackingCount: number,
+    poUpserts: T[],
+    max: number = MAX_TRACKINGS_PER_INGEST,
+): { poUpserts: T[]; refused: boolean; refusedPOs: string[] } {
+    if (trackingCount <= max) {
+        return { poUpserts, refused: false, refusedPOs: [] };
+    }
+    const refusedPOs = poUpserts.map((u) => u.po).filter((p): p is string => Boolean(p));
+    return {
+        poUpserts: [{ po: null, inferred: false } as T],
+        refused: true,
+        refusedPOs,
+    };
 }
 
 /**
