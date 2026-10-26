@@ -2891,7 +2891,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         // downstream filters (party resolution, DNR, dailyRate===0,
         // hasDeliverablePO) prune noise. Catches SKUs like RMC103 that
         // Finale's native engine silently drops on low-volume items.
-        const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
+        const candidates: Array<{ productId: string, finaleReorderQty: number | null, finaleStdReorderQty: number | null, finaleStockoutDays: number | null, finaleConsumptionQty: number | null, finaleDemandQty: number | null, finaleDemandPerDay: number | null }> = [];
         // REST slug per SKU for renamed products (see rename fingerprint note below).
         const restSlugBySku = new Map<string, string>();
         const failedProductIds: string[] = [];
@@ -2923,7 +2923,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     query: `{
                         productViewConnection(first: ${PAGE_SIZE}${afterClause}) {
                             pageInfo { hasNextPage endCursor }
-                            edges { node { productId status consumptionQuantity reorderQuantityToOrder stockoutDays demandQuantity demandPerDay productUrl } }
+                            edges { node { productId status consumptionQuantity reorderQuantityToOrder reorderQuantity stockoutDays demandQuantity demandPerDay productUrl } }
                         }
                     }`
                 };
@@ -2948,6 +2948,12 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const candidate = {
                         productId: p.productId,
                         finaleReorderQty: reorderQty,
+                        // "Std reorder in qty of" — the pack multiple Finale's UI shows.
+                        // Distinct from reorderQuantityToOrder (the suggested qty) and
+                        // from the REST orderIncrementQuantity, which is 1/unset on many
+                        // SKUs (RMC102: REST increment 1, std reorder 25 → drafts must
+                        // snap to 25s, not 1s).
+                        finaleStdReorderQty: this.parseFinaleNum(p.reorderQuantity),
                         finaleStockoutDays: stockoutDays,
                         finaleConsumptionQty: consumption,
                         finaleDemandQty: demandQty,
@@ -3426,6 +3432,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         leadTimeP90: distribution?.p90 ?? null,
                         // coverBufferDays intentionally omitted — safety is velocity-scaled (2026-10-05)
                         orderIncrementQty,
+                        // "Std reorder in qty of" fallback when the REST increment is 1/unset
+                        // (RMC102 class: increment 1, std reorder 25 → snap to 25-multiples).
+                        finaleStdReorderQty: candidate.finaleStdReorderQty ?? null,
                         safetyMultiplier: calibration?.safetyMultiplier ?? 1,
                         calibrationSampleCount: calibration?.sampleCount ?? 0,
                         calibrationMedianErrorPct: calibration?.medianErrorPct ?? null,

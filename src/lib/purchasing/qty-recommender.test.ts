@@ -860,3 +860,54 @@ describe("dailyRateLabel", () => {
     });
 });
 
+
+describe("finaleStdReorderQty — 'Std reorder in qty of' as increment fallback (RMC102)", () => {
+    it("snaps to the std-reorder multiple when the REST increment is 1/unset", () => {
+        // RMC102 live case: REST orderIncrementQuantity 1, std reorder 25.
+        // Raw need ~73 (1.16/d × 111d cover − 56 on hand) → 75, not 73.
+        const r = recommendQty(baseInput({
+            sku: "RMC102",
+            vendorName: "Rootwise Soil Dynamics",
+            dailyRate: 1.16,
+            stockOnHand: 56,
+            stockOnOrder: 0,
+            leadTimeDays: 21,
+            leadTimeProvenance: "21d default",
+            orderIncrementQty: 1,
+            finaleStdReorderQty: 25,
+            unitPrice: 38.25,
+        }));
+        expect(r.suggestedQty).toBeGreaterThan(0);
+        expect(r.suggestedQty % 25).toBe(0);
+    });
+
+    it("a real REST pack increment wins over the std reorder field", () => {
+        // ORS101-class: increment 12 is a genuine case pack; std reorder 40
+        // must not override it.
+        const r = recommendQty(baseInput({
+            vendorName: "Test Vendor",
+            dailyRate: 2,
+            stockOnHand: 100,
+            leadTimeDays: 14,
+            leadTimeProvenance: "14d default",
+            orderIncrementQty: 12,
+            finaleStdReorderQty: 40,
+            unitPrice: 5,
+        }));
+        expect(r.suggestedQty % 12).toBe(0);
+    });
+
+    it("no increment anywhere → untouched", () => {
+        const r = recommendQty(baseInput({
+            vendorName: "Test Vendor",
+            dailyRate: 2,
+            stockOnHand: 100,
+            leadTimeDays: 14,
+            leadTimeProvenance: "14d default",
+            orderIncrementQty: null,
+            finaleStdReorderQty: null,
+            unitPrice: 5,
+        }));
+        expect(r.suggestedQty).toBeGreaterThan(0);
+    });
+});

@@ -95,6 +95,9 @@ export interface RecommenderInput {
      */
     coverBufferDays?: number;
     orderIncrementQty?: number | null;  // pack rounding (Finale "Std reorder in qty of")
+    /** Finale productView reorderQuantity — the "Std reorder in qty of" multiple.
+     *  Used when the REST orderIncrementQuantity is 1/unset (RMC102 class). */
+    finaleStdReorderQty?: number | null;
 
     /** Phase 2 — vendor calibration multiplier (>1 widens cover; <1 tightens). */
     safetyMultiplier?: number;
@@ -281,9 +284,18 @@ function median(values: number[]): number {
         : sorted[mid];
 }
 
-function effectiveOrderIncrement(input: RecommenderInput): { increment: number | null; source: "finale" | "vendor_fallback" | "none" } {
+function effectiveOrderIncrement(input: RecommenderInput): { increment: number | null; source: "finale" | "finale_std_reorder" | "vendor_fallback" | "none" } {
     if (input.orderIncrementQty && input.orderIncrementQty > 1) {
         return { increment: input.orderIncrementQty, source: "finale" };
+    }
+    // HERMIA(2026-10-26): Finale's "Std reorder in qty of" (productView
+    // reorderQuantity) is the pack multiple the UI shows. Many SKUs carry
+    // REST orderIncrementQuantity = 1/unset while the std reorder is a real
+    // multiple (RMC102: increment 1, std reorder 25 → a draft snapped to 1s
+    // produced a 60-unit line that is not a 25-multiple). Use it when the
+    // REST increment doesn't supply one.
+    if (input.finaleStdReorderQty && input.finaleStdReorderQty > 1) {
+        return { increment: input.finaleStdReorderQty, source: "finale_std_reorder" };
     }
     const fallback = fallbackIncrementForVendor(input.vendorName);
     if (fallback && fallback > 1) {
