@@ -14,6 +14,7 @@ import {
   daysBetween,
   firstFridayAfter,
   isoFromUs,
+  isExcludedVendor,
   money,
   parseBillsCsv,
   renderOverdueHtml,
@@ -116,7 +117,7 @@ describe("buildPaymentPlan", () => {
 
   it("plans every payable bill exactly once", () => {
     const planned = runs.flatMap((r) => r.bills);
-    const payable = overdue.filter((b) => !/^fedex/i.test(b.vendor));
+    const payable = overdue.filter((b) => !isExcludedVendor(b.vendor));
     expect(planned).toHaveLength(payable.length);
     expect(sumAmount(planned)).toBeCloseTo(sumAmount(payable), 2);
     expect(new Set(planned.map((b) => b.invoiceNo)).size).toBe(payable.length);
@@ -129,21 +130,62 @@ describe("buildPaymentPlan", () => {
   });
 });
 
+const EXCLUSION_CSV = `\uFEFF${HEADER}
+64471690,,AAA Cooper Transportation,Shipping,,Manual,10/26/2026,,06/20/2026,06/27/2026,Unassigned,USD,411.73,411.73,Unpaid,10/27/2026,ePayment --> 10/28,411.73
+2907,,Ferticell,Inventory,,Manual,10/26/2026,,06/11/2026,07/11/2026,Unassigned,USD,7243.02,7243.02,Unpaid,10/27/2026,Check --> 10/30,7243.02
+9-388-19130,,FedEx,Freight,,Manual,10/26/2026,,07/21/2026,07/21/2026,Unassigned,USD,16589.60,16589.60,Unpaid,10/27/2026,Check --> 10/30,16589.60
+125001,,Berger Horticultural Products LTD,Inventory,,Manual,10/26/2026,,04/23/2026,08/21/2026,Unassigned,USD,"13,981.50","13,981.50",Unpaid,10/27/2026,ePayment --> 10/28,13981.50
+64471999,,AAA Cooper Transportation,Shipping,,Manual,10/26/2026,,10/30/2026,11/02/2026,Unassigned,USD,500,500,Unpaid,11/03/2026,ePayment --> 11/04,500
+`;
+
+describe("vendor exclusions", () => {
+  const model = buildOverdueModel(EXCLUSION_CSV, AS_OF, "exclusions.csv", "2026-10-26T14:00:00Z");
+
+  it("leaves AAA Cooper and Ferticell out of the payable stack", () => {
+    expect(model.overdue.map((b) => b.vendor)).toEqual(["Berger Horticultural Products LTD"]);
+    expect(model.overdue.map((b) => b.invoiceNo)).not.toContain("64471690");
+    expect(model.overdue.map((b) => b.invoiceNo)).not.toContain("2907");
+  });
+
+  it("groups exclusions by reason with counts and amounts", () => {
+    const autopay = model.exclusionSummary.find((g) => g.reason === "CC autopay");
+    const plan = model.exclusionSummary.find((g) => g.reason === "existing payment plan");
+    expect(autopay?.count).toBe(1);
+    expect(autopay?.amount).toBe(16589.6);
+    expect(plan?.count).toBe(2);
+    expect(plan?.amount).toBeCloseTo(411.73 + 7243.02, 2);
+    expect(plan?.vendors.sort()).toEqual(["AAA Cooper Transportation", "Ferticell"]);
+  });
+
+  it("plans only the payable vendor", () => {
+    const planned = model.runs.flatMap((r) => r.bills.map((b) => b.vendor));
+    expect(planned).toEqual(["Berger Horticultural Products LTD"]);
+    expect(model.totalOverdue).toBe(13981.5);
+  });
+
+  it("keeps excluded vendors out of the new-due cash column too", () => {
+    expect(model.runs.every((r) => r.newDueAmount === 0)).toBe(true);
+    expect(model.futureDue.some((b) => /aaa cooper/i.test(b.vendor))).toBe(false);
+  });
+});
+
 describe("buildOverdueModel", () => {
   const model = buildOverdueModel(CSV, AS_OF, "fixture.csv", "2026-10-26T14:00:00Z");
 
-  it("drops excluded vendors (FedEx, CC autopay) from every total", () => {
-    expect(model.excluded.map((b) => b.invoiceNo)).toEqual(["9-388-19130"]);
-    expect(model.excludedAmount).toBe(16589.6);
-    expect(model.totalOverdue).toBeCloseTo(411.73 + 650 + 81, 2);
+  it("drops excluded vendors from every total", () => {
+    expect(model.excluded.map((b) => b.invoiceNo)).toEqual(["64471690", "9-388-19130"]);
+    expect(model.excludedAmount).toBeCloseTo(411.73 + 16589.6, 2);
+    expect(model.totalOverdue).toBeCloseTo(650 + 81, 2);
     expect(model.totalOverdueIncludingExcluded).toBeCloseTo(411.73 + 650 + 81 + 16589.6, 2);
   });
 
   it("keeps excluded invoices out of the rendered report body", () => {
     const html = renderOverdueHtml(model);
     expect(html).not.toContain("9-388-19130");
+    expect(html).not.toContain("64471690");
     expect(html).not.toContain("Verify Before Release");
-    expect(html).toContain("paid by CC autopay");
+    expect(html).toContain("CC autopay");
+    expect(html).toContain("existing payment plan");
   });
 
   it("reports aging buckets that reconcile to the payable total", () => {

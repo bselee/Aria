@@ -85,9 +85,9 @@ async function main(): Promise<void> {
 
   console.log(`WROTE ${pdfPath}`);
   console.log(`${model.overdue.length} bills ${money(model.totalOverdue)} past due`);
-  if (model.excluded.length > 0) {
+  for (const g of model.exclusionSummary) {
     console.log(
-      `excluded ${model.excluded.length} FedEx ${money(model.excludedAmount)} (CC autopay)`,
+      `excluded ${g.count} bills ${money(g.amount)}: ${g.vendors.join(", ")} (${g.reason})`,
     );
   }
   for (const run of model.runs) {
@@ -111,9 +111,12 @@ async function main(): Promise<void> {
       })}`,
       "",
       `Total past due: ${model.overdue.length} bills / ${money(model.totalOverdue)}`,
-      ...(model.excluded.length > 0
-        ? [`Excluded: ${model.excluded.length} FedEx bills paid by CC autopay.`]
-        : []),
+      ...model.exclusionSummary.map(
+        (g) =>
+          `Not in this run: ${g.vendors.join(", ")} ${g.count} bills / ${money(
+            g.amount,
+          )} (${g.reason}).`,
+      ),
       "",
       "Friday plan, oldest first:",
       ...planLines,

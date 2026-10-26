@@ -70,6 +70,8 @@ export interface OverdueModel {
   /** Excluded rows (FedEx on CC autopay). Count and total only; not tabled. */
   excluded: OverdueBill[];
   excludedAmount: number;
+  /** Excluded rows rolled up by reason, for a single summary line. */
+  exclusionSummary: { reason: string; count: number; amount: number; vendors: string[] }[];
   runs: PaymentRun[];
   buckets: { bucket: AgingBucket; count: number; amount: number }[];
   vendors: { vendor: string; count: number; amount: number; oldestDue: string }[];
@@ -77,16 +79,49 @@ export interface OverdueModel {
   generatedAt: string;
 }
 
-// ── Vendors never released from Bill.com ─────────────────────────────────────
+// ── Vendors outside this payment run ─────────────────────────────────────────
+
+/** One reason a vendor is left out of the plan. */
+export interface ExclusionRule {
+  /** Matched against the vendor name. */
+  pattern: RegExp;
+  /** Short reason shown in the report. */
+  reason: string;
+}
 
 /**
- * Vendors excluded from the report entirely.
- * FedEx is on credit-card autopay, so its bills in Bill.com are duplicates and
- * pure noise in an aging/payment-run view. Excluded from every total and table.
+ * Vendors that never belong in the past-due pay queue.
+ * - FedEx bills on the credit card autopay.
+ * - AAA Cooper and Ferticell are already handled on an existing payment plan,
+ *   so their Bill.com rows must not be re-planned here.
+ * POs are deliberately not correlated: Bill.com bills carry no PO by policy,
+ * and there is no reliable invoice-to-PO key in local data.
  */
-export function isExcludedVendor(vendor: string): boolean {
-  return /^fedex\b/i.test((vendor || "").trim());
+export const EXCLUSIONS: ExclusionRule[] = [
+  { pattern: /^fedex\b/i, reason: "CC autopay" },
+  { pattern: /^aaa cooper/i, reason: "existing payment plan" },
+  { pattern: /^ferticell/i, reason: "existing payment plan" },
+];
+
+/** Exclusion rule that applies to a vendor, or undefined when it is payable. */
+export function exclusionFor(vendor: string): ExclusionRule | undefined {
+  const name = (vendor || "").trim();
+  return EXCLUSIONS.find((rule) => rule.pattern.test(name));
 }
+
+/** True when the vendor is handled outside this report. */
+export function isExcludedVendor(vendor: string): boolean {
+  return exclusionFor(vendor) !== undefined;
+}
+
+/** Approved arrangements that explain an exclusion. Kept here so the report
+ *  states the commitment instead of the inflated Bill.com total. */
+export const STANDING_ARRANGEMENTS: { pattern: RegExp; note: string }[] = [
+  {
+    pattern: /^aaa cooper/i,
+    note: "Approved catch-up plan through December, roughly $13,729 remaining. Freight pickups reinstated.",
+  },
+];
 
 // ── Date helpers ─────────────────────────────────────────────────────────────
 
@@ -336,6 +371,7 @@ export function buildPaymentPlan(
       (b) =>
         b.dueDate !== "" &&
         b.balanceDue > 0 &&
+        !isExcludedVendor(b.vendor) &&
         daysBetween(previousCutoff, b.dueDate) > 0 &&
         daysBetween(b.dueDate, dates[i]) >= 0,
     );
@@ -354,6 +390,7 @@ export function buildPaymentPlan(
     (b) =>
       b.dueDate !== "" &&
       b.balanceDue > 0 &&
+      !isExcludedVendor(b.vendor) &&
       daysBetween(previousCutoff, b.dueDate) > 0 &&
       daysBetween(b.dueDate, dates[runCount]) >= 0,
   );
@@ -412,6 +449,17 @@ export function buildOverdueModel(
   const allOverdue = selectOverdue(bills, asOf);
   const excluded = allOverdue.filter((b) => isExcludedVendor(b.vendor));
   const overdue = allOverdue.filter((b) => !isExcludedVendor(b.vendor));
+  const exclusionSummary = [...new Set(excluded.map((b) => exclusionFor(b.vendor)?.reason ?? "excluded"))]
+    .map((reason) => {
+      const rows = excluded.filter((b) => (exclusionFor(b.vendor)?.reason ?? "excluded") === reason);
+      return {
+        reason,
+        count: rows.length,
+        amount: sumAmount(rows),
+        vendors: [...new Set(rows.map((b) => b.vendor))],
+      };
+    })
+    .sort((a, b) => b.amount - a.amount);
   const horizon = addDays(asOf, 14);
   const futureDue = bills
     .filter(
@@ -431,6 +479,7 @@ export function buildOverdueModel(
     overdue,
     excluded,
     excludedAmount: sumAmount(excluded),
+    exclusionSummary,
     totalOverdue: sumAmount(overdue),
     totalOverdueIncludingExcluded: sumAmount(allOverdue),
     runs: buildPaymentPlan(allOverdue, asOf, bills, 3),
@@ -521,6 +570,29 @@ export function renderOverdueHtml(model: OverdueModel): string {
       model.totalOverdue,
     )}</b> past due</p>`,
   );
+  if (model.exclusionSummary.length > 0) {
+    const line = model.exclusionSummary
+      .map(
+        (g) =>
+          `${esc(g.vendors.join(", "))} ${g.count} bill${g.count === 1 ? "" : "s"} (${money(
+            g.amount,
+          )}), ${esc(g.reason)}`,
+      )
+      .join(" · ");
+    parts.push(
+      `<p class="summary" style="font-size:7.5pt;color:#666">Not in this run: ${line}</p>`,
+    );
+    const arranged = STANDING_ARRANGEMENTS.filter((a) =>
+      model.excluded.some((b) => a.pattern.test(b.vendor)),
+    );
+    if (arranged.length > 0) {
+      parts.push(
+        `<p class="summary" style="font-size:7.5pt;color:#666">${arranged
+          .map((a) => esc(a.note))
+          .join(" ")}</p>`,
+      );
+    }
+  }
   parts.push(`<table>
   <thead><tr><th>Aging</th><th class="amt">Bills</th><th class="amt">Balance</th><th class="amt">Share</th></tr></thead>
   <tbody>`);
@@ -572,21 +644,21 @@ export function renderOverdueHtml(model: OverdueModel): string {
     }</p>`,
   );
   parts.push(`<table>
-  <col class="bill-vendor"><col class="bill-inv"><col class="bill-po"><col class="bill-due"><col class="days"><col class="bill-amt"><col class="bill-sched">
-  <thead><tr><th>Vendor</th><th>Invoice #</th><th>PO #</th><th>Date due</th><th class="days">Days</th><th class="amt">Amount</th><th>Scheduled</th></tr></thead>
+  <col class="bill-vendor"><col class="bill-inv"><col class="bill-due"><col class="days"><col class="bill-amt"><col class="bill-sched">
+  <thead><tr><th>Vendor</th><th>Invoice #</th><th>Date due</th><th class="days">Days</th><th class="amt">Amount</th><th>Scheduled</th></tr></thead>
   <tbody>`);
   for (const b of model.overdue) {
     const cls = b.daysOverdue > 60 ? ' class="crit"' : "";
     parts.push(
-      `<tr${cls}><td>${esc(b.vendor)}</td><td>${esc(b.invoiceNo)}</td><td>${esc(
-        b.poNumber && b.poNumber !== "-1" ? b.poNumber : "—",
-      )}</td><td>${md(b.dueDate)}</td><td class="days">${b.daysOverdue}</td><td class="amt">${money(
+      `<tr${cls}><td>${esc(b.vendor)}</td><td>${esc(b.invoiceNo)}</td><td>${md(
+        b.dueDate,
+      )}</td><td class="days">${b.daysOverdue}</td><td class="amt">${money(
         b.balanceDue,
       )}</td><td>${b.processDate ? md(b.processDate) : "—"}</td></tr>`,
     );
   }
   parts.push(
-    `<tr class="total-row"><td>Total</td><td></td><td></td><td></td><td class="days"></td><td class="amt">${money(
+    `<tr class="total-row"><td>Total</td><td></td><td></td><td class="days"></td><td class="amt">${money(
       model.totalOverdue,
     )}</td><td></td></tr>`,
   );
@@ -620,11 +692,7 @@ export function renderOverdueHtml(model: OverdueModel): string {
   parts.push(`</ol></div>`);
 
   parts.push(
-    `<div class="foot">Source: ${esc(model.source)} · ${esc(model.generatedAt)} · ${
-      model.excluded.length > 0
-        ? `${model.excluded.length} FedEx bills (${money(model.excludedAmount)}) excluded, paid by CC autopay · `
-        : ""
-    }Aria overdue-bills report</div>`,
+    `<div class="foot">Source: ${esc(model.source)} · ${esc(model.generatedAt)} · Aria overdue-bills report</div>`,
   );
   parts.push(`</body></html>`);
   return parts.join("\n");
@@ -643,54 +711,57 @@ export function onTimeNotes(model: OverdueModel): string[] {
   if (offFridayBills.length > 0) {
     const dates = [...new Set(offFridayBills.map((b) => md(b.processDate)))].sort();
     notes.push(
-      `<b>Reset process dates.</b> ${offFridayBills.length} of ${model.overdue.length} past-due bills are booked to process on ${dates.join(
+      `<b>Reset process dates.</b> ${offFridayBills.length} of ${model.overdue.length} bills are booked to process on ${dates.join(
         ", ",
-      )} — no Friday in the set. Point each bill at its planned run date or the batch releases mid-week.`,
-    );
-  }
-
-  const noPo = model.overdue.filter((b) => !b.poNumber || b.poNumber === "-1").length;
-  if (noPo > 0) {
-    notes.push(
-      `<b>Missing PO numbers are the root cause.</b> ${
-        noPo === model.overdue.length ? "All" : `${noPo} of`
-      } ${model.overdue.length} past-due bills carry no PO#, so they cannot be three-way matched and approval stalls. Capture the PO at intake.`,
-    );
-  }
-
-  const aaa = model.vendors.find((v) => /aaa cooper/i.test(v.vendor));
-  if (aaa && aaa.count >= 5) {
-    notes.push(
-      `<b>Consolidate AAA Cooper.</b> ${aaa.count} invoices · ${money(
-        aaa.amount,
-      )}. Release one weekly payment with a PRO# remittance list instead of per-invoice checks.`,
+      )}, none on a Friday. Point each bill at its planned run date so the release lands on the right day.`,
     );
   }
 
   const logan = model.vendors.find((v) => /logan labs/i.test(v.vendor));
   if (logan && logan.count >= 5) {
     notes.push(
-      `<b>Move Logan Labs off checks.</b> ${logan.count} invoices · ${money(
+      `<b>Move Logan Labs to ePayment.</b> ${logan.count} invoices, ${money(
         logan.amount,
-      )}, most under $200. Switch to ePayment/ACH — check issuance is the delay, not cash.`,
+      )}, most under $200. Check issuance adds days that ACH does not.`,
+    );
+  }
+
+  const bigTerms = model.vendors.find((v) => /berger/i.test(v.vendor));
+  if (bigTerms && bigTerms.amount > 10_000) {
+    notes.push(
+      `<b>Confirm Berger terms.</b> ${money(bigTerms.amount)} across ${
+        bigTerms.count
+      } bills, oldest due ${md(bigTerms.oldestDue)}. The dates imply roughly net 120, so confirm the term before the first run.`,
+    );
+  }
+
+  const cardVendor = model.overdue.find((b) => /virtual card/i.test(b.paymentMethod));
+  if (cardVendor) {
+    const firstRun = model.runs[0]?.date ?? "";
+    notes.push(
+      `<b>Check the virtual card.</b> ${esc(cardVendor.vendor)} ${money(
+        cardVendor.balanceDue,
+      )} is set to pay by virtual card on ${md(cardVendor.processDate)}. Confirm the card is active before ${runLabel(
+        firstRun,
+      )}.`,
     );
   }
 
   const biggest = model.vendors[0];
-  if (biggest && biggest.amount > 10_000) {
+  if (biggest && biggest.amount > 10_000 && !/berger/i.test(biggest.vendor)) {
     notes.push(
-      `<b>Protect the top relationship.</b> ${esc(biggest.vendor)} is ${money(
+      `<b>${esc(biggest.vendor)} is the largest single exposure.</b> ${money(
         biggest.amount,
-      )} across ${biggest.count} bills, oldest ${md(biggest.oldestDue)}. Call the rep before the first run, not after.`,
+      )} across ${biggest.count} bills, oldest ${md(biggest.oldestDue)}.`,
     );
   }
 
   const maxDays = model.overdue[0]?.daysOverdue ?? 0;
   notes.push(
-    `<b>Hard ceiling of 45 days.</b> Oldest payable bill is ${maxDays} days. Run the aging report every Friday; anything crossing 45 days gets paid that run regardless of band.`,
+    `<b>45-day ceiling.</b> Oldest bill on this report is ${maxDays} days. Aging runs every Friday; anything crossing 45 days is paid that run regardless of band.`,
   );
   notes.push(
-    `<b>Keep the weekly cadence.</b> Enter bills within 24h of receipt, process date = that week's Friday, one release per week. A three-week catch-up only works if new bills stop piling up behind it.`,
+    `<b>Weekly cadence.</b> Bills entered within 24h of receipt, process date set to that week's Friday, one release per week. The three-week catch-up assumes new bills stay current.`,
   );
   return notes;
 }
