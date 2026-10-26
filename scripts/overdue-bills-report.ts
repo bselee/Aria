@@ -84,8 +84,12 @@ async function main(): Promise<void> {
   chromePdf(htmlPath, pdfPath);
 
   console.log(`WROTE ${pdfPath}`);
-  console.log(`payable ${model.overdue.length} ${money(model.totalOverdue)}`);
-  console.log(`verify-only ${model.excluded.length} ${money(model.excludedAmount)}`);
+  console.log(`${model.overdue.length} bills ${money(model.totalOverdue)} past due`);
+  if (model.excluded.length > 0) {
+    console.log(
+      `excluded ${model.excluded.length} FedEx ${money(model.excludedAmount)} (CC autopay)`,
+    );
+  }
   for (const run of model.runs) {
     console.log(
       `  ${runLabel(run.date)}  ${String(run.bills.length).padStart(2)} bills  ` +
@@ -106,23 +110,22 @@ async function main(): Promise<void> {
         timeZone: "UTC",
       })}`,
       "",
-      `Total past due: ${model.excluded.length + model.overdue.length} bills / ${money(
-        model.totalOverdueIncludingExcluded,
-      )}`,
-      `  payable, planned: ${model.overdue.length} bills / ${money(model.totalOverdue)}`,
-      `  verify only (FedEx): ${model.excluded.length} bills / ${money(model.excludedAmount)}`,
+      `Total past due: ${model.overdue.length} bills / ${money(model.totalOverdue)}`,
+      ...(model.excluded.length > 0
+        ? [`Excluded: ${model.excluded.length} FedEx bills paid by CC autopay.`]
+        : []),
       "",
       "Friday plan, oldest first:",
       ...planLines,
       "",
-      "PDF attached. Excluded vendors are listed separately - do not release them from Bill.com.",
+      "PDF attached.",
     ].join("\n");
 
     const res = await sendGmailPdfEmail({
       tokenName: "default",
       to: TO,
-      subject: `Overdue bills ${model.overdue.length + model.excluded.length} / ${money(
-        model.totalOverdueIncludingExcluded,
+      subject: `Overdue bills ${model.overdue.length} / ${money(
+        model.totalOverdue,
       )} - plan through ${runLabel(runs[runs.length - 1].date)}`,
       body,
       pdfBuffer: fs.readFileSync(pdfPath),

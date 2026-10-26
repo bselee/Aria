@@ -62,9 +62,12 @@ export interface PaymentRun {
 export interface OverdueModel {
   asOf: string;
   source: string;
+  /** Past due, excluding excluded vendors (the only number the report shows). */
   totalOverdue: number;
+  /** Past due including excluded vendors, for audit only. */
   totalOverdueIncludingExcluded: number;
   overdue: OverdueBill[];
+  /** Excluded rows (FedEx on CC autopay). Count and total only; not tabled. */
   excluded: OverdueBill[];
   excludedAmount: number;
   runs: PaymentRun[];
@@ -77,11 +80,11 @@ export interface OverdueModel {
 // ── Vendors never released from Bill.com ─────────────────────────────────────
 
 /**
- * Vendors whose invoices must be verified before any Bill.com release.
- * FedEx parcel/freight is paid through the Billtrust COLL batch; a FedEx bill
- * sitting in Bill.com is almost always a duplicate from AP email ingest.
+ * Vendors excluded from the report entirely.
+ * FedEx is on credit-card autopay, so its bills in Bill.com are duplicates and
+ * pure noise in an aging/payment-run view. Excluded from every total and table.
  */
-export function isVerifyOnlyVendor(vendor: string): boolean {
+export function isExcludedVendor(vendor: string): boolean {
   return /^fedex\b/i.test((vendor || "").trim());
 }
 
@@ -303,8 +306,8 @@ const BANDS: { label: string; test: (days: number) => boolean }[] = [
  *
  * Band 1 takes everything 61+ days, band 2 everything 15-60, band 3 the rest.
  * This pays oldest first, clears the relationship-damaging tail in the first
- * release, and finishes the backlog in three Fridays. Verify-only vendors
- * (FedEx) are excluded from cash but still reported.
+ * release, and finishes the backlog in three Fridays. Excluded vendors
+ * (FedEx, CC autopay) never enter the plan.
  *
  * @param overdue      Past-due bills, oldest first.
  * @param asOf         ISO as-of date.
@@ -319,7 +322,7 @@ export function buildPaymentPlan(
   runCount = 3,
 ): PaymentRun[] {
   const dates = nextFridays(asOf, runCount + 1);
-  const payable = overdue.filter((b) => !isVerifyOnlyVendor(b.vendor));
+  const payable = overdue.filter((b) => !isExcludedVendor(b.vendor));
   const used = new Set<string>();
 
   const runs: PaymentRun[] = [];
@@ -407,11 +410,18 @@ export function buildOverdueModel(
 ): OverdueModel {
   const bills = parseBillsCsv(csvText);
   const allOverdue = selectOverdue(bills, asOf);
-  const excluded = allOverdue.filter((b) => isVerifyOnlyVendor(b.vendor));
-  const overdue = allOverdue.filter((b) => !isVerifyOnlyVendor(b.vendor));
+  const excluded = allOverdue.filter((b) => isExcludedVendor(b.vendor));
+  const overdue = allOverdue.filter((b) => !isExcludedVendor(b.vendor));
   const horizon = addDays(asOf, 14);
   const futureDue = bills
-    .filter((b) => b.dueDate !== "" && b.balanceDue > 0 && b.dueDate >= asOf && b.dueDate <= horizon)
+    .filter(
+      (b) =>
+        b.dueDate !== "" &&
+        b.balanceDue > 0 &&
+        !isExcludedVendor(b.vendor) &&
+        b.dueDate >= asOf &&
+        b.dueDate <= horizon,
+    )
     .sort((a, b) => a.dueDate.localeCompare(b.dueDate) || b.balanceDue - a.balanceDue);
 
   return {
@@ -488,7 +498,6 @@ const CSS = `
  */
 export function renderOverdueHtml(model: OverdueModel): string {
   const parts: string[] = [];
-  const totalCount = model.overdue.length + model.excluded.length;
   const payableRuns = model.runs.filter((r) => r.bills.length > 0);
   const planTotal = payableRuns.reduce((a, r) => a + r.overdueAmount, 0);
 
@@ -508,11 +517,9 @@ export function renderOverdueHtml(model: OverdueModel): string {
   // Summary
   parts.push(`<div class="keep"><h2>Summary</h2>`);
   parts.push(
-    `<p class="summary">${model.overdue.length} payable bills · <b>${money(model.totalOverdue)}</b> past due` +
-      (model.excluded.length > 0
-        ? ` · ${model.excluded.length} verify-only (${money(model.excludedAmount)}) excluded from plan`
-        : "") +
-      ` · ${totalCount} rows in export past due</p>`,
+    `<p class="summary">${model.overdue.length} bills · <b>${money(
+      model.totalOverdue,
+    )}</b> past due</p>`,
   );
   parts.push(`<table>
   <thead><tr><th>Aging</th><th class="amt">Bills</th><th class="amt">Balance</th><th class="amt">Share</th></tr></thead>
@@ -585,33 +592,6 @@ export function renderOverdueHtml(model: OverdueModel): string {
   );
   parts.push(`</tbody></table></div>`);
 
-  // Verify-only
-  if (model.excluded.length > 0) {
-    parts.push(`<div class="keep"><h2>Verify Before Release — Excluded From Plan</h2>`);
-    parts.push(
-      `<p class="summary">${model.excluded.length} bills · ${money(
-        model.excludedAmount,
-      )} · not released from Bill.com under current SOP</p>`,
-    );
-    parts.push(`<table>
-    <col class="bill-vendor"><col class="bill-inv"><col class="bill-due"><col class="days"><col class="bill-amt"><col class="bill-sched">
-    <thead><tr><th>Vendor</th><th>Invoice #</th><th>Date due</th><th class="days">Days</th><th class="amt">Amount</th><th>Scheduled</th></tr></thead>
-    <tbody>`);
-    for (const b of model.excluded) {
-      parts.push(
-        `<tr><td>${esc(b.vendor)}</td><td>${esc(b.invoiceNo)}</td><td>${md(b.dueDate)}</td><td class="days">${
-          b.daysOverdue
-        }</td><td class="amt">${money(b.balanceDue)}</td><td>${b.processDate ? md(b.processDate) : "—"}</td></tr>`,
-      );
-    }
-    parts.push(
-      `<tr class="total-row"><td>Total</td><td></td><td></td><td class="days"></td><td class="amt">${money(
-        model.excludedAmount,
-      )}</td><td></td></tr>`,
-    );
-    parts.push(`</tbody></table></div>`);
-  }
-
   // Coming due
   if (model.futureDue.length > 0) {
     parts.push(`<div class="keep"><h2>Coming Due — Next 14 Days</h2>`);
@@ -640,9 +620,11 @@ export function renderOverdueHtml(model: OverdueModel): string {
   parts.push(`</ol></div>`);
 
   parts.push(
-    `<div class="foot">Source: ${esc(model.source)} · ${esc(
-      model.generatedAt,
-    )} · Aria overdue-bills report</div>`,
+    `<div class="foot">Source: ${esc(model.source)} · ${esc(model.generatedAt)} · ${
+      model.excluded.length > 0
+        ? `${model.excluded.length} FedEx bills (${money(model.excludedAmount)}) excluded, paid by CC autopay · `
+        : ""
+    }Aria overdue-bills report</div>`,
   );
   parts.push(`</body></html>`);
   return parts.join("\n");
@@ -700,14 +682,6 @@ export function onTimeNotes(model: OverdueModel): string[] {
       `<b>Protect the top relationship.</b> ${esc(biggest.vendor)} is ${money(
         biggest.amount,
       )} across ${biggest.count} bills, oldest ${md(biggest.oldestDue)}. Call the rep before the first run, not after.`,
-    );
-  }
-
-  if (model.excluded.length > 0) {
-    notes.push(
-      `<b>Verify FedEx before releasing anything.</b> ${model.excluded.length} FedEx bills · ${money(
-        model.excludedAmount,
-      )} are in Bill.com. FedEx goes through the Billtrust batch, so these are likely duplicate entries — clear them out of Bill.com rather than paying twice.`,
     );
   }
 

@@ -16,6 +16,7 @@ import {
   isoFromUs,
   money,
   parseBillsCsv,
+  renderOverdueHtml,
   selectOverdue,
   sumAmount,
 } from "./overdue-bills";
@@ -131,11 +132,18 @@ describe("buildPaymentPlan", () => {
 describe("buildOverdueModel", () => {
   const model = buildOverdueModel(CSV, AS_OF, "fixture.csv", "2026-10-26T14:00:00Z");
 
-  it("separates verify-only vendors from the payable stack", () => {
+  it("drops excluded vendors (FedEx, CC autopay) from every total", () => {
     expect(model.excluded.map((b) => b.invoiceNo)).toEqual(["9-388-19130"]);
     expect(model.excludedAmount).toBe(16589.6);
     expect(model.totalOverdue).toBeCloseTo(411.73 + 650 + 81, 2);
     expect(model.totalOverdueIncludingExcluded).toBeCloseTo(411.73 + 650 + 81 + 16589.6, 2);
+  });
+
+  it("keeps excluded invoices out of the rendered report body", () => {
+    const html = renderOverdueHtml(model);
+    expect(html).not.toContain("9-388-19130");
+    expect(html).not.toContain("Verify Before Release");
+    expect(html).toContain("paid by CC autopay");
   });
 
   it("reports aging buckets that reconcile to the payable total", () => {
