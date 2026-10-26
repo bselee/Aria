@@ -58,17 +58,23 @@ async function main(): Promise<void> {
   const send = process.argv.includes("--send");
   const asOf = arg("asof") || denverToday();
   const csvPath = arg("csv") || DEFAULT_CSV;
+  const paymentsPath = arg("payments");
 
   if (!fs.existsSync(csvPath)) {
     throw new Error(`CSV not found: ${csvPath}`);
   }
+  if (paymentsPath && !fs.existsSync(paymentsPath)) {
+    throw new Error(`Payments CSV not found: ${paymentsPath}`);
+  }
 
   const csvText = fs.readFileSync(csvPath, "utf8");
+  const paymentsCsv = paymentsPath ? fs.readFileSync(paymentsPath, "utf8") : undefined;
   const model = buildOverdueModel(
     csvText,
     asOf,
     path.basename(csvPath),
     new Date().toLocaleString("en-US", { timeZone: "America/Denver" }),
+    paymentsCsv,
   );
 
   if (model.overdue.length === 0) {
@@ -85,6 +91,15 @@ async function main(): Promise<void> {
 
   console.log(`WROTE ${pdfPath}`);
   console.log(`${model.overdue.length} bills ${money(model.totalOverdue)} past due`);
+  if (model.paymentSummary) {
+    console.log(
+      `applied ${model.paymentSummary.applied.length} payments ${money(
+        model.paymentSummary.totalApplied,
+      )} · unapplied ${model.paymentSummary.unappliedCount} ${money(
+        model.paymentSummary.totalUnapplied,
+      )}`,
+    );
+  }
   for (const g of model.exclusionSummary) {
     console.log(
       `excluded ${g.count} bills ${money(g.amount)}: ${g.vendors.join(", ")} (${g.reason})`,

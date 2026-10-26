@@ -14,7 +14,12 @@
  *  - Runs are Friday-dated because BuildASoil releases payments on Fridays.
  *  - FedEx is flagged, never planned: per standing SOP FedEx invoices are paid
  *    through the Billtrust/COLL batch and must not be released from Bill.com.
+ *  - An optional Payments Out export is netted against balances, so the report
+ *    shows what is still owed after the batch that has already gone out.
  */
+
+import type { AllocatedPayment } from "./payments-out";
+import { applyPayments, billKey, parsePaymentsCsv } from "./payments-out";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,6 +44,10 @@ export interface BillRecord {
 /** A bill past its due date, with the age that drives prioritisation. */
 export interface OverdueBill extends BillRecord {
   daysOverdue: number;
+  /** Balance before payments out were applied. */
+  originalBalance: number;
+  /** Amount already applied from the Payments Out export. */
+  paidAmount: number;
 }
 
 /** Aging bucket label used in the summary strip. */
@@ -72,6 +81,13 @@ export interface OverdueModel {
   excludedAmount: number;
   /** Excluded rows rolled up by reason, for a single summary line. */
   exclusionSummary: { reason: string; count: number; amount: number; vendors: string[] }[];
+  /** Payments Out netting, present only when a payments export was supplied. */
+  paymentSummary: {
+    applied: AllocatedPayment[];
+    totalApplied: number;
+    unappliedCount: number;
+    totalUnapplied: number;
+  } | null;
   runs: PaymentRun[];
   buckets: { bucket: AgingBucket; count: number; amount: number }[];
   vendors: { vendor: string; count: number; amount: number; oldestDue: string }[];
@@ -310,11 +326,33 @@ export function bucketOf(days: number): AgingBucket {
   return "1-14";
 }
 
-/** Select past-due bills, oldest first (ties broken by vendor then invoice). */
+/** A bill carrying the pre-payment balance for the detail table. */
+export interface BillWithBalance extends BillRecord {
+  /** Balance before any Payments Out netting. */
+  originalBalance: number;
+  /** Amount applied from the Payments Out export. */
+  paidAmount: number;
+}
+
+/**
+ * Select past-due bills, oldest first (ties broken by vendor then invoice).
+ * Accepts plain bill rows or rows already carrying payment netting.
+ */
 export function selectOverdue(bills: BillRecord[], asOf: string): OverdueBill[] {
   return bills
     .filter((b) => b.dueDate !== "" && b.balanceDue > 0 && daysBetween(b.dueDate, asOf) > 0)
-    .map((b) => ({ ...b, daysOverdue: daysBetween(b.dueDate, asOf) }))
+    .map((b) => {
+      const withBalance = b as Partial<BillWithBalance>;
+      return {
+        ...b,
+        originalBalance:
+          typeof withBalance.originalBalance === "number"
+            ? withBalance.originalBalance
+            : b.balanceDue,
+        paidAmount: typeof withBalance.paidAmount === "number" ? withBalance.paidAmount : 0,
+        daysOverdue: daysBetween(b.dueDate, asOf),
+      };
+    })
     .sort(
       (a, b) =>
         a.dueDate.localeCompare(b.dueDate) ||
@@ -434,18 +472,33 @@ export function vendorTotals(overdue: OverdueBill[]): OverdueModel["vendors"] {
 
 /**
  * Build the complete report model from raw CSV text.
- * @param csvText  Contents of the Bill.com All Bills export.
- * @param asOf     ISO as-of date (aging reference).
- * @param source   Label written in the PDF footer.
+ * @param csvText     Contents of the Bill.com All Bills export.
+ * @param asOf        ISO as-of date (aging reference).
+ * @param source      Label written in the PDF footer.
  * @param generatedAt ISO timestamp of generation.
+ * @param paymentsCsv Optional Bill.com Payments Out export to net off balances.
  */
 export function buildOverdueModel(
   csvText: string,
   asOf: string,
   source: string,
   generatedAt: string,
+  paymentsCsv?: string,
 ): OverdueModel {
-  const bills = parseBillsCsv(csvText);
+  const parsed = parseBillsCsv(csvText);
+  const allocation = paymentsCsv ? applyPayments(parsed, parsePaymentsCsv(paymentsCsv), asOf) : null;
+
+  // Net applied payments off the balance; keep the original for the detail table.
+  const bills = parsed.map((b) => {
+    const paidAmount = allocation?.paidByBill.get(billKey(b)) ?? 0;
+    const originalBalance = b.balanceDue;
+    return {
+      ...b,
+      originalBalance,
+      paidAmount,
+      balanceDue: Math.max(0, Number((originalBalance - paidAmount).toFixed(2))),
+    };
+  });
   const allOverdue = selectOverdue(bills, asOf);
   const excluded = allOverdue.filter((b) => isExcludedVendor(b.vendor));
   const overdue = allOverdue.filter((b) => !isExcludedVendor(b.vendor));
@@ -480,6 +533,14 @@ export function buildOverdueModel(
     excluded,
     excludedAmount: sumAmount(excluded),
     exclusionSummary,
+    paymentSummary: allocation
+      ? {
+          applied: allocation.rows.filter((r) => r.applied > 0),
+          totalApplied: allocation.totalApplied,
+          unappliedCount: allocation.unapplied.length,
+          totalUnapplied: allocation.totalUnapplied,
+        }
+      : null,
     totalOverdue: sumAmount(overdue),
     totalOverdueIncludingExcluded: sumAmount(allOverdue),
     runs: buildPaymentPlan(allOverdue, asOf, bills, 3),
@@ -538,6 +599,8 @@ const CSS = `
   .run-detail { font-size: 8pt; color: #444; }
   .bill-vendor { width: 26%; } .bill-inv { width: 14%; } .bill-po { width: 8%; }
   .bill-due { width: 9%; } .bill-sched { width: 9%; } .bill-amt { width: 12%; }
+  .bill-paid { width: 10%; }
+  .pay-method { width: 16%; } .pay-status { width: 14%; }
 `;
 
 /**
@@ -570,6 +633,18 @@ export function renderOverdueHtml(model: OverdueModel): string {
       model.totalOverdue,
     )}</b> past due</p>`,
   );
+  if (model.paymentSummary) {
+    const ps = model.paymentSummary;
+    parts.push(
+      `<p class="summary" style="font-size:7.5pt;color:#666">Payments out applied: ${ps.applied.length} payments, ${money(
+        ps.totalApplied,
+      )} netted against balances${
+        ps.unappliedCount > 0
+          ? ` · ${ps.unappliedCount} with ${money(ps.totalUnapplied)} unapplied (no open bill)`
+          : ""
+      }</p>`,
+    );
+  }
   if (model.exclusionSummary.length > 0) {
     const line = model.exclusionSummary
       .map(
@@ -639,13 +714,15 @@ export function renderOverdueHtml(model: OverdueModel): string {
   // Detail, oldest first
   parts.push(`<div><h2>Past Due — Oldest First</h2>`);
   parts.push(
-    `<p class="summary">${model.overdue.length} bills · ${money(model.totalOverdue)} · oldest ${
+    `<p class="summary">${model.overdue.length} bills · ${money(
+      model.overdue.reduce((a, b) => a + b.originalBalance, 0),
+    )} billed · ${money(model.totalOverdue)} remaining · oldest ${
       model.overdue.length ? `${model.overdue[0].daysOverdue} days` : "—"
     }</p>`,
   );
   parts.push(`<table>
-  <col class="bill-vendor"><col class="bill-inv"><col class="bill-due"><col class="days"><col class="bill-amt"><col class="bill-sched">
-  <thead><tr><th>Vendor</th><th>Invoice #</th><th>Date due</th><th class="days">Days</th><th class="amt">Amount</th><th>Scheduled</th></tr></thead>
+  <col class="bill-vendor"><col class="bill-inv"><col class="bill-due"><col class="days"><col class="bill-amt"><col class="bill-paid"><col class="bill-amt">
+  <thead><tr><th>Vendor</th><th>Invoice #</th><th>Date due</th><th class="days">Days</th><th class="amt">Amount</th><th class="amt">Paid</th><th class="amt">Remaining</th></tr></thead>
   <tbody>`);
   for (const b of model.overdue) {
     const cls = b.daysOverdue > 60 ? ' class="crit"' : "";
@@ -653,16 +730,50 @@ export function renderOverdueHtml(model: OverdueModel): string {
       `<tr${cls}><td>${esc(b.vendor)}</td><td>${esc(b.invoiceNo)}</td><td>${md(
         b.dueDate,
       )}</td><td class="days">${b.daysOverdue}</td><td class="amt">${money(
+        b.originalBalance,
+      )}</td><td class="amt">${b.paidAmount > 0 ? money(b.paidAmount) : "—"}</td><td class="amt">${money(
         b.balanceDue,
-      )}</td><td>${b.processDate ? md(b.processDate) : "—"}</td></tr>`,
+      )}</td></tr>`,
     );
   }
+  const originalTotal = model.overdue.reduce((a, b) => a + b.originalBalance, 0);
+  const paidTotal = model.overdue.reduce((a, b) => a + b.paidAmount, 0);
   parts.push(
     `<tr class="total-row"><td>Total</td><td></td><td></td><td class="days"></td><td class="amt">${money(
+      originalTotal,
+    )}</td><td class="amt">${paidTotal > 0 ? money(paidTotal) : "—"}</td><td class="amt">${money(
       model.totalOverdue,
-    )}</td><td></td></tr>`,
+    )}</td></tr>`,
   );
   parts.push(`</tbody></table></div>`);
+
+  // Payments out applied
+  if (model.paymentSummary && model.paymentSummary.applied.length > 0) {
+    const ps = model.paymentSummary;
+    parts.push(`<div class="keep"><h2>Payments Out Applied</h2>`);
+    parts.push(
+      `<p class="summary">${ps.applied.length} payments · ${money(
+        ps.totalApplied,
+      )} netted against the bills above</p>`,
+    );
+    parts.push(`<table>
+    <col class="bill-vendor"><col class="bill-inv"><col class="pay-method"><col class="pay-status"><col class="bill-amt">
+    <thead><tr><th>Vendor</th><th>Invoice #</th><th>Method</th><th>Status</th><th class="amt">Amount</th></tr></thead>
+    <tbody>`);
+    for (const row of ps.applied) {
+      parts.push(
+        `<tr><td>${esc(row.payment.vendor)}</td><td>${esc(row.payment.invoiceNumber)}</td><td>${esc(
+          row.payment.method,
+        )}</td><td>${esc(row.payment.status)}</td><td class="amt">${money(row.applied)}</td></tr>`,
+      );
+    }
+    parts.push(
+      `<tr class="total-row"><td>Total</td><td></td><td></td><td></td><td class="amt">${money(
+        ps.totalApplied,
+      )}</td></tr>`,
+    );
+    parts.push(`</tbody></table></div>`);
+  }
 
   // Coming due
   if (model.futureDue.length > 0) {
@@ -704,6 +815,20 @@ export function renderOverdueHtml(model: OverdueModel): string {
  */
 export function onTimeNotes(model: OverdueModel): string[] {
   const notes: string[] = [];
+  if (model.paymentSummary && model.paymentSummary.totalApplied > 0) {
+    notes.push(
+      `<b>Batch already out.</b> ${model.paymentSummary.applied.length} payments totalling ${money(
+        model.paymentSummary.totalApplied,
+      )} are netted against these bills, so the plan above covers only the remainder.`,
+    );
+  }
+  if (model.paymentSummary && model.paymentSummary.unappliedCount > 0) {
+    notes.push(
+      `<b>Unapplied payments.</b> ${model.paymentSummary.unappliedCount} payments (${money(
+        model.paymentSummary.totalUnapplied,
+      )}) had no matching open bill in this export. Confirm they landed on invoices already off the report.`,
+    );
+  }
   const offFridayBills = model.overdue.filter((b) => {
     if (!b.processDate) return false;
     return new Date(`${b.processDate}T00:00:00Z`).getUTCDay() !== 5;
