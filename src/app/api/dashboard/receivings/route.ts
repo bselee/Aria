@@ -13,8 +13,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
-import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive } from '@/lib/purchasing/invoice-pool';
+import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive, invoiceNumberFromAttachment } from '@/lib/purchasing/invoice-pool';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
+import { sanitizeOcrPoCandidate } from '@/lib/purchasing/ocr-po-sanitize';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
@@ -311,9 +312,11 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             // Only skip confirmed matches — OCR may set po_number as candidate
                             if (row.matched_po) continue;
                             seen.add(key);
+                            const invoiceNumber = invoiceNumberFromAttachment(row.vendor_invoice_id, row.invoice_number);
+                            const ocrPo = sanitizeOcrPoCandidate(row.po_number);
                             unmatchedInvoices.push({
                                 id: row.vendor_invoice_id || key,
-                                invoice_number: row.invoice_number,
+                                invoice_number: invoiceNumber,
                                 vendor_name: row.vendor_name,
                                 invoice_date: row.invoice_date,
                                 subtotal: row.total || 0,
@@ -329,7 +332,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         }
                                     })(),
                                     source: 'invoice_cache',
-                                    ocrPoCandidate: row.po_number || null,
+                                    ocrPoCandidate: ocrPo,
                                 },
                                 _fromCache: true,
                             });
@@ -341,24 +344,37 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         if (seen.has(key)) continue;
                         if (row.matched_po) continue;
                         seen.add(key);
-                        unmatchedInvoices.push({
-                            id: row.vendor_invoice_id || key,
-                            invoice_number: row.invoice_number,
-                            vendor_name: row.vendor_name,
-                            invoice_date: row.invoice_date,
-                            subtotal: row.total || 0,
-                            freight: row.freight || 0,
-                            tax: row.tax || 0,
-                            total: row.total || 0,
-                            raw_data: {
-                                source: 'invoice_cache',
-                                ocrPoCandidate: row.po_number || null,
-                            },
-                            _fromCache: true,
-                        });
+                            const invoiceNumber = invoiceNumberFromAttachment(row.vendor_invoice_id, row.invoice_number);
+                            const ocrPo = sanitizeOcrPoCandidate(row.po_number);
+                            unmatchedInvoices.push({
+                                id: row.vendor_invoice_id || key,
+                                invoice_number: invoiceNumber,
+                                vendor_name: row.vendor_name,
+                                invoice_date: row.invoice_date,
+                                subtotal: row.total || 0,
+                                freight: row.freight || 0,
+                                tax: row.tax || 0,
+                                total: row.total || 0,
+                                raw_data: {
+                                    source: 'invoice_cache',
+                                    ocrPoCandidate: ocrPo,
+                                },
+                                _fromCache: true,
+                            });
                     }
                 } catch (cacheErr: any) {
                     console.warn('[receivings] invoice_cache fallback failed:', cacheErr?.message || cacheErr);
+                }
+
+                const recoveredNumbers = unmatchedInvoices.map((i: any) => i.invoice_number).filter(Boolean);
+                if (recoveredNumbers.length > 0) {
+                    const { data: alreadyLinked } = await sb
+                        .from('vendor_invoices')
+                        .select('invoice_number')
+                        .in('invoice_number', recoveredNumbers)
+                        .not('po_number', 'is', null);
+                    const linked = new Set((alreadyLinked || []).map((r: any) => r.invoice_number));
+                    unmatchedInvoices = unmatchedInvoices.filter((i: any) => !linked.has(i.invoice_number));
                 }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
@@ -397,8 +413,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     // GET is paint-only. Auto-match writes belong on POST/cron.
                                     const scoredResults = await mapConcurrent(scoreList, 4, async (inv) => {
                                         // OCR short-circuit: no DB call needed — still never offer dropship POs
-                                        const ocrPo = inv.raw_data?.ocrPoCandidate || inv.po_number || null;
-                                        if (inv._fromCache && ocrPo && !/DropshipPO/i.test(String(ocrPo))) {
+                                        const ocrPo = sanitizeOcrPoCandidate(inv.raw_data?.ocrPoCandidate || inv.po_number || null);
+                                        if (inv._fromCache && ocrPo) {
                                             return {
                                                 inv,
                                                 status: 'ocr' as const,

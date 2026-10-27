@@ -10,6 +10,8 @@ import {
     isJunkInvoiceNumber,
     isPhantomInvoiceRow,
     isCarrierFreightArchive,
+    invoiceNumberFromAttachment,
+    isJunkInvoiceLabel,
     firstRealInvoice,
 } from "./invoice-pool";
 
@@ -52,6 +54,18 @@ describe("isPhantomInvoiceRow", () => {
         // survive (2026-10-27 regression: this row was rejected, blanking the
         // whole Receivings panel).
         expect(isPhantomInvoiceRow({ vendor_name: null, invoice_number: "9488427" })).toBe(false);
+    });
+});
+
+describe("invoiceNumberFromAttachment", () => {
+    it("keeps a real number and recovers Uline's from the filename", () => {
+        expect(invoiceNumberFromAttachment("apfwd:x:Uline_Invoice_215047605_216827642_1.pdf", "BERINVOICE")).toBe("215047605");
+        expect(invoiceNumberFromAttachment("apfwd:x:Uline_Invoice_212698005_1.pdf", "212698005")).toBe("212698005");
+    });
+    it("returns null when both sides are header words", () => {
+        expect(invoiceNumberFromAttachment("apfwd:x:scan.pdf", "BERINVOICE")).toBeNull();
+        expect(isJunkInvoiceLabel("BERINVOICE")).toBe(true);
+        expect(isJunkInvoiceLabel("215047605")).toBe(false);
     });
 });
 

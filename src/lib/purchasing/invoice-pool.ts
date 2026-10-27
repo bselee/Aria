@@ -34,6 +34,39 @@ const JUNK_INVOICE_NUMBERS = new Set([
     "nan",
 ]);
 
+const JUNK_INVOICE_LABELS = new Set([
+    "berinvoice",
+    "invoice",
+    "number",
+    "invoicenumber",
+    "unknown",
+    "error",
+    "null",
+    "nan",
+]);
+
+/** Header-word invoice numbers ("BERINVOICE") are OCR jams, not documents. */
+export function isJunkInvoiceLabel(invoiceNumber: string | null | undefined): boolean {
+    const n = String(invoiceNumber ?? "").replace(/\s+/g, "").toLowerCase();
+    if (!n) return true;
+    return JUNK_INVOICE_LABELS.has(n);
+}
+
+/**
+ * Recover a real invoice number from an attachment id when OCR stored a
+ * header word. `apfwd:…:Uline_Invoice_215047605_216827642_1.pdf` → 215047605.
+ */
+export function invoiceNumberFromAttachment(
+    attachmentId: string | null | undefined,
+    current: string | null | undefined,
+): string | null {
+    const cur = String(current ?? "").trim();
+    if (cur && !isJunkInvoiceLabel(cur)) return cur;
+    const id = String(attachmentId ?? "");
+    const named = id.match(/Invoice[_-](\d{6,})/i);
+    return named ? named[1] : null;
+}
+
 function norm(value: string | null | undefined): string {
     return String(value ?? "").replace(/\s+/g, "").toLowerCase();
 }
