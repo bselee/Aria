@@ -5,7 +5,7 @@
  * @created 2026-10-27
  */
 import { describe, expect, it } from "vitest";
-import { isPaidInAdvanceVendor } from "./paid-in-advance-vendors";
+import { isPaidInAdvanceVendor, isBilledUpfrontVendor } from "./paid-in-advance-vendors";
 
 describe("isPaidInAdvanceVendor", () => {
     it("matches the named class and close spellings", () => {
@@ -20,5 +20,13 @@ describe("isPaidInAdvanceVendor", () => {
         expect(isPaidInAdvanceVendor("Rootwise Soil Dynamics")).toBe(false);
         expect(isPaidInAdvanceVendor("Colorado Worm Company")).toBe(false);
         expect(isPaidInAdvanceVendor(null)).toBe(false);
+    });
+});
+
+describe("isBilledUpfrontVendor", () => {
+    it("matches New Moon and not a normal vendor", () => {
+        expect(isBilledUpfrontVendor("New Moon Development Co")).toBe(true);
+        expect(isBilledUpfrontVendor("NEWMOONDEVCO")).toBe(true);
+        expect(isBilledUpfrontVendor("ULINE")).toBe(false);
     });
 });

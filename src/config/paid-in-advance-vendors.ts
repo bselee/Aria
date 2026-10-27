@@ -19,6 +19,12 @@ const PAID_IN_ADVANCE = [
     "colorful packaging",
 ];
 
+/** Bills the whole PO before the shipments finish. Invoice number in Bill.com is the PO number. */
+const BILLED_UPFRONT = [
+    "new moon",
+    "newmoon",
+];
+
 function norm(name: string): string {
     return name.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -32,4 +38,12 @@ export function isPaidInAdvanceVendor(vendorName: string | null | undefined): bo
     if (!n) return false;
     const compact = n.replace(/ /g, "");
     return PAID_IN_ADVANCE.some((key) => n.includes(key) || compact.includes(key.replace(/ /g, "")));
+}
+
+/** True when the vendor bills the full PO up front and then delivers in parts. */
+export function isBilledUpfrontVendor(vendorName: string | null | undefined): boolean {
+    const n = norm(String(vendorName ?? ""));
+    if (!n) return false;
+    const compact = n.replace(/ /g, "");
+    return BILLED_UPFRONT.some((key) => n.includes(key) || compact.includes(key.replace(/ /g, "")));
 }

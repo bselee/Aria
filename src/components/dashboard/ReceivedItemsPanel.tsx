@@ -6,7 +6,7 @@ import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import InvoicePOMatcher from "./InvoicePOMatcher";
-import { isPaidInAdvanceVendor } from "@/config/paid-in-advance-vendors";
+import { isPaidInAdvanceVendor, isBilledUpfrontVendor } from "@/config/paid-in-advance-vendors";
 
 type ReceivedPO = {
     orderId: string;
@@ -580,6 +580,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         cls = hasChanges
                             ? "text-blue-400 border-blue-500/30 bg-blue-500/10"
                             : "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
+                    } else if (st === "received" || st === "forwarded" || st === "invoiced") {
+                        label = "INVOICED";
+                        cls = "text-cyan-300 border-cyan-500/30 bg-cyan-500/10";
                     } else if (st === "unmatched") {
                         label = "UNMATCHED";
                         cls = "text-zinc-400 border-zinc-500/30 bg-zinc-500/10";
@@ -1079,6 +1082,18 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             },
                                                         };
                                                     }
+                                                    if (isPartial && hasOpenQty) {
+                                                        const inv = rec?.matchedInvoice;
+                                                        const open = po.items.reduce((sum, i) => sum + (i.openQuantity ?? 0), 0);
+                                                        if (inv || isBilledUpfrontVendor(po.supplier)) {
+                                                            const num = inv?.invoice_number && inv.invoice_number !== "1" ? inv.invoice_number : po.orderId;
+                                                            const dollars = inv ? ` $${Number(inv.total || 0).toFixed(0)}` : "";
+                                                            const lead = isBilledUpfrontVendor(po.supplier) ? "Billed upfront" : "Invoice on file";
+                                                            const where = isBilledUpfrontVendor(po.supplier) ? "already in Bill.com" : "already billed";
+                                                            return { text: `${lead} — invoice ${num}${dollars} ${where}. ${open.toLocaleString()} still open.`, button: undefined };
+                                                        }
+                                                        return { text: "Partial receipt — backorder remains", button: undefined };
+                                                    }
                                                     if (rec?.matchedInvoice) {
                                                         return {
                                                             text: `Invoice ${rec.matchedInvoice.invoice_number} $${rec.matchedInvoice.total?.toFixed(2)} matched — verify, then complete`,
@@ -1122,9 +1137,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 onClick: () => approveReconciliation(po.orderId),
                                                             },
                                                         };
-                                                    }
-                                                    if (isPartial && hasOpenQty) {
-                                                        return { text: "Partial receipt — backorder remains", button: undefined };
                                                     }
                                                     if (hasInvoice) {
                                                         return {
