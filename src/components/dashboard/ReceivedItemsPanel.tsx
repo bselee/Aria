@@ -40,7 +40,8 @@ type ReceivedPO = {
         outcomes: Array<{ outcome: string; created_at: string; resolved_at: string | null }>;
         hasPendingApproval: boolean;
         hasAutoApplied: boolean;
-        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
+        vendorHasUnlinkedBills?: boolean;
+        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
 };
 
@@ -157,23 +158,22 @@ function relativeSku(item: ReceivedPO["items"][number]): string {
     return `${item.productId} ${fmtQty(received)}/${fmtQty(ordered)}`;
 }
 
-function getNextActionText(po: ReceivedPO, apLabel: string): string {
-    const receiptStatus = getDynamicReceiptStatus(po);
-    const isPartial = receiptStatus === "partial";
-    const hasOpenQty = po.items.some(i => (i.openQuantity ?? 0) > 0);
-    const hasInvoice = apLabel !== "UNMATCHED" && apLabel !== "";
-    const isReconciled = apLabel === "RECONCILED" || apLabel === "RECONCILED ±" || receiptStatus === "full" && apLabel === "RECONCILED";
-    const isPendingReview = apLabel === "PENDING";
-    const hasDiscrepancy = apLabel === "RECONCILED ±";
-    const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
+/** Junk OCR invoice numbers that must never be printed as a bill identity. */
+const JUNK_BILL_NUMBERS = new Set(["error", "unknown", "null", "nan", "1", "berinvoice"]);
 
-    if (isComplete) return "✅ PO closed — no action needed";
-    if (hasDiscrepancy && isReconciled) return "⚠️ Reconciled with pricing differences — verify final amounts";
-    if (hasDiscrepancy) return "⚠️ Invoice $ differs from PO $ — resolve with vendor";
-    if (isPendingReview) return "🔍 Invoice matched — review & approve reconciliation";
-    if (isPartial && hasOpenQty) return "🔄 Partial receipt — backorder remains";
-    if (hasInvoice) return "📋 Verify invoice matches PO qty & price";
-    return "📋 Awaiting invoice match";
+/**
+ * Canonical bill identifier: `bill 125377 $7,875`, or `bill $2,688` when the
+ * OCR failed to read a number (identityUnknown). One wording everywhere.
+ */
+function billLabel(
+    mi: { invoice_number?: string | null; total?: number | null } | null | undefined,
+): string {
+    if (!mi) return "";
+    const num = String(mi.invoice_number || "");
+    const dollars = `$${Number(mi.total || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+    const clean = num.trim().toLowerCase();
+    if (!clean || JUNK_BILL_NUMBERS.has(clean)) return `bill ${dollars}`;
+    return `bill ${num} ${dollars}`;
 }
 
 function daysSince(dateStr: string | undefined | null): number | null {
@@ -1060,7 +1060,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             })}
                                             {po._reconciliation?.matchedInvoice && (
                                                 <span className="text-[10px] font-mono text-cyan-300/90">
-                                                    bill {po._reconciliation.matchedInvoice.invoice_number} ${Number(po._reconciliation.matchedInvoice.total || 0).toFixed(0)}
+                                                    {billLabel(po._reconciliation.matchedInvoice)}
                                                 </span>
                                             )}
                                             {po.items.length > 3 && (
@@ -1142,6 +1142,15 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                 const isPendingReview = apLabel === "PENDING";
                                                 const hasDiscrepancy = apLabel === "RECONCILED ±";
                                                 const isComplete = isReconciled && receiptStatus === "full" && !hasDiscrepancy;
+                                                const receiptKnown = po.items.some(i => i.receivedQuantity !== undefined);
+                                                // ── Canonical vocabulary (2026-10-27) ────────────────────────
+                                                // Every state line is one fixed phrase from this set:
+                                                //   Done — …          · Approve … vs PO …
+                                                //   Billed upfront — …· Bill on file $N. X still open.
+                                                //   Partial receipt. … · Full receipt. … · Receipt recorded. …
+                                                //   Pricing differences — … · Paid in advance.
+                                                const receiptLead = !receiptKnown ? "Receipt recorded" : isPartial ? "Partial receipt" : "Full receipt";
+                                                const openTotal = po.items.reduce((sum, i) => sum + (i.openQuantity ?? 0), 0);
 
                                                 // ── One plain state line + at most one action ──
                                                 // Order of checks mirrors the pre-2026-10-27 stepper
@@ -1152,7 +1161,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     }
                                                     if (rec?.hasPendingApproval && rec?.matchedInvoice) {
                                                         return {
-                                                            text: `Invoice ${rec.matchedInvoice.invoice_number} $${rec.matchedInvoice.total?.toFixed(2)} vs PO $${po.total?.toLocaleString()} — approve to complete`,
+                                                            text: `Approve ${billLabel(rec.matchedInvoice)} vs PO $${Number(po.total || 0).toFixed(0)}`,
                                                             button: {
                                                                 text: "Approve & Complete",
                                                                 tone: "warning",
@@ -1163,19 +1172,21 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     }
                                                     if (isPartial && hasOpenQty) {
                                                         const inv = rec?.matchedInvoice;
-                                                        const open = po.items.reduce((sum, i) => sum + (i.openQuantity ?? 0), 0);
-                                                        if (inv || isBilledUpfrontVendor(po.supplier)) {
-                                                            const num = inv?.invoice_number && inv.invoice_number !== "1" ? inv.invoice_number : po.orderId;
-                                                            const dollars = inv ? ` $${Number(inv.total || 0).toFixed(0)}` : "";
-                                                            const lead = isBilledUpfrontVendor(po.supplier) ? "Billed upfront" : "Invoice on file";
-                                                            const where = isBilledUpfrontVendor(po.supplier) ? "already in Bill.com" : "already billed";
-                                                            return { text: `${lead} — invoice ${num}${dollars} ${where}. ${open.toLocaleString()} still open.`, button: undefined };
+                                                        if (isBilledUpfrontVendor(po.supplier)) {
+                                                            return { text: `Billed upfront — invoice ${po.orderId} $${Number(inv?.total || po.total || 0).toFixed(0)} in Bill.com. ${openTotal.toLocaleString()} still open.`, button: undefined };
                                                         }
-                                                        return { text: "Partial receipt — backorder remains", button: undefined };
+                                                        if (inv) {
+                                                            return { text: `Bill on file $${Number(inv.total || 0).toFixed(0)}. ${openTotal.toLocaleString()} still open.`, button: undefined };
+                                                        }
+                                                        if (isPaidInAdvanceVendor(po.supplier)) {
+                                                            return { text: `Partial receipt. ${openTotal.toLocaleString()} still open. Paid in advance.`, button: undefined };
+                                                        }
+                                                        const orderedTotal = po.items.reduce((sum, i) => sum + (i.orderedQuantity ?? i.quantity), 0);
+                                                        return { text: `Partial receipt. ${openTotal.toLocaleString()} of ${fmtQty(orderedTotal)} still open. No bill yet.`, button: undefined };
                                                     }
                                                     if (rec?.matchedInvoice) {
                                                         return {
-                                                            text: `Invoice ${rec.matchedInvoice.invoice_number} $${rec.matchedInvoice.total?.toFixed(2)} matched — verify, then complete`,
+                                                            text: `${receiptLead}. Verify ${billLabel(rec.matchedInvoice)} against the PO.`,
                                                             button: {
                                                                 text: "Complete PO",
                                                                 tone: "success",
@@ -1186,7 +1197,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     if (isComplete) {
                                                         return { text: "Done — matched and closed", button: undefined };
                                                     }
-                                                    if (hasDiscrepancy && isReconciled) {
+                                                    if (hasDiscrepancy) {
                                                         return {
                                                             text: "Pricing differences — review before completing",
                                                             button: {
@@ -1196,19 +1207,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             },
                                                         };
                                                     }
-                                                    if (hasDiscrepancy) {
-                                                        return {
-                                                            text: "Invoice $ differs from PO $ — resolve with vendor",
-                                                            button: {
-                                                                text: "Modify PO",
-                                                                tone: "danger",
-                                                                onClick: () => toggleModifier(po.orderId, rec?.matchedInvoice?.invoice_number),
-                                                            },
-                                                        };
-                                                    }
                                                     if (isPendingReview) {
                                                         return {
-                                                            text: "Invoice matched — review line items and approve",
+                                                            text: "Approve — review line items first",
                                                             button: {
                                                                 text: "Approve",
                                                                 tone: "warning",
@@ -1219,7 +1220,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     }
                                                     if (hasInvoice) {
                                                         return {
-                                                            text: "Received in full — verify invoice matches the PO",
+                                                            text: `${receiptLead}. Verify bill matches the PO.`,
                                                             button: {
                                                                 text: "Verify & Complete",
                                                                 tone: "success",
@@ -1228,9 +1229,12 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         };
                                                     }
                                                     if (isPaidInAdvanceVendor(po.supplier)) {
-                                                        return { text: "Paid in advance", button: undefined };
+                                                        return { text: `${receiptLead}. Paid in advance.`, button: undefined };
                                                     }
-                                                    return { text: "Awaiting vendor invoice", button: undefined };
+                                                    if (rec?.vendorHasUnlinkedBills) {
+                                                        return { text: `${receiptLead}. Bill in AP — link to PO.`, button: undefined };
+                                                    }
+                                                    return { text: `${receiptLead}. No bill yet.`, button: undefined };
                                                 })();
 
                                                 const toneCls: Record<string, string> = {

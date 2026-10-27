@@ -292,4 +292,80 @@ describe("ReceivedItemsPanel", () => {
     expect(await screen.findByText(/inv 96/i)).toBeTruthy();
     expect(screen.getByText(/±weight/i)).toBeTruthy();
   });
+
+  it("names an OCR-identity bill by dollars and never says awaiting", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-800",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "Miles Filippelli",
+          total: 3140,
+          items: [{ productId: "BASLPE102", quantity: 100, orderedQuantity: 100, receivedQuantity: 100, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "error", subtotal: 0, freight: 0, tax: 0, total: 2688, status: "received", identityUnknown: true },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect((await screen.findAllByText(/bill \$2,688/i)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Awaiting vendor invoice/i)).toBeNull();
+    expect(screen.getByText(/Verify bill \$2,688 against the PO/i)).toBeTruthy();
+  });
+
+  it("says bill in AP instead of awaiting when the vendor has unlinked bills", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-900",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "ULINE",
+          total: 2996,
+          items: [{ productId: "S-4738", quantity: 1000, orderedQuantity: 1000, receivedQuantity: 1000, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            vendorHasUnlinkedBills: true,
+            matchedInvoice: null,
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Bill in AP — link to PO/i)).toBeTruthy();
+    expect(screen.queryByText(/Awaiting vendor invoice/i)).toBeNull();
+  });
 });

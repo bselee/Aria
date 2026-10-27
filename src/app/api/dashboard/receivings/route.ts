@@ -235,7 +235,11 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
                 const invoiceMap = new Map<string, any[]>();
                 for (const inv of (invoices || [])) {
-                    if (isCarrierFreightArchive(inv) || isPhantomInvoiceRow(inv)) continue;
+                    // Carrier freight archives never satisfy a goods bill. Phantom
+                    // rows (OCR "error" identity) STAY in the map — a row with real
+                    // money is a real bill whose OCR identity failed, and the row
+                    // must name it rather than say "awaiting vendor invoice".
+                    if (isCarrierFreightArchive(inv)) continue;
                     const key = inv.po_number;
                     if (!invoiceMap.has(key)) invoiceMap.set(key, []);
                     invoiceMap.get(key)!.push(inv);
@@ -250,8 +254,18 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
                 for (const po of received) {
                     const poNum = po.poNumber || po.orderId;
+                    // First real invoice wins; if every row is phantom-named but
+                    // one carries real money, surface it with identityUnknown so
+                    // the panel names the bill instead of "awaiting vendor invoice".
+                    const rows = invoiceMap.get(poNum) || [];
+                    const real = firstRealInvoice(rows);
+                    const moneyRow = real
+                        ? null
+                        : rows
+                            .filter((r: any) => Number(r.total || 0) > 1)
+                            .sort((a: any, b: any) => Number(b.total) - Number(a.total))[0] ?? null;
                     (po as any)._reconciliation = {
-                        invoices: invoiceMap.get(poNum) || [],
+                        invoices: rows,
                         outcomes: outcomeMap.get(poNum) || [],
                         hasPendingApproval: (outcomeMap.get(poNum) || []).some(
                             (o: any) => o.outcome === 'pending_approval' && !o.resolved_at
@@ -259,7 +273,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         hasAutoApplied: (outcomeMap.get(poNum) || []).some(
                             (o: any) => o.outcome === 'auto_applied'
                         ),
-                        matchedInvoice: firstRealInvoice(invoiceMap.get(poNum)),
+                        matchedInvoice: real ?? (moneyRow ? { ...moneyRow, identityUnknown: true } : null),
                     };
                 }
             }
@@ -523,6 +537,27 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         });
                                     }
                                 }
+                            }
+
+                            // ── Unlinked-bill presence (2026-10-27) ──────────────────
+                            // A received PO whose vendor has bills sitting in AP
+                            // with no PO link is NOT "awaiting vendor invoice" —
+                            // the bill arrived, it just is not linked yet. The
+                            // matchSuggestions list is exactly those bills, so
+                            // stamp each PO from it (case-insensitive; vendor
+                            // spellings drift: ULINE vs Uline).
+                            const unlinkedVendors = new Set(
+                                matchSuggestions.map((m) => String(m.vendorName || "").toLowerCase()).filter(Boolean),
+                            );
+                            for (const po of received) {
+                                const v = String(po.supplier || "").toLowerCase();
+                                if (!v) continue;
+                                const hit =
+                                    unlinkedVendors.has(v) ||
+                                    [...unlinkedVendors].some(
+                                        (u) => (v.length >= 8 && u.includes(v)) || (u.length >= 8 && v.includes(u)),
+                                    );
+                                (po as any)._reconciliation.vendorHasUnlinkedBills = hit;
                             }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
