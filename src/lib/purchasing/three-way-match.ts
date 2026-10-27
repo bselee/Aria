@@ -196,6 +196,10 @@ export function evaluateThreeWayMatch(input: ThreeWayMatchInput): ThreeWayMatchR
         const invoiceQtyBase = line.invoiceQty * pack;
         const invoiceUnitPriceBase = line.invoiceUnitPrice / pack;
         const receivedQty = line.receivedQty ?? 0;
+        // Unknown receipt ≠ zero receipt. A missing read must never fabricate an
+        // overbill ("billed N but received 0") nor a short/over-discrepancy.
+        // Skip the receipt-vs-invoice and receipt-vs-order checks when null.
+        const receiptKnown = line.receivedQty !== null && line.receivedQty !== undefined;
         const label = line.description ? `${line.productId} (${line.description})` : line.productId;
 
         // Invoice line that isn't on the PO at all.
@@ -212,7 +216,7 @@ export function evaluateThreeWayMatch(input: ThreeWayMatchInput): ThreeWayMatchR
 
         // ── Billing for more than was received. The cardinal 3-way failure. ──
         const qtyAllowance = Math.max(tol.qtyAbsUnits, receivedQty * tol.qtyOverPct);
-        if (invoiceQtyBase > receivedQty + qtyAllowance) {
+        if (receiptKnown && invoiceQtyBase > receivedQty + qtyAllowance) {
             const over = invoiceQtyBase - receivedQty;
             discrepancies.push({
                 productId: line.productId,
@@ -250,7 +254,7 @@ export function evaluateThreeWayMatch(input: ThreeWayMatchInput): ThreeWayMatchR
         // ── Informational: receipt vs order quantity ────────────────────────
         // A short shipment does not block paying for what DID arrive; it is
         // surfaced so the buyer can chase the balance or request a credit.
-        if (receivedQty > 0 && receivedQty < line.poQty - tol.qtyAbsUnits) {
+        if (receiptKnown && receivedQty > 0 && receivedQty < line.poQty - tol.qtyAbsUnits) {
             discrepancies.push({
                 productId: line.productId,
                 kind: "qty_short_received",
@@ -261,7 +265,7 @@ export function evaluateThreeWayMatch(input: ThreeWayMatchInput): ThreeWayMatchR
         }
 
         const overRecvAllowance = Math.max(tol.qtyAbsUnits, line.poQty * tol.qtyOverPct);
-        if (receivedQty > line.poQty + overRecvAllowance) {
+        if (receiptKnown && receivedQty > line.poQty + overRecvAllowance) {
             discrepancies.push({
                 productId: line.productId,
                 kind: "qty_over_received",

@@ -18,6 +18,7 @@ import { FinaleClient } from "@/lib/finale/client";
 import { createClient } from "@/lib/db";
 import { transitionLifecycleState } from "@/lib/purchasing/po-lifecycle";
 import { recordFreightEvidence } from "@/lib/purchasing/vendor-freight-learning";
+import { loadTrueReceiptQuantities, receiptShorts } from "@/lib/finale/receipt-quantities";
 import {
     computeInvoicePODiff,
     applyInvoiceModification,
@@ -278,6 +279,29 @@ export async function POST(req: NextRequest) {
             const { orderId, invoiceId } = body;
             if (!orderId) {
                 return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+            }
+
+            // ── Receipt gate (2026-10-27) ──────────────────────────────────
+            // Same rule as receivings complete_po: never close a PO whose
+            // goods have not all arrived. Read true per-SKU receipts from
+            // Finale shipments right now; a real short refuses with 409.
+            const receipt = await loadTrueReceiptQuantities(orderId);
+            if (!receipt) {
+                return NextResponse.json(
+                    { error: 'Could not read shipment receipts for this PO — not completing', orderId },
+                    { status: 502 },
+                );
+            }
+            const shorts = receiptShorts(receipt);
+            if (shorts.length > 0) {
+                const detail = shorts
+                    .map((s) => `${s.sku} ${s.received}/${s.ordered} short ${s.short}`)
+                    .join(' · ');
+                console.warn(`[po-modify] verify_and_complete refused for ${orderId}: ${detail}`);
+                return NextResponse.json(
+                    { error: `Goods not all received — ${detail}`, orderId, shorts },
+                    { status: 409 },
+                );
             }
 
             const finale = new FinaleClient();

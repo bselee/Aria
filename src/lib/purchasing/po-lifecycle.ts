@@ -250,10 +250,16 @@ export async function transitionLifecycleState(
 
                     if (invoiceData?.line_items && poData?.line_items) {
                             const { evaluateThreeWayMatch } = await import("./three-way-match");
+                            // ── True receipt quantities (2026-10-27) ─────────────
+                            // Never assume received = ordered. The old gate used
+                            // `pi.quantity` as receivedQty whenever a receive_date
+                            // existed, so a 50/250 partial receipt passed as full.
+                            const { loadTrueReceiptQuantities } = await import("@/lib/finale/receipt-quantities");
+                            const trueReceipt = await loadTrueReceiptQuantities(poNumber).catch(() => null);
                         const match = evaluateThreeWayMatch({
                             orderId: poNumber,
                             hasPurchaseOrder: !!poData,
-                            hasReceipt,
+                            hasReceipt: hasReceipt,
                             hasInvoice: !!invoiceData,
                                 lines: (poData.line_items ?? []).map((pi: any) => {
                                 const il = (invoiceData.line_items ?? []).find(
@@ -261,12 +267,15 @@ export async function transitionLifecycleState(
                                             l.sku === pi.productId ||
                                             l.description === pi.description,
                                 );
+                                const receivedQty = trueReceipt
+                                    ? trueReceipt.receivedBySku.get(pi.productId)
+                                    : null;
                                 return {
                                         productId:
                                             pi.productId ?? pi.sku ?? pi.description ?? "UNKNOWN",
                                     poQty: pi.quantity ?? 0,
                                     poUnitPrice: pi.unitPrice ?? 0,
-                                        receivedQty: hasReceipt ? pi.quantity ?? null : null,
+                                        receivedQty: receivedQty !== undefined ? receivedQty : null,
                                     invoiceQty: il?.qty ?? 0,
                                     invoiceUnitPrice: il?.unitPrice ?? 0,
                                 };

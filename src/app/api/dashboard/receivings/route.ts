@@ -19,6 +19,7 @@ import { sanitizeOcrPoCandidate } from '@/lib/purchasing/ocr-po-sanitize';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
+import { loadTrueReceiptQuantities, receiptShorts } from '@/lib/finale/receipt-quantities';
 
 // ── In-flight PO reconciliation guard ─────────────────────────────────────
 // Prevents concurrent Finale writes when two browser tabs / bust=1 calls
@@ -759,6 +760,32 @@ export async function POST(req: NextRequest) {
         if (action === 'complete_po') {
             const { orderId, vendorName, hadFreightOnPO, invoiceFreight, freightMatched } = body;
             if (!orderId) return NextResponse.json({ error: 'orderId required' }, { status: 400 });
+
+            // ── Receipt gate (2026-10-27) ──────────────────────────────────
+            // Complete is a financial close. It must never fire on a PO whose
+            // goods have not all arrived. Read the true per-SKU receipt from
+            // Finale shipment details right now; a real short refuses with 409.
+            // Billed-upfront vendors are NOT exempt: their bill already covers
+            // the whole PO, so completing while goods are short is exactly the
+            // mistake this gate exists to stop.
+            const receipt = await loadTrueReceiptQuantities(orderId);
+            if (!receipt) {
+                return NextResponse.json(
+                    { error: 'Could not read shipment receipts for this PO — not completing', orderId },
+                    { status: 502 },
+                );
+            }
+            const shorts = receiptShorts(receipt);
+            if (shorts.length > 0) {
+                const detail = shorts
+                    .map((s) => `${s.sku} ${s.received}/${s.ordered} short ${s.short}`)
+                    .join(' · ');
+                console.warn(`[receivings] complete_po refused for ${orderId}: ${detail}`);
+                return NextResponse.json(
+                    { error: `Goods not all received — ${detail}`, orderId, shorts },
+                    { status: 409 },
+                );
+            }
 
             const finale = new FinaleClient();
             const result = await finale.completeOrder(orderId);

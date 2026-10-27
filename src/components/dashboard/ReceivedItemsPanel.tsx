@@ -119,17 +119,6 @@ function getDynamicReceiptStatus(po: ReceivedPO): "full" | "partial" | "received
     return isFull ? "full" : "partial";
 }
 
-function receiptBadge(po: ReceivedPO): { label: string; cls: string } | null {
-    const status = getDynamicReceiptStatus(po);
-    if (status === "full") {
-        return { label: "FULL", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" };
-    }
-    if (status === "partial") {
-        return { label: "PARTIAL", cls: "text-amber-300 border-amber-500/30 bg-amber-500/10" };
-    }
-    return null;
-}
-
 function receiveSortValue(po: ReceivedPO): number {
     const parsed = parseDenverDate(po.receiveDate || po.receiveDateTime);
     return parsed?.getTime() ?? 0;
@@ -969,11 +958,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                                         );
                                                                                     })()}
                                                                                     <span className="text-sm font-semibold text-zinc-100 truncate">{po.supplier}</span>
-                                            {receiptBadge(po) && (
-                                                <span className={`text-[10px] font-mono px-1 py-px rounded border shrink-0 ${receiptBadge(po)!.cls}`}>
-                                                    {receiptBadge(po)!.label}
-                                                </span>
-                                            )}
                                             {dollars && <span className="text-xs font-mono text-emerald-400 shrink-0 ml-auto">{dollars}</span>}
                                         </div>
                                         {/* Line 2: PO# + SKUs */}

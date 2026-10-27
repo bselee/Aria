@@ -63,17 +63,22 @@ async function mapConcurrent<T, R>(
 // shipment detail on every 30s dashboard poll. The cache is module-scoped
 // so it persists across calls within the same Node process (PM2 / Next.js).
 const _shipmentDetailCache = new Map<string, { data: any; fetchedAt: number }>();
-const SHIPMENT_CACHE_TTL_MS = 5 * 60 * 1_000; // 5 minutes
+// TTL must outlive the 30-min panel poll AND leave headroom, or entries expire
+// between polls and every paint degrades to "received unknown". Was 5 min,
+// which made the warm cache unreachable from a 30-min poll (measured 2026-10-27:
+// 20 of 44 rows had numbers, 3 of 6 spot-checked were WRONG numbers summed
+// from the subset of shipments that happened to be warm).
+const SHIPMENT_CACHE_TTL_MS = 45 * 60 * 1_000; // 45 minutes
 
 // ── Background warm-up controls ──────────────────────────────────────────
 // HARD CAP per invocation. With a process-wide 500ms serial queue
-// (REQUEST_INTERVAL_MS in core-client.ts), 24 × 0.5s ≈ 12s worst-case warm-up.
+// (REQUEST_INTERVAL_MS in core-client.ts), 100 × 0.5s ≈ 50s worst-case warm-up.
 // That runs DETACHED (never on the request path), so it costs the user nothing.
-// DECISION(2026-07-27): raised 8 → 24 once the shipment URL bug was fixed and
-// fetches actually succeed. At 8/poll a 63-shipment window needed ~8 polls
-// (~4min) to fully warm; at 24 it converges in ~3 polls while still staying far
-// below the 63-request storm that saturated the shared queue.
-const SHIPMENT_WARM_BATCH = 24;
+// Raised 24 → 100 (2026-10-27): a full 30-day receivings window holds ~70
+// shipment URLs; at 24 the warm-up converged over multiple polls and — with the
+// old 5-min TTL — never actually finished before entries expired. One sweep now
+// warms the whole window.
+const SHIPMENT_WARM_BATCH = 100;
 // Single-flight guard: prevents overlapping warm-ups when the 30s dashboard
 // poll fires before the previous warm-up completes, which was the mechanism
 // that made the 63-request storm self-sustaining.
@@ -288,7 +293,26 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                     .finally(() => { _warmupInFlight = false; });
             }
 
-            return enrichReceivedPurchaseOrdersWithShipmentDetails(received, shipmentDetailsByOrderId, today, tomorrowStr);
+            // ── Complete-or-unknown bookkeeping ───────────────────────────────
+            // The enrichment must know the FULL expected shipment set for each
+            // order: a PO with a partially warm shipment list must render
+            // "received unknown", never a sum over the warm subset.
+            const expectedShipmentUrlsByOrderId: Record<string, string[]> = {};
+            for (const task of shipmentTasks) {
+                if (!expectedShipmentUrlsByOrderId[task.orderId]) {
+                    expectedShipmentUrlsByOrderId[task.orderId] = [];
+                }
+                expectedShipmentUrlsByOrderId[task.orderId].push(task.url);
+            }
+
+            return enrichReceivedPurchaseOrdersWithShipmentDetails(
+                received,
+                shipmentDetailsByOrderId,
+                warmTasks.map((t) => t.url),
+                expectedShipmentUrlsByOrderId,
+                today,
+                tomorrowStr,
+            );
         } catch (err: any) {
             console.error("Failed to fetch received POs:", err.message);
             return [];

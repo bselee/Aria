@@ -85,7 +85,8 @@ describe("receivings helpers", () => {
 
     it("marks open received purchase orders as partial", () => {
         expect(getReceiptStatusFromPoStatus("Committed")).toBe("partial");
-        expect(getReceiptStatusFromPoStatus("Locked")).toBe("partial");
+        expect(getReceiptStatusFromPoStatus("Locked")).toBe("received");
+        expect(getReceiptStatusFromPoStatus("ORDER_LOCKED")).toBe("received");
         expect(getReceiptStatusFromPoStatus("Completed")).toBe("full");
         expect(getReceiptStatusFromPoStatus("Closed")).toBe("full");
     });
@@ -142,7 +143,7 @@ describe("receivings helpers", () => {
                     ],
                 },
             ],
-        });
+        }, [], {});
 
         expect(enriched[0]).toMatchObject({
             orderId: "23372817A-DropshipPO",
@@ -184,7 +185,7 @@ describe("receivings helpers", () => {
                     ],
                 },
             ],
-        });
+        }, ["rcv-1", "rcv-2"], { "PO-PARTIAL": ["rcv-1", "rcv-2"] });
 
         expect(enriched[0]?.receiptHistory).toEqual([
             {
@@ -212,5 +213,46 @@ describe("receivings helpers", () => {
                 openQuantity: 75,
             },
         ]);
+    });
+
+    it("leaves received quantities unknown when any shipment is not warm", () => {
+        // Only rcv-1 is in the warm set; rcv-2 is expected but missing.
+        // The sum over the warm subset (150) must NOT be painted as a receipt.
+        const enriched = enrichReceivedPurchaseOrdersWithShipmentDetails([
+            {
+                orderId: "PO-PARTIAL",
+                orderDate: "2026-05-01",
+                receiveDate: "2026-05-06",
+                receiveDateTime: "2026-05-06",
+                receivedBy: null,
+                receiptStatus: "partial",
+                supplier: "Bottle Vendor",
+                total: 900,
+                items: [{ productId: "BOTTLE-1G", quantity: 300 }],
+                finaleUrl: "https://example.test/finale-order",
+            },
+        ], {
+            "PO-PARTIAL": [
+                {
+                    shipmentId: "rcv-1",
+                    receiveDate: "2026-05-06T09:00:00-06:00",
+                    receivedByName: "Luis",
+                    itemList: [{ productId: "BOTTLE-1G", quantityReceived: "150" }],
+                },
+            ],
+        }, ["rcv-1"], { "PO-PARTIAL": ["rcv-1", "rcv-2"] });
+
+        expect(enriched[0]?.items).toEqual([
+            { productId: "BOTTLE-1G", quantity: 300, orderedQuantity: 300 },
+        ]);
+    });
+
+    it("resolves the receiver from the DELIVERED event userLoginUrl", () => {
+        expect(getShipmentReceiverName({
+            statusIdHistoryList: [
+                { statusId: null, txStamp: 1792184734, userLoginUrl: "/buildasoilorganics/api/userlogin/nicholas.kubin" },
+                { statusId: "SHIPMENT_DELIVERED", txStamp: 1792184736, userLoginUrl: "/buildasoilorganics/api/userlogin/nicholas.kubin" },
+            ],
+        })).toBe("NK");
     });
 });

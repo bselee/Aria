@@ -126,6 +126,12 @@ export interface PurchasingItem {
     dailyRateSource?: "demand" | "sales" | "receipts" | "ledger";
     runwayDays: number;            // effectiveStock / dailyRate (effectiveStock = min(stockOnHand, stockAvailable) via recommender)
     adjustedRunwayDays: number;    // (effectiveStock + stockOnOrder - reservedQty) / dailyRate
+    /** Total on-hand for this physical carton size across every vendor SKU.
+     *  Set by carton pooling; merge must use it instead of the SKU's own stock,
+     *  otherwise a size we hold reads as a shortage on the board. */
+    pooledOnHand?: number;
+    /** Canonical size key (e.g. "15x15x30") when this row was carton-pooled. */
+    pooledDimKey?: string;
     leadTimeDays: number;
     leadTimeProvenance: string;    // e.g. "14d (Finale)" | "21d default"
     /** The lead time the qty recommender actually used (P90 > vendor override > Finale median).
@@ -589,8 +595,14 @@ export function getReceiptQueryStartDate(windowStart: string, lookbackDays: numb
     return parsed.toISOString().slice(0, 10);
 }
 
-export function getReceiptStatusFromPoStatus(status: string | null | undefined): "full" | "partial" {
+export function getReceiptStatusFromPoStatus(status: string | null | undefined): "full" | "partial" | "received" {
     const normalized = String(status || "").toLowerCase();
+    // ORDER_LOCKED is the normal state of a received-but-unclosed PO. It is not
+    // evidence of a short receipt — the receipt truth lives in shipment
+    // quantities. A locked PO without loaded quantities reads "received"
+    // (nothing known yet), never PARTIAL. This is what made rows read PARTIAL
+    // with a second sentence contradicting it.
+    if (normalized.includes("locked") || normalized.includes("created")) return "received";
     const fullStatuses = ["complete", "completed", "closed", "received"];
     return fullStatuses.some(token => normalized.includes(token)) ? "full" : "partial";
 }
@@ -649,7 +661,35 @@ export function getShipmentReceiverName(shipment: any): string | null {
         if (typeof value === "string" && value.trim()) return value.trim();
     }
 
+    // Finale's shipment payload carries no direct receiver name, but the
+    // statusIdHistoryList SHIPMENT_DELIVERED entry carries userLoginUrl
+    // (e.g. /buildasoilorganics/api/userlogin/nicholas.kubin). That user is the
+    // receiver — the same correlation the EOW received-items list uses
+    // (receiverFromStatusHistory in eow-report.ts). Prefer the DELIVERED
+    // event's own login; fall back to the latest history entry that has one.
+    const loginUrl =
+        deliveredEvent?.userLoginUrl ??
+        (shipment?.statusIdHistoryList || []).reduce(
+            (acc: string | null, entry: any) =>
+                acc ?? (typeof entry?.userLoginUrl === "string" ? entry.userLoginUrl : null),
+            null,
+        );
+
+    if (loginUrl) {
+        const m = String(loginUrl).match(/\/userlogin\/([^/?#]+)/);
+        if (m) return prettyUserLogin(decodeURIComponent(m[1]));
+    }
+
     return null;
+}
+
+/** Nick → nicky: prettifies a Finale user login for a compact byline. */
+export function prettyUserLogin(login: string): string {
+    const base = (login || "").trim();
+    if (!base) return "";
+    const parts = base.split(/[._\-\s]+/).filter(Boolean);
+    if (parts.length >= 2) return parts.map((p) => p[0].toUpperCase()).join("");
+    return base[0].toUpperCase() + base.slice(1);
 }
 
 export function getShipmentLineContainers(shipment: any): any[] {
@@ -765,9 +805,12 @@ export function deriveReceivedPurchaseOrders(
 export function enrichReceivedPurchaseOrdersWithShipmentDetails(
     orders: ReceivedPO[],
     shipmentDetailsByOrderId: Record<string, any[]>,
+    knownShipmentUrls: string[],
+    expectedShipmentUrlsByOrderId: Record<string, string[]>,
     windowStart?: string,
     windowEnd?: string,
 ): ReceivedPO[] {
+    const warmUrls = new Set(knownShipmentUrls);
     return orders.map((order) => {
         const shipmentDetails = shipmentDetailsByOrderId[order.orderId] || [];
         const shipmentReceipts = shipmentDetails
@@ -808,6 +851,17 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
         }
         const hasLineReceiptQuantities = receivedBySku.size > 0;
 
+        // ── Complete-or-unknown (2026-10-27) ─────────────────────────────
+        // A partially warm shipment cache must never sum to a "received" number:
+        // the sum over whatever subset happens to be cached understates the
+        // receipt and fabricates shorts (measured: 125408 read 0/50 against a
+        // real 50/50). The caller passes the full expected shipment URL set;
+        // if any of this order's shipments is NOT warm, the whole order's
+        // received quantities are unknown — no numbers, never wrong numbers.
+        const expectedUrls = expectedShipmentUrlsByOrderId[order.orderId] || [];
+        const receiptsComplete =
+            expectedUrls.length === 0 || expectedUrls.every((url) => warmUrls.has(url));
+
         return {
             ...order,
             receiveDateTime: latestReceipt.receiptDateTime || order.receiveDateTime,
@@ -816,7 +870,7 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
             receiptHistory,
             items: order.items.map((item) => {
                 const orderedQuantity = item.orderedQuantity ?? item.quantity;
-                if (!hasLineReceiptQuantities) {
+                if (!hasLineReceiptQuantities || !receiptsComplete) {
                     // Preserve any receivedQuantity that may have come from GraphQL
                     return { ...item, orderedQuantity };
                 }
