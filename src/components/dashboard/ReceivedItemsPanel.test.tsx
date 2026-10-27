@@ -96,10 +96,10 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(screen.getAllByText(/PARTIAL/i)[0]).toBeTruthy();
+    expect(screen.queryByText(/PARTIAL/i)).toBeNull();
+    expect(screen.queryByText(/backorder remains/i)).toBeNull();
     expect(screen.getByText(/Apr 1 10:15 AM/i)).toBeTruthy();
     expect(screen.getByText(/rcvd by Luis/i)).toBeTruthy();
-    expect(screen.getByText(/received unknown/i)).toBeTruthy();
   });
 
   it("renders partial receipt history and open quantities", async () => {

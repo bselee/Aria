@@ -217,7 +217,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             // This 404-on-every-call is why receivedBy/receiptHistory were 0/63 for
             // months; it was never a rate-limit problem. Cache is keyed on the
             // internal URL so it can never collide across namespaces.
-            const shipmentTasks: Array<{ orderId: string; shipmentId: string; url: string }> = [];
+            const shipmentTasks: Array<{ orderId: string; shipmentId: string; url: string; receiveDate: string }> = [];
             for (const edge of edges) {
                 const po = edge.node;
                 if (!receivedOrderIds.has(po?.orderId)) continue;
@@ -226,8 +226,9 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                     if (!url) continue; // no resolvable detail endpoint — skip
                     shipmentTasks.push({
                         orderId: po.orderId,
-                        shipmentId: url, // cache key: internal URL, collision-free
+                        shipmentId: url,
                         url,
+                        receiveDate: String(shipment?.receiveDate || ""),
                     });
                 }
             }
@@ -264,12 +265,12 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
             // the 30s dashboard poll fires before the previous warm-up completes.
             if (coldTasks.length > 0 && !_warmupInFlight) {
                 _warmupInFlight = true;
-                // NOTE(2026-07-27): Simply takes the first 8 cold tasks rather than
-                // recency-ordering by receiveDate. The coldTasks array is built in
-                // the same edge iteration order (descending orderDate from the
-                // GraphQL sort), so the first entries are already the most recently
-                // ordered POs, which is a reasonable proxy for recency.
-                const batch = coldTasks.slice(0, SHIPMENT_WARM_BATCH);
+                // Warm the most recently received shipments first. Order date is the
+                // wrong key: a PO ordered a month ago and received yesterday never
+                // got its quantity, and the panel then treated the locked PO as a short.
+                const batch = [...coldTasks]
+                    .sort((a, b) => String(b.receiveDate).localeCompare(String(a.receiveDate)))
+                    .slice(0, SHIPMENT_WARM_BATCH);
                 mapConcurrent(batch, CONCURRENCY, async (task) => {
                     const cached = _shipmentDetailCache.get(task.shipmentId);
                     if (cached && Date.now() - cached.fetchedAt < SHIPMENT_CACHE_TTL_MS) {

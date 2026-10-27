@@ -108,7 +108,8 @@ function getDynamicReceiptStatus(po: ReceivedPO): "full" | "partial" | "received
     }
     const hasDetails = po.items.some(i => i.receivedQuantity !== undefined);
     if (!hasDetails) {
-        return po.receiptStatus || "received";
+        // A missing shipment read is not a short. PO lock status is not a receipt.
+        return "received";
     }
     const isFull = po.items.every(i => {
         const ordered = i.orderedQuantity ?? i.quantity;
@@ -138,8 +139,7 @@ function partialDiscrepancy(po: ReceivedPO): string | null {
     const status = getDynamicReceiptStatus(po);
     if (status !== "partial" || po.items.length === 0) return null;
     
-    const shortItems = po.items
-        .filter(item => item.openQuantity == null || item.openQuantity > 0);
+    const shortItems = po.items.filter(item => (item.openQuantity ?? 0) > 0);
     
     if (shortItems.length === 0) return "partial receipt";
     
@@ -1123,7 +1123,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             },
                                                         };
                                                     }
-                                                    if (isPartial) {
+                                                    if (isPartial && hasOpenQty) {
                                                         return { text: "Partial receipt — backorder remains", button: undefined };
                                                     }
                                                     if (hasInvoice) {
