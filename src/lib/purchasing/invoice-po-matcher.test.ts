@@ -483,6 +483,39 @@ describe("findPOCandidates with Tier A auto-match", () => {
         expect(hasConfirmedReason).toBe(true);
     });
 
+    it("does not let a confirmed match boost an invoice dated before the PO exists (2026-10-27)", async () => {
+        // Rootwise freight bills dated 2025-03 → 2026-04 rode the
+        // Rootwise→125080 confirm to 95 while the PO was issued 2026-07-13.
+        const invoice: InvoiceToMatch = {
+            id: "inv-predate",
+            invoiceNumber: "772769286160",
+            vendorName: "Rootwise Soil Dynamics",
+            invoiceDate: "2026-04-14",
+            subtotal: 369.2,
+            freight: 0,
+            tax: 0,
+            total: 369.2,
+        };
+
+        stubDbForPoSearch([{
+            po_number: "125080",
+            vendor_name: "Rootwise Soil Dynamics",
+            issue_date: "2026-07-13",
+            total_amount: 4141.09,
+            total: 4141.09,
+            status: "received",
+        }], [{
+            vendor_name: "Rootwise Soil Dynamics",
+            po_number: "125080",
+        }]);
+
+        const result = await findPOCandidates(invoice);
+        const best = result.candidates[0];
+        const hasConfirmedReason = best?.reasons?.some((r: string) => r.includes("previously confirmed")) ?? false;
+        expect(hasConfirmedReason).toBe(false);
+        expect(best?.score ?? 0).toBeLessThan(95);
+    });
+
     it("does not let a confirmed match take an invoice its PO cannot cover", async () => {
         // Ferticell invoice 2907 ($7,243.02) against the two Ferticell POs open
         // that day: 124904 ($7,353.28, ordered 1 day before) and 124857

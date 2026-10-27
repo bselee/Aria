@@ -468,10 +468,21 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             // few percent past its PO, so allow that headroom and block only a PO
             // that cannot come close to covering the amount.
             const poTotalForConfirm = Number(po.total_amount || po.total || 0);
+            // 2026-10-27: a confirmed pair still cannot bill a PO before the
+            // PO exists. Six Rootwise freight bills (FedEx-style 12-digit
+            // invoice numbers dated 2025-03 → 2026-04) rode the
+            // Rootwise→125080 confirm to 95 while the PO was issued
+            // 2026-07-13 — months after every one of them. Gate the boost on
+            // date precedence too, so a pre-PO invoice stays a low-score
+            // candidate instead of a fake 95.
+            const invMs = new Date((invoice.invoiceDate || "").slice(0, 10) + "T12:00:00Z").getTime();
+            const poMs = new Date((po.issue_date || "").slice(0, 10) + "T12:00:00Z").getTime();
+            const predatesPo = !isNaN(invMs) && !isNaN(poMs) && invMs < poMs;
             if (
-                invoice.total > 0 &&
+                (invoice.total > 0 &&
                 poTotalForConfirm > 0 &&
-                poTotalForConfirm * CONFIRMED_COVER_TOLERANCE < invoice.total
+                poTotalForConfirm * CONFIRMED_COVER_TOLERANCE < invoice.total) ||
+                predatesPo
             ) {
                 confirmedMatchReason = null;
             } else {

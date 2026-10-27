@@ -252,7 +252,13 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     /** Computed: count of POs needing human attention */
     const needsReviewCount = pos.filter(p => {
         const lbl = apMap[p.orderId]?.label || "";
-        return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
+        // Only rows that genuinely need a human decision count as "need
+        // review": a matched invoice awaiting approval (PENDING) or a
+        // reconciled discrepancy (RECONCILED ±). Awaiting-vendor-invoice rows
+        // are a passive wait, not a review — counting them as "need review"
+        // made the header read "43 need review" over a column where most rows
+        // need nothing from anyone (2026-10-27).
+        return lbl === "RECONCILED ±" || lbl === "PENDING";
     }).length;
     /** Manual match state: invoiceId → manual PO input */
     const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
