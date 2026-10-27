@@ -161,6 +161,13 @@ function fmtQty(n: number | null | undefined): string {
     return Number(n || 0).toLocaleString();
 }
 
+function relativeSku(item: ReceivedPO["items"][number]): string {
+    const ordered = item.orderedQuantity ?? item.quantity;
+    const received = item.receivedQuantity;
+    if (received === undefined) return `${item.productId} ordered ${fmtQty(ordered)}`;
+    return `${item.productId} ${fmtQty(received)}/${fmtQty(ordered)}`;
+}
+
 function getNextActionText(po: ReceivedPO, apLabel: string): string {
     const receiptStatus = getDynamicReceiptStatus(po);
     const isPartial = receiptStatus === "partial";
@@ -991,18 +998,19 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             <span className="text-xs font-mono text-zinc-300">
                                                 {po.items.length} item{po.items.length === 1 ? "" : "s"}
                                             </span>
-                                            {po.items.slice(0, 2).map((item, index) => {
-                                                const displayQty = item.receivedInWindow !== undefined ? item.receivedInWindow : (item.receivedQuantity ?? item.quantity);
-                                                return (
-                                                    <span key={`${item.productId}-${index}`} className="text-xs font-mono text-zinc-400">
-                                                        {item.productId}
-                                                        <span className="text-zinc-500 ml-0.5">×{displayQty.toLocaleString()}</span>
-                                                    </span>
-                                                );
-                                            })}
-                                            {po.items.length > 2 && (
+                                            {po.items.slice(0, 3).map((item, index) => (
+                                                <span key={`${item.productId}-${index}`} className="text-xs font-mono text-zinc-300">
+                                                    {relativeSku(item)}
+                                                </span>
+                                            ))}
+                                            {po._reconciliation?.matchedInvoice && (
+                                                <span className="text-[10px] font-mono text-cyan-300/90">
+                                                    bill {po._reconciliation.matchedInvoice.invoice_number} ${Number(po._reconciliation.matchedInvoice.total || 0).toFixed(0)}
+                                                </span>
+                                            )}
+                                            {po.items.length > 3 && (
                                                 <span className="text-xs font-mono text-zinc-500">
-                                                    +{po.items.length - 2} more
+                                                    +{po.items.length - 3} more
                                                 </span>
                                             )}
                                         </div>
