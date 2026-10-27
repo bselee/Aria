@@ -6,6 +6,7 @@ import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import InvoicePOMatcher from "./InvoicePOMatcher";
+import { isPaidInAdvanceVendor } from "@/config/paid-in-advance-vendors";
 
 type ReceivedPO = {
     orderId: string;
@@ -1128,6 +1129,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 onClick: () => toggleModifier(po.orderId),
                                                             },
                                                         };
+                                                    }
+                                                    if (isPaidInAdvanceVendor(po.supplier)) {
+                                                        return { text: "Paid in advance", button: undefined };
                                                     }
                                                     return { text: "Awaiting vendor invoice", button: undefined };
                                                 })();
