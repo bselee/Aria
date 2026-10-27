@@ -179,10 +179,10 @@ export default function InvoicePOMatcher({
                         <Check className="w-3 h-3 text-emerald-500 shrink-0" />
                     ) : best && best.score >= 80 ? (
                         <span className="text-[9px] font-mono font-bold px-1 py-px rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 shrink-0">High</span>
-                    ) : best && best.score >= 70 ? (
+                    ) : best && best.score >= 70 && (best.reasons || []).some((r: string) => /OCR PO|amount/i.test(r)) ? (
                         <span className="text-[9px] font-mono font-bold px-1 py-px rounded border border-amber-500/30 bg-amber-500/10 text-amber-400 shrink-0">Good</span>
                     ) : best && best.score >= 50 ? (
-                        <span className="text-[9px] font-mono font-bold px-1 py-px rounded border border-zinc-600/40 bg-zinc-700/20 text-zinc-400 shrink-0">Low</span>
+                        <span className="text-[9px] font-mono font-bold px-1 py-px rounded border border-zinc-600/40 bg-zinc-700/20 text-zinc-400 shrink-0">Check</span>
                     ) : (
                         <span className="text-[9px] font-mono text-zinc-600 shrink-0">—</span>
                     )}
@@ -217,8 +217,12 @@ export default function InvoicePOMatcher({
 
                     {/* → PO target */}
                     {best && !isAuto && (
-                        <span className="text-[9px] font-mono text-zinc-600 shrink-0">
+                        <span className="text-[9px] font-mono text-zinc-400 shrink-0">
                             → {best.orderId}
+                            {best.total != null ? ` $${Number(best.total).toFixed(0)}` : ""}
+                            {best.total != null && s.invoiceTotal > 0 && Math.abs(Number(best.total) - s.invoiceTotal) >= 1
+                                ? ` Δ$${Math.abs(Number(best.total) - s.invoiceTotal).toFixed(0)}`
+                                : ""}
                         </span>
                     )}
 
@@ -245,7 +249,7 @@ export default function InvoicePOMatcher({
                                         : "border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
                                 }`}
                             >
-                                {compact ? "Review match" : "Compare"}
+                                {compact ? "Link" : "Compare"}
                             </button>
                         ) : (
                             <div className="flex items-center gap-1">
