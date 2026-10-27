@@ -93,6 +93,66 @@ let _warmupInFlight = false;
 // size so one batch completes in one sweep.
 const CONCURRENCY = 8;
 
+// ── In-process warm cycle (2026-10-27) ────────────────────────────────────
+// The shipment detail cache is module-scoped in the DASHBOARD process. A cron
+// in aria-bot warms a different process's map and accomplishes nothing. The
+// cycle lives here, pinned to globalThis so Next.js chunk splitting cannot
+// register duplicate timers, and is started from instrumentation.ts at boot.
+const warmGlobal = globalThis as typeof globalThis & { __aria_receivings_warm?: boolean };
+let warmTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Run one warm pass: pull the receivings window and let its detached
+ * background warm-up fill the shipment detail cache.
+ *
+ * Business-hours only (M-F 7-19 America/Denver) — Finale rate limits are hard
+ * and the panel poll keeps the cache warm during active use anyway; the timer
+ * exists so the FIRST paint after a dashboard restart or a quiet period does
+ * not show "received unknown" everywhere.
+ */
+export function runShipmentWarmCycle(): void {
+    const now = new Date();
+    const denver = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Denver",
+        hour: "numeric",
+        weekday: "short",
+        hour12: false,
+    }).formatToParts(now);
+    const parts: Record<string, string> = {};
+    for (const p of denver) parts[p.type] = p.value;
+    const hour = Number(parts.hour);
+    const weekday = parts.weekday || "";
+    if (weekday === "Sat" || weekday === "Sun" || hour < 7 || hour >= 19) return;
+
+    // Warm the SAME window the panel paints (default 30 days), so the whole
+    // visible shipment set is resident, not just today's.
+    const start = new Date(now);
+    start.setDate(start.getDate() - 30);
+    const startStr = start.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const endStr = tomorrow.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+
+    const client = new FinaleReceivingsClient();
+    console.log("[receivings-warm] warm cycle pass");
+    client.getTodaysReceivedPOs(startStr, endStr)
+        .then((pos) => console.log(`[receivings-warm] warmed ${pos.length} POs`))
+        .catch((err: any) => {
+            console.warn("[receivings-warm] warm pass failed:", err?.message || err);
+        });
+}
+
+/**
+ * Start the shipment warm timer. Idempotent across hot reloads.
+ */
+export function startShipmentWarmLoop(): void {
+    if (warmGlobal.__aria_receivings_warm) return;
+    warmGlobal.__aria_receivings_warm = true;
+    runShipmentWarmCycle();
+    warmTimer = setInterval(runShipmentWarmCycle, 15 * 60 * 1_000);
+    if (warmTimer.unref) warmTimer.unref();
+}
+
 export class FinaleReceivingsClient extends FinalePurchasingClient {
     constructor() {
         super();

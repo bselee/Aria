@@ -593,7 +593,19 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             freightClasses,
                             recentAutoCompletions,
                         };
-                        _getCache = { at: Date.now(), key: cacheKey, payload };
+                        // A payload with no received quantities is a cold
+                        // shipment cache (boot or quiet period). Cache it only
+                        // 60s — the background warm-up fills quantities within
+                        // ~50s and the next poll must paint them, not replay
+                        // "unknown" for 3 minutes.
+                        const hasAnyReceivedQty = (received || []).some((p: any) =>
+                            (p.items || []).some((i: any) => i.receivedQuantity !== undefined),
+                        );
+                        const cacheAt = hasAnyReceivedQty ? Date.now() : Date.now() - (GET_CACHE_TTL_MS - 60_000);
+                        _getCache = { at: cacheAt, key: cacheKey, payload };
+                        if (!hasAnyReceivedQty) {
+                            console.log("[receivings] cold shipment cache — serving with 60s cache, warm-up in flight");
+                        }
                         return NextResponse.json(payload, {
                             headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss' },
                         });

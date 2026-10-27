@@ -18,4 +18,13 @@ export async function register() {
         // Prewarm is best-effort; dashboard still works via on-demand SWR + disk fallback.
         console.warn('[instrumentation] Failed to start purchasing prewarm (chunk issue):', err?.message || err);
     }
+
+    try {
+        const { startShipmentWarmLoop } = await import('@/lib/finale/receivings');
+        startShipmentWarmLoop();
+    } catch (err: any) {
+        // Same chunk-resolution failure mode as above. The receivings GET
+        // re-arms the warm-up on next paint, so this is non-fatal.
+        console.warn('[instrumentation] Failed to start receivings warm loop (chunk issue):', err?.message || err);
+    }
 }
