@@ -13,6 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
+import { firstRealInvoice, isPhantomInvoiceRow } from '@/lib/purchasing/invoice-pool';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
@@ -255,7 +256,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         hasAutoApplied: (outcomeMap.get(poNum) || []).some(
                             (o: any) => o.outcome === 'auto_applied'
                         ),
-                        matchedInvoice: (invoiceMap.get(poNum) || [])[0] || null,
+                        matchedInvoice: firstRealInvoice(invoiceMap.get(poNum)),
                     };
                 }
             }
@@ -300,6 +301,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             ...getInvoiceCacheByVendor(v).filter((r) => !r.matched_po && !r.po_number),
                         ];
                         for (const row of rows) {
+                            if (isPhantomInvoiceRow(row)) continue;
                             const key = `${(row.vendor_name || '').toLowerCase()}|${row.invoice_number || ''}|${row.total || 0}`;
                             if (seen.has(key)) continue;
                             // Only skip confirmed matches — OCR may set po_number as candidate

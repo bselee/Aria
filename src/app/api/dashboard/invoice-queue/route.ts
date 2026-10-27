@@ -12,6 +12,7 @@ import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
 import { classifyInvoice, type InvoiceClassification } from '@/config/invoice-classification';
 import { resolveStatus, isPendingStatus, type ResolvedStatus } from './resolve-status';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
+import { isPhantomInvoiceRow } from '@/lib/purchasing/invoice-pool';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -253,6 +254,13 @@ export async function GET(req: NextRequest) {
         let totalDollarImpact = 0;
 
         const invoices: InvoiceQueueItem[] = rows.flatMap(row => {
+            // Phantom rows (packing slips / failed ingests with vendor or
+            // invoice number literally "error" / "PACKING SLIP" / blank) are
+            // not invoices: they never render and never count in the stats.
+            // (2026-10-27: PO 125411 class.)
+            if (isPhantomInvoiceRow(row)) {
+                return [];
+            }
             const vendorName = row.vendor_name ?? 'Unknown';
             const fromEmail = row.email_from ?? '';
             const subject = row.email_subject ?? '';

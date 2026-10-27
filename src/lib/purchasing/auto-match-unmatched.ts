@@ -23,6 +23,7 @@
 
 import { createClient } from "@/lib/db";
 import { findPOCandidates, type InvoiceToMatch, type MatchResult } from "@/lib/purchasing/invoice-po-matcher";
+import { isPhantomInvoiceRow } from "@/lib/purchasing/invoice-pool";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -111,6 +112,9 @@ export async function loadUnmatchedInvoicesForAutoMatch(
         if (inv.po_number && String(inv.po_number).trim().length > 0) continue;
         // Skip no_po_required
         if (inv.no_po_required === true) continue;
+        // Skip phantom rows — packing slips / failed ingests are not invoices
+        // and must never be auto-linked (2026-10-27: PO 125411 class).
+        if (isPhantomInvoiceRow(inv)) continue;
 
         const key = (inv.vendor_name ?? "") + "|" + (inv.invoice_number ?? "");
         const rawData = viMap.get(key);
