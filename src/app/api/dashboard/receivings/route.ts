@@ -560,6 +560,120 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 (po as any)._reconciliation.vendorHasUnlinkedBills = hit;
                             }
 
+                            // ── Vendor bill pool + covering-bill detection (2026-10-27) ──
+                            // Some vendors (Miles) email ONE bill per delivery batch that
+                            // covers lines on SEVERAL POs, but vendor_invoices.po_number is
+                            // a single scalar, so the bill is linked to only one PO. Every
+                            // sibling PO must still name the bill. Match each bill line to
+                            // this PO's items by quantity (ordered OR received) AND unit
+                            // price; one hit means the bill covers this PO.
+                            const poolCutoff = new Date(Date.now() - 60 * 86400 * 1000).toISOString();
+                            const poolOrFilter = vendorNames.map((v) => `vendor_name.ilike.*${v}*`).join(",");
+                            let vendorBillRows: any[] = [];
+                            try {
+                                const { data: billRows } = await sb
+                                    .from("vendor_invoices")
+                                    .select("po_number, invoice_number, vendor_name, total, line_items")
+                                    .or(poolOrFilter)
+                                    .gte("created_at", poolCutoff)
+                                    .order("created_at", { ascending: false })
+                                    .limit(300);
+                                vendorBillRows = billRows || [];
+                            } catch (poolErr: any) {
+                                console.warn(`[receivings] vendor bill pool failed: ${poolErr?.message || poolErr}`);
+                            }
+                            // Rows linked to a received PO regardless of vendor name:
+                            // the OCR "error" vendor on the Miles bill never matches an
+                            // ilike filter, but the PO link is exactly the identity that
+                            // makes it a candidate for that vendor's sibling POs.
+                            try {
+                                const { data: linkedRows } = await sb
+                                    .from("vendor_invoices")
+                                    .select("po_number, invoice_number, vendor_name, total, line_items")
+                                    .in("po_number", received.map((r: any) => r.poNumber || r.orderId).filter(Boolean))
+                                    .gte("created_at", poolCutoff)
+                                    .order("created_at", { ascending: false })
+                                    .limit(300);
+                                vendorBillRows = vendorBillRows.concat(linkedRows || []);
+                            } catch (linkedErr: any) {
+                                console.warn(`[receivings] linked bill pool failed: ${linkedErr?.message || linkedErr}`);
+                            }
+
+                            const billPoolByVendor = new Map<string, any[]>();
+                            for (const row of vendorBillRows) {
+                                const rv = String(row.vendor_name || "").toLowerCase().trim();
+                                if (!rv) continue;
+                                if (!billPoolByVendor.has(rv)) billPoolByVendor.set(rv, []);
+                                billPoolByVendor.get(rv)!.push(row);
+                            }
+
+                            // Linked rows whose OCR vendor name is junk ("error") can
+                            // only be found through the PO they ARE linked to. A bill
+                            // linked to one PO of a vendor covers that vendor's sibling
+                            // POs when its lines match theirs.
+                            const supplierByPo = new Map<string, string>();
+                            for (const r of received) {
+                                supplierByPo.set(String(r.orderId), String(r.supplier || ""));
+                            }
+
+                            for (const po of received) {
+                                const rec = (po as any)._reconciliation;
+                                if (rec?.matchedInvoice) continue; // bill already named on this row
+                                const v = String(po.supplier || "").toLowerCase().trim();
+                                if (!v) continue;
+                                const pool: any[] = [];
+                                for (const row of vendorBillRows) {
+                                    const linkedPo = String(row.po_number || "");
+                                    const linkedSupplier = supplierByPo.get(linkedPo) || "";
+                                    if (linkedPo && linkedPo !== String(po.orderId) && linkedSupplier === po.supplier) {
+                                        pool.push(row); // sibling PO bill of the same supplier
+                                    }
+                                }
+                                const vendorRows = billPoolByVendor.get(v) || [];
+                                pool.push(...vendorRows);
+                                if (pool.length === 0) {
+                                    for (const [pv, rows] of billPoolByVendor) {
+                                        if ((v.length >= 8 && pv.includes(v)) || (pv.length >= 8 && v.includes(pv))) {
+                                            pool.push(...rows);
+                                        }
+                                    }
+                                }
+                                if (pool.length === 0) continue;
+
+                                const items = (po.items || []).map((it: any) => ({
+                                    ordered: Number(it.orderedQuantity ?? it.quantity ?? 0),
+                                    received: it.receivedQuantity !== undefined ? Number(it.receivedQuantity) : null,
+                                    unitPrice: Number(it.unitPrice ?? 0),
+                                }));
+
+                                let coveringBill: { invoice_number?: string | null; total?: number } | null = null;
+                                for (const row of pool) {
+                                    let lines: any[] = [];
+                                    try {
+                                        const parsed =
+                                            typeof row.line_items === "string" ? JSON.parse(row.line_items) : row.line_items;
+                                        lines = Array.isArray(parsed) ? parsed : [];
+                                    } catch { /* not JSON */ }
+                                    let hits = 0;
+                                    for (const line of lines) {
+                                        const q = Number(line?.qty ?? line?.quantity ?? 0);
+                                        if (!(q > 0)) continue;
+                                        const up = Number(line?.unit_price ?? 0);
+                                        const hit = items.some((it: any) => {
+                                            const qtyMatch = q === it.ordered || (it.received !== null && q === it.received);
+                                            const priceMatch = up > 0 ? Math.abs(up - it.unitPrice) < 0.01 : true;
+                                            return qtyMatch && priceMatch;
+                                        });
+                                        if (hit) hits++;
+                                    }
+                                    if (hits > 0) {
+                                        coveringBill = { invoice_number: row.invoice_number ?? null, total: Number(row.total || 0) };
+                                        break;
+                                    }
+                                }
+                                if (coveringBill) rec.coveringBill = coveringBill;
+                            }
+
             // ── Recent auto-completions (audit trail for auto-processed) ──
             let recentAutoCompletions: Array<{
                 intent: string;

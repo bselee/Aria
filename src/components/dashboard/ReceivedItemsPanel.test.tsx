@@ -331,6 +331,44 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/Verify bill \$2,688 against the PO/i)).toBeTruthy();
   });
 
+  it("names a covering bill on a sibling PO with no linked invoice", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-408",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "Miles Filippelli",
+          total: 2090,
+          items: [{ productId: "HTF101", quantity: 10, orderedQuantity: 10, receivedQuantity: 10, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            coveringBill: { invoice_number: "error", total: 2688 },
+            matchedInvoice: null,
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Bill \$2,688 covers this PO's lines/i)).toBeTruthy();
+    expect(screen.queryByText(/No bill yet/i)).toBeNull();
+  });
+
   it("says bill in AP instead of awaiting when the vendor has unlinked bills", async () => {
     stubLocalStorage();
     const recent = new Date();

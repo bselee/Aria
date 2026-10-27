@@ -41,6 +41,7 @@ type ReceivedPO = {
         hasPendingApproval: boolean;
         hasAutoApplied: boolean;
         vendorHasUnlinkedBills?: boolean;
+        coveringBill?: { invoice_number?: string | null; total?: number | null } | null;
         matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
 };
@@ -174,6 +175,12 @@ function billLabel(
     const clean = num.trim().toLowerCase();
     if (!clean || JUNK_BILL_NUMBERS.has(clean)) return `bill ${dollars}`;
     return `bill ${num} ${dollars}`;
+}
+
+/** Capitalize the first letter of a label for sentence-internal use. */
+function capFirst(s: string): string {
+    if (!s) return s;
+    return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 function daysSince(dateStr: string | undefined | null): number | null {
@@ -1063,6 +1070,11 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     {billLabel(po._reconciliation.matchedInvoice)}
                                                 </span>
                                             )}
+                                            {!po._reconciliation?.matchedInvoice && po._reconciliation?.coveringBill && (
+                                                <span className="text-[10px] font-mono text-cyan-300/70">
+                                                    {billLabel(po._reconciliation.coveringBill)}
+                                                </span>
+                                            )}
                                             {po.items.length > 3 && (
                                                 <span className="text-xs font-mono text-zinc-500">
                                                     +{po.items.length - 3} more
@@ -1178,6 +1190,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         if (inv) {
                                                             return { text: `Bill on file $${Number(inv.total || 0).toFixed(0)}. ${openTotal.toLocaleString()} still open.`, button: undefined };
                                                         }
+                                                        if (rec?.coveringBill) {
+                                                            return { text: `Partial receipt. ${capFirst(billLabel(rec.coveringBill))} covers lines here. ${openTotal.toLocaleString()} still open.`, button: undefined };
+                                                        }
                                                         if (isPaidInAdvanceVendor(po.supplier)) {
                                                             return { text: `Partial receipt. ${openTotal.toLocaleString()} still open. Paid in advance.`, button: undefined };
                                                         }
@@ -1193,6 +1208,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 onClick: () => toggleModifier(po.orderId, rec!.matchedInvoice!.invoice_number),
                                                             },
                                                         };
+                                                    }
+                                                    if (rec?.coveringBill) {
+                                                        return { text: `${receiptLead}. ${capFirst(billLabel(rec.coveringBill))} covers this PO's lines.`, button: undefined };
                                                     }
                                                     if (isComplete) {
                                                         return { text: "Done — matched and closed", button: undefined };
