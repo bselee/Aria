@@ -20,18 +20,23 @@ describe("isJunkVendorName", () => {
         expect(isJunkVendorName("PackiNG  list")).toBe(true);
         expect(isJunkVendorName("")).toBe(true);
     });
-    it("keeps real vendor names", () => {
+    it("keeps real vendor names — and null is unknown, not junk", () => {
         expect(isJunkVendorName("Colorado Worm Company")).toBe(false);
         expect(isJunkVendorName("Rootwise Soil Dynamics")).toBe(false);
-        expect(isJunkVendorName(null)).toBe(true); // null = missing, still junk
+        expect(isJunkVendorName(null)).toBe(false); // unknown ≠ junk (2026-10-27 regression)
+        expect(isJunkVendorName(undefined)).toBe(false);
     });
 });
 
 describe("isJunkInvoiceNumber", () => {
     it("flags failure markers only", () => {
         expect(isJunkInvoiceNumber("error")).toBe(true);
-        expect(isJunkInvoiceNumber("")).toBe(true);
+        expect(isJunkInvoiceNumber("unknown")).toBe(true);
         expect(isJunkInvoiceNumber("9488427")).toBe(false);
+    });
+    it("empty is not junk — a photo invoice with an unreadable number is real; its vendor decides", () => {
+        expect(isJunkInvoiceNumber("")).toBe(false);
+        expect(isJunkInvoiceNumber(null)).toBe(false);
     });
 });
 
@@ -40,8 +45,12 @@ describe("isPhantomInvoiceRow", () => {
         expect(isPhantomInvoiceRow({ vendor_name: "error", invoice_number: "error" })).toBe(true);
         expect(isPhantomInvoiceRow({ vendor_name: "PACKING SLIP", invoice_number: "" })).toBe(true);
     });
-    it("keeps real invoice rows", () => {
+    it("keeps real invoice rows — including null vendor with a real invoice number", () => {
         expect(isPhantomInvoiceRow({ vendor_name: "Colorado Worm Company", invoice_number: "9488427" })).toBe(false);
+        // The enrichment query omits vendor_name — a real invoice number must
+        // survive (2026-10-27 regression: this row was rejected, blanking the
+        // whole Receivings panel).
+        expect(isPhantomInvoiceRow({ vendor_name: null, invoice_number: "9488427" })).toBe(false);
     });
 });
 

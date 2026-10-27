@@ -21,11 +21,18 @@ const JUNK_VENDOR_NAMES = new Set([
     "packingslip",
     "packinglist",
     "unknown",
+    "unknownvendor",
     "invoice", // bare OCR garbage seen in the wild ("I N V O I C E" collapses to this)
 ]);
 
-/** Invoice numbers that mark a failed extraction. Lowercased, trimmed. */
-const JUNK_INVOICE_NUMBERS = new Set(["", "error", "unknown", "null", "nan"]);
+/** Invoice numbers that mark a failed extraction. EMPTY is deliberately NOT
+ *  here — see isJunkInvoiceNumber. */
+const JUNK_INVOICE_NUMBERS = new Set([
+    "error",
+    "unknown",
+    "null",
+    "nan",
+]);
 
 function norm(value: string | null | undefined): string {
     return String(value ?? "").replace(/\s+/g, "").toLowerCase();
@@ -34,16 +41,23 @@ function norm(value: string | null | undefined): string {
 /**
  * True when a vendor name is an ingest-failure marker (OCR/gateway wrote the
  * literal error string, or the document was classified as something that is
- * not an invoice — packing slip / packing list).
+ * not an invoice — packing slip / packing list). NULL / missing vendor name
+ * is NOT junk: the enrichment queries often omit the column, and an unknown
+ * vendor must never hide a real invoice (2026-10-27 regression: null-vendor
+ * rows with real invoice numbers were rejected, blanking the whole panel).
  */
 export function isJunkVendorName(vendorName: string | null | undefined): boolean {
+    if (vendorName == null) return false;
     return JUNK_VENDOR_NAMES.has(norm(vendorName));
 }
 
 /**
- * True when an invoice number is an extraction-failure marker.
+ * True when an invoice number is an extraction-failure marker. An EMPTY
+ * invoice number is not junk by itself — a photo invoice with an unreadable
+ * number is still a real document; its vendor name decides.
  */
 export function isJunkInvoiceNumber(invoiceNumber: string | null | undefined): boolean {
+    if (invoiceNumber == null) return false;
     return JUNK_INVOICE_NUMBERS.has(norm(invoiceNumber));
 }
 
