@@ -13,7 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
-import { firstRealInvoice, isPhantomInvoiceRow } from '@/lib/purchasing/invoice-pool';
+import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive } from '@/lib/purchasing/invoice-pool';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
@@ -233,6 +233,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
                 const invoiceMap = new Map<string, any[]>();
                 for (const inv of (invoices || [])) {
+                    if (isCarrierFreightArchive(inv) || isPhantomInvoiceRow(inv)) continue;
                     const key = inv.po_number;
                     if (!invoiceMap.has(key)) invoiceMap.set(key, []);
                     invoiceMap.get(key)!.push(inv);
@@ -270,16 +271,19 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 try {
                     const { data } = await sb
                         .from('vendor_invoices')
-                        .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data')
+                        .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, source, source_ref')
                         .is('po_number', null)
                         .in('vendor_name', vendorNames)
                         .order('created_at', { ascending: false })
-                        .limit(20);
+                        .limit(40);
                     unmatchedInvoices = data || [];
                 } catch (fetchErr: any) {
                     console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
                     unmatchedInvoices = [];
                 }
+                unmatchedInvoices = unmatchedInvoices.filter(
+                    (i) => !isPhantomInvoiceRow(i) && !isCarrierFreightArchive(i),
+                );
 
                 // Local invoice_cache fallback when PostgREST is empty/down (photo invoices etc.)
                 try {

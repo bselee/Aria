@@ -9,6 +9,7 @@ import {
     isJunkVendorName,
     isJunkInvoiceNumber,
     isPhantomInvoiceRow,
+    isCarrierFreightArchive,
     firstRealInvoice,
 } from "./invoice-pool";
 
@@ -51,6 +52,17 @@ describe("isPhantomInvoiceRow", () => {
         // survive (2026-10-27 regression: this row was rejected, blanking the
         // whole Receivings panel).
         expect(isPhantomInvoiceRow({ vendor_name: null, invoice_number: "9488427" })).toBe(false);
+    });
+});
+
+describe("isCarrierFreightArchive", () => {
+    it("flags FedEx / Billtrust CSV archives", () => {
+        expect(isCarrierFreightArchive({ source_ref: "FEDEX_4174571_20261020155330_0.csv" })).toBe(true);
+        expect(isCarrierFreightArchive({ source_ref: "fedex-csv-FEDEX_1.csv" })).toBe(true);
+    });
+    it("keeps goods invoices", () => {
+        expect(isCarrierFreightArchive({ source_ref: "gmail-abc", vendor_name: "Rootwise Soil Dynamics" })).toBe(false);
+        expect(isCarrierFreightArchive(null)).toBe(false);
     });
 });
 

@@ -660,10 +660,12 @@ async function main() {
                     invoice_number: inv.invoiceNumber,
                     invoice_date: inv.invoiceDate,
                     total: inv.amountDue,
-                    po_number: inv.poNumber || null,
+                    freight: inv.amountDue,
+                    po_number: null,
                     source: "csv_import",
                     source_ref: path.basename(csvPath),
-                    raw_data: { bol: inv.bol || null },
+                    notes: "FedEx COLLECT freight CSV. Not a goods invoice — freight pipeline only.",
+                    raw_data: { bol: inv.bol || null, shipFromVendor: inv.vendorName || null, kind: "fedex_collect_freight" },
                 }).catch(() => {});
             }
             console.log(`\n🗂  Archived ${invoices.length} to vendor_invoices`);

@@ -65,6 +65,20 @@ export function isJunkInvoiceNumber(invoiceNumber: string | null | undefined): b
 export interface InvoicePoolRow {
     vendor_name?: string | null;
     invoice_number?: string | null;
+    source?: string | null;
+    source_ref?: string | null;
+}
+
+/**
+ * FedEx / Billtrust CSV archives are carrier freight, not goods invoices.
+ * They belong on the freight reconcile path (reconcile-billtrust-freight /
+ * reconcile-fedex), never in the PO match pool. source_ref is
+ * `FEDEX_*.csv` (Billtrust archive) or `fedex-csv-*` (FBO archive).
+ */
+export function isCarrierFreightArchive(row: InvoicePoolRow | null | undefined): boolean {
+    if (!row) return false;
+    const ref = String(row.source_ref ?? "");
+    return /^FEDEX_/i.test(ref) || /^fedex-csv-/i.test(ref);
 }
 
 /**

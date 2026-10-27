@@ -23,7 +23,7 @@
 
 import { createClient } from "@/lib/db";
 import { findPOCandidates, type InvoiceToMatch, type MatchResult } from "@/lib/purchasing/invoice-po-matcher";
-import { isPhantomInvoiceRow } from "@/lib/purchasing/invoice-pool";
+import { isPhantomInvoiceRow, isCarrierFreightArchive } from "@/lib/purchasing/invoice-pool";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -72,7 +72,7 @@ export async function loadUnmatchedInvoicesForAutoMatch(
     // no_po_required is not explicitly true.
     const { data: invoices, error } = await db
         .from("vendor_invoices")
-        .select("id, invoice_number, vendor_name, total, subtotal, freight, tax, invoice_date, created_at, po_number, no_po_required, status")
+        .select("id, invoice_number, vendor_name, total, subtotal, freight, tax, invoice_date, created_at, po_number, no_po_required, status, source, source_ref")
         .or("po_number.is.null,po_number.eq.,status.eq.unmatched")
         .or("no_po_required.is.null,no_po_required.eq.false")
         .order("created_at", { ascending: false })
@@ -115,6 +115,7 @@ export async function loadUnmatchedInvoicesForAutoMatch(
         // Skip phantom rows — packing slips / failed ingests are not invoices
         // and must never be auto-linked (2026-10-27: PO 125411 class).
         if (isPhantomInvoiceRow(inv)) continue;
+        if (isCarrierFreightArchive(inv)) continue;
 
         const key = (inv.vendor_name ?? "") + "|" + (inv.invoice_number ?? "");
         const rawData = viMap.get(key);
