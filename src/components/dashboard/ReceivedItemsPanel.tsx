@@ -974,25 +974,23 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                 </>
                                             )}
                                             <span className="text-zinc-700 text-xs">·</span>
-                                            {po.items.map((item, index) => {
-                                                const badgeMatch = lifecycle.checkMatchDetails({ productIds: [item.productId] });
-                                                const badgeColor = badgeMatch.isLockedDirect
-                                                    ? "text-amber-300 font-bold"
-                                                    : badgeMatch.isLockedBom
-                                                    ? "text-amber-400/90 font-semibold"
-                                                    : badgeMatch.isDirect
-                                                    ? "text-cyan-300 font-semibold"
-                                                    : badgeMatch.isBom
-                                                    ? "text-cyan-400/90 font-medium"
-                                                    : "text-zinc-200";
+                                            <span className="text-xs font-mono text-zinc-300">
+                                                {po.items.length} item{po.items.length === 1 ? "" : "s"}
+                                            </span>
+                                            {po.items.slice(0, 2).map((item, index) => {
                                                 const displayQty = item.receivedInWindow !== undefined ? item.receivedInWindow : (item.receivedQuantity ?? item.quantity);
                                                 return (
-                                                    <span key={`${item.productId}-${index}`} className={`text-sm font-mono ${badgeColor}`}>
+                                                    <span key={`${item.productId}-${index}`} className="text-xs font-mono text-zinc-400">
                                                         {item.productId}
-                                                        <span className="text-zinc-400 ml-0.5">×{displayQty.toLocaleString()}</span>
+                                                        <span className="text-zinc-500 ml-0.5">×{displayQty.toLocaleString()}</span>
                                                     </span>
                                                 );
                                             })}
+                                            {po.items.length > 2 && (
+                                                <span className="text-xs font-mono text-zinc-500">
+                                                    +{po.items.length - 2} more
+                                                </span>
+                                            )}
                                         </div>
                                         {/* For PARTIAL receipts: show per-item detail breakdown */}
                                         {getDynamicReceiptStatus(po) === "partial" && po.items.length > 0 && (

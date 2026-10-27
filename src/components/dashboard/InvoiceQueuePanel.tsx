@@ -922,21 +922,6 @@ export default function InvoiceQueuePanel() {
                                   {inv.vendorName}
                                 </span>
                               )}
-                              {/* source_inbox badge */}
-                              {(() => {
-                                const src = (inv as any).source_inbox as string | null | undefined;
-                                if (!src || src === 'default') return null;
-                                const isAp = src === 'ap';
-                                return (
-                                  <span className={`text-[9px] font-mono font-semibold px-1 py-0.5 rounded shrink-0 ${
-                                    isAp
-                                      ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
-                                      : 'bg-zinc-600/30 text-zinc-400 border border-zinc-600/40'
-                                  }`}>
-                                    @{isAp ? 'ap' : src.split('@')[0]}
-                                  </span>
-                                );
-                              })()}
                               {inv.invoiceNumber && (
                                 <span className="text-[10px] font-mono text-zinc-500 shrink-0">
                                   #{inv.invoiceNumber}
@@ -952,29 +937,7 @@ export default function InvoiceQueuePanel() {
                                   {fmtShortDate(inv.invoiceDate)}
                                 </span>
                               )}
-                              <span className="text-[10px] font-mono text-[var(--dash-ts)] shrink-0 ml-auto">
-                                {timeAgo(inv.processedAt)}
-                              </span>
                             </div>
-                            {inv.classificationReason && inv.classificationReason.trim().length > 0 && !inv.classificationReason.includes("No dropship rules") && (
-                              <div className="text-[10px] font-mono text-zinc-500 truncate mt-0.5 leading-tight">
-                                {inv.classificationReason}
-                              </div>
-                            )}
-                            {(inv.ocrPoCandidate || inv.ocrOrderCandidate) && (
-                              <div className="flex items-center gap-1 mt-0.5 flex-wrap">
-                                {inv.ocrPoCandidate && (
-                                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
-                                    OCR: PO {inv.ocrPoCandidate}
-                                  </span>
-                                )}
-                                {inv.ocrOrderCandidate && (
-                                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
-                                    OCR: order {inv.ocrOrderCandidate}
-                                  </span>
-                                )}
-                              </div>
-                            )}
                             {/* PO Candidate chips — top 3, one-click Apply (unmatched only) */}
                             {(inv as any).poCandidates?.length > 0 && (
                               <div className="flex items-center gap-1 mt-0.5 flex-wrap">
