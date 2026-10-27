@@ -214,4 +214,82 @@ describe("ReceivedItemsPanel", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(await screen.findByText(/1 shipment arriving today/i)).toBeTruthy();
   });
+
+  it("drops a settled full receipt with a known bill after 7 days", async () => {
+    stubLocalStorage();
+    const old = new Date();
+    old.setDate(old.getDate() - 9);
+    const oldDate = old.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-600",
+          orderDate: "2026-01-01",
+          receiveDate: oldDate,
+          receiveDateTime: oldDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "Settled Vendor",
+          total: 500,
+          items: [{ productId: "SKU-S", quantity: 10, orderedQuantity: 10, receivedQuantity: 10, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "INV-1", subtotal: 500, freight: 0, tax: 0, total: 500, status: "received" },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    // Default list: settled 9 days ago is gone.
+    expect(screen.queryByText(/PO-600/i)).toBeNull();
+  });
+
+  it("shows the invoiced quantity and flags a mismatch against the receipt", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-700",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "JM",
+          receiptStatus: "full",
+          supplier: "Weight Vendor",
+          total: 500,
+          items: [{ productId: "RAWCASTINGS", quantity: 100, orderedQuantity: 100, receivedQuantity: 100, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: {
+              invoice_number: "INV-2", subtotal: 500, freight: 0, tax: 0, total: 500, status: "received",
+              line_items: [{ sku: "RAWCASTINGS", qty: 96, description: "castings" }],
+            },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/inv 96/i)).toBeTruthy();
+    expect(screen.getByText(/±weight/i)).toBeTruthy();
+  });
 });

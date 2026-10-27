@@ -36,11 +36,11 @@ type ReceivedPO = {
     }>;
     finaleUrl: string;
     _reconciliation?: {
-        invoices: Array<{ invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string }>;
+        invoices: Array<{ invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null }>;
         outcomes: Array<{ outcome: string; created_at: string; resolved_at: string | null }>;
         hasPendingApproval: boolean;
         hasAutoApplied: boolean;
-        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null } | null;
+        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
 };
 
@@ -183,6 +183,53 @@ function daysSince(dateStr: string | undefined | null): number | null {
     const now = new Date();
     const diff = now.getTime() - d.getTime();
     return Math.floor(diff / (1000 * 60 * 60 * 24));
+}
+
+/** SKU classes whose delivered weight legitimately varies from the PO. */
+function isWeightVariantSku(productId: string | undefined | null): boolean {
+    return /^RAW/i.test(String(productId || ""));
+}
+
+/**
+ * Invoice quantity for one PO line item, matched by SKU (or the invoice's
+ * only line). Returns null when the bill carries no usable per-line qty.
+ */
+function invoiceQtyForItem(
+    po: ReceivedPO,
+    productId: string,
+): { qty: number; skuMatched: boolean } | null {
+    const inv = po._reconciliation?.matchedInvoice;
+    if (!inv?.line_items) return null;
+    let lines: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> = [];
+    try {
+        lines = Array.isArray(inv.line_items)
+            ? inv.line_items
+            : typeof inv.line_items === "string"
+                ? JSON.parse(inv.line_items)
+                : [];
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(lines) || lines.length === 0) return null;
+
+    // Match by SKU first.
+    const skuLine = lines.find(
+        (l) => l?.sku && String(l.sku).trim().toUpperCase() === String(productId).toUpperCase(),
+    );
+    if (skuLine) {
+        const qty = Number(skuLine.qty ?? skuLine.quantity ?? 0);
+        if (Number.isFinite(qty) && qty > 0) return { qty, skuMatched: true };
+    }
+
+    // Invoice with NO SKU-carrying lines and a single PO line: that line is
+    // this SKU. Never fall back when the bill has multiple lines — quantity
+    // belongs to an unknown mix, and guessing is worse than showing nothing.
+    const skuBearing = lines.filter((l) => l?.sku && String(l.sku).trim());
+    if (skuBearing.length === 0 && po.items.length === 1 && lines.length === 1) {
+        const qty = Number(lines[0].qty ?? lines[0].quantity ?? 0);
+        if (Number.isFinite(qty) && qty > 0) return { qty, skuMatched: false };
+    }
+    return null;
 }
 
 function hasPartialLineQuantities(po: ReceivedPO): boolean {
@@ -910,7 +957,18 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 .filter(po => {
                                     if (showAllReceived) return true;
                                     const lbl = apMap[po.orderId]?.label || "";
-                                    return lbl === "RECONCILED ±" || lbl === "PENDING" || (po as { receiptStatus?: string }).receiptStatus === "partial" || po.items.some(i => (i.openQuantity ?? 0) > 0);
+                                    const dynStatus = getDynamicReceiptStatus(po);
+                                    const needsAttention = lbl === "RECONCILED ±" || lbl === "PENDING" || dynStatus === "partial" || (po as { receiptStatus?: string }).receiptStatus === "partial";
+                                    if (needsAttention) return true;
+                                    // Settled = fully received AND the bill is known. A settled
+                                    // row drops off the default list 7 days after receipt;
+                                    // Show all still reaches it. Unknown receipt data is not
+                                    // settled — it stays visible.
+                                    const hasKnownBill = !!po._reconciliation?.matchedInvoice || isBilledUpfrontVendor(po.supplier) || isPaidInAdvanceVendor(po.supplier);
+                                    const isSettled = dynStatus === "full" && hasKnownBill;
+                                    if (!isSettled) return true;
+                                    const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
+                                    return rcvDays === null || rcvDays < 7;
                                 })
                                 .map(po => {
                                 const apStatus = apMap[po.orderId];
@@ -943,7 +1001,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     >
                                         {/* Line 1: date · vendor · AP status · total */}
                                         <div className="flex items-center gap-2 min-w-0">
-                                                                                    <span className="text-xs font-mono text-[var(--dash-ts)] shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
+                                                                                    <span className="text-[13px] font-semibold text-cyan-300 shrink-0">{fmtDateTime(po.receiveDateTime || po.receiveDate)}</span>
                                                                                     {(() => {
                                                                                         const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
                                                                                         const ordDays = daysSince(po.orderDate);
@@ -952,8 +1010,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                                         if (ordDays !== null) chips.push(`ord ${ordDays}d`);
                                                                                         if (chips.length === 0) return null;
                                                                                         return (
-                                                                                            <span className="text-[10px] font-mono text-zinc-600 shrink-0">
-                                                                                                · {chips.join(" · ")}
+                                                                                            <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                                                                                {chips.join(" · ")}
                                                                                             </span>
                                                                                         );
                                                                                     })()}
@@ -982,11 +1040,24 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                             <span className="text-xs font-mono text-zinc-300">
                                                 {po.items.length} item{po.items.length === 1 ? "" : "s"}
                                             </span>
-                                            {po.items.slice(0, 3).map((item, index) => (
-                                                <span key={`${item.productId}-${index}`} className="text-xs font-mono text-zinc-300">
-                                                    {relativeSku(item)}
-                                                </span>
-                                            ))}
+                                            {po.items.slice(0, 3).map((item, index) => {
+                                                const invQty = invoiceQtyForItem(po, item.productId);
+                                                const received = item.receivedQuantity;
+                                                const differs = invQty && received !== undefined && invQty.qty !== received;
+                                                return (
+                                                    <span key={`${item.productId}-${index}`} className="text-xs font-mono text-zinc-300">
+                                                        {relativeSku(item)}
+                                                        {invQty && (
+                                                            <span className={differs ? "text-amber-300" : "text-zinc-500"}>
+                                                                {" "}· inv {fmtQty(invQty.qty)}
+                                                            </span>
+                                                        )}
+                                                        {differs && isWeightVariantSku(item.productId) && (
+                                                            <span className="text-[10px] font-mono text-amber-300/80"> ±weight</span>
+                                                        )}
+                                                    </span>
+                                                );
+                                            })}
                                             {po._reconciliation?.matchedInvoice && (
                                                 <span className="text-[10px] font-mono text-cyan-300/90">
                                                     bill {po._reconciliation.matchedInvoice.invoice_number} ${Number(po._reconciliation.matchedInvoice.total || 0).toFixed(0)}
@@ -1015,6 +1086,22 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 <>
                                                                     <span className="text-zinc-500"> · received </span>
                                                                     <span className="text-cyan-300">{fmtQty(received)}</span>
+                                                                    {(() => {
+                                                                        const invQty = invoiceQtyForItem(po, item.productId);
+                                                                        if (!invQty) return null;
+                                                                        const differs = invQty.qty !== (received ?? 0);
+                                                                        return (
+                                                                            <>
+                                                                                <span className="text-zinc-500"> · invoiced </span>
+                                                                                <span className={differs ? "text-amber-300" : "text-zinc-300"}>{fmtQty(invQty.qty)}</span>
+                                                                                {differs && (
+                                                                                    <span className="text-amber-300/90">
+                                                                                        {" "}· differs from receipt{isWeightVariantSku(item.productId) ? " (weight class)" : ""}
+                                                                                    </span>
+                                                                                )}
+                                                                            </>
+                                                                        );
+                                                                    })()}
                                                                     {(open ?? 0) > 0 && (
                                                                         <>
                                                                             <span className="text-zinc-500"> · </span>

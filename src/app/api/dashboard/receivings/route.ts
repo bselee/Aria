@@ -223,7 +223,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             if (poNumbers.length > 0) {
                 const { data: invoices } = await sb
                     .from('vendor_invoices')
-                    .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref')
+                    .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items')
                     .in('po_number', poNumbers)
                     .order('created_at', { ascending: false });
 
