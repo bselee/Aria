@@ -681,7 +681,13 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             return () => clearInterval(t);
         }, [fetchReceivings]);
 
-    const matchDollars = matchSuggestions.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
+    const linkable = matchSuggestions.filter((s) => {
+        const best = s.candidates?.[0];
+        if (!best) return false;
+        if (!/^(?:12\d{4}|123\d{6})$/.test(String(best.orderId || ""))) return false;
+        return (best.reasons || []).some((r) => /OCR PO/i.test(r));
+    });
+    const matchDollars = linkable.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
     const exceptionCount = pos.filter(po => {
         const lbl = (apMap[po.orderId]?.label || "").toLowerCase();
         if (lbl.includes("unmatched") || lbl.includes("review")) return true;
@@ -701,14 +707,14 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                 <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Invoices</span>
                 <span className="text-[10px] text-[var(--dash-ts)] font-mono">unmatched</span>
-                                {matchSuggestions.length > 0 && (
+                                {linkable.length > 0 && (
                                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                        {matchSuggestions.length} need a PO
+                                        {linkable.length} named a PO
                                     </span>
                                 )}
                                 <div className="flex-1" />
                 {!loading && (
-                    <span className="text-xs font-mono text-zinc-500">{matchSuggestions.length} invoices</span>
+                    <span className="text-xs font-mono text-zinc-500">{linkable.length > 0 ? `${linkable.length} to link` : ""}</span>
                 )}
                 <button onClick={() => fetchReceivings(true)} disabled={refreshing}
                     className="ml-2 text-zinc-700 hover:text-zinc-400 transition-colors disabled:opacity-40">
@@ -726,15 +732,15 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             {!effectivelyCollapsed && !loading && (
                 <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
                     <span className="text-zinc-600 uppercase tracking-wider shrink-0">AP</span>
-                    {matchSuggestions.length > 0 ? (
+                    {linkable.length > 0 ? (
                         <>
-                            <span className="text-amber-300">{matchSuggestions.length} invoice{matchSuggestions.length === 1 ? "" : "s"} need a PO</span>
+                            <span className="text-amber-300">{linkable.length} invoice{linkable.length === 1 ? "" : "s"} named a PO</span>
                             {matchDollars > 0 && (
                                 <span className="text-amber-200/90">${Math.round(matchDollars).toLocaleString()}</span>
                             )}
                         </>
                     ) : (
-                        <span className="text-emerald-400/80">every invoice is matched</span>
+                        <span className="text-zinc-500">no invoice named a PO</span>
                     )}
                 </div>
             )}
@@ -789,10 +795,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             )}
 
                             {/* ── Split-panel Invoice → PO Matcher ── */}
+                            {linkable.length > 0 && (
                             <InvoicePOMatcher
-                                suggestions={matchSuggestions.filter(s =>
-                                    s.candidates.every(c => !/DropshipPO/i.test(String(c.orderId || "")))
-                                )}
+                                suggestions={linkable}
                                 receivedPOs={pos}
                                 onMatch={handleMatchInvoice}
                                 onManualMatch={handleManualMatch}
@@ -801,9 +806,10 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 manuallyMatching={manuallyMatching}
                                 onManualInputChange={handleManualInputChange}
                             />
+                            )}
 
                             {/* ── Received POs toggle ── */}
-                            {matchSuggestions.length > 0 && (
+                            {linkable.length > 0 && (
                                 <button
                                     onClick={() => setShowReceivedPOs(!showReceivedPOs)}
                                     className="w-full px-4 py-1.5 text-[10px] font-mono text-zinc-500 hover:text-zinc-300 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1.5"
@@ -815,7 +821,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     )}
                                 </button>
                             )}
-                            {(!matchSuggestions.length || showReceivedPOs) && (
+                            {(!linkable.length || showReceivedPOs) && (
                             <div>
 
                             {/* ── Unmatched POs Check ── */}
@@ -905,7 +911,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 .filter(po => {
                                     if (showAllReceived) return true;
                                     const lbl = apMap[po.orderId]?.label || "";
-                                    return lbl === "RECONCILED ±" || lbl === "PENDING" || lbl === "UNMATCHED" || lbl === "";
+                                    return lbl === "RECONCILED ±" || lbl === "PENDING" || (po as { receiptStatus?: string }).receiptStatus === "partial" || po.items.some(i => (i.openQuantity ?? 0) > 0);
                                 })
                                 .map(po => {
                                 const apStatus = apMap[po.orderId];
