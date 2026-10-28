@@ -60,6 +60,22 @@ export const ARTWORK_LINK_SEED: ArtworkLinkSeed[] = [
     // Coconut Water Powder printed bags (Colorful)
     { componentSku: 'CWP01BAG', artworkSku: 'CWP01', vendor: 'Colorful Packaging Ltd' },
     { componentSku: 'CWP02BAG', artworkSku: 'CWP02', vendor: 'Colorful Packaging Ltd' },
+    // Coconut Water Powder labels (2lb, 5lb) — name-search links
+    { componentSku: '900168', artworkSku: 'CWP03', vendor: '', note: 'Label - (Horticultural Coconut - 2lb) Front and Back' },
+    { componentSku: '900171', artworkSku: 'CWP05', vendor: '', note: 'Label - (Horticultural Coconut - 5lb) Front and Back' },
+    // Horticultural Aloe labels (name-search links; HAL10x are Finale label SKUs)
+    { componentSku: 'HAL100', artworkSku: 'GA104', vendor: 'Axiom Print', note: 'Label - (Horticultural Aloe - 1oz) Front' },
+    { componentSku: 'HAL102', artworkSku: 'GA105', vendor: 'Axiom Print', note: 'Label - (Horticultural Aloe - 4oz) Front' },
+    { componentSku: 'HAL103', artworkSku: 'GA106', vendor: 'Axiom Print', note: 'Label - (Horticultural Aloe - 16oz) Front and Back' },
+    { componentSku: 'HAL107', artworkSku: 'GA107', vendor: 'Axiom Print', note: 'Label - (Horticultural Aloe - 1Kilo) Front' },
+    // Agsil bottle labels (name-search links)
+    { componentSku: 'AG110LABELFR', artworkSku: 'AG110', vendor: 'Axiom Print', note: 'Agsil 25 Potassium Silicate Liquid - Quart Label FR' },
+    { componentSku: 'AG111LABELFR', artworkSku: 'AG111', vendor: 'Axiom Print', note: 'Agsil 25 Potassium Silicate Liquid - 1/2 Gallon LABEL FR' },
+    // BuildAFlower 1cf label (name-search link)
+    { componentSku: 'APL105', artworkSku: 'BAF02', vendor: 'Axiom Print', note: 'Label - (B.A.F. Build A Flower 8.5x11 - Cubic Foot)' },
+    // GnarBar 44lb labels (name-search links)
+    { componentSku: 'GNS14', artworkSku: 'Gnarbar04', vendor: 'Axiom Print', note: 'Label - (GnarBar-Whole - 44lb) Front' },
+    { componentSku: 'GNS19', artworkSku: 'Gnarbar09', vendor: 'Axiom Print', note: 'Label - (GnarBar-Milled - 44lb) Front' },
     // 3.0 soil poly bag (Colorful)
     { componentSku: '3.0BAGCP', artworkSku: 'LOSOLY3', vendor: 'Colorful Packaging Ltd', note: '25L poly bag for 1 Cu Ft 3.0 soil' },
 ];
