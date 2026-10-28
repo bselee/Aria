@@ -515,4 +515,67 @@ describe("buildTodayShipmentSummary", () => {
         expect(summary.lines[0]).toContain("PO-200");
         expect(summary.lines[1]).toContain("PO-300");
     });
+
+    it("excludes PO-less tracking and dropships (2026-10-28)", () => {
+        const rollup = (po_numbers: string[], vendor_names: string[], status_category: "in_transit" | "out_for_delivery") => ({
+            id: "x",
+            poNumbers: po_numbers,
+            vendorNames: vendor_names,
+            trackingNumber: "384061609853",
+            carrierName: "FedEx",
+            carrierKey: "fedex",
+            trackingKind: "parcel" as const,
+            statusCategory: status_category,
+            statusDisplay: status_category === "out_for_delivery" ? "Out for delivery" : "In transit",
+            estimatedDeliveryAt: "2026-10-28T14:15:00.000Z",
+            deliveredAt: null,
+            publicTrackingUrl: null,
+            freshnessMinutes: 5,
+            lastCheckedAt: "2026-10-28T10:00:00.000Z",
+        });
+        const summary = buildTodayShipmentSummary({
+            arrivingToday: [
+                rollup([], ["FedEx"], "in_transit"), // bare tracking, no PO
+                rollup(["23577107-S-DropshipPO"], ["Autopot Watering Systems"], "in_transit"), // teammate's
+                rollup(["125394"], ["Safe Solutions, Inc."], "in_transit"), // real incoming PO
+            ],
+            outForDelivery: [rollup([], ["FedEx"], "out_for_delivery")], // bare FedEx, no PO
+            deliveredAwaitingReceipt: [],
+            exceptions: [],
+            stale: [],
+            recentlyDelivered: [],
+        });
+        expect(summary).not.toBeNull();
+        expect(summary!.headline).toBe("1 arriving today");
+        expect(summary!.lines).toHaveLength(1);
+        expect(summary!.lines[0]).toContain("125394");
+    });
+
+    it("returns null when only noise is present", () => {
+        const rollup = () => ({
+            id: "y",
+            poNumbers: [],
+            vendorNames: ["FedEx"],
+            trackingNumber: "383123033066",
+            carrierName: "FedEx",
+            carrierKey: "fedex",
+            trackingKind: "parcel" as const,
+            statusCategory: "out_for_delivery" as const,
+            statusDisplay: "Out for delivery",
+            estimatedDeliveryAt: null,
+            deliveredAt: null,
+            publicTrackingUrl: null,
+            freshnessMinutes: 5,
+            lastCheckedAt: null,
+        });
+        const summary = buildTodayShipmentSummary({
+            arrivingToday: [],
+            outForDelivery: [rollup(), rollup()],
+            deliveredAwaitingReceipt: [],
+            exceptions: [],
+            stale: [],
+            recentlyDelivered: [],
+        });
+        expect(summary).toBeNull();
+    });
 });

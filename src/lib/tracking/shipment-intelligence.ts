@@ -517,9 +517,22 @@ function formatSummaryEta(value: string | null | undefined): string {
     });
 }
 
+/**
+ * A shipment only earns a Shipping Today line when it is attached to a real
+ * incoming PO and is not a dropship (dropships belong to a teammate, and a
+ * bare FedEx tracking number with no PO is meaningless — Bill, 2026-10-28).
+ */
+function isMeaningfulTodayShipment(shipment: ShipmentRollup): boolean {
+    const pos = shipment.poNumbers || [];
+    if (pos.length === 0) return false; // tracking-first noise without a PO
+    const dropshipPo = pos.some((p) => /dropship/i.test(String(p)));
+    const dropshipVendor = (shipment.vendorNames || []).some((v) => /dropship/i.test(String(v)));
+    return !(dropshipPo || dropshipVendor);
+}
+
 export function buildTodayShipmentSummary(board: ShipmentBoardBuckets): TodayShipmentSummary | null {
-    const outForDelivery = board.outForDelivery || [];
-    const arrivingToday = board.arrivingToday || [];
+    const outForDelivery = (board.outForDelivery || []).filter(isMeaningfulTodayShipment);
+    const arrivingToday = (board.arrivingToday || []).filter(isMeaningfulTodayShipment);
     const total = outForDelivery.length + arrivingToday.length;
     if (total === 0) return null;
 
