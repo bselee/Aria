@@ -916,12 +916,12 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                             .limit(500),
                                     ]);
                                     const flagCount = new Map<string, number>();
-                                    for (const r of (disputeRes.data || []) as any[]) {
+                                    for (const r of (disputeRes.data || []) as Array<{ vendor_name?: unknown }>) {
                                         const v = String(r.vendor_name || '');
                                         if (v) flagCount.set(v, (flagCount.get(v) || 0) + 1);
                                     }
                                     const billCount = new Map<string, number>();
-                                    for (const r of (billRes.data || []) as any[]) {
+                                    for (const r of (billRes.data || []) as Array<{ vendor_name?: unknown }>) {
                                         const v = String(r.vendor_name || '');
                                         if (v) billCount.set(v, (billCount.get(v) || 0) + 1);
                                     }
@@ -930,15 +930,21 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         const flagged = flagCount.get(po.supplier) || 0;
                                         const bills = billCount.get(po.supplier) || 0;
                                         if (flagged > 0) {
-                                            (po as any)._reconciliation.vendorOverbillPattern = {
-                                                flagged,
-                                                bills,
-                                            };
+                                            const rec = po._reconciliation as
+                                                | { vendorOverbillPattern?: { flagged: number; bills: number } }
+                                                | undefined;
+                                            if (rec) {
+                                                rec.vendorOverbillPattern = {
+                                                    flagged,
+                                                    bills,
+                                                };
+                                            }
                                         }
                                     }
                                 }
-                            } catch (patErr: any) {
-                                console.warn(`[receivings] vendor overbill pattern failed: ${patErr?.message || patErr}`);
+                            } catch (patErr: unknown) {
+                                const msg = patErr instanceof Error ? patErr.message : String(patErr);
+                                console.warn(`[receivings] vendor overbill pattern failed: ${msg}`);
                             }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
