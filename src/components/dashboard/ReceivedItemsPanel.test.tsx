@@ -175,44 +175,29 @@ describe("ReceivedItemsPanel", () => {
     expect(await screen.findByText(/SKU-A short 2 of 10/i)).toBeTruthy();
   });
 
-  it("shows a today shipment summary above receivings when tracking data is available", async () => {
+  it("no longer renders a Shipping Today block — arriving lives in Active Purchases", async () => {
     stubLocalStorage();
-    stubFetch(
-      {
-        received: [
-          {
-            orderId: "PO-500",
-            orderDate: "2026-04-01",
-            receiveDate: "2026-04-01",
-            supplier: "Test Vendor",
-            total: 100,
-            items: [{ productId: "SKU-X", quantity: 1 }],
-            finaleUrl: "https://example.com/po",
-          },
-        ],
-        days: 14,
-        asOf: "2026-04-01",
-      },
-      {
-        board: {
-          arrivingToday: [{ id: "ship-1", carrier: "FedEx", status: "in_transit" }],
-          outForDelivery: [],
-          deliveredAwaitingReceipt: [],
-          exceptions: [],
-          stale: [],
-          recentlyDelivered: [],
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-500",
+          orderDate: "2026-04-01",
+          receiveDate: "2026-04-01",
+          supplier: "Test Vendor",
+          total: 100,
+          items: [{ productId: "SKU-X", quantity: 1 }],
+          finaleUrl: "https://example.com/po",
         },
-        shipments: [],
-        asOf: "2026-04-01T12:00:00.000Z",
-        todaySummary: { headline: "1 shipment arriving today", lines: ["FedEx: ship-1"] },
-        answer: null,
-      }
-    );
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
 
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    expect(await screen.findByText(/1 shipment arriving today/i)).toBeTruthy();
+    // Receipts panel is receipt-only (2026-10-28): no arriving block here.
+    expect(screen.queryByText(/shipping today/i)).toBeNull();
   });
 
   it("renders one list with the Receiving header and a settled footer toggle", async () => {

@@ -94,14 +94,39 @@ describe("ActivePurchasesPanel movement badge strip", () => {
         render(<ActivePurchasesPanel embedded />);
 
         await waitFor(() => expect(screen.getByText(/TRACK 1Z99/)).toBeTruthy());
-        expect(screen.getByText(/ETA Apr 3/)).toBeTruthy();
+        // Low-confidence ETA carries the honest `est` prefix (2026-10-28).
+        expect(screen.getByText(/ETA est Apr 3/)).toBeTruthy();
         expect(screen.getByText("INV paid")).toBeTruthy();
 
         const trackLink = screen.getByRole("link", { name: /TRACK/ });
         expect(trackLink.getAttribute("href")).toBe("https://www.ups.com/track?tracknum=1Z999AA10123456784");
     });
 
-    it("shows DELIVERED · need receive when carrier delivered but Finale not received", async () => {
+    it("surfaces an Arriving block with a time for tracking-derived ETAs", async () => {
+    stubLocalStorage();
+    const todayIso = new Date();
+    todayIso.setHours(14, 15, 0, 0);
+    stubFetch({
+      purchases: [
+        makePurchase({
+          isReceived: false,
+          movement: {
+            ...confirmedMovement,
+            primaryEta: todayIso.toISOString(),
+          },
+        }),
+      ],
+      cachedAt: new Date().toISOString(),
+    });
+
+    render(<ActivePurchasesPanel embedded />);
+
+    await waitFor(() => expect(screen.getByText(/TRACK 1Z99/)).toBeTruthy());
+    expect(screen.getByText(/Arriving/i)).toBeTruthy();
+    expect(screen.getByText(/today/)).toBeTruthy();
+  });
+
+  it("shows DELIVERED · need receive when carrier delivered but Finale not received", async () => {
         stubLocalStorage();
         stubFetch({
             purchases: [

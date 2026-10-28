@@ -82,11 +82,6 @@ type ReceivedPO = {
     };
 };
 
-type TrackingTodaySummary = {
-    headline: string;
-    lines: string[];
-} | null;
-
 type MatchSuggestion = {
     invoiceId: string;
     invoiceNumber: string;
@@ -368,7 +363,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         const [pos, setPos] = useState<ReceivedPO[]>([]);
         const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
         const [, setFreightClasses] = useState<Record<string, FreightClass>>({});
-        const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
         const [apMap, setApMap] = useState<ApStatusMap>({});
         const [loading, setLoading] = useState(true);
         const [refreshing, setRefreshing] = useState(false);
@@ -697,11 +691,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     const ctrl = new AbortController();
                     const kill = setTimeout(() => ctrl.abort(), 18_000);
                     let receivingsRes: Response;
-                    let trackingRes: Response | null = null;
                     try {
-                        [receivingsRes, trackingRes] = await Promise.all([
+                        [receivingsRes] = await Promise.all([
                             fetch('/api/dashboard/receivings', { signal: ctrl.signal }),
-                            fetch('/api/dashboard/tracking', { signal: ctrl.signal }).catch(() => null),
                         ]);
                     } finally {
                         clearTimeout(kill);
@@ -726,13 +718,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     setMatchSuggestions(data.matchSuggestions || []);
                     setRecentAutoCompletions(data.recentAutoCompletions || []);
                     setFreightClasses(data.freightClasses || {});
-
-                    if (trackingRes && trackingRes.ok) {
-                        const trackingData = await trackingRes.json();
-                        setTodaySummary(trackingData.todaySummary || null);
-                    } else if (!hasRows) {
-                        setTodaySummary(null);
-                    }
                 } catch (e: unknown) {
                     // Keep painted rows on timeout/abort — only surface error when empty
                     if (!posRef.current.length) {
@@ -833,27 +818,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                             className={`overflow-y-auto border-t border-zinc-800/60 ${embedded ? "flex-1 min-h-0" : ""}`}
                             style={embedded ? undefined : { height: bodyHeight }}
                         >
-                            {todaySummary && (
-                                <div className="px-4 py-3 border-b border-cyan-500/20 bg-cyan-500/5">
-                                    <div className="text-[11px] font-mono uppercase tracking-[0.18em] text-cyan-300/80">
-                                        Shipping Today
-                                    </div>
-                                    <div className="mt-1 text-sm font-semibold text-cyan-100">
-                                        {todaySummary.headline}
-                                    </div>
-                                    <div className="mt-2 space-y-1">
-                                        {todaySummary.lines.map((line) => {
-                                            const isValidated = line.includes('✓ validated');
-                                            return (
-                                                <div key={line} className={`text-[11px] font-mono ${isValidated ? 'text-emerald-300' : 'text-cyan-200/85'}`}>
-                                                    {line}
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-                            )}
-
                             {/* ── Auto-processed summary — full trail in Activity tab ── */}
                             {recentAutoCompletions.length > 0 && !showAllReceived && (
                                 <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">

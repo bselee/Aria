@@ -146,6 +146,42 @@ function fmtDateTime(dateStr: string | null | undefined): string {
         : d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
+/** Denver calendar day for an ISO timestamp (today/tomorrow compares). */
+function denverDay(iso: string): string | null {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    return d.toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+}
+
+/**
+ * "When is it getting here" label (2026-10-28). Tracking-derived ETAs answer
+ * with time when today or tomorrow; lead-time estimates never fake a time
+ * and carry an `est` prefix so the answer's provenance is honest.
+ */
+function etaArrivalLabel(iso: string, isEstimate: boolean): string {
+    const day = denverDay(iso);
+    const today = denverDay(new Date().toISOString());
+    const tomorrow = denverDay(new Date(Date.now() + 86400 * 1000).toISOString());
+    if (isEstimate) return `est ${fmtDate(iso)}`;
+    if (day === today) {
+        const t = new Date(iso).toLocaleTimeString("en-US", {
+            timeZone: "America/Denver",
+            hour: "numeric",
+            minute: "2-digit",
+        });
+        return `today ${t}`;
+    }
+    if (day === tomorrow) {
+        const t = new Date(iso).toLocaleTimeString("en-US", {
+            timeZone: "America/Denver",
+            hour: "numeric",
+            minute: "2-digit",
+        });
+        return `tomorrow ${t}`;
+    }
+    return fmtDate(iso);
+}
+
 function timeAgo(iso: string) {
     const ms = Date.now() - new Date(iso).getTime();
     if (isNaN(ms)) return "";
@@ -329,7 +365,7 @@ function MovementBadgeStrip({ po }: { po: ActivePurchase }) {
                     className={`${badge} ${etaTone}`}
                     title={`ETA ${fmtDateTime(etaIso)} · ${po.etaProfile?.label || po.leadProvenance || ""}`}
                 >
-                    ETA {fmtDate(etaIso)}
+                    ETA {etaArrivalLabel(etaIso, etaConfidence === "low")}
                 </span>
             )}
 
@@ -838,6 +874,25 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                     return (a.orderDate || "").localeCompare(b.orderDate || "");
                 });
 
+    // ── Arriving block: POs landing today or tomorrow, soonest first ──
+    // Answers "when is it getting here" in one place (2026-10-28). Tracking
+    // ETAs carry a time; lead-time estimates are marked `est`.
+    const arrivingNext = visiblePurchases
+        .filter((po) => !po.isReceived && deriveStage(po) !== "RECEIVED" && deriveStage(po) !== "DELIVERED")
+        .map((po) => {
+            const iso = po.movement?.primaryEta || po.etaProfile?.expectedDate || po.expectedDate || null;
+            return { po, iso, isEstimate: !po.movement?.primaryEta };
+        })
+        .filter((x) => {
+            if (!x.iso) return false;
+            const day = denverDay(x.iso);
+            const today = denverDay(new Date().toISOString());
+            const tomorrow = denverDay(new Date(Date.now() + 86400 * 1000).toISOString());
+            return day === today || day === tomorrow;
+        })
+        .sort((a, b) => String(a.iso).localeCompare(String(b.iso)))
+        .slice(0, 5);
+
     // ── Aggregate stats for human-readable alert banner ──
     const aggTotal = visiblePurchases.length;
     const aggOverdue = purchases.filter(p => isOverdue(p) && !dismissed.has(p.orderId)).length;
@@ -970,6 +1025,30 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                         </div>
                     )}
                     {/* Aggregate status banner removed 2026-07-28 — duplicated Overdue chip + Stage filters below. */}
+                                                            {/* ── Arriving block: the "when is it getting here" answer ── */}
+                                                            {!loading && !error && arrivingNext.length > 0 && (
+                                                                <div className="px-3 py-2 border-b border-cyan-500/20 bg-cyan-500/5">
+                                                                    <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-cyan-300/80">
+                                                                        Arriving
+                                                                    </div>
+                                                                    <div className="mt-1 space-y-0.5">
+                                                                        {arrivingNext.map(({ po, iso, isEstimate }) => (
+                                                                            <div key={po.orderId} className="text-[11px] font-mono flex items-center gap-2 flex-wrap">
+                                                                                <span className={isEstimate ? "text-zinc-400" : "text-cyan-200"}>
+                                                                                    {etaArrivalLabel(String(iso), isEstimate)}
+                                                                                </span>
+                                                                                <span className="text-zinc-200 font-semibold truncate max-w-[180px]" title={po.vendorName}>
+                                                                                    {po.vendorName}
+                                                                                </span>
+                                                                                <span className="text-zinc-500">PO {po.orderId}</span>
+                                                                                <span className="ml-auto text-zinc-400">
+                                                                                    ${Number(po.total || 0).toLocaleString()}
+                                                                                </span>
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                            )}
                                                             {/* ── Stage FilterChips Row ── */}
                                                             {!loading && !error && purchases.length > 0 && (!embedded || showStageFilters || filterStage) && (
                                                                 <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/20 flex flex-wrap items-center gap-x-2 gap-y-1">
