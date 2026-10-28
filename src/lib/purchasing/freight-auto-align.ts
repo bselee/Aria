@@ -49,6 +49,7 @@ export interface FreightAlignStats {
     assessed: number;
     appliedVendor: number;
     appliedDestination: number;
+    appliedCarrier: number;
     completed: number;
     skipped: number;
     errors: number;
@@ -86,6 +87,66 @@ interface FinaleOrderDoc {
     orderItemList?: Array<{ productId?: string; quantity?: number; weight?: number }>;
     orderAdjustmentList?: FinaleAdjustmentLine[];
     [key: string]: unknown;
+}
+
+/** One carrier bill from the Billtrust export, the fields the matcher reads. */
+export interface CarrierBill {
+    invoiceNumber: string;
+    shipDate: string; // MM/DD/YYYY
+    terms: string;
+    amountDue: number;
+    bol: string;
+    poNumber: string;
+    vendorName: string | null;
+}
+
+/**
+ * Pure carrier-bill match for ONE blocked PO. Joins are the same the weekly
+ * reconciler uses: a hard 6-digit PO# on the bill, or a vendor + ship-date
+ * window around the PO's receive date when exactly one bill sits in it.
+ * Composite PO# fields (freight-account strings like `9226398101-646135168`)
+ * are bill numbers, not POs — never matched. COLLECT only.
+ */
+export function matchCarrierBillForPo(
+    bills: CarrierBill[],
+    po: string,
+    vendorName: string,
+    receiveDateIso: string | null | undefined,
+): CarrierBill | null {
+    const collect = bills.filter((b) => {
+        if (!/COLLECT/i.test(b.terms)) return false;
+        const pn = String(b.poNumber || "").trim();
+        if (pn && (pn.includes("-") || !/^\d{6}$/.test(pn))) return false; // freight-account composite
+        return true;
+    });
+
+    // Hard PO match first — the printed PO is the primary join.
+    const hard = collect.find((b) => String(b.poNumber || "").trim() === po);
+    if (hard) return hard;
+
+    // Vendor + receive window: receive within [ship, ship+10d].
+    if (!receiveDateIso) return null;
+    const rcv = new Date(receiveDateIso).getTime();
+    if (Number.isNaN(rcv)) return null;
+    const v = vendorName.trim().toLowerCase();
+    const windowed = collect.filter((b) => {
+        if (!b.vendorName) return false;
+        const bv = b.vendorName.toLowerCase();
+        if (!(v && (bv.includes(v) || v.includes(bv)))) return false;
+        const ship = parseUsDateMs(b.shipDate);
+        if (Number.isNaN(ship)) return false;
+        const delta = rcv - ship;
+        return delta >= 0 && delta <= 10 * 86400 * 1000;
+    });
+    return windowed.length === 1 ? windowed[0] : null;
+}
+
+/** MM/DD/YYYY → epoch ms (Invalid Date → NaN). */
+function parseUsDateMs(s: string): number {
+    const m = String(s || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (!m) return NaN;
+    const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+    return new Date(y, Number(m[1]) - 1, Number(m[2])).getTime();
 }
 
 /** Env kill switch — on by default (Bill authorized autonomous alignment). */
@@ -214,6 +275,7 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
         assessed: 0,
         appliedVendor: 0,
         appliedDestination: 0,
+        appliedCarrier: 0,
         completed: 0,
         skipped: 0,
         errors: 0,
@@ -244,6 +306,31 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
     const finale = new FinaleClient();
     const nowMs = Date.now();
     let writes = 0;
+    /** Billtrust carrier bills, loaded once on first need. */
+    let carrierBills: CarrierBill[] | null = null;
+
+    const loadCarrierBills = async (): Promise<CarrierBill[]> => {
+        try {
+            const { findLatestBilltrustCsv, parseBilltrustCsv, dedupInboundInvoices } = await import(
+                "../../cli/reconcile-billtrust-freight"
+            );
+            const csv = findLatestBilltrustCsv();
+            if (!csv) return [];
+            return dedupInboundInvoices(parseBilltrustCsv(csv)).map((b) => ({
+                invoiceNumber: b.invoiceNumber,
+                shipDate: b.shipDate,
+                terms: b.terms,
+                amountDue: b.amountDue,
+                bol: b.bol,
+                poNumber: b.poNumber,
+                vendorName: b.vendorName,
+            }));
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`[freight-auto-align] carrier CSV load failed: ${msg}`);
+            return [];
+        }
+    };
 
     for (const row of candidates.slice(0, MAX_CANDIDATES)) {
         const po = String(row.po_number);
@@ -289,14 +376,60 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
                     : 0;
 
                 const lane = pickFreightLane({ invoiceFreight, destAmount });
-                if (lane.lane === "none") {
-                    stats.blocked.push({ po, reason: lane.reason || "awaiting carrier bill" });
+
+                // Idempotency: another process (weekly mailbox reconciler)
+                // may have landed freight since the sweep read. Re-read the
+                // PO right before any write and skip when freight appeared.
+                const doc: FinaleOrderDoc = await finale.getOrderDetails(po);
+                await new Promise((r) => setTimeout(r, GAP_MS));
+                if (sumFreightAdjustments(doc) > FREIGHT_EPS) {
+                    stats.skipped++;
+                    // Aligned now — completion happens on a later pass.
                     await new Promise((r) => setTimeout(r, GAP_MS));
                     continue;
                 }
 
-                const doc: FinaleOrderDoc = await finale.getOrderDetails(po);
-                await new Promise((r) => setTimeout(r, GAP_MS));
+                if (lane.lane === "none") {
+                    // Carrier lane (2026-10-28): the same Billtrust joins the
+                    // weekly reconciler uses, run here for THIS blocked PO.
+                    if (carrierBills === null) carrierBills = await loadCarrierBills();
+                    const carrier = matchCarrierBillForPo(
+                        carrierBills,
+                        po,
+                        String(row.vendor_name || ""),
+                        String(row.receive_date || ""),
+                    );
+                    if (!carrier) {
+                        stats.blocked.push({ po, reason: "no carrier bill matched yet" });
+                        await new Promise((r) => setTimeout(r, GAP_MS));
+                        continue;
+                    }
+                    const applyCarrier = await appendFreightLine(finale, po, carrier.amountDue, doc);
+                    writes++;
+                    if (!applyCarrier.ok) {
+                        stats.errors++;
+                        stats.blocked.push({ po, reason: `carrier apply failed: ${applyCarrier.error}` });
+                        continue;
+                    }
+                    stats.appliedCarrier++;
+                    await sb.from("ap_activity_log").insert({
+                        intent: "FREIGHT_AUTO_ALIGNED",
+                        created_at: new Date().toISOString(),
+                        metadata: {
+                            poNumber: po,
+                            lane: "carrier",
+                            amount: carrier.amountDue,
+                            invoiceNumber: carrier.invoiceNumber,
+                            bol: carrier.bol,
+                        },
+                    });
+                    console.log(
+                        `[freight-auto-align] ${po}: applied carrier freight $${carrier.amountDue.toFixed(2)} (${carrier.invoiceNumber})`,
+                    );
+                    await new Promise((r) => setTimeout(r, GAP_MS));
+                    continue;
+                }
+
                 const apply = await appendFreightLine(finale, po, lane.amount, doc);
                 writes++;
                 if (!apply.ok) {
@@ -405,7 +538,7 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
     if (stats.assessed > 0) {
         console.log(
             `[freight-auto-align] assessed=${stats.assessed} vendor=${stats.appliedVendor} dest=${stats.appliedDestination} ` +
-                `completed=${stats.completed} skipped=${stats.skipped} errors=${stats.errors} blocked=${stats.blocked.length}`,
+                `carrier=${stats.appliedCarrier} completed=${stats.completed} skipped=${stats.skipped} errors=${stats.errors} blocked=${stats.blocked.length}`,
         );
     }
     return stats;

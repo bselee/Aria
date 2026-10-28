@@ -4,7 +4,63 @@
  *          dwell, and the completion blocker. No DB or Finale access.
  */
 import { describe, it, expect } from "vitest";
-import { pickFreightLane, dwellSatisfied, completionBlocker, sumFreightAdjustments } from "./freight-auto-align";
+import {
+    pickFreightLane,
+    dwellSatisfied,
+    completionBlocker,
+    sumFreightAdjustments,
+    matchCarrierBillForPo,
+    type CarrierBill,
+} from "./freight-auto-align";
+
+function bill(over: Partial<CarrierBill>): CarrierBill {
+    return {
+        invoiceNumber: "1551430904",
+        shipDate: "10/26/2026",
+        terms: "COLLECT",
+        amountDue: 560.2,
+        bol: "BOL-1",
+        poNumber: "",
+        vendorName: null,
+        ...over,
+    };
+}
+
+describe("matchCarrierBillForPo", () => {
+    it("matches a hard printed 6-digit PO number", () => {
+        const b = bill({ poNumber: "125429" });
+        expect(matchCarrierBillForPo([b], "125429", "Uline", null)).toBe(b);
+    });
+
+    it("never matches a freight-account composite PO field", () => {
+        const b = bill({ poNumber: "9226398101-646135168" });
+        expect(matchCarrierBillForPo([b], "125429", "Uline", "2026-10-28T10:00:00-06:00")).toBeNull();
+    });
+
+    it("ignores non-COLLECT bills", () => {
+        const b = bill({ poNumber: "125429", terms: "PPD" });
+        expect(matchCarrierBillForPo([b], "125429", "Uline", null)).toBeNull();
+    });
+
+    it("matches a unique vendor bill in the receive window", () => {
+        const b = bill({ shipDate: "10/20/2026", vendorName: "Rootwise Soil Dynamics" });
+        const r = matchCarrierBillForPo([b], "125241", "Rootwise Soil Dynamics", "2026-10-24T10:00:00-06:00");
+        expect(r).toBe(b);
+    });
+
+    it("holds when two bills sit in the window", () => {
+        const b1 = bill({ shipDate: "10/20/2026", invoiceNumber: "A", vendorName: "Rootwise Soil Dynamics" });
+        const b2 = bill({ shipDate: "10/21/2026", invoiceNumber: "B", vendorName: "Rootwise Soil Dynamics" });
+        const r = matchCarrierBillForPo([b1, b2], "125241", "Rootwise Soil Dynamics", "2026-10-24T10:00:00-06:00");
+        expect(r).toBeNull();
+    });
+
+    it("holds when the receive date is outside the window", () => {
+        const b = bill({ shipDate: "10/01/2026", vendorName: "Rootwise Soil Dynamics" });
+        const r = matchCarrierBillForPo([b], "125241", "Rootwise Soil Dynamics", "2026-10-24T10:00:00-06:00");
+        expect(r).toBeNull();
+    });
+});
 
 describe("pickFreightLane", () => {
     it("picks the vendor lane when the goods invoice carries freight", () => {
