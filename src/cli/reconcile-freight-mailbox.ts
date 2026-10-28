@@ -17,8 +17,9 @@
  *
  *          REPORT-ONLY by default. `--live` applies ONLY high-confidence NEW freight
  *          (no freight already on the PO). A bill whose PO already carries a DIFFERENT
- *          amount is a CORRECTION and is reported, never auto-applied (landed-cost
- *          restatement is Bill's call).
+ *          amount is a CORRECTION and is reported; positive deltas auto-apply
+ *          under --correct, negative deltas (savings) auto-apply only when
+ *          unambiguous (hard PO ref, single carrier line, single-delivery).
  *
  * @usage
  *   node --import tsx --env-file=.env.local src/cli/reconcile-freight-mailbox.ts
@@ -137,6 +138,8 @@ interface MailboxResult {
     freightAlreadyOnPO: boolean;
     /** invoice.amountDue − freightOnPo when a DIFFERENT amount is already on the PO. */
     correctionDelta: number | null;
+    /** Count of /10007 lines above the house-charge threshold on the PO. */
+    carrierLineCount: number | null;
     /** Multi-PO split (one truck → several POs), when applicable. */
     split?: Array<{ orderId: string; pounds: number; amount: number }>;
     lagDays: number | null;
@@ -251,6 +254,7 @@ async function applyFreightToPo(
     poId: string,
     amount: number,
     isMultiDelivery: boolean,
+    forceFreshAlloc = false,
 ): Promise<void> {
     const po = await finale.getOrderDetails(poId);
     const originalStatus = await finale.unlockForEditing(po, poId);
@@ -258,7 +262,7 @@ async function applyFreightToPo(
     const adjustments = [...(po.orderAdjustmentList ?? [])];
     const items = await finale.freightAllocLines(po.orderItemList);
     const existingFreight = adjustments.filter((a) => (a.productPromoUrl ?? "").includes("/10007"));
-    const existingAlloc = !isMultiDelivery && existingFreight.length === 1
+    const existingAlloc = !forceFreshAlloc && !isMultiDelivery && existingFreight.length === 1
         ? existingFreight[0].orderAdjustmentAllocationList
         : undefined;
     const replacement = freightAdjustmentForPo(amount, items, existingAlloc);
@@ -470,6 +474,7 @@ async function main() {
             freightOnPo: null,
             freightAlreadyOnPO: false,
             correctionDelta: null,
+            carrierLineCount: null,
             lagDays: daysBetween(parseUsDate(inv.shipDate), parseUsDate(inv.invoiceDate)),
             receiveDiffDays: null,
             reasons: [],
@@ -627,15 +632,18 @@ async function main() {
                 // honest (a correlated receive + vendor is still a high-confidence
                 // MATCH); only the WRITE is gated, because it restates landed cost.
                 r.freightOnPo = carrierTotal;
+                r.carrierLineCount = carrierFreight.length;
                 r.correctionDelta = r.invoice.amountDue - carrierTotal;
                 r.wouldApply = false;
                 r.reasons.push(
-                    `CORRECTION: PO has $${carrierTotal.toFixed(2)}, invoice $${r.invoice.amountDue.toFixed(2)} (Δ $${r.correctionDelta >= 0 ? "+" : ""}${r.correctionDelta.toFixed(2)})`,
+                    `CORRECTION: PO has $${carrierTotal.toFixed(2)}, invoice ${r.invoice.amountDue.toFixed(2)} (Δ ${r.correctionDelta >= 0 ? "+" : ""}${r.correctionDelta.toFixed(2)})`,
                 );
                 if (r.correctionDelta < 0) {
-                    // FedEx re-rated DOWN: reducing freight/COGS is a manual call.
-                    r.confidence = "low";
-                    r.reasons.push("negative delta → manual review (reduces landed cost)");
+                    // FedEx re-rated DOWN — savings. Auto-applies under --correct
+                    // ONLY when unambiguous: hard PO ref, single carrier line,
+                    // single-delivery vendor (2026-10-28, Bill: "no approval
+                    // needed that is savings do not ask me if confidence is high").
+                    r.reasons.push("negative delta (savings) — auto-applies when unambiguous");
                 }
             }
             await new Promise((res) => setTimeout(res, GAP_MS));
@@ -700,10 +708,23 @@ async function main() {
         console.log("\nNo high-confidence NEW rows to apply.");
     }
 
-    // 8b. Apply positive corrections (--correct + --live): append the delta so the
-    // PO lands on the final invoice amount. Negative deltas never auto-apply.
+    // 8b. Apply corrections (--correct + --live). Positive deltas append the
+    // difference. Negative deltas (savings) auto-apply only when unambiguous:
+    // high confidence, hard PO ref, exactly one carrier line, single-delivery
+    // vendor — then the carrier line is rewritten to the final amount with a
+    // fresh allocation (2026-10-28).
     const toCorrect = results.filter(
         (r) => r.correctionDelta !== null && r.correctionDelta > 0 && r.confidence === "high",
+    );
+    const toSave = results.filter(
+        (r) =>
+            r.correctionDelta !== null &&
+            r.correctionDelta < 0 &&
+            r.confidence === "high" &&
+            r.matchSource === "po_ref" &&
+            r.carrierLineCount === 1 &&
+            r.vendor !== null &&
+            !isMultiDeliveryVendor(r.vendor),
     );
     if (CORRECT && LIVE && toCorrect.length > 0) {
         console.log(`\nApplying ${toCorrect.length} positive correction(s) (append delta)\n`);
@@ -720,6 +741,24 @@ async function main() {
         }
     } else if (CORRECT && LIVE) {
         console.log("\nNo high-confidence positive corrections to apply.");
+    }
+
+    // 8b2. Negative savings corrections: rewrite the single carrier line to the
+    // final invoice amount with a fresh allocation. Never appends a negative
+    // line (that would be a funky line, and hygiene blocks it downstream).
+    if (CORRECT && LIVE && toSave.length > 0) {
+        console.log(`\nApplying ${toSave.length} savings correction(s) (rewrite carrier line to final)\n`);
+        for (const r of toSave) {
+            if (!r.finalePoId) continue;
+            try {
+                await applyFreightToPo(finale, r.finalePoId, r.invoice.amountDue, false, true);
+                console.log(`   OK PO ${r.finalePoId}: carrier line → $${r.invoice.amountDue.toFixed(2)} (saved $${Math.abs(r.correctionDelta as number).toFixed(2)})`);
+                await new Promise((res) => setTimeout(res, GAP_MS));
+            } catch (err) {
+                r.error = err instanceof Error ? err.message : String(err);
+                console.log(`   FAIL PO ${r.finalePoId}: ${r.error.slice(0, 120)}`);
+            }
+        }
     }
 
     // 8c. Drift report (--drift): booked (LTL Select quote) vs actual (final
