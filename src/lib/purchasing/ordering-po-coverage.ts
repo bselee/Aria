@@ -17,6 +17,8 @@
 export type RecentPOLine = {
     productId: string;
     quantity: number;
+    /** Finale productUnitsRemainingToBeShipped — null when the field was not fetched. */
+    remainingQty?: number | null;
 };
 
 export type RecentPOForCoverage = {
@@ -108,7 +110,16 @@ export function buildRecentOpenCoverageByProduct(
         const isDraft = isDraftOrderingStatus(po.status ?? "");
         for (const line of po.items ?? []) {
             if (!line?.productId) continue;
-            const qty = Math.max(0, Number(line.quantity) || 0);
+            // HERMIA(2026-10-28): credit only the unshipped remainder. Finale
+            // productUnitsRemainingToBeShipped is the receipt truth; crediting the
+            // full ordered qty for a partially (or fully) received line double-counts
+            // goods already in stockOnHand and can hold the SKU off the board
+            // (BASLCE102 family). Missing field → fail open to ordered qty.
+            const orderedQty = Math.max(0, Number(line.quantity) || 0);
+            const remainingQty = line.remainingQty == null
+                ? orderedQty
+                : Math.max(0, Number(line.remainingQty) || 0);
+            const qty = Math.min(orderedQty, remainingQty);
             if (qty <= 0) continue;
 
             const hit: OpenPOCoverageHit = {

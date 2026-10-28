@@ -1857,6 +1857,7 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                                                 product { productId }
                                                 quantity
                                                 unitPrice
+                                                productUnitsRemainingToBeShipped
                                             }
                                         }
                                     }
@@ -1883,6 +1884,9 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                         productId: e.node?.product?.productId ?? '',
                         quantity: e.node?.quantity ?? 0,
                         unitPrice: parseFinaleNumber(e.node?.unitPrice),
+                        remainingQty: e.node?.productUnitsRemainingToBeShipped == null
+                            ? null
+                            : parseFinaleNumber(e.node?.productUnitsRemainingToBeShipped),
                     }))
                     .filter((i: any) => i.productId);
                 // Normalize any date to YYYY-MM-DD (Finale returns inconsistent formats like "4/2/2026")

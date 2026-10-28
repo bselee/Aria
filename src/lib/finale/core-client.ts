@@ -234,7 +234,7 @@ export interface FullPO {
     shipments?: Array<{ shipmentId: string; status: string; receiveDate: string | null; shipDate: string | null }>;
     /** Goods subtotal. Freight already on the PO is total − subtotal. */
     subtotal?: number;
-    items: Array<{ productId: string; quantity: number; unitPrice?: number }>;
+    items: Array<{ productId: string; quantity: number; unitPrice?: number; remainingQty?: number | null }>;
 }
 
 export interface DraftPOReview {

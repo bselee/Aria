@@ -2125,7 +2125,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     edges { node {
                         orderId status orderDate dueDate
                         itemList(first: 20) {
-                            edges { node { product { productId } quantity } }
+                            edges { node { product { productId } quantity productUnitsRemainingToBeShipped } }
                         }
                     }}
                 }
@@ -2186,6 +2186,20 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                 if (po.status !== 'Committed' && po.status !== 'Locked') continue;
                 for (const ie of po.itemList?.edges || []) {
                     if (ie.node.product?.productId === sku) {
+                        // HERMIA(2026-10-28): credit only the unshipped remainder. A
+                        // fully-received line on an uncompleted PO (BASLCE102/PO 125379:
+                        // remaining 0 while ORDER_LOCKED) is already sitting in
+                        // stockOnHand — crediting the full ordered qty double-counts and
+                        // produces a false HOLD (36d phantom runway vs BAS Auto URGENT).
+                        // Finale productUnitsRemainingToBeShipped is the authoritative
+                        // receipt signal; Aria's lifecycle/receiving tables can lag it.
+                        const remainingRaw = ie.node.productUnitsRemainingToBeShipped;
+                        const remaining = remainingRaw == null ? null : parseFinaleNumber(remainingRaw);
+                        const orderedQty = parseFinaleNumber(ie.node.quantity);
+                        const creditQty = remaining == null
+                            ? orderedQty
+                            : Math.max(0, Math.min(orderedQty, remaining));
+                        if (creditQty <= 0) break;
                         const toIsoDate = (d: unknown): string | null => {
                             if (!d || typeof d !== 'string') return null;
                             const parsed = new Date(d);
@@ -2195,7 +2209,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                         };
                         openPOs.push({
                             orderId: po.orderId,
-                            quantity: parseFinaleNumber(ie.node.quantity),
+                            quantity: creditQty,
                             orderDate: po.orderDate || '',
                             dueDate: toIsoDate(po.dueDate),
                         });

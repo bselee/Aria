@@ -103,6 +103,52 @@ describe("buildRecentOpenCoverageByProduct", () => {
         expect(map.get("SKU1")?.totalQty).toBe(100);
         expect(map.get("SKU1")?.openHits).toHaveLength(2);
     });
+
+    // HERMIA(2026-10-28): BASLCE102 phantom-cover regression. Finale
+    // productUnitsRemainingToBeShipped is the receipt truth — coverage must
+    // never credit more than the unshipped remainder, or received goods are
+    // counted twice and the SKU is held off the board.
+    it("credits only the unshipped remainder when remainingQty is present", () => {
+        const map = buildRecentOpenCoverageByProduct([
+            {
+                orderId: "125379",
+                status: "Committed",
+                items: [{ productId: "BASLCE102", quantity: 20, remainingQty: 0 }],
+            },
+            {
+                orderId: "125408",
+                status: "Committed",
+                items: [{ productId: "BASLCE103", quantity: 50, remainingQty: 24 }],
+            },
+        ]);
+        // Fully received line on an uncompleted PO credits nothing.
+        expect(map.has("BASLCE102")).toBe(false);
+        // Partial receipt credits only what is left to ship.
+        expect(map.get("BASLCE103")?.totalQty).toBe(24);
+        expect(map.get("BASLCE103")?.openHits[0]?.quantity).toBe(24);
+    });
+
+    it("fails open to ordered qty when remainingQty is absent", () => {
+        const map = buildRecentOpenCoverageByProduct([
+            {
+                orderId: "X",
+                status: "Committed",
+                items: [{ productId: "SKU9", quantity: 40 }],
+            },
+        ]);
+        expect(map.get("SKU9")?.totalQty).toBe(40);
+    });
+
+    it("caps over-receipt (negative remaining) at zero credit", () => {
+        const map = buildRecentOpenCoverageByProduct([
+            {
+                orderId: "125289",
+                status: "Committed",
+                items: [{ productId: "RAWWHOLEGNARBAR", quantity: 2000, remainingQty: -39 }],
+            },
+        ]);
+        expect(map.has("RAWWHOLEGNARBAR")).toBe(false);
+    });
 });
 
 describe("mergeOpenPOsWithRecentCoverage", () => {
