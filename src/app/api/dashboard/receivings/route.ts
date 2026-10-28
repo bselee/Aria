@@ -673,7 +673,13 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         if (hit) hits++;
                                     }
                                     if (hits > 0) {
-                                        coveringBill = { invoice_number: row.invoice_number ?? null, total: Number(row.total || 0) };
+                                        coveringBill = {
+                                            invoice_number: row.invoice_number ?? null,
+                                            total: Number(row.total || 0),
+                                            // Keep the lines — invoice-vs-delivery attribution
+                                            // needs them to slice this PO's share of the bill.
+                                            line_items: row.line_items ?? null,
+                                        };
                                         break;
                                     }
                                 }
@@ -687,6 +693,15 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             // always over bill us a complete PO". Stamp the
                             // comparison so the panel flags an overbill the
                             // moment the bill and the receipt are both known.
+                            //
+                            // ATTRIBUTION RULE (verified against the 10/27
+                            // Miles delivery): one bill can cover several POs.
+                            // Comparing the WHOLE bill against ONE PO's
+                            // receipts manufactures a false "exceeds delivery"
+                            // on every sibling (125415 $2,688 vs $1,344).
+                            // Compare only the bill lines that MATCH this PO's
+                            // items (ordered or received qty + unit price) —
+                            // the rest of the bill belongs to sibling POs.
                             for (const po of received) {
                                 const rec = (po as any)._reconciliation;
                                 if (!rec || !isDeliverAndBillVendor(po.supplier)) continue;
@@ -706,18 +721,55 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     seenTotals.add(t);
                                     return true;
                                 });
-                                let invoicedTotal = 0;
-                                let invoicedQty = 0;
+                                const billLines: Array<{ qty: number; unit_price: number; ext_price: number }> = [];
                                 for (const b of dedup) {
-                                    invoicedTotal += Number(b?.total || 0);
                                     let lines: any[] = [];
                                     try {
                                         const parsed =
                                             typeof b?.line_items === "string" ? JSON.parse(b.line_items) : b?.line_items;
                                         lines = Array.isArray(parsed) ? parsed : [];
                                     } catch { /* not JSON */ }
-                                    for (const l of lines) invoicedQty += Number(l?.qty ?? l?.quantity ?? 0);
+                                    for (const l of lines) {
+                                        const q = Number(l?.qty ?? l?.quantity ?? 0);
+                                        if (!(q > 0)) continue;
+                                        const up = Number(l?.unit_price ?? 0);
+                                        billLines.push({
+                                            qty: q,
+                                            unit_price: up,
+                                            ext_price: Number(l?.ext_price ?? 0) || q * up,
+                                        });
+                                    }
                                 }
+
+                                const items = (po.items || []).map((it: any) => ({
+                                    ordered: Number(it.orderedQuantity ?? it.quantity ?? 0),
+                                    received: it.receivedQuantity !== undefined ? Number(it.receivedQuantity) : null,
+                                    unitPrice: Number(it.unitPrice ?? 0),
+                                }));
+
+                                let coveredValue = 0;
+                                let coveredQty = 0;
+                                for (const line of billLines) {
+                                    const hit = items.some((it: any) => {
+                                        const qtyMatch =
+                                            line.qty === it.ordered || (it.received !== null && line.qty === it.received);
+                                        const priceMatch =
+                                            line.unit_price > 0 ? Math.abs(line.unit_price - it.unitPrice) < 0.01 : true;
+                                        return qtyMatch && priceMatch;
+                                    });
+                                    if (hit) {
+                                        coveredValue += line.ext_price;
+                                        coveredQty += line.qty;
+                                    }
+                                }
+
+                                // A bill with NO usable line items cannot be
+                                // attributed — assume the linked bill belongs
+                                // wholly to the PO it is linked to.
+                                if (billLines.length === 0 && rec.matchedInvoice) {
+                                    coveredValue = Number(rec.matchedInvoice.total || 0);
+                                }
+
                                 let receivedQty = 0;
                                 let receivedValue = 0;
                                 for (const it of po.items || []) {
@@ -727,15 +779,71 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     receivedValue += Number(rc) * Number(it.unitPrice ?? 0);
                                 }
                                 receivedValue = Math.round(receivedValue * 100) / 100;
+                                coveredValue = Math.round(coveredValue * 100) / 100;
                                 rec.invoiceVsReceipt = {
-                                    invoicedTotal,
+                                    invoicedTotal: coveredValue,
                                     receivedValue,
-                                    invoicedQty,
+                                    invoicedQty: coveredQty,
                                     receivedQty,
                                     overbilled:
-                                        invoicedTotal > 0 && receivedValue > 0 && invoicedTotal > receivedValue * 1.05 + 5,
-                                    billed: invoicedTotal > 0,
+                                        coveredValue > 0 && receivedValue > 0 && coveredValue > receivedValue * 1.05 + 5,
+                                    billed: coveredValue > 0,
                                 };
+                            }
+
+                            // ── Batch-level unmatched-line check (2026-10-28) ──
+                            // A bill line that matches NO received PO of the
+                            // vendor is the true rogue line — billed something
+                            // nobody received. Stamp it on the row that carries
+                            // the matched invoice so the review lands on the
+                            // bill, not on a guessing sibling.
+                            for (const po of received) {
+                                const rec = (po as any)._reconciliation;
+                                if (!rec || !isDeliverAndBillVendor(po.supplier) || !rec.matchedInvoice) continue;
+                                const vendor = String(po.supplier || "").toLowerCase();
+                                const vendorPos = received.filter(
+                                    (p: any) => String(p.supplier || "").toLowerCase() === vendor,
+                                );
+                                let lines: any[] = [];
+                                try {
+                                    const parsed =
+                                        typeof rec.matchedInvoice?.line_items === "string"
+                                            ? JSON.parse(rec.matchedInvoice.line_items)
+                                            : rec.matchedInvoice?.line_items;
+                                    lines = Array.isArray(parsed) ? parsed : [];
+                                } catch { /* not JSON */ }
+                                let unmatchedValue = 0;
+                                for (const l of lines) {
+                                    const q = Number(l?.qty ?? l?.quantity ?? 0);
+                                    if (!(q > 0)) continue;
+                                    const up = Number(l?.unit_price ?? 0);
+                                    const ev = Number(l?.ext_price ?? 0) || q * up;
+                                    const hit = vendorPos.some((p: any) =>
+                                        (p.items || []).some((it: any) => {
+                                            const ordered = Number(it.orderedQuantity ?? it.quantity ?? 0);
+                                            const received =
+                                                it.receivedQuantity !== undefined ? Number(it.receivedQuantity) : null;
+                                            const qtyMatch = q === ordered || (received !== null && q === received);
+                                            const priceMatch =
+                                                up > 0 ? Math.abs(up - Number(it.unitPrice ?? 0)) < 0.01 : true;
+                                            return qtyMatch && priceMatch;
+                                        }),
+                                    );
+                                    if (!hit) unmatchedValue += ev;
+                                }
+                                if (unmatchedValue > 5) {
+                                    rec.invoiceVsReceipt = {
+                                        ...(rec.invoiceVsReceipt || {
+                                            invoicedTotal: 0,
+                                            receivedValue: 0,
+                                            invoicedQty: 0,
+                                            receivedQty: 0,
+                                            overbilled: false,
+                                            billed: false,
+                                        }),
+                                        unmatchedValue: Math.round(unmatchedValue * 100) / 100,
+                                    };
+                                }
                             }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──

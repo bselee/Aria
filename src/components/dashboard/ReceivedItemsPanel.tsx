@@ -42,7 +42,11 @@ type ReceivedPO = {
         hasPendingApproval: boolean;
         hasAutoApplied: boolean;
         vendorHasUnlinkedBills?: boolean;
-        coveringBill?: { invoice_number?: string | null; total?: number | null } | null;
+        coveringBill?: {
+            invoice_number?: string | null;
+            total?: number | null;
+            line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null;
+        } | null;
         /** "deliver_and_bill" when the vendor bills per delivery (2026-10-28). */
         billingPattern?: "deliver_and_bill" | null;
         /** Invoice-vs-delivery comparison for bill-as-they-deliver vendors. */
@@ -53,6 +57,8 @@ type ReceivedPO = {
             receivedQty: number;
             overbilled: boolean;
             billed: boolean;
+            /** Value of bill lines matching no received PO of the vendor. */
+            unmatchedValue?: number;
         } | null;
         matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
@@ -1203,7 +1209,14 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             return { text: `Bill on file $${Number(inv.total || 0).toFixed(0)}. ${openTotal.toLocaleString()} still open.`, button: undefined };
                                                         }
                                                         if (rec?.coveringBill) {
-                                                            return { text: `Partial receipt. ${capFirst(billLabel(rec.coveringBill))} covers lines here. ${openTotal.toLocaleString()} still open.`, button: undefined };
+                                                            // The bill covers several POs — show the slice that
+                                                            // belongs to THIS PO so "covers this PO's lines" is a
+                                                            // checked claim, not a whole-bill assertion.
+                                                            const slice =
+                                                                rec.invoiceVsReceipt?.billed && rec.invoiceVsReceipt.invoicedTotal > 0
+                                                                    ? ` (${fmtDollars(rec.invoiceVsReceipt.invoicedTotal)})`
+                                                                    : "";
+                                                            return { text: `Partial receipt. ${capFirst(billLabel(rec.coveringBill))} covers lines here${slice}. ${openTotal.toLocaleString()} still open.`, button: undefined };
                                                         }
                                                         if (rec?.billingPattern === "deliver_and_bill") {
                                                             // Bill-as-they-deliver vendors: a partial receipt
@@ -1228,7 +1241,11 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         };
                                                     }
                                                     if (rec?.coveringBill) {
-                                                        return { text: `${receiptLead}. ${capFirst(billLabel(rec.coveringBill))} covers this PO's lines.`, button: undefined };
+                                                        const slice =
+                                                            rec.invoiceVsReceipt?.billed && rec.invoiceVsReceipt.invoicedTotal > 0
+                                                                ? ` (${fmtDollars(rec.invoiceVsReceipt.invoicedTotal)})`
+                                                                : "";
+                                                        return { text: `${receiptLead}. ${capFirst(billLabel(rec.coveringBill))} covers this PO's lines${slice}.`, button: undefined };
                                                     }
                                                     if (isComplete) {
                                                         return { text: "Done — matched and closed", button: undefined };
@@ -1304,6 +1321,12 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             <div className="mt-1 text-[11px] font-mono text-rose-300">
                                                                 Bill exceeds delivery — ${rec.invoiceVsReceipt.invoicedTotal.toLocaleString()} invoiced vs $
                                                                 {rec.invoiceVsReceipt.receivedValue.toLocaleString()} received. Verify before completing.
+                                                            </div>
+                                                        )}
+                                                        {rec?.invoiceVsReceipt?.unmatchedValue && (
+                                                            <div className="mt-1 text-[11px] font-mono text-rose-300">
+                                                                Bill line covers nothing delivered — $
+                                                                {rec.invoiceVsReceipt.unmatchedValue.toLocaleString()}. Verify against receipts.
                                                             </div>
                                                         )}
 

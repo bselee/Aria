@@ -369,6 +369,53 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.queryByText(/No bill yet/i)).toBeNull();
   });
 
+  it("names the covered slice, not the whole bill, on a multi-PO bill (2026-10-28)", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-415",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "Miles Filippelli",
+          total: 1344,
+          items: [{ productId: "BASLPE102", quantity: 56, orderedQuantity: 56, receivedQuantity: 56, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            billingPattern: "deliver_and_bill",
+            coveringBill: { invoice_number: "error", total: 2688 },
+            invoiceVsReceipt: {
+              invoicedTotal: 1344,
+              receivedValue: 1344,
+              invoicedQty: 56,
+              receivedQty: 56,
+              overbilled: false,
+              billed: true,
+            },
+            matchedInvoice: null,
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Bill \$2,688 covers this PO's lines \(\$1,344\)/i)).toBeTruthy();
+    expect(screen.queryByText(/Bill exceeds delivery/i)).toBeNull();
+  });
+
   it("says bill in AP instead of awaiting when the vendor has unlinked bills", async () => {
     stubLocalStorage();
     const recent = new Date();
