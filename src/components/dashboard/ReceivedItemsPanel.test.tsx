@@ -2,7 +2,7 @@
 
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 
 import ReceivedItemsPanel from "./ReceivedItemsPanel";
 
@@ -213,6 +213,71 @@ describe("ReceivedItemsPanel", () => {
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(await screen.findByText(/1 shipment arriving today/i)).toBeTruthy();
+  });
+
+  it("renders one list with the Receiving header and a settled footer toggle", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    const old = new Date();
+    old.setDate(old.getDate() - 9);
+    const oldDate = old.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-800",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "Fresh Vendor",
+          total: 400,
+          items: [{ productId: "SKU-F", quantity: 4, orderedQuantity: 4, receivedQuantity: 4, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "INV-2", subtotal: 400, freight: 0, tax: 0, total: 400, status: "received" },
+          },
+        },
+        {
+          orderId: "PO-801",
+          orderDate: oldDate,
+          receiveDate: oldDate,
+          receiveDateTime: oldDate,
+          receivedBy: "JM",
+          receiptStatus: "full",
+          supplier: "Old Vendor",
+          total: 200,
+          items: [{ productId: "SKU-O", quantity: 2, orderedQuantity: 2, receivedQuantity: 2, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "INV-3", subtotal: 200, freight: 0, tax: 0, total: 200, status: "received" },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    // Re-labeled header (2026-10-28): Receiving, not Invoices/unmatched.
+    expect(await screen.findByText("Receiving")).toBeTruthy();
+    // One list: the recent row is in it, the 9-day settled row is not.
+    expect(screen.getByText(/PO-800/i)).toBeTruthy();
+    expect(screen.queryByText(/PO-801/i)).toBeNull();
+    // Footer toggle reaches the settled rows in the same list.
+    fireEvent.click(screen.getByText(/1 settled/));
+    expect(screen.getByText(/PO-801/i)).toBeTruthy();
   });
 
   it("drops a settled full receipt with a known bill after 7 days", async () => {

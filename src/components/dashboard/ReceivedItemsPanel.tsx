@@ -5,7 +5,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
-import InvoicePOMatcher from "./InvoicePOMatcher";
 import { isPaidInAdvanceVendor, isBilledUpfrontVendor } from "@/config/paid-in-advance-vendors";
 import { isDeliverAndBillVendor } from "@/lib/purchasing/deliver-bill-vendors";
 
@@ -321,17 +320,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         saving?: boolean;
     }>>(new Map());
     const [modifySuccess, setModifySuccess] = useState<string | null>(null);
-    /** Unmatched POs check state */
-    const [unmatchedData, setUnmatchedData] = useState<{
-        unmatchedPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string }>;
-        unreconciledPos: Array<{ orderId: string; vendorName: string; date: string; total: number; status: string; lifecycleState: string }>;
-    } | null>(null);
-    const [unmatchedLoading, setUnmatchedLoading] = useState(false);
     /** Show all received POs toggle (default: only exceptions) */
     const [showAllReceived, setShowAllReceived] = useState(false);
-    /** Collapse received PO list when there are invoices to match. */
-    const [showReceivedPOs, setShowReceivedPOs] = useState(false);
-    const [showCompleted, setShowCompleted] = useState(false);
     const [recentAutoCompletions, setRecentAutoCompletions] = useState<Array<{
         intent: string; poNumber?: string; invoiceNumber?: string; vendorName?: string; createdAt: string;
     }>>([]);
@@ -346,34 +336,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         // need nothing from anyone (2026-10-27).
         return lbl === "RECONCILED ±" || lbl === "PENDING";
     }).length;
-    /** Manual match state: invoiceId → manual PO input */
-    const [manuallyMatching, setManuallyMatching] = useState<Map<string, { poNumber: string; loading: boolean }>>(new Map());
-
-    /** Update manual PO input for a given invoice. */
-    function handleManualInputChange(invoiceId: string, value: string) {
-        setManuallyMatching(prev => {
-            const next = new Map(prev);
-            const existing = next.get(invoiceId);
-            next.set(invoiceId, { poNumber: value, loading: existing?.loading ?? false });
-            return next;
-        });
-    }
-
-    async function handleMatchInvoice(invoiceId: string, poNumber: string) {
-        try {
-            const res = await fetch("/api/dashboard/receivings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber }),
-            });
-            if (res.ok) {
-                // Remove from suggestions
-                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
-            }
-        } catch (e: any) {
-            console.error("Match invoice error:", e.message);
-        }
-    }
 
     async function handleCompletePO(orderId: string, vendorName: string) {
         try {
@@ -418,43 +380,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             setOverbillActing((prev) => {
                 const next = new Set(prev);
                 next.delete(orderId);
-                return next;
-            });
-        }
-    }
-
-    async function handleManualMatch(invoiceId: string) {
-        const state = manuallyMatching.get(invoiceId);
-        if (!state || !state.poNumber.trim()) return;
-        setManuallyMatching(prev => {
-            const next = new Map(prev);
-            next.set(invoiceId, { ...state, loading: true });
-            return next;
-        });
-        try {
-            const res = await fetch("/api/dashboard/receivings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "match_invoice", invoiceId, poNumber: state.poNumber.trim() }),
-            });
-            if (res.ok) {
-                setManuallyMatching(prev => { const next = new Map(prev); next.delete(invoiceId); return next; });
-                setMatchSuggestions(prev => prev.filter(s => s.invoiceId !== invoiceId));
-                fetchReceivings(true);
-            } else {
-                const err = await res.text();
-                console.error("Manual match failed:", err);
-                setManuallyMatching(prev => {
-                    const next = new Map(prev);
-                    next.set(invoiceId, { ...manuallyMatching.get(invoiceId)!, loading: false });
-                    return next;
-                });
-            }
-        } catch (e: any) {
-            console.error("Manual match error:", e.message);
-            setManuallyMatching(prev => {
-                const next = new Map(prev);
-                next.set(invoiceId, { ...manuallyMatching.get(invoiceId)!, loading: false });
                 return next;
             });
         }
@@ -607,29 +532,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             });
         } else {
             loadPOInvoiceDiff(orderId, invoiceId);
-        }
-    }
-
-    /** Check for POs without matched invoices. */
-    async function checkUnmatchedPOs() {
-        setUnmatchedLoading(true);
-        try {
-            const res = await fetch("/api/dashboard/po-modify", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "check_unmatched" }),
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            setUnmatchedData(data);
-        } catch (e: any) {
-            console.error("Failed to check unmatched POs:", e);
-            setUnmatchedData({
-                unmatchedPos: [],
-                unreconciledPos: [],
-            });
-        } finally {
-            setUnmatchedLoading(false);
         }
     }
 
@@ -802,19 +704,30 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             return () => clearInterval(t);
         }, [fetchReceivings]);
 
-    const linkable = matchSuggestions.filter((s) => {
-        const best = s.candidates?.[0];
-        if (!best) return false;
-        if (!/^(?:12\d{4}|123\d{6})$/.test(String(best.orderId || ""))) return false;
-        return (best.reasons || []).some((r) => /OCR PO/i.test(r));
-    });
-    const matchDollars = linkable.reduce((sum, m) => sum + (Number(m.invoiceTotal) || 0), 0);
-    const exceptionCount = pos.filter(po => {
-        const lbl = (apMap[po.orderId]?.label || "").toLowerCase();
-        if (lbl.includes("unmatched") || lbl.includes("review")) return true;
-        if ((po as any).receiptStatus === "partial") return true;
-        return false;
-    }).length;
+    /** One list (2026-10-28): every received PO renders as a row. A settled
+     *  row (full receipt + known bill) leaves the list 7 days after receipt;
+     *  the footer toggle still reaches it. */
+    const isRowVisible = (po: ReceivedPO): boolean => {
+        if (showAllReceived) return true;
+        const lbl = apMap[po.orderId]?.label || "";
+        const dynStatus = getDynamicReceiptStatus(po);
+        const needsAttention =
+            lbl === "RECONCILED ±" ||
+            lbl === "PENDING" ||
+            dynStatus === "partial" ||
+            (po as { receiptStatus?: string }).receiptStatus === "partial";
+        if (needsAttention) return true;
+        // Settled = fully received AND the bill is known. Unknown receipt
+        // data is not settled — it stays visible.
+        const hasKnownBill =
+            !!po._reconciliation?.matchedInvoice || isBilledUpfrontVendor(po.supplier) || isPaidInAdvanceVendor(po.supplier);
+        const isSettled = dynStatus === "full" && hasKnownBill;
+        if (!isSettled) return true;
+        const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
+        return rcvDays === null || rcvDays < 7;
+    };
+    const visiblePos = pos.filter(isRowVisible);
+    const hiddenSettled = pos.length - visiblePos.length;
 
     return (
         <div
@@ -826,17 +739,11 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         >
             <div className="px-3 h-11 min-h-11 shrink-0 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md overflow-hidden">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Invoices</span>
-                <span className="text-[10px] text-[var(--dash-ts)] font-mono">unmatched</span>
-                                {linkable.length > 0 && (
-                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                        {linkable.length} named a PO
-                                    </span>
-                                )}
+                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receiving</span>
+                <span className="text-[10px] text-[var(--dash-ts)] font-mono">
+                    {needsReviewCount > 0 ? `${needsReviewCount} need review` : `${pos.length} received`}
+                </span>
                                 <div className="flex-1" />
-                {!loading && (
-                    <span className="text-xs font-mono text-zinc-500">{linkable.length > 0 ? `${linkable.length} to link` : ""}</span>
-                )}
                 <button onClick={() => fetchReceivings(true)} disabled={refreshing}
                     className="ml-2 text-zinc-700 hover:text-zinc-400 transition-colors disabled:opacity-40">
                     <RefreshCw className={`w-3 h-3 ${refreshing ? 'animate-spin' : ''}`} />
@@ -848,23 +755,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
-
-            {/* Accounting status — Receivings (separate from Ordering / Active) */}
-            {!effectivelyCollapsed && !loading && (
-                <div className="px-3 py-1 border-b border-zinc-800/50 bg-zinc-950/60 flex items-center gap-2 text-[10px] font-mono text-zinc-400">
-                    <span className="text-zinc-600 uppercase tracking-wider shrink-0">AP</span>
-                    {linkable.length > 0 ? (
-                        <>
-                            <span className="text-amber-300">{linkable.length} invoice{linkable.length === 1 ? "" : "s"} named a PO</span>
-                            {matchDollars > 0 && (
-                                <span className="text-amber-200/90">${Math.round(matchDollars).toLocaleString()}</span>
-                            )}
-                        </>
-                    ) : (
-                        <span className="text-zinc-500">no invoice named a PO</span>
-                    )}
-                </div>
-            )}
 
             {!effectivelyCollapsed && (
                 <div className={embedded ? "flex-1 min-h-0 flex flex-col overflow-hidden" : undefined}>
@@ -915,110 +805,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                 </div>
                             )}
 
-                            {/* ── Split-panel Invoice → PO Matcher ── */}
-                            {linkable.length > 0 && (
-                            <InvoicePOMatcher
-                                suggestions={linkable}
-                                receivedPOs={pos}
-                                onMatch={handleMatchInvoice}
-                                onManualMatch={handleManualMatch}
-                                onApproveReconciliation={approveReconciliation}
-                                approvingReconcile={approvingReconcile}
-                                manuallyMatching={manuallyMatching}
-                                onManualInputChange={handleManualInputChange}
-                            />
-                            )}
-
-                            {/* ── Received POs toggle ── */}
-                            {linkable.length > 0 && (
-                                <button
-                                    onClick={() => setShowReceivedPOs(!showReceivedPOs)}
-                                    className="w-full px-4 py-1.5 text-[10px] font-mono text-zinc-500 hover:text-zinc-300 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1.5"
-                                >
-                                    <span>{showReceivedPOs ? "▼" : "▶"}</span>
-                                    <span>Received POs ({pos.length})</span>
-                                    {needsReviewCount > 0 && (
-                                        <span className="text-rose-400/70">· {needsReviewCount} need review</span>
-                                    )}
-                                </button>
-                            )}
-                            {(!linkable.length || showReceivedPOs) && (
-                            <div>
-
-                            {/* ── Unmatched POs Check ── */}
-                            <div className="border-b border-zinc-800/40">
-                                <div className="px-4 py-2 flex items-center gap-2">
-                                    <span className="text-[10px] font-mono text-zinc-500">
-                                        {unmatchedData
-                                            ? `${unmatchedData.unmatchedPos.length + unmatchedData.unreconciledPos.length} POs need review`
-                                            : `PO-invoice match status unknown`}
-                                    </span>
-                                    <div className="flex-1" />
-                                    <button
-                                        onClick={e => { e.stopPropagation(); checkUnmatchedPOs(); }}
-                                        disabled={unmatchedLoading}
-                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-zinc-700/40 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors disabled:opacity-40"
-                                    >
-                                        {unmatchedLoading ? "checking..." : "Check Match Status"}
-                                    </button>
-                                </div>
-                                {unmatchedData && (unmatchedData.unmatchedPos.length > 0 || unmatchedData.unreconciledPos.length > 0) && (
-                                    <div className="px-4 py-1.5 space-y-1 pb-2">
-                                        {unmatchedData.unmatchedPos.map(po => (
-                                            <div key={`u-${po.orderId}`} className="flex items-center gap-2 text-[10px] font-mono text-rose-300">
-                                                <span className="w-1 h-1 rounded-full bg-rose-500 shrink-0" />
-                                                <span className="font-semibold">{po.orderId}</span>
-                                                <span className="text-zinc-400 truncate">{po.vendorName}</span>
-                                                <span className="text-zinc-600">· no invoice</span>
-                                                <span className="ml-auto text-zinc-500">{po.date ? new Date(po.date).toLocaleDateString() : ''}</span>
-                                            </div>
-                                        ))}
-                                        {unmatchedData.unreconciledPos.slice(0, 10).map(po => (
-                                            <div key={`r-${po.orderId}`} className="flex items-center gap-2 text-[10px] font-mono text-amber-300">
-                                                <span className="w-1 h-1 rounded-full bg-amber-500 shrink-0" />
-                                                <span className="font-semibold">{po.orderId}</span>
-                                                <span className="text-zinc-400 truncate">{po.vendorName}</span>
-                                                <span className="text-zinc-600">· {po.lifecycleState || 'unknown'}</span>
-                                                <span className="ml-auto text-zinc-500">{po.date ? new Date(po.date).toLocaleDateString() : ''}</span>
-                                            </div>
-                                        ))}
-                                        {(unmatchedData.unreconciledPos.length > 10) && (
-                                            <div className="text-[10px] font-mono text-zinc-600 pl-3">
-                                                +{unmatchedData.unreconciledPos.length - 10} more
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
-                                {unmatchedData && unmatchedData.unmatchedPos.length === 0 && unmatchedData.unreconciledPos.length === 0 && (
-                                    <div className="px-4 py-1.5 text-[10px] font-mono text-emerald-400/70 pb-2">
-                                        ✅ All POs have matched invoices or are reconciled
-                                    </div>
-                                )}
-                            </div>
-
-                            {/* ── Needs Review / All Received split ── */}
-                            {needsReviewCount > 0 && (
-                                <div className="px-4 py-1.5 border-b border-rose-500/20 bg-rose-500/5 flex items-center gap-2">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-                                    <span className="text-[10px] font-mono text-rose-300/90 uppercase tracking-wider">
-                                        {needsReviewCount} need{needsReviewCount > 1 ? "" : "s"} review
-                                    </span>
-                                    <div className="flex-1" />
-                                    <span className="text-[9px] font-mono text-zinc-600">
-                                        {pos.length - needsReviewCount} auto-processed
-                                    </span>
-                                </div>
-                            )}
-                            {pos.length > needsReviewCount && (
-                                <button
-                                    onClick={() => setShowAllReceived(!showAllReceived)}
-                                    className="w-full px-4 py-1 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 border-b border-zinc-800/40 transition-colors text-left flex items-center gap-1"
-                                >
-                                    {showAllReceived ? "−" : "+"}
-                                    <span>{showAllReceived ? "Show only items needing review" : `Show all ${pos.length} received POs`}</span>
-                                </button>
-                            )}
-
                             {/* ── Auto-processed summary — full trail in Activity tab ── */}
                             {recentAutoCompletions.length > 0 && !showAllReceived && (
                                 <div className="px-4 py-1.5 border-b border-zinc-800/30 flex items-center gap-2">
@@ -1028,23 +814,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     </span>
                                 </div>
                             )}
-                            {pos
-                                .filter(po => {
-                                    if (showAllReceived) return true;
-                                    const lbl = apMap[po.orderId]?.label || "";
-                                    const dynStatus = getDynamicReceiptStatus(po);
-                                    const needsAttention = lbl === "RECONCILED ±" || lbl === "PENDING" || dynStatus === "partial" || (po as { receiptStatus?: string }).receiptStatus === "partial";
-                                    if (needsAttention) return true;
-                                    // Settled = fully received AND the bill is known. A settled
-                                    // row drops off the default list 7 days after receipt;
-                                    // Show all still reaches it. Unknown receipt data is not
-                                    // settled — it stays visible.
-                                    const hasKnownBill = !!po._reconciliation?.matchedInvoice || isBilledUpfrontVendor(po.supplier) || isPaidInAdvanceVendor(po.supplier);
-                                    const isSettled = dynStatus === "full" && hasKnownBill;
-                                    if (!isSettled) return true;
-                                    const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
-                                    return rcvDays === null || rcvDays < 7;
-                                })
+                            {visiblePos
                                 .map(po => {
                                 const apStatus = apMap[po.orderId];
                                 const dollars = fmtDollars(po.total);
@@ -1705,6 +1475,15 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                     </div>
                                 );
                             })}
+                            {hiddenSettled > 0 && (
+                                <button
+                                    onClick={() => setShowAllReceived(!showAllReceived)}
+                                    className="w-full px-4 py-1 text-[10px] font-mono text-zinc-600 hover:text-zinc-400 border-t border-zinc-800/40 transition-colors text-left flex items-center gap-1"
+                                >
+                                    {showAllReceived ? "−" : "+"}
+                                    <span>{showAllReceived ? "Hide settled" : `${hiddenSettled} settled`}</span>
+                                </button>
+                            )}
                         </div>
                     )}
 
@@ -1712,8 +1491,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                         <div onMouseDown={startResize}
                             className="h-1.5 cursor-ns-resize bg-zinc-900 hover:bg-zinc-700 transition-colors border-t border-zinc-800/60" />
                     )}
-                            </div>
-                            )}
                 </div>
             )}
         </div>
