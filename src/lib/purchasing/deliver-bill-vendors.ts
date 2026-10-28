@@ -1,14 +1,19 @@
 /**
  * @file    src/lib/purchasing/deliver-bill-vendors.ts
  * @purpose Domain model for vendors that bill AS they deliver. Bill's words
- *          (2026-10-28): Miles, Cowoco, New Moon Dev Co, CR Minerals, Rootwise
- *          and Thrive bill per delivery. Several deliveries land on one
- *          blanket PO (CR Minerals ~4, New Moon and Miles also multi). These
- *          vendors "hardly ever fill or complete a PO in a single delivery"
- *          but invoice accordingly — so a bill smaller than the PO total is
- *          EXPECTED, not a discrepancy. The hazard is the opposite direction:
- *          invoices that do NOT match their delivery and "almost always over
- *          bill us a complete PO".
+ *          (2026-10-28): Miles, Cowoco, CR Minerals, Rootwise and Thrive bill
+ *          per delivery. Several deliveries land on one blanket PO (CR
+ *          Minerals ~4, Miles also multi). These vendors "hardly ever fill or
+ *          complete a PO in a single delivery" but invoice accordingly — so a
+ *          bill smaller than the PO total is EXPECTED, not a discrepancy. The
+ *          hazard is the opposite direction: invoices that do NOT match their
+ *          delivery and "almost always over bill us a complete PO".
+ *
+ *          New Moon is deliberately NOT here: it always bills up front (the
+ *          full-PO bill lands in Bill.com with the PO number as the invoice
+ *          number — see BILLED_UPFRONT in @/config/paid-in-advance-vendors).
+ *          Its partial receipts must never read as an invoice-vs-delivery
+ *          overbill; that is its normal billing pattern.
  *
  *          A partial receipt from these vendors is therefore a normal state,
  *          and invoice-vs-delivery comparison (not invoice-vs-PO) is the
@@ -23,8 +28,6 @@ const DELIVER_AND_BILL = [
     "miles filippelli",
     "fermented plant extracts",
     "cowoco",
-    "new moon dev co",
-    "new moon",
     "cr minerals",
     "rootwise",
     "thrive",
@@ -33,8 +36,6 @@ const DELIVER_AND_BILL = [
 /** Vendors whose POs are known blanket orders with several deliveries. */
 const BLANKET_MULTI_DELIVERY = [
     "cr minerals",
-    "new moon dev co",
-    "new moon",
 ];
 
 function norm(name: string): string {
