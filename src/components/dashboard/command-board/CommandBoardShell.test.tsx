@@ -242,7 +242,7 @@ describe("CommandBoardShell", () => {
 
         expect(orderingPane.textContent).toContain("Ordering");
         expect(purchasesPane.textContent).toContain("Purchases");
-        expect(rcvPane.textContent).toContain("Receiving");
+        expect(rcvPane.textContent).toContain("Invoices/Receiving");
     });
 
     it("does not render Ops Board header chrome or module tabs", async () => {

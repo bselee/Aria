@@ -739,7 +739,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         >
             <div className="px-3 h-11 min-h-11 shrink-0 flex items-center gap-2 bg-zinc-900/50 border border-zinc-300/40 rounded-md overflow-hidden">
                 <Package className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Receiving</span>
+                <span className="text-xs font-mono font-semibold text-zinc-400 uppercase tracking-widest">Invoices/Receiving</span>
                 <span className="text-[10px] text-[var(--dash-ts)] font-mono">
                     {needsReviewCount > 0 ? `${needsReviewCount} need review` : `${pos.length} received`}
                 </span>

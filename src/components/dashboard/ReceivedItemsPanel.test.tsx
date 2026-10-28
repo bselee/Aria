@@ -270,8 +270,8 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    // Re-labeled header (2026-10-28): Receiving, not Invoices/unmatched.
-    expect(await screen.findByText("Receiving")).toBeTruthy();
+    // Re-labeled header (2026-10-28): Invoices/Receiving.
+    expect(await screen.findByText("Invoices/Receiving")).toBeTruthy();
     // One list: the recent row is in it, the 9-day settled row is not.
     expect(screen.getByText(/PO-800/i)).toBeTruthy();
     expect(screen.queryByText(/PO-801/i)).toBeNull();
