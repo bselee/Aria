@@ -287,18 +287,37 @@ const PO_LABEL_PATTERNS: RegExp[] = [
 // (Uline "Your Order No.", Coats "Customer Ref") are unaffected because their
 // lines carry none of these tokens.
 const SHIPMENT_CONTEXT_RE =
-    /\b(?:PRO|B\.?\s*L\.?|BOL|TRAILER|STATEMENT)\b|\bSO\s*#?|\bADV\s+ORDER\b|\bINVOICE\s+DATE\b/i;
+    /\b(?:PRO|B\.?\s*L\.?|BOL|TRAILER|STATEMENT)\b|\bSO\s*#|\bADV\s+ORDER\b/i;
 
 function isShipmentContextLine(line: string): boolean {
     return SHIPMENT_CONTEXT_RE.test(line);
 }
 
 /**
- * True when the PO candidate at `candidateIndex` in `rawText` sits on a line
- * (or the line directly above it, for the value-below-label layout) that is
- * shipment-context. Used to reject freight references before they become POs.
+ * Explicit PO labels (P.O./PO#/Purchase Order/Customer PO) carry their value on
+ * the same line, so the line above a same-line match is a different field and
+ * must NOT be scanned for shipment tokens. Only generic labels (Your Order /
+ * Reference / Memo / Order No.) may have their value on the line below the
+ * label, which is when the line-above check is meaningful.
  */
-function candidateInShipmentContext(rawText: string, candidateIndex: number): boolean {
+const EXPLICIT_PO_LABEL_RE = /^(?:P\.?\s*O\.?|PO\s*#?|Purchase\s+Order|Customer\s+PO)/i;
+
+function isExplicitPoLabel(match: RegExpMatchArray): boolean {
+    const label = match[0].slice(0, match[0].indexOf(match[1])).trim();
+    return EXPLICIT_PO_LABEL_RE.test(label);
+}
+
+/**
+ * True when the PO candidate at `candidateIndex` in `rawText` sits on a line
+ * that is shipment-context, or — when `checkLineAbove` is set (generic labels)
+ * — on the line directly above it (the value-below-label layout). Used to
+ * reject freight references before they become POs.
+ */
+function candidateInShipmentContext(
+    rawText: string,
+    candidateIndex: number,
+    checkLineAbove: boolean,
+): boolean {
     const before = rawText.slice(0, candidateIndex);
     const lineStart = before.lastIndexOf("\n") + 1;
     const rest = rawText.slice(candidateIndex);
@@ -308,7 +327,7 @@ function candidateInShipmentContext(rawText: string, candidateIndex: number): bo
     if (isShipmentContextLine(currentLine)) return true;
 
     // value-below-label: the label (and any shipment token) is on the line above
-    if (lineStart > 0) {
+    if (checkLineAbove && lineStart > 0) {
         const aboveStart = rawText.slice(0, lineStart - 1).lastIndexOf("\n") + 1;
         const aboveLine = rawText.slice(aboveStart, lineStart - 1);
         if (isShipmentContextLine(aboveLine)) return true;
@@ -339,7 +358,7 @@ export function extractPOByRegex(rawText: string, tables?: string[][]): string |
         for (const match of rawText.matchAll(global)) {
             const candidate = match[1];
             if (!candidate) continue;
-            if (candidateInShipmentContext(rawText, candidateIndex(match))) continue;
+            if (candidateInShipmentContext(rawText, candidateIndex(match), !isExplicitPoLabel(match))) continue;
             return candidate;
         }
     }
@@ -378,7 +397,7 @@ export function extractPOByRegex(rawText: string, tables?: string[][]): string |
             for (const match of tableText.matchAll(global)) {
                 const candidate = match[1];
                 if (!candidate) continue;
-                if (candidateInShipmentContext(tableText, candidateIndex(match))) continue;
+                if (candidateInShipmentContext(tableText, candidateIndex(match), !isExplicitPoLabel(match))) continue;
                 return candidate;
             }
         }

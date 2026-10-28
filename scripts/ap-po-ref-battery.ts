@@ -137,6 +137,36 @@ for (const [name, text, want] of positives) {
         "4520-DropshipPO",
     );
 
+    // ─── E. corpus contract: the validator must never reject a real PO ──────
+    // Every po_number that exists must survive validatePoRef with its DB
+    // spelling intact. This is the strongest shape of the rule: no suffix
+    // grammar, case form or legacy zero-pad may be nulled out of the ledger.
+    {
+        const { Client } = await import("pg");
+        const { readFileSync } = await import("fs");
+        const env = readFileSync(".env.local", "utf8");
+        for (const l of env.split(/\r?\n/)) {
+            const m = l.match(/^([A-Z0-9_]+)=(.*)$/);
+            if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+        }
+        const pg = new Client({ connectionString: process.env.DATABASE_URL });
+        await pg.connect();
+        const all = await pg.query(`select po_number from purchase_orders where po_number is not null order by po_number`);
+        await pg.end();
+        const rejected: string[] = [];
+        const respelled: string[] = [];
+        for (const row of all.rows as Array<{ po_number: string }>) {
+            const out = await validatePoRef(row.po_number);
+            if (out === null) rejected.push(row.po_number);
+            else if (out !== row.po_number.trim()) respelled.push(`${row.po_number} -> ${out}`);
+        }
+        // One assertion each, so the report stays readable.
+        check(`E corpus ${all.rowCount} real POs — none rejected`, rejected.slice(0, 12), []);
+        check(`E corpus — spelling preserved`, respelled.slice(0, 12), []);
+        if (rejected.length > 12) console.log(`  (+${rejected.length - 12} more rejected)`);
+        if (respelled.length > 12) console.log(`  (+${respelled.length - 12} more respelled)`);
+    }
+
     // ─── verdict ─────────────────────────────────────────────────────────────
     const defects = cases.filter((c) => JSON.stringify(c.got) !== JSON.stringify(c.want));
     console.log(`\n${cases.length} cases, ${defects.length} defect(s)\n`);

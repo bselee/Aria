@@ -29,8 +29,30 @@ describe("isPoShaped", () => {
         expect(isPoShaped("23320587")).toBe(true);
         expect(isPoShaped("21410811")).toBe(true);
         expect(isPoShaped("23320587-DropshipPO")).toBe(true);
-        expect(isPoShaped("23322307-S-DropshipPO")).toBe(true);
-        expect(isPoShaped("23333907F1-DropshipPO")).toBe(true);
+        expect(isPoShaped("23268687A-DropshipPO")).toBe(true); // attached letter
+        expect(isPoShaped("23333907F1-DropshipPO")).toBe(true); // attached letter+digit
+        expect(isPoShaped("23322307-S-DropshipPO")).toBe(true); // dashed segment
+        expect(isPoShaped("23322657-SF1-DropshipPO")).toBe(true); // dashed multi-char
+        expect(isPoShaped("23356217-SA-DropshipPO")).toBe(true); // dashed multi-char
+    });
+
+    it("is case-insensitive on the dropship suffix and letter", () => {
+        expect(isPoShaped("23320587-dropshippo")).toBe(true);
+        expect(isPoShaped("23268687a-DropshipPO")).toBe(true);
+    });
+
+    it("rejects the 9-digit rating-estimate family (shape is anchored)", () => {
+        for (const ref of [
+            "278411572-1",
+            "276170239-1",
+            "268244264-1",
+            "269178799-1",
+            "270404873-1",
+            "275691812-1",
+            "123456789-1",
+        ]) {
+            expect(isPoShaped(ref)).toBe(false);
+        }
     });
 
     it("rejects non-PO numbers: 4-digit order refs, box numbers, B.L./PRO digits", () => {
@@ -38,6 +60,7 @@ describe("isPoShaped", () => {
         expect(isPoShaped("935003")).toBe(false);
         expect(isPoShaped("18700362")).toBe(false);
         expect(isPoShaped("64058931")).toBe(false);
+        expect(isPoShaped("71473626-1")).toBe(false); // 8-digit PRO, not a PO
         expect(isPoShaped("")).toBe(false);
         expect(isPoShaped(null)).toBe(false);
         expect(isPoShaped(undefined)).toBe(false);
@@ -60,7 +83,7 @@ describe("validatePoRef", () => {
         createClientMock.mockReset();
         maybeSingleMock.mockReset();
         createClientMock.mockReturnValue({
-            from: () => ({ select: () => ({ eq: () => ({ maybeSingle: maybeSingleMock }) }) }),
+            from: () => ({ select: () => ({ ilike: () => ({ limit: () => ({ maybeSingle: maybeSingleMock }) }) }) }),
         });
     });
 
@@ -75,6 +98,12 @@ describe("validatePoRef", () => {
         const r = await validatePoRef("0400773");
         expect(r).toBe("0400773");
         expect(maybeSingleMock).toHaveBeenCalled();
+    });
+
+    it("returns the DB spelling for a legacy dropship PO whose case was mangled", async () => {
+        maybeSingleMock.mockResolvedValue({ data: { po_number: "4520-DropshipPO" }, error: null });
+        const r = await validatePoRef("4520-DROPSHIPPO", "gmail=xyz");
+        expect(r).toBe("4520-DropshipPO");
     });
 
     it("nulls non-shaped refs missing from purchase_orders", async () => {

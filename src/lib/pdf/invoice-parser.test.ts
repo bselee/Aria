@@ -26,8 +26,22 @@ describe("extractPOByRegex", () => {
         expect(extractPOByRegex("ADV ORDER # 124547\nTotal $100.00")).toBeNull();
     });
 
-    it("rejects a candidate whose label line above is shipment-context (B.L.)", () => {
-        expect(extractPOByRegex("B.L. P.O. Number\n124547")).toBeNull();
+    it("rejects a generic-label candidate whose line above is shipment-context", () => {
+        expect(extractPOByRegex("PRO NUMBER 64058931\nYour Order No. 124547")).toBeNull();
+    });
+
+    it("keeps an explicit PO label even when a shipment line sits above it", () => {
+        expect(extractPOByRegex("PRO NUMBER 64058931\nP.O. NUMBER 125213")).toBe("125213");
+        expect(extractPOByRegex("B.L.NUMBER 18700362\nP.O. NUMBER 125213")).toBe("125213");
+    });
+
+    it("does not treat address tokens (SOLD TO / SOUTH BEND) as SO# shipment context", () => {
+        expect(extractPOByRegex("SOLD TO\nP.O. NUMBER 125213")).toBe("125213");
+        expect(extractPOByRegex("SOUTH BEND, IN 46601\nP.O. NUMBER 125213")).toBe("125213");
+    });
+
+    it("keeps the header-row PO when INVOICE DATE is a column header", () => {
+        expect(extractPOByRegex("P.O. NUMBER   INVOICE DATE   TERMS\n125213   10/15/26   NET 30")).toBe("125213");
     });
 
     it("keeps goods-vendor PO labels (Your Order No. / Customer Ref)", () => {
