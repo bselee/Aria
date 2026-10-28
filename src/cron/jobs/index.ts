@@ -1515,12 +1515,12 @@ defineJob({
 // (reweigh/accessorial gap) surface to the task hub for review. No Slack/Telegram.
 defineJob({
     name: "fedex-freight-mailbox-reconcile",
-    schedule: "10 9 * * 1",
+    schedule: "10 9 * * 1-5",
     onFail: "log",
-    description: "Weekly FedEx Freight mailbox → Finale PO apply (final invoice truth; task-first review).",
+    description: "Daily FedEx Freight mailbox → Finale PO apply (final invoice truth; task-first review).",
     handler: async () => {
         const { execFileSync } = await import("child_process");
-        console.log("[fedex-mailbox] Running weekly FedEx Freight mailbox reconcile (--live --correct --drift)...");
+        console.log("[fedex-mailbox] Running daily FedEx Freight mailbox reconcile (--live --correct --drift)...");
         let stdout = "";
         try {
             stdout = execFileSync(
