@@ -10,6 +10,7 @@ import {
     completionBlocker,
     sumFreightAdjustments,
     matchCarrierBillForPo,
+    freightLinesHygieneOk,
     type CarrierBill,
 } from "./freight-auto-align";
 
@@ -25,6 +26,47 @@ function bill(over: Partial<CarrierBill>): CarrierBill {
         ...over,
     };
 }
+
+describe("freightLinesHygieneOk", () => {
+    it("passes bare Freight lines with a full allocation", () => {
+        const adjs = [
+            {
+                description: "Freight",
+                productPromoUrl: "/x/api/productpromo/10007",
+                adjustmentAllocationEnumId: "ADJ_BY_WEIGHT",
+                orderAdjustmentAllocationList: [1, 2, 3],
+            },
+        ];
+        expect(freightLinesHygieneOk(adjs, 3)).toBe(true);
+    });
+
+    it("fails a decorated description", () => {
+        const adjs = [
+            {
+                description: "Freight from invoice (backfill) 125221",
+                productPromoUrl: "/x/api/productpromo/10007",
+                adjustmentAllocationEnumId: "ADJ_BY_WEIGHT",
+                orderAdjustmentAllocationList: [1, 2, 3],
+            },
+        ];
+        expect(freightLinesHygieneOk(adjs, 3)).toBe(false);
+    });
+
+    it("fails a missing allocation enum", () => {
+        const adjs = [
+            {
+                description: "Freight",
+                productPromoUrl: "/x/api/productpromo/10007",
+                orderAdjustmentAllocationList: [1, 2, 3],
+            },
+        ];
+        expect(freightLinesHygieneOk(adjs, 3)).toBe(false);
+    });
+
+    it("passes a PO with no freight lines", () => {
+        expect(freightLinesHygieneOk([], 2)).toBe(true);
+    });
+});
 
 describe("matchCarrierBillForPo", () => {
     it("matches a hard printed 6-digit PO number", () => {

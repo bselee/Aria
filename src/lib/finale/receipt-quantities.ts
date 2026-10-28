@@ -24,6 +24,10 @@ export interface TrueReceiptQuantities {
      *  total − subtotal (Finale carries no freight line until applied). */
     total: number;
     subtotal: number;
+    /** Raw item count — allocation lists must match it to reach landed cost. */
+    orderItemCount: number;
+    /** Raw adjustments, for the freight-line hygiene gate (2026-10-28). */
+    orderAdjustmentList: Array<Record<string, unknown>>;
 }
 
 /**
@@ -67,7 +71,14 @@ export async function loadTrueReceiptQuantities(orderId: string): Promise<TrueRe
             }
         }
     }
-    return { orderedBySku, receivedBySku, total: Number(order.total || 0), subtotal: Number(order.subtotal || 0) };
+    return {
+        orderedBySku,
+        receivedBySku,
+        total: Number(order.total || 0),
+        subtotal: Number(order.subtotal || 0),
+        orderItemCount: (order as { orderItemList?: unknown[] }).orderItemList?.length ?? 0,
+        orderAdjustmentList: ((order as { orderAdjustmentList?: unknown }).orderAdjustmentList as Array<Record<string, unknown>>) ?? [],
+    };
 }
 
 /**

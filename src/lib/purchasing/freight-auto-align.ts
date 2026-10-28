@@ -30,7 +30,7 @@
 import { createClient } from "../db";
 import { FinaleClient } from "../finale/client";
 import { loadTrueReceiptQuantities } from "../finale/receipt-quantities";
-import { allocateFreightByWeight, buildFinaleFreightAdjustment } from "../finale/freight-adjustment";
+import { allocateFreightByWeight, buildFinaleFreightAdjustment, freightLineSkipsLandedCost } from "../finale/freight-adjustment";
 import { isFreightRequiredVendor, freightOnPo } from "../../config/freight-required-vendors";
 
 /** Finale-gentle: pause between per-PO calls. Bursts upset Finale and staff. */
@@ -189,6 +189,21 @@ export function dwellSatisfied(anchorIso: string | null | undefined, nowMs: numb
 }
 
 /**
+ * True when every /10007 line on the PO is bare `Freight` + ADJ_BY_WEIGHT
+ * with an allocation sized to the raw item count. A decorated line
+ * ("Freight from invoice (backfill)", "BOL …") never reaches landed cost —
+ * the watcher refuses to apply or complete on top of one (2026-10-28).
+ */
+export function freightLinesHygieneOk(
+    orderAdjustmentList: Array<Record<string, unknown>>,
+    orderItemCount: number,
+): boolean {
+    const freightLines = orderAdjustmentList.filter((a) => String(a.productPromoUrl || "").includes("/10007"));
+    if (freightLines.length === 0) return true; // no freight lines to judge
+    return freightLines.every((line) => !freightLineSkipsLandedCost(line as never, orderItemCount));
+}
+
+/**
  * Pure completion blocker: the only reasons an otherwise-aligned PO may not
  * be closed autonomously. Returns null when nothing blocks.
  */
@@ -201,7 +216,9 @@ export function completionBlocker(input: {
     poFreight: number;
     openDispute: boolean;
     pendingApproval: boolean;
+    freightHygieneOk?: boolean;
 }): string | null {
+    if (input.freightHygieneOk === false) return "funky freight line on PO — description/allocation hygiene";
     if (input.shortsCount > 0) return "goods not all received";
     if (!input.hasMatchedInvoice) return "no matched goods invoice";
     if (input.openDispute) return "open overbill dispute";
@@ -347,6 +364,14 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
             stats.assessed++;
             const shortsCount = receiptShortsCount(receipt);
             const freightNow = freightOnPo(receipt.total, receipt.subtotal);
+            // Hygiene gate (2026-10-28): never apply or complete on top of a
+            // decorated freight line. It must be bare `Freight` + allocation.
+            const hygieneOk = freightLinesHygieneOk(receipt.orderAdjustmentList, receipt.orderItemCount);
+            if (!hygieneOk) {
+                stats.blocked.push({ po, reason: "funky freight line — description/allocation hygiene" });
+                await new Promise((r) => setTimeout(r, GAP_MS));
+                continue;
+            }
 
             // ── Lanes: only act when the PO carries no freight yet ──
             if (freightNow <= FREIGHT_EPS) {
@@ -503,6 +528,7 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
                 poFreight: freightNow,
                 openDispute: (dispRows || []).length > 0,
                 pendingApproval: (paRows || []).length > 0,
+                freightHygieneOk: hygieneOk,
             });
             if (blocker) {
                 stats.blocked.push({ po, reason: blocker });
