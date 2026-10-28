@@ -141,20 +141,29 @@ db.close();
     check("H bare 8-digit still null", extractPONumberFromText(BODY_248343), null);
     check("H six-digit unchanged", extractPONumberFromText("Purchase Order # 125333"), "125333");
     check("H vendor-ref six-digit tail", extractPONumberFromText("71473626-124833"), "124833");
-    // KNOWN-GAP (pre-existing, identical at HEAD): the label set accepts PO / P.O. /
-    // "Purchase Order" / ORDER but NOT the word "Number", so "P.O. Number 125333"
-    // never matched — same for 8 digits. Verified by running both regexes side by
-    // side; not introduced by the widening.
-    check("H KNOWN-GAP 'P.O. Number' form", extractPONumberFromText("P.O. Number 23578097A"), null);
-    check("H KNOWN-GAP 'P.O. Number' 6-digit", extractPONumberFromText("P.O. Number 125333"), null);
-    // KNOWN-GAP (pre-existing doc bug): the function's own comment advertises
-    // "71473626-1124833 -> 124833", but \d{6}\b cannot match a 7-digit tail, so that
-    // exact example returns null. Only a true 6-digit tail matches.
-    check("H KNOWN-GAP documented vendor-ref example", extractPONumberFromText("71473626-1124833"), null);
-    // KNOWN-GAP (new door opened by widening, proved by running old vs new regex):
-    // ORDER is in the label set, so an 8-digit Finale SALES_ORDER now matches where
-    // 5-7 digits used to be the only width. AAA's "REF# ORDER <n>" is class 13.
-    check("H KNOWN-GAP REF# ORDER 8-digit", extractPONumberFromText("REF# ORDER 23566017"), "23566017");
+    // Flipped by the bridge pass (ORDER dropped, Number/No. connector added):
+    // these three were pinned as today's behavior and are now asserted at their
+    // intended values.
+    check("H 'P.O. Number' form", extractPONumberFromText("P.O. Number 23578097A"), "23578097A");
+    check("H 'P.O. Number' 6-digit", extractPONumberFromText("P.O. Number 125333"), "125333");
+    check("H ORDER is no longer a PO label", extractPONumberFromText("REF# ORDER 23566017"), null);
+    check("H ORDER alias cannot mint a ref", extractPONumberFromText("ADV ORDER 4798"), null);
+    // Uline's own order number, printed beside a blank PURCHASE ORDER NO.
+    check("H uline ORDER # junk gone", extractPONumberFromText("INVOICE #: 215047605\nORDER #: 59853790"), null);
+    check("H uline letterhead PO Box", extractPONumberFromText("uline.com\nPO Box 88741 • Chicago, IL 60680-1741"), null);
+    // Vendor labels split by column layout: connector + newline before the digits.
+    check("H 'P.O. NO.' newline uppercase", extractPONumberFromText("Approval CodeP.O. NO.\n23576187\nTerms"), "23576187");
+    check("H 'PO Number' newline", extractPONumberFromText("DescriptionPO Number\n125257\nNet 30"), "125257");
+    check("H 'Purchase Order No.'", extractPONumberFromText("Purchase Order No. 125383"), "125383");
+    // Concentrates carries both theirs and ours: only the PO-labeled one may win.
+    check(
+        "H theirs-vs-ours in one doc",
+        extractPONumberFromText("INVOICE\n3084520\nORDER NUMBER\nMilwaukie, OR\nPO Number\n125257"),
+        "125257",
+    );
+    // KNOWN-GAP (pre-existing, unchanged by this pass): the doc comment's old example
+    // never matched its own regex; only a true 6-digit tail does.
+    check("H vendor-ref 7-digit tail matches nothing", extractPONumberFromText("71473626-1124833"), null);
     for (const [id, label] of [
         ["1a16c4a2f0550ba0", "H statement 2938"],
         ["1a180d27ed8d16fb", "H statement 2886"],
@@ -176,8 +185,8 @@ db.close();
         }
     }
 
-    // ═══ D. documented sibling gap (not this commit's scope) ════════════════
-    check("D bridge extractor still blind to 8-digit", extractPONumberFromText(BODY_248343), null);
+    // ═══ D. bare form on the bridge stays null by design ════════════════════
+    check("D bridge ignores the label-free AutoPot form", extractPONumberFromText(BODY_248343), null);
 
     // ─── verdict ─────────────────────────────────────────────────────────────
     const defects = cases.filter((c) => JSON.stringify(c.got) !== JSON.stringify(c.want));

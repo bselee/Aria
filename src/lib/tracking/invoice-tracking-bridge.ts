@@ -64,9 +64,15 @@ const NO_PO_CONFIDENCE = 0.75;
 /**
  * Extract a PO number from free OCR text. Mirrors email-tracking-ingest's
  * extractPONumbersFromText conventions: standard "PO #124833" / "PO-124833" /
- * "Purchase Order 124833" refs first (5-7 digit, plus the 8-digit dropship
- * "PO 23581487" / "P.O. 23578097A" family), then Finale vendor-ref
- * format "71473626-1124833" (last 6 digits = PO).
+ * "Purchase Order 124833" refs (5-7 digit, plus the 8-digit dropship
+ * "PO 23581487" / "P.O. 23578097A" family), then Finale vendor-ref format
+ * "71473626-124833" (last 6 digits = PO).
+ *
+ * Label set is PO / P.O. / Purchase Order only — "ORDER" is deliberately NOT
+ * a label (a carrier statement's "ORDER #" is the vendor's own number, e.g.
+ * Uline, not our PO). An optional "Number" / "No." connector is allowed between
+ * the label and the digits, so "P.O. NO.\n23576187" and "PO Number\n125257"
+ * resolve across a newline.
  *
  * Label-bounded only: a bare 8-digit ref with no PO label ("View and pay
  * 23581487") is intentionally NOT a PO candidate here — the caller resolves
@@ -77,11 +83,11 @@ export function extractPONumberFromText(text: string): string | null {
     if (!text) return null;
 
     const poRef = text.match(
-        /(?:PO|P\.?\s*O\.?|Purchase\s+Order|ORDER)\s*[-#:.]*\s*(\d{8}[A-Z]?|\d{5,7})\b/i,
+        /(?:PO|P\.?\s*O\.?|Purchase\s+Order)(?:\s+(?:Number|No\.?))?\s*[-#:.]*\s*(\d{8}[A-Z]?|\d{5,7})\b/i,
     );
     if (poRef) return poRef[1];
 
-    // Finale vendor-ref: "71473626-1124833" → PO 124833
+    // Finale vendor-ref: "71473626-124833" → PO 124833
     const vendorRef = text.match(/\b\d{7,10}-(\d{6})\b/);
     if (vendorRef) return vendorRef[1];
 

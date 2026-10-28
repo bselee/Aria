@@ -72,6 +72,21 @@ describe("extractPONumberFromText", () => {
         expect(extractPONumberFromText("View and pay 23581487")).toBeNull();
     });
 
+    it("extracts across a Number/No. connector, including a newline", () => {
+        expect(extractPONumberFromText("PO Number\n125257")).toBe("125257");
+        expect(extractPONumberFromText("P.O. Number 125333")).toBe("125333");
+        expect(extractPONumberFromText("Approval CodeP.O. NO.\n23576187")).toBe("23576187");
+    });
+
+    it("does NOT treat ORDER as a PO label", () => {
+        expect(extractPONumberFromText("REF# ORDER 23566017")).toBeNull();
+        expect(extractPONumberFromText("ORDER #: 59853790")).toBeNull();
+    });
+
+    it("does NOT match PO Box (digits must follow the label, not a word)", () => {
+        expect(extractPONumberFromText("PO Box 88741")).toBeNull();
+    });
+
     it("returns null when no PO reference exists", () => {
         expect(extractPONumberFromText("Invoice #20260805 amount due $1,234.56")).toBeNull();
         expect(extractPONumberFromText("")).toBeNull();
