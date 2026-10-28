@@ -1203,11 +1203,13 @@ async function resolveSenderVendor(fromEmail: string): Promise<string | null> {
             return byOrdersEmail[0].vendor_name;
         }
 
-        // 2. vendor_emails[] contains the address.
+        // 2. vendor_emails[] contains the address. `.overlaps`, not `.contains`:
+        //    supabase-js serialises a JS array as JSON and 400s on a PostgREST
+        //    text[] column (22P02 "malformed array literal").
         const { data: byVendorEmail } = await db
             .from("vendor_profiles")
             .select("vendor_name")
-            .contains("vendor_emails", [email])
+            .overlaps("vendor_emails", [email])
             .limit(1);
         if (Array.isArray(byVendorEmail) && byVendorEmail.length > 0 && byVendorEmail[0]?.vendor_name) {
             return byVendorEmail[0].vendor_name;
@@ -1218,7 +1220,7 @@ async function resolveSenderVendor(fromEmail: string): Promise<string | null> {
             const { data: byDomain } = await db
                 .from("vendor_profiles")
                 .select("vendor_name")
-                .contains("vendor_domains", [domain])
+                .overlaps("vendor_domains", [domain])
                 .limit(1);
             if (Array.isArray(byDomain) && byDomain.length > 0 && byDomain[0]?.vendor_name) {
                 return byDomain[0].vendor_name;

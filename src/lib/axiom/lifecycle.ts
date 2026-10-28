@@ -211,12 +211,14 @@ export async function reassessActiveLifecyclesForSKU(sku: string): Promise<void>
     const db = createClient();
     if (!db) return;
 
-    // Find any lifecycle rows in status 'needs_spec' that contain this sku in missing_template_skus
+    // Find any lifecycle rows in status 'needs_spec' that contain this sku in missing_template_skus.
+    // `.overlaps`, not `.contains`: supabase-js `.contains` serialises a JS array
+    // as JSON and 400s on a PostgREST text[] column (22P02).
     const { data: lifecycles, error } = await supabase
         .from("axiom_order_lifecycle")
         .select("*")
         .eq("status", "needs_spec")
-        .contains("missing_template_skus", [sku]);
+        .overlaps("missing_template_skus", [sku]);
 
     if (error) {
         console.error(`[axiom-lifecycle] Failed to query lifecycles for SKU ${sku}:`, error);

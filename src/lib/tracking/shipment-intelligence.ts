@@ -712,11 +712,24 @@ export async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise
         return;
     }
 
-    const { data: shipments } = await db
+    const { data: shipments, error: shipmentsError } = await db
         .from("shipments")
         .select("tracking_number, public_tracking_url")
-        .contains("po_numbers", [poNumber])
+        .overlaps("po_numbers", [poNumber])
         .eq("active", true);
+
+    // Fail CLOSED: a failed read is not evidence of zero shipments. PostgREST
+    // `.contains` on a text[] column serialises a JS array as a JSON array and
+    // 400s (22P02 "malformed array literal"); `.overlaps` is the drop-in that
+    // works for single-element membership. If the read still errors for any
+    // reason, leave tracking_numbers untouched rather than writing [] over a
+    // populated column (silent data loss — this blanked 71 real PO columns).
+    if (shipmentsError) {
+        console.warn(
+            `[tracking-sync] Failed to read active shipments for PO ${poNumber}: ${shipmentsError.message ?? String(shipmentsError)} — skipping tracking write (fail-closed)`,
+        );
+        return;
+    }
 
     const trackingNumbers = uniqueStrings((shipments || []).map((s: any) => s.tracking_number));
     const publicUrls = uniqueStrings((shipments || []).map((s: any) => s.public_tracking_url));

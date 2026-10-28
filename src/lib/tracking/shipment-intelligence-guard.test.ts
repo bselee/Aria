@@ -19,6 +19,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
     poRows: [] as any[],
     shipments: [] as any[],
+    shipmentsError: null as string | null,
     updateCalls: [] as Array<{ po_number: string; payload: any }>,
     upsertCalls: [] as any[],
 }));
@@ -57,8 +58,11 @@ vi.mock("@/lib/db", () => ({
                 if (table === "shipments") {
                     return {
                         select: () => ({
-                            contains: () => ({
-                                eq: async () => ({ data: state.shipments, error: null }),
+                            overlaps: () => ({
+                                eq: async () =>
+                                    state.shipmentsError
+                                        ? { data: null, error: { message: state.shipmentsError } }
+                                        : { data: state.shipments, error: null },
                             }),
                         }),
                     };
@@ -112,6 +116,7 @@ function makeShipment(overrides: Record<string, any> = {}): any {
 beforeEach(() => {
     state.poRows = [];
     state.shipments = [];
+    state.shipmentsError = null;
     state.updateCalls = [];
     state.upsertCalls = [];
     finale.updateTracking.mockClear();
@@ -177,6 +182,20 @@ describe("syncLegacyPurchaseOrderTracking (UPDATE-only guard)", () => {
 
         await syncLegacyPurchaseOrderTracking("125280");
 
+        expect(state.updateCalls).toHaveLength(0);
+        expect(state.upsertCalls).toHaveLength(0);
+        expect(finale.updateTracking).not.toHaveBeenCalled();
+    });
+
+    it("does NOT write [] over a populated column when the shipments read fails (fail-closed)", async () => {
+        state.poRows = [{ po_number: "125280", vendor_name: "Cen-Tec", status: "open" }];
+        // Simulate the PostgREST 22P02 that `.contains` on text[] used to throw.
+        state.shipmentsError = 'malformed array literal: "["23550677-DropshipPO"]"';
+
+        await syncLegacyPurchaseOrderTracking("125280");
+
+        // A failed read is not evidence of zero shipments: no update, no
+        // upsert, no Finale push — the existing tracking_numbers column survives.
         expect(state.updateCalls).toHaveLength(0);
         expect(state.upsertCalls).toHaveLength(0);
         expect(finale.updateTracking).not.toHaveBeenCalled();
