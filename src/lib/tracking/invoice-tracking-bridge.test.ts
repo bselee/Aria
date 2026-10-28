@@ -62,6 +62,16 @@ describe("extractPONumberFromText", () => {
         expect(extractPONumberFromText("Ref: 71473626-124833")).toBe("124833");
     });
 
+    it("extracts a labeled 8-digit dropship PO", () => {
+        expect(extractPONumberFromText("PO 23581487")).toBe("23581487");
+        expect(extractPONumberFromText("P.O. 23578097A")).toBe("23578097A");
+        expect(extractPONumberFromText("Purchase Order 23320587 dated 10/26")).toBe("23320587");
+    });
+
+    it("does NOT extract a bare 8-digit ref with no PO label", () => {
+        expect(extractPONumberFromText("View and pay 23581487")).toBeNull();
+    });
+
     it("returns null when no PO reference exists", () => {
         expect(extractPONumberFromText("Invoice #20260805 amount due $1,234.56")).toBeNull();
         expect(extractPONumberFromText("")).toBeNull();

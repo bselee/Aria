@@ -124,6 +124,17 @@ export async function validatePoRef(
         if (rawSpelling) return rawSpelling;
     }
 
+    // Bare 8-digit dropship ref (base, or base + a single letter, with no
+    // "-DropshipPO" suffix): shape alone cannot tell which suffixed row it is
+    // (23581487 -> 23581487-S-DropshipPO, 23578097A -> 23578097A-DropshipPO),
+    // so resolve the DB spelling first so the write joins. Falls through to
+    // shape/existence below when no row matches (a genuine bare row, or a PO
+    // not yet propagated to purchase_orders).
+    if (/^2\d{7}[A-Z]?$/i.test(clean)) {
+        const resolved = await resolveDropshipPOByRef(clean);
+        if (resolved) return resolved;
+    }
+
     if (isPoShaped(clean)) return clean;
     const dbSpelling = await poRefExistsInPurchaseOrders(clean);
     if (dbSpelling) return dbSpelling;
@@ -136,48 +147,69 @@ export async function validatePoRef(
 }
 
 /**
- * Resolve an 8-digit dropship base (e.g. "23578097") to the purchase_orders
- * spelling that carries it (e.g. "23578097A-DropshipPO"). Prefix match, not
- * exact: the label/bare extractors yield the bare base or the base + a single
- * trailing letter, while the DB stores the full "2xxxxxxx"-suffix spelling.
+ * Resolve a bare 8-digit dropship ref (base, or base + a single trailing
+ * letter) to the purchase_orders spelling, in this locked order:
+ *
+ *   1. Exact DB spelling match (candidate equals a stored po_number verbatim,
+ *      case-insensitive) -> that row.
+ *   2. Base has exactly one row -> that row, letter ignored. The letter is OCR
+ *      noise (S/5, B/8, A/4), never authoritative, so a mangled "23581487S"
+ *      still resolves to "23581487-S-DropshipPO".
+ *   3. Base has more than one row and no exact match -> null, never guess.
  *
  * The base is restricted to the 2-prefixed dropship family (`^2\d{7}$`): every
  * 8-digit dropship PO in purchase_orders starts with 2, so a non-2-prefixed
  * candidate (an AAA Cooper PRO like "64058931", a B.L. digit-run) is rejected
- * here without a DB round-trip. A bare 235xxxxxxx that resolves to no row
- * stays null — that is what keeps class 11 (carrier P.O. box / Finale
- * SALES_ORDER holding a bare 8-digit) closed.
+ * here without a DB round-trip. A bare 235xxxxxxx that resolves to no row stays
+ * null — that is what keeps class 11 (carrier P.O. box / Finale SALES_ORDER
+ * holding a bare 8-digit) closed.
  *
- * @param base  Raw 8-digit candidate base (e.g. "23578097", "23578097A").
- * @returns     The purchase_orders.po_number spelling, or null when no row's
- *              base matches (or on DB error — fail closed).
+ * @param ref  Raw 8-digit candidate (e.g. "23578097", "23578097A").
+ * @returns    The purchase_orders.po_number spelling, or null when no row's
+ *             base matches, or when the base is ambiguous (or on DB error —
+ *             fail closed).
  */
-export async function resolveDropshipPOByBase(base: string): Promise<string | null> {
-    const prefix = base.slice(0, 8);
-    if (!/^2\d{7}$/.test(prefix)) return null;
+export async function resolveDropshipPOByRef(ref: string): Promise<string | null> {
+    const clean = String(ref ?? "").trim();
+    if (!/^2\d{7}[A-Z]?$/i.test(clean)) return null;
+    const base = clean.slice(0, 8);
     try {
         const client = createClient();
         const { data, error } = await client
             .from("purchase_orders")
             .select("po_number")
-            .ilike("po_number", `${prefix}%`)
-            .limit(1)
-            .maybeSingle();
+            .ilike("po_number", `${base}%`);
         if (error) {
             console.warn(
-                `[po-ref-validator] dropship base lookup failed for ${prefix}: ` +
+                `[po-ref-validator] dropship ref lookup failed for ${clean}: ` +
                 `${error.message || error}`,
             );
             return null;
         }
-        return data?.po_number ?? null;
+        const spellings = Array.from(
+            new Set((data ?? []).map((r: any) => r.po_number as string)),
+        );
+        // Rule 1: exact spelling match (candidate == a stored po_number).
+        const exact = spellings.find((s) => s.toLowerCase() === clean.toLowerCase());
+        if (exact) return exact;
+        // Rule 2 (single row, letter ignored) and rule 3 (ambiguous -> null).
+        return spellings.length === 1 ? spellings[0] : null;
     } catch (err: any) {
         console.warn(
-            `[po-ref-validator] dropship base lookup threw for ${prefix}: ` +
+            `[po-ref-validator] dropship ref lookup threw for ${clean}: ` +
             `${err?.message || err}`,
         );
         return null;
     }
+}
+
+/**
+ * Thin wrapper for callers that hold only a bare 8-digit base (no trailing
+ * letter). Delegates to resolveDropshipPOByRef, which owns the ambiguity
+ * preference.
+ */
+export async function resolveDropshipPOByBase(base: string): Promise<string | null> {
+    return resolveDropshipPOByRef(base);
 }
 
 /**
@@ -198,7 +230,7 @@ export async function resolveExtractedPOs(poNumbers: string[]): Promise<string[]
     const out: string[] = [];
     for (const ref of poNumbers) {
         if (/^\d{8}[A-Z]?$/i.test(ref)) {
-            const spelling = await resolveDropshipPOByBase(ref.slice(0, 8));
+            const spelling = await resolveDropshipPOByRef(ref);
             if (spelling) out.push(spelling);
         } else {
             out.push(ref);
