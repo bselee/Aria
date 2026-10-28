@@ -94,6 +94,19 @@ db.close();
     // ungated (the ingest has no validatePoRef call). Not a regression from this change.
     check("B KNOWN-GAP seven-digit junk passes", await resolveExtractedPOs(["9477993"]), ["9477993"]);
 
+    // KNOWN-GAP, asserted as today's behavior so the resolver change has to touch
+    // this line and declare its intent: a candidate whose letter matches no PO
+    // spelling resolves to whatever row shares the base. Tolerable while every
+    // base has exactly one row (OCR mangles letters — S/5, B/8, A/4), wrong the
+    // moment a base carries two spellings. Flip these to [] with the ambiguity
+    // hardening.
+    check("B KNOWN-GAP wrong letter -> sibling spelling", await resolveExtractedPOs(["23581487B"]), [
+        "23581487-S-DropshipPO",
+    ]);
+    check("B KNOWN-GAP wrong letter -> sibling spelling 2", await resolveExtractedPOs(["23578097B"]), [
+        "23578097A-DropshipPO",
+    ]);
+
     // ═══ C. real statements through both layers ═════════════════════════════
     for (const [id, label] of [
         ["1a16c4a2f0550ba0", "statement 2938"],
