@@ -7,6 +7,7 @@ import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import InvoicePOMatcher from "./InvoicePOMatcher";
 import { isPaidInAdvanceVendor, isBilledUpfrontVendor } from "@/config/paid-in-advance-vendors";
+import { isDeliverAndBillVendor } from "@/lib/purchasing/deliver-bill-vendors";
 
 type ReceivedPO = {
     orderId: string;
@@ -42,6 +43,17 @@ type ReceivedPO = {
         hasAutoApplied: boolean;
         vendorHasUnlinkedBills?: boolean;
         coveringBill?: { invoice_number?: string | null; total?: number | null } | null;
+        /** "deliver_and_bill" when the vendor bills per delivery (2026-10-28). */
+        billingPattern?: "deliver_and_bill" | null;
+        /** Invoice-vs-delivery comparison for bill-as-they-deliver vendors. */
+        invoiceVsReceipt?: {
+            invoicedTotal: number;
+            receivedValue: number;
+            invoicedQty: number;
+            receivedQty: number;
+            overbilled: boolean;
+            billed: boolean;
+        } | null;
         matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
 };
@@ -1193,6 +1205,12 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         if (rec?.coveringBill) {
                                                             return { text: `Partial receipt. ${capFirst(billLabel(rec.coveringBill))} covers lines here. ${openTotal.toLocaleString()} still open.`, button: undefined };
                                                         }
+                                                        if (rec?.billingPattern === "deliver_and_bill") {
+                                                            // Bill-as-they-deliver vendors: a partial receipt
+                                                            // with no bill yet is the NORMAL shape — the bill
+                                                            // comes with the delivery.
+                                                            return { text: `Partial receipt. ${openTotal.toLocaleString()} still open. Billed per delivery.`, button: undefined };
+                                                        }
                                                         if (isPaidInAdvanceVendor(po.supplier)) {
                                                             return { text: `Partial receipt. ${openTotal.toLocaleString()} still open. Paid in advance.`, button: undefined };
                                                         }
@@ -1249,6 +1267,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     if (isPaidInAdvanceVendor(po.supplier)) {
                                                         return { text: `${receiptLead}. Paid in advance.`, button: undefined };
                                                     }
+                                                    if (rec?.billingPattern === "deliver_and_bill") {
+                                                        return { text: `${receiptLead}. Billed per delivery — no bill yet.`, button: undefined };
+                                                    }
                                                     if (rec?.vendorHasUnlinkedBills) {
                                                         return { text: `${receiptLead}. Bill in AP — link to PO.`, button: undefined };
                                                     }
@@ -1275,6 +1296,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 </button>
                                                             )}
                                                         </div>
+
+                                                        {/* The invoice covers more than the delivery — the exact
+                                                            overbill pattern Bill named (2026-10-28): bill-as-they-deliver
+                                                            vendors "almost always over bill us a complete PO". */}
+                                                        {rec?.invoiceVsReceipt?.overbilled && (
+                                                            <div className="mt-1 text-[11px] font-mono text-rose-300">
+                                                                Bill exceeds delivery — ${rec.invoiceVsReceipt.invoicedTotal.toLocaleString()} invoiced vs $
+                                                                {rec.invoiceVsReceipt.receivedValue.toLocaleString()} received. Verify before completing.
+                                                            </div>
+                                                        )}
 
                                                         {/* The choice, on the row. Finale has no freight until we add the amount the invoice charges. */}
                                                         {rec?.matchedInvoice && (() => {

@@ -24,6 +24,15 @@ const BAD_SENTINELS = new Set([
     "undefined",
     "-",
     "—",
+    // A parse failure falls back to invoice-parser's literal "error" values
+    // (see parseInvoice catch-all). Those are sentinels, never real identity:
+    // storing them poisons the (vendor_name, invoice_number) conflict key and
+    // routes real bills into the phantom/junk filters. Clean them so the
+    // regex/email fallbacks get their chance.
+    "error",
+    "failed",
+    "parse error",
+    "ocr error",
 ]);
 
 /** Treat model/schema sentinels as missing. */
@@ -55,16 +64,24 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
 
     // INVOICE # 1682  /  Invoice No. 1682  /  Invoice Number:\n1682
     // DTE paper layout: "INVOICE #\n4/24/2026\n1682" — date then number.
+    // Miles template layout: "Invoice ID Issue Date Terms\n\nMiles Filippelli
+    // Fermented Plant Extracts\n10,272,026 10.27.2026" — label is Invoice ID,
+    // the number sits on the next line and carries a thousands comma. Both ID
+    // patterns capture a digit-run ONLY, so header prose ("Issue Date Terms")
+    // can never be captured as an invoice number.
     const invPatterns = [
         /INVOICE\s*#\s*\n\s*\d{1,2}\/\d{1,2}\/\d{2,4}\s*\n\s*([0-9]{3,8})\b/i,
+        /INVOICE\s+ID(?:ENTIFICATION)?[\s\S]{0,120}?\n\s*([0-9][0-9,\-]{2,18})/i,
+        /INVOICE\s*ID(?:ENTIFICATION)?\s*[:.]?\s*([0-9][0-9,\-]{2,18})/i,
         /INVOICE\s*(?:NO|NUM|NUMBER)\.?\s*[:.]?\s*([A-Z0-9][A-Z0-9\-\/]{1,20})/i,
         /INVOICE\s*#\s*[:.]?\s*([A-Z0-9][A-Z0-9\-\/]{1,20})/i,
         /\bINV[#\s\-]*([0-9]{3,8})\b/i,
     ];
     for (const re of invPatterns) {
         const m = text.match(re);
-        if (m?.[1] && !/^unknown$/i.test(m[1]) && !looksLikeDate(m[1])) {
-            invoiceNumber = m[1].trim();
+        const raw = m?.[1]?.trim();
+        if (raw && !/^unknown$/i.test(raw) && !looksLikeDate(raw)) {
+            invoiceNumber = raw;
             break;
         }
     }

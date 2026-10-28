@@ -406,4 +406,95 @@ describe("ReceivedItemsPanel", () => {
     expect(await screen.findByText(/Bill in AP — link to PO/i)).toBeTruthy();
     expect(screen.queryByText(/Awaiting vendor invoice/i)).toBeNull();
   });
+
+  it("says billed per delivery for a partial receipt with no bill yet (2026-10-28)", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-415",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "partial",
+          supplier: "CR Minerals",
+          total: 6000,
+          items: [{ productId: "CR101", quantity: 250, orderedQuantity: 250, receivedQuantity: 60, openQuantity: 190 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            billingPattern: "deliver_and_bill",
+            matchedInvoice: null,
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/190 still open\. Billed per delivery/i)).toBeTruthy();
+    expect(screen.queryByText(/No bill yet/i)).toBeNull();
+  });
+
+  it("flags a bill that exceeds the delivery (overbill guard, 2026-10-28)", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-377",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "partial",
+          supplier: "Miles Filippelli",
+          total: 6000,
+          items: [{ productId: "BASLPE102", quantity: 250, orderedQuantity: 250, receivedQuantity: 50, openQuantity: 200 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            billingPattern: "deliver_and_bill",
+            invoiceVsReceipt: {
+              invoicedTotal: 6000,
+              receivedValue: 1200,
+              invoicedQty: 250,
+              receivedQty: 50,
+              overbilled: true,
+              billed: true,
+            },
+            matchedInvoice: {
+              invoice_number: "125377",
+              subtotal: 6000,
+              freight: 0,
+              tax: 0,
+              total: 6000,
+              status: "received",
+              line_items: null,
+            },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Bill exceeds delivery — \$6,000 invoiced vs \$1,200 received/i)).toBeTruthy();
+  });
 });

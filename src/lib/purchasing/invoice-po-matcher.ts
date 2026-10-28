@@ -391,6 +391,43 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         pos = merged;
     }
 
+    // ── Current-open-PO fast path (2026-10-28) ─────────────────────────────
+    // Bill: an invoice landing for a vendor with exactly one open PO belongs
+    // to that PO — bill-as-they-deliver vendors (Miles, CR Minerals, New Moon,
+    // Rootwise, Cowoco, Thrive) run blanket POs with several deliveries, so
+    // date/amount scoring against the full PO total can never win and the
+    // bill sits unmatched. Guard: sane vendor identity, positive total, and
+    // the open PO issued within the date window of the invoice.
+    if (Number(invoice.total || 0) > 0 && (invoice.vendorName || invoice.senderName)) {
+        const openStatuses = new Set(["open", "partial", "committed", "locked", "created", "pending"]);
+        const openPos = (pos || []).filter((p: any) => openStatuses.has(String(p.status || "").toLowerCase()));
+        if (openPos.length === 1) {
+            const po = openPos[0];
+            const dateScore = scoreDateProximity(invoice.invoiceDate || "", po.issue_date || "");
+            if (dateScore.score >= 6) {
+                const candidate: POCandidate = {
+                    orderId: String(po.po_number),
+                    vendorName: po.vendor_name || "",
+                    orderDate: po.issue_date || "",
+                    total: Number(po.total_amount || po.total || 0),
+                    status: po.status || "unknown",
+                    score: 85,
+                    reasons: [
+                        `single open PO — current PO for ${invoice.vendorName || invoice.senderName}`,
+                        dateScore.reason,
+                    ],
+                    isOpen: true,
+                };
+                return {
+                    invoice,
+                    candidates: [candidate],
+                    bestMatch: candidate,
+                    autoApplyReady: true,
+                };
+            }
+        }
+    }
+
     for (const po of (pos || []) as any[]) {
         let vendorScore = scoreVendorName(invoice.vendorName, po.vendor_name || "");
         if (vendorScore.score < 30 && invoice.senderName) {

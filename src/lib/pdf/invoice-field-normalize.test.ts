@@ -38,6 +38,13 @@ describe("cleanInvoiceField", () => {
         expect(cleanInvoiceField("n/a")).toBeNull();
         expect(cleanInvoiceField("1682")).toBe("1682");
     });
+
+    it("nulls parse-failure sentinels so fallbacks get their chance (2026-10-28)", () => {
+        expect(cleanInvoiceField("error")).toBeNull();
+        expect(cleanInvoiceField("ERROR")).toBeNull();
+        expect(cleanInvoiceField("failed")).toBeNull();
+        expect(cleanInvoiceField("parse error")).toBeNull();
+    });
 });
 
 describe("extractInvoiceFieldsFromOcrText", () => {
@@ -48,6 +55,13 @@ describe("extractInvoiceFieldsFromOcrText", () => {
         expect(f.total).toBe(7875);
         expect(f.invoiceDate).toBe("2026-04-24");
         expect(f.vendorHint).toBe("Down to Earth Worms");
+    });
+
+    it("reads the Miles 'Invoice ID' label with thousands comma (2026-10-28)", () => {
+        const MILES_OCR = `INVOICE\nInvoice For: BuildASoil\n\nFrom:\nInvoice ID Issue Date Terms\n\nMiles Filippelli Fermented Plant Extracts\n10,272,026 10.27.2026 Due Upon Delivery\n\nDESCRIPTION Comfrey Gallon Pumpkin Gallon\nQUANTITY 26.00 56.00\nUNIT PRICE $24.00 $24.00\nAMOUNT $624.00 $1,344.00\nTOTAL\n$2,688.00`;
+        const f = extractInvoiceFieldsFromOcrText(MILES_OCR);
+        expect(f.invoiceNumber).toBe("10,272,026");
+        expect(f.total).toBe(2688);
     });
 });
 

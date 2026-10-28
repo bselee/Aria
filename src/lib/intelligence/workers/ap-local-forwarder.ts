@@ -542,18 +542,37 @@ async function enrichInvoiceForPoMatch(args: {
         }
     }
 
+    // Vendor hint precedence: caller hint > DTE regex > sender display name.
+    // The email From is the one identity the OCR can never corrupt — when a
+    // parse fails to "error", the sender name is the honest fallback.
+    const senderName = String(args.emailFrom || "").split("<")[0].replace(/["']/g, "").trim();
+    const senderVendor = senderName && !senderName.includes("@") && !/^(no-?reply|accounts payable|ap|billing|invoice)/i.test(senderName)
+        ? senderName.replace(/\b\w/g, (c) => c.toUpperCase())
+        : undefined;
     let vendorHint =
         args.vendorHint ||
         (/ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(args.emailFrom)
             ? "Down to Earth Worms"
-            : undefined);
+            : undefined) ||
+        senderVendor;
 
     let parsed: any = null;
     if (rawText.length >= 20) {
         try {
             parsed = await parseInvoice(rawText);
-        } catch (e: any) {
-            console.warn(`   [AP-Local] parseInvoice failed: ${e?.message || e}`);
+        } catch (firstErr: any) {
+            console.warn(`   [AP-Local] parseInvoice failed (attempt 1): ${firstErr?.message || firstErr}`);
+            // One retry — the 2026-10-27 Miles invoice landed with vendor and
+            // invoice number "error" because a single transient parse failure
+            // fell through to the catch-all fallback. The same text parses
+            // cleanly on retry.
+            try {
+                await new Promise((r) => setTimeout(r, 2000));
+                parsed = await parseInvoice(rawText);
+                console.log("   [AP-Local] parseInvoice succeeded on retry");
+            } catch (secondErr: any) {
+                console.warn(`   [AP-Local] parseInvoice failed (attempt 2): ${secondErr?.message || secondErr}`);
+            }
         }
     }
 
@@ -584,11 +603,50 @@ async function enrichInvoiceForPoMatch(args: {
     // The rejected string is logged inside validatePoRef as a document trace;
     // the null then flows to every downstream write (bridge, matched_po_number,
     // invoice_cache, vendor_invoices).
+    //
+    // KAIZEN(2026-10-28): a REJECTED ref must also CLEAR a previously-written
+    // matched_po_number. The UPDATE below used COALESCE(?, matched_po_number),
+    // so a null — the validator's whole verdict — was swallowed and a stale bad
+    // value survived every re-run. That is how "DropshipPO" and "PO125395" sat
+    // in reconciliation state looking like candidates. poRefRejected
+    // distinguishes "validator said no" (clear) from "no ref found at all"
+    // (leave any existing value alone).
+    let poRefRejected = false;
     if (norm.poNumber) {
+        const rawRef = norm.poNumber;
         norm.poNumber = await validatePoRef(
-            norm.poNumber,
+            rawRef,
             `gmail=${args.gmailMessageId} pdf=${args.pdfFilename}`,
         );
+        poRefRejected = norm.poNumber === null;
+    }
+
+    // ── Current-PO link (2026-10-28) ──────────────────────────────────────
+    // Bill: "recognize when an invoice comes through AP or bill.selee email
+    // and link to current PO for that vendor." When the document carries no
+    // usable PO reference, link the invoice to the vendor's current open PO
+    // at ingest time instead of leaving it for the 30-minute batch matcher.
+    if (!norm.poNumber && norm.total > 0) {
+        try {
+            const { findCurrentPoForInvoice } = await import("@/lib/purchasing/invoice-delivery-link");
+            const decision = await findCurrentPoForInvoice({
+                vendorName: norm.vendorName,
+                senderName,
+                total: norm.total,
+                invoiceDate: norm.invoiceDate,
+                lineItems: norm.lineItems,
+            });
+            if (decision?.linked && decision.poNumber) {
+                norm.poNumber = decision.poNumber;
+                console.log(
+                    `   [AP-Local] linked invoice to current PO ${decision.poNumber} (${decision.confidence}: ${decision.reason})`,
+                );
+            } else {
+                console.log(`   [AP-Local] no current-PO link: ${decision?.reason || "no decision"}`);
+            }
+        } catch (linkErr: any) {
+            console.warn(`   [AP-Local] current-PO link failed: ${linkErr?.message || linkErr}`);
+        }
     }
 
     // ── WS2 (2026-08-05): bridge invoice tracking → shipments ──
@@ -623,8 +681,13 @@ async function enrichInvoiceForPoMatch(args: {
                  ocr_freight = ?,
                  ocr_tax = ?,
                  ocr_line_items = ?,
-                 matched_po_number = COALESCE(?, matched_po_number),
+                 matched_po_number = CASE
+                   WHEN ? = 1 THEN NULL
+                   ELSE COALESCE(?, matched_po_number)
+                 END,
                  reconciliation_status = CASE
+                   WHEN ? = 1 AND reconciliation_status = 'PO_CANDIDATE'
+                   THEN 'PO_UNMATCHED'
                    WHEN ? IS NOT NULL AND (reconciliation_status IS NULL OR reconciliation_status = '' OR reconciliation_status = 'PO_UNMATCHED')
                    THEN 'PO_CANDIDATE'
                    ELSE reconciliation_status
@@ -639,11 +702,17 @@ async function enrichInvoiceForPoMatch(args: {
             norm.freight ? String(norm.freight) : null,
             norm.tax ? String(norm.tax) : null,
             norm.lineItems.length ? JSON.stringify(norm.lineItems) : null,
+            // Better-sqlite3 binds booleans as-is, which SQLite compares badly
+            // against `= 1`; pass a literal 1/0.
+            poRefRejected ? 1 : 0,
             norm.poNumber,
+            poRefRejected ? 1 : 0,
             norm.poNumber,
             norm.poNumber
                 ? `OCR logged; PO candidate ${norm.poNumber}`
-                : "OCR logged; no PO# found — needs match",
+                : poRefRejected
+                    ? "OCR logged; PO ref rejected by validator — needs match"
+                    : "OCR logged; no PO# found — needs match",
             args.rowId ?? args.gmailMessageId,
         );
     } catch (e: any) {

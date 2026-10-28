@@ -20,6 +20,7 @@ import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
 import { loadTrueReceiptQuantities, receiptShorts } from '@/lib/finale/receipt-quantities';
+import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
 
 // ── In-flight PO reconciliation guard ─────────────────────────────────────
 // Prevents concurrent Finale writes when two browser tabs / bust=1 calls
@@ -274,6 +275,11 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             (o: any) => o.outcome === 'auto_applied'
                         ),
                         matchedInvoice: real ?? (moneyRow ? { ...moneyRow, identityUnknown: true } : null),
+                        // Vendors that bill per delivery (2026-10-28): the
+                        // panel must treat a partial receipt as the normal
+                        // shape and compare the bill to the DELIVERY, not to
+                        // the whole PO.
+                        billingPattern: isDeliverAndBillVendor(po.supplier) ? "deliver_and_bill" : null,
                     };
                 }
             }
@@ -672,6 +678,64 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     }
                                 }
                                 if (coveringBill) rec.coveringBill = coveringBill;
+                            }
+
+                            // ── Invoice-vs-delivery comparison (2026-10-28) ──
+                            // For bill-as-they-deliver vendors the review that
+                            // matters is NOT invoice-vs-PO — it is invoice-vs-
+                            // what actually arrived. Bill: invoices "almost
+                            // always over bill us a complete PO". Stamp the
+                            // comparison so the panel flags an overbill the
+                            // moment the bill and the receipt are both known.
+                            for (const po of received) {
+                                const rec = (po as any)._reconciliation;
+                                if (!rec || !isDeliverAndBillVendor(po.supplier)) continue;
+                                const bills: any[] = [];
+                                if (rec.matchedInvoice) bills.push(rec.matchedInvoice);
+                                if (
+                                    rec.coveringBill &&
+                                    (!rec.matchedInvoice ||
+                                        String(rec.coveringBill.invoice_number) !== String(rec.matchedInvoice.invoice_number))
+                                ) {
+                                    bills.push(rec.coveringBill);
+                                }
+                                const seenTotals = new Set<number>();
+                                const dedup = bills.filter((b) => {
+                                    const t = Number(b?.total || 0);
+                                    if (!t || seenTotals.has(t)) return false;
+                                    seenTotals.add(t);
+                                    return true;
+                                });
+                                let invoicedTotal = 0;
+                                let invoicedQty = 0;
+                                for (const b of dedup) {
+                                    invoicedTotal += Number(b?.total || 0);
+                                    let lines: any[] = [];
+                                    try {
+                                        const parsed =
+                                            typeof b?.line_items === "string" ? JSON.parse(b.line_items) : b?.line_items;
+                                        lines = Array.isArray(parsed) ? parsed : [];
+                                    } catch { /* not JSON */ }
+                                    for (const l of lines) invoicedQty += Number(l?.qty ?? l?.quantity ?? 0);
+                                }
+                                let receivedQty = 0;
+                                let receivedValue = 0;
+                                for (const it of po.items || []) {
+                                    const rc = it.receivedQuantity;
+                                    if (rc === undefined || rc === null) continue;
+                                    receivedQty += Number(rc);
+                                    receivedValue += Number(rc) * Number(it.unitPrice ?? 0);
+                                }
+                                receivedValue = Math.round(receivedValue * 100) / 100;
+                                rec.invoiceVsReceipt = {
+                                    invoicedTotal,
+                                    receivedValue,
+                                    invoicedQty,
+                                    receivedQty,
+                                    overbilled:
+                                        invoicedTotal > 0 && receivedValue > 0 && invoicedTotal > receivedValue * 1.05 + 5,
+                                    billed: invoicedTotal > 0,
+                                };
                             }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
