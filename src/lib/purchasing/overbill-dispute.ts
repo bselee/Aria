@@ -26,20 +26,13 @@ export interface OverbillDisputeInput {
 }
 
 /**
- * The vendor email body in Bill's voice: facts, grace, and what he will
- * enter. Short (<=45 words), no em dashes, no signature block.
+ * The vendor email body in Bill's voice — verbatim (2026-10-28):
+ * "Hey- Noticed the delivery did not match up with the invoice. What would
+ * you like to do?" The numbers live in the dispute record, not the email;
+ * the vendor gets a chance in grace before any figures are quoted.
  */
-export function overbillDraftBody(input: OverbillDisputeInput): string {
-    const inv = Number(input.invoicedTotal || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const rcv = Number(input.receivedValue || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const dlt = Number(input.delta || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const invNum = String(input.invoiceNumber || "").trim();
-    const numClause = invNum && !/^(error|null|nan|1)$/i.test(invNum) ? ` on invoice ${invNum}` : "";
-    return (
-        `Received $${rcv} of the $${inv} billed${numClause}. ` +
-        `Holding the bill and will enter $${rcv} for what was delivered, ` +
-        `unless you credit the $${dlt} or send a revised invoice. PO ${input.poNumber}.`
-    );
+export function overbillDraftBody(_input: OverbillDisputeInput): string {
+    return "Hey- Noticed the delivery did not match up with the invoice. What would you like to do?";
 }
 
 type DbClient = ReturnType<typeof createClient>;
