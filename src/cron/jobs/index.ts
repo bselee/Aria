@@ -40,6 +40,25 @@ defineJob({
 });
 
 defineJob({
+    name: "bag-artwork-sync",
+    schedule: "0 8 * * 1",
+    onFail: "log",
+    description:
+        "Weekly (Mon 8am) read-only mirror of the teammate's bag artwork sheet (Drive export) into bag_artwork + link resolution + completion alerts. Never edits the sheet; only our Postgres.",
+    handler: async () => {
+        const { syncBagArtwork } = await import("@/lib/artwork/bag-artwork-sync");
+        const result = await syncBagArtwork({ live: true });
+        const alertCount = result.alerts.length;
+        const movedCount = result.events.filter((e) => e.kind === "tab_move" && e.toTab === "complete").length;
+        console.log(
+            `[bag-artwork-sync] rows=${result.rows} events=${result.events.length} links=${result.links.length} ` +
+            `completed=${movedCount} alerts=${alertCount} unlinked=${result.unlinked.length}`,
+        );
+    },
+    budget: { durationMs: 300_000 },
+});
+
+defineJob({
     name: "inbox-screen",
     schedule: "*/15 7-18 * * *",
     onFail: "log",

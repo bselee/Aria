@@ -208,6 +208,13 @@ export interface PurchasingItem {
     lastPurchaseQty?: number | null;
     isBulkVendor?: boolean;
     vendorOnTimeRate?: number;
+    /** Bag/label artwork state (Phase 2). Set only for items with a
+     *  bag_artwork_link row. 'in_review' blocks reorder until Complete. */
+    artStatus?: 'complete' | 'in_review';
+    /** Sheet SKU (Finale SKU) the artwork row is keyed on. */
+    artSku?: string;
+    /** Latest artwork version string seen (e.g. "v3"). */
+    artVersion?: string;
 }
 
 export interface PurchasingGroup {

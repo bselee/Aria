@@ -518,7 +518,18 @@ async function runSlotScan(
         }
         // Same carton size ships under several vendor SKUs; pool before publishing
         // so the board and the Friday report judge the size, not the SKU.
-        const value = await applyCartonPooling(key, scanned);
+        let value = await applyCartonPooling(key, scanned);
+        // Phase 2 (2026-10-28): stamp bag/label artwork state on resale items.
+        // Art in review must hold the reorder (Bill's rule), so the gate rides
+        // on the same snapshot the board and reports read.
+        if (key === 'resale') {
+            try {
+                const { applyArtworkStatus } = await import('../artwork/enrich');
+                value = await applyArtworkStatus(value);
+            } catch (err: unknown) {
+                console.warn(`[purchasing/cycle] ${key} artwork enrichment failed (using unenriched scan):`, errText(err));
+            }
+        }
         slot.value = value;
         slot.at = Date.now();
         if (windowKey) slot.windowKey = windowKey;
