@@ -1,7 +1,7 @@
 import { createClient } from "@/lib/db";
 import { withAdvisoryLock } from "@/lib/purchasing/advisory-lock";
 import { FinaleClient } from "@/lib/finale/client";
-import { upsertTrackingLocal, syncTrackingToPostgREST, getTrackingLocal } from "@/lib/storage/tracking-cache";
+import { upsertTrackingLocal, syncTrackingToPostgREST, getTrackingLocal, registerTrackingForPolling } from "@/lib/storage/tracking-cache";
 import {
     carrierUrl,
     detectCarrier,
@@ -1037,6 +1037,19 @@ export async function upsertShipmentEvidence(input: ShipmentUpsertInput): Promis
     if (data && input.poNumber && classifyShipmentEvidence(data as ShipmentRecord).level === "confirmed") {
         await syncLegacyPurchaseOrderTracking(input.poNumber);
         await syncPOLifecycleFromShipment(input.poNumber, data as ShipmentRecord);
+    }
+
+    // Register into the poll cache so the carrier loop picks this number up
+    // (2026-10-28). Before this, only email evidence fed the board; carrier
+    // ETAs and out-for-delivery never surfaced.
+    if (data && !(data as ShipmentRecord).delivered_at) {
+        registerTrackingForPolling({
+            trackingNumber: (data as ShipmentRecord).tracking_number,
+            poNumbers: (data as ShipmentRecord).po_numbers,
+            statusCategory: (data as ShipmentRecord).status_category,
+            statusDisplay: (data as ShipmentRecord).status_display,
+            estimatedDeliveryAt: (data as ShipmentRecord).estimated_delivery_at,
+        });
     }
 
     return data as ShipmentRecord;

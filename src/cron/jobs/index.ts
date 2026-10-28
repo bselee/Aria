@@ -777,13 +777,16 @@ defineJob({
     onFail: "log",
     description: "Refresh stale tracking numbers from carrier APIs into local cache.",
     handler: async () => {
+        // Fire-and-forget (2026-10-28): a capped tiered refresh must never
+        // starve the cron loop — the in-flight guard prevents overlap.
         const { refreshStaleTrackings, countActiveTrackings } = await import("@/lib/storage/tracking-cache");
         const active = countActiveTrackings();
         console.log(`[tracking-refresh] ${active} active tracking records in cache`);
-        const refreshed = await refreshStaleTrackings(60);
-        if (refreshed > 0) {
-            console.log(`[tracking-refresh] Refreshed ${refreshed} tracking records`);
-        }
+        void refreshStaleTrackings(120).then((refreshed) => {
+            if (refreshed > 0) {
+                console.log(`[tracking-refresh] Refreshed ${refreshed} tracking records`);
+            }
+        });
     },
 });
 
@@ -1523,6 +1526,19 @@ defineJob({
         }
     },
     budget: { durationMs: 300_000 },
+});
+
+// ── Weekly tracking accuracy (2026-10-28): realized vs predicted, written to
+// the activity log. Silent — Bill reads the number, never an alert.
+defineJob({
+    name: "tracking-accuracy-report",
+    schedule: "15 7 * * 1",
+    onFail: "log",
+    description: "Weekly tracking accuracy: ETA coverage, on-time rate, staleness.",
+    handler: async () => {
+        const { runTrackingAccuracyReport } = await import("@/lib/tracking/accuracy-report");
+        await runTrackingAccuracyReport();
+    },
 });
 
 // DECISION(2026-10-19): Weekly FedEx Freight Billing Online mailbox reconcile.

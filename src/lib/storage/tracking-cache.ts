@@ -25,7 +25,8 @@
  */
 
 import { getLocalDb } from "./local-db";
-import { getTrackingStatus } from "../carriers/tracking-service";
+import { getTrackingStatus, type TrackingStatus } from "../carriers/tracking-service";
+import { createClient } from "../db";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -136,6 +137,48 @@ export function getStaleTrackings(staleMinutes: number = 60): CachedShipment[] {
     return rows;
 }
 
+/** Tiered staleness for the poll loop (2026-10-28). Soon-arriving and
+ *  exception rows poll most often; the long tail drains on a 12h cadence. */
+export interface PollTiers {
+    tier1: CachedShipment[]; // out_for_delivery / exception / ETA today-tomorrow, stale > 30m
+    tier2: CachedShipment[]; // in_transit with an ETA, stale > 4h
+    tier3: CachedShipment[]; // everything else active, stale > 12h
+}
+
+export function getStaleTrackingsTiered(nowMs: number = Date.now()): PollTiers {
+    const db = getLocalDb();
+    const now = new Date(nowMs).toISOString();
+    const t30 = new Date(nowMs - 30 * 60_000).toISOString();
+    const t4h = new Date(nowMs - 4 * 3600_000).toISOString();
+    const t12h = new Date(nowMs - 12 * 3600_000).toISOString();
+    const rows = db.prepare(
+        `SELECT * FROM shipments_cache
+         WHERE (status_category IS NULL OR status_category != 'delivered')
+         ORDER BY last_checked_at ASC`
+    ).all() as CachedShipment[];
+
+    const tomorrowIso = new Date(nowMs + 86400_000).toISOString().slice(0, 10);
+    const tier1: CachedShipment[] = [];
+    const tier2: CachedShipment[] = [];
+    const tier3: CachedShipment[] = [];
+    for (const row of rows) {
+        const checked = row.last_checked_at ?? "";
+        const etaSoon =
+            row.estimated_delivery_at != null &&
+            (row.estimated_delivery_at.slice(0, 10) === now.slice(0, 10) ||
+                row.estimated_delivery_at.slice(0, 10) === tomorrowIso);
+        const hot = row.status_category === "out_for_delivery" || row.status_category === "exception";
+        if (hot || etaSoon) {
+            if (!checked || checked < t30) tier1.push(row);
+        } else if (row.estimated_delivery_at != null) {
+            if (!checked || checked < t4h) tier2.push(row);
+        } else if (!checked || checked < t12h) {
+            tier3.push(row);
+        }
+    }
+    return { tier1, tier2, tier3 };
+}
+
 /**
  * Count active shipments (not delivered, checked recently).
  */
@@ -152,12 +195,70 @@ export function countActiveTrackings(): number {
 // ── PostgREST Sync ─────────────────────────────────────────────────────────
 
 /**
+ * Write a carrier poll result into the PostgREST `shipments` table — the
+ * store the dashboard board actually reads (2026-10-28). Before this, polls
+ * only landed in SQLite/tracking_info and the board stayed frozen at ingest
+ * time: ETAs and out-for-delivery never surfaced. Guards:
+ * - `delivered` is terminal — a poll never downgrades a delivered row.
+ * - A missing ETA in the poll keeps the existing one; nulls never wipe data.
+ * - `last_checked_at` always advances so staleness is honest.
+ */
+export async function writePollResultToShipments(
+    trackingNumber: string,
+    status: TrackingStatus,
+): Promise<number> {
+    const db = createClient();
+    if (!db) return 0;
+    const now = new Date().toISOString();
+    const { data: rows } = await db
+        .from("shipments")
+        .select("id, tracking_number, tracking_key, status_category, status_display, estimated_delivery_at, delivered_at")
+        .or(`tracking_number.eq.${trackingNumber},tracking_key.ilike.%:::${trackingNumber}`)
+        .eq("active", true)
+        .limit(20);
+    let written = 0;
+    for (const row of (rows || []) as Array<{
+        id: string;
+        tracking_number: string | null;
+        tracking_key: string;
+        status_category: string | null;
+        status_display: string | null;
+        estimated_delivery_at: string | null;
+        delivered_at: string | null;
+    }>) {
+        const isDelivered = row.status_category === "delivered" || row.delivered_at != null;
+        const incomingDelivered = status.category === "delivered" || status.delivered_at != null;
+        if (isDelivered && !incomingDelivered) continue; // terminal — never downgrade
+
+        const patch: Record<string, string> = { last_checked_at: now };
+        if (incomingDelivered) {
+            patch.status_category = "delivered";
+            if (status.delivered_at) patch.delivered_at = status.delivered_at;
+            else if (!row.delivered_at) patch.delivered_at = now;
+        } else if (status.category && status.category !== row.status_category) {
+            patch.status_category = status.category;
+        }
+        if (status.display && status.display !== row.status_display) {
+            patch.status_display = status.display;
+        }
+        if (status.estimated_delivery_at && status.estimated_delivery_at !== row.estimated_delivery_at) {
+            patch.estimated_delivery_at = status.estimated_delivery_at;
+        }
+        // Always write: `last_checked_at` must advance even when the carrier
+        // echoes an unchanged status, or the board's staleness never improves.
+        const { error } = await db.from("shipments").update(patch).eq("id", row.id);
+        if (!error) written++;
+    }
+    return written;
+}
+
+/**
  * Enqueue a tracking record for async sync to PostgREST via the unified sync queue.
  * Fire-and-forget — never blocks the caller.
  */
 export async function syncTrackingToPostgREST(record: CachedShipment): Promise<void> {
     const { enqueueSync } = await import("./sync-queue");
-    await enqueueSync("tracking_info", record.tracking_number, "upsert", record as any);
+    await enqueueSync("tracking_info", record.tracking_number, "upsert", record as unknown as Record<string, unknown>);
 }
 
 /**
@@ -180,30 +281,71 @@ export async function refreshAndCacheTracking(trackingNumber: string): Promise<C
         // Fire-and-forget sync to PostgREST
         syncTrackingToPostgREST(record).catch(() => {});
 
+        // Live writeback into the board's `shipments` table (2026-10-28).
+        // Best-effort, never blocks or breaks the poll.
+        writePollResultToShipments(trackingNumber, status).catch(() => {});
+
         return record;
-    } catch (err: any) {
-        console.warn(`[tracking-cache] Refresh failed for ${trackingNumber}: ${err.message}`);
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[tracking-cache] Refresh failed for ${trackingNumber}: ${msg}`);
         return null;
     }
 }
 
 /**
- * Bulk refresh: get stale trackings, refresh each from carrier API.
- * Returns count of refreshed records.
+ * Register a tracking number into the poll cache so the carrier loop picks
+ * it up (2026-10-28). Called on every successful ingest upsert. A row that
+ * already exists is left untouched — the poll refreshes it on cadence.
  */
-export async function refreshStaleTrackings(staleMinutes: number = 60): Promise<number> {
-    const stale = getStaleTrackings(staleMinutes);
-    let refreshed = 0;
+export function registerTrackingForPolling(input: {
+    trackingNumber: string;
+    poNumbers?: string[];
+    statusCategory?: string | null;
+    statusDisplay?: string | null;
+    estimatedDeliveryAt?: string | null;
+}): void {
+    const existing = getTrackingLocal(input.trackingNumber);
+    if (existing) return;
+    upsertTrackingLocal({
+        trackingNumber: input.trackingNumber,
+        poNumbers: input.poNumbers,
+        statusCategory: input.statusCategory,
+        statusDisplay: input.statusDisplay,
+        estimatedDeliveryAt: input.estimatedDeliveryAt,
+    });
+}
 
-    for (const s of stale) {
-        const result = await refreshAndCacheTracking(s.tracking_number);
-        if (result) refreshed++;
-        // Rate limit: 500ms between carrier API calls
-        await new Promise(r => setTimeout(r, 500));
+/** In-flight guard so overlapping cron ticks never double-poll. */
+let refreshing = false;
+
+/**
+ * Bulk refresh: tiered by urgency (soon-arriving > ETA-bearing > long tail),
+ * capped per run so carrier rate limits hold and the event loop is never
+ * starved. Returns 0 when a refresh is already in flight.
+ */
+export async function refreshStaleTrackings(maxPerRun: number = 120): Promise<number> {
+    if (refreshing) return 0;
+    refreshing = true;
+    try {
+        const { tier1, tier2, tier3 } = getStaleTrackingsTiered();
+        const queue = [...tier1, ...tier2, ...tier3].slice(0, maxPerRun);
+        let refreshed = 0;
+
+        for (const s of queue) {
+            const result = await refreshAndCacheTracking(s.tracking_number);
+            if (result) refreshed++;
+            // Rate limit: 500ms between carrier API calls
+            await new Promise((r) => setTimeout(r, 500));
+        }
+
+        console.log(
+            `[tracking-cache] Refreshed ${refreshed}/${queue.length} (tiers ${tier1.length}/${tier2.length}/${tier3.length} stale)`,
+        );
+        return refreshed;
+    } finally {
+        refreshing = false;
     }
-
-    console.log(`[tracking-cache] Refreshed ${refreshed}/${stale.length} stale tracking records`);
-    return refreshed;
 }
 
 // ── Dashboard Query ────────────────────────────────────────────────────────
