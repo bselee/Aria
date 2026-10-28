@@ -23,6 +23,9 @@ export interface OverbillDisputeInput {
     invoicedTotal: number;
     receivedValue: number;
     delta: number;
+    /** Sum of delivered quantities at hold time — the per-line auto-resolve
+     *  compares a later bill's quantity sum against this (2026-10-28). */
+    receivedQtySum?: number | null;
 }
 
 /**
@@ -53,6 +56,7 @@ export async function recordOverbillDispute(
         invoiced_total: input.invoicedTotal,
         received_value: input.receivedValue,
         delta: input.delta,
+        received_qty_sum: input.receivedQtySum ?? null,
         disposition: "held" as const,
         status: "open" as const,
         vendor_notified_at: input.vendorNotified ? new Date().toISOString() : null,
@@ -107,17 +111,25 @@ export interface DisputeForAutoResolve {
     poNumber: string;
     receivedValue: number;
     createdAt: string;
+    /** Delivered quantity sum captured when the hold was recorded. */
+    receivedQtySum?: number | null;
 }
 
 export interface NewBillForDispute {
     total: number;
     createdAt: string;
+    /** Sum of the bill's line quantities (null when line items unknown). */
+    quantitySum?: number | null;
 }
 
 /**
  * Pure decision: has a bill landed AFTER the hold that is at or below the
  * delivered value? That is the vendor's revision or credit — the hold closes
  * itself. Never resolves on a bill that still exceeds the delivery.
+ *
+ * Per-line guard (2026-10-28): when both sides carry quantities, the bill's
+ * quantity sum must equal what was delivered. A later bill for a DIFFERENT
+ * delivery with a coincidentally lower total must not clear the hold.
  */
 export function shouldAutoResolve(
     dispute: DisputeForAutoResolve,
@@ -130,7 +142,15 @@ export function shouldAutoResolve(
         return t > 0 && !Number.isNaN(at) && at > heldAt;
     });
     if (later.length === 0) return { resolve: false };
-    const settled = later.find((b) => Number(b.total) <= Number(dispute.receivedValue));
+    const settled = later.find((b) => {
+        if (Number(b.total) > Number(dispute.receivedValue)) return false;
+        const bQty = b.quantitySum;
+        const dQty = dispute.receivedQtySum;
+        if (bQty != null && bQty > 0 && dQty != null && dQty > 0) {
+            return Math.abs(bQty - dQty) <= 0.5;
+        }
+        return true; // quantities unknown on one side — fall back to total only
+    });
     if (!settled) return { resolve: false };
     return {
         resolve: true,
@@ -151,16 +171,21 @@ export async function autoResolveBalancedDisputes(): Promise<{ resolved: number;
     if (!db) return { resolved: 0, skipped: 0, error: "DB unavailable" };
     const { data: open, error: openErr } = await db
         .from("overbill_disputes")
-        .select("po_number, received_value, created_at")
+        .select("po_number, received_value, received_qty_sum, created_at")
         .eq("status", "open")
         .order("created_at", { ascending: true })
         .limit(50);
     if (openErr) return { resolved: 0, skipped: 0, error: openErr.message };
     let resolved = 0;
-    for (const d of (open || []) as Array<{ po_number: string; received_value: unknown; created_at: string }>) {
+    for (const d of (open || []) as Array<{
+        po_number: string;
+        received_value: unknown;
+        received_qty_sum?: unknown;
+        created_at: string;
+    }>) {
         const { data: bills } = await db
             .from("vendor_invoices")
-            .select("total, created_at")
+            .select("total, created_at, line_items")
             .eq("po_number", d.po_number)
             .order("created_at", { ascending: false })
             .limit(10);
@@ -168,12 +193,18 @@ export async function autoResolveBalancedDisputes(): Promise<{ resolved: number;
             {
                 poNumber: d.po_number,
                 receivedValue: Number(d.received_value || 0),
+                receivedQtySum: d.received_qty_sum == null ? null : Number(d.received_qty_sum),
                 createdAt: d.created_at,
             },
-            ((bills || []) as Array<{ total?: unknown; created_at?: unknown }>).map((b) => ({
-                total: Number(b?.total || 0),
-                createdAt: String(b?.created_at || ""),
-            })),
+            ((bills || []) as Array<{ total?: unknown; created_at?: unknown; line_items?: unknown }>).map((b) => {
+                const lines = Array.isArray(b?.line_items) ? (b.line_items as Array<Record<string, unknown>>) : [];
+                const quantitySum = lines.reduce((s, l) => s + (Number(l.quantity) || 0), 0);
+                return {
+                    total: Number(b?.total || 0),
+                    createdAt: String(b?.created_at || ""),
+                    quantitySum: lines.length > 0 ? quantitySum : null,
+                };
+            }),
         );
         if (!decision.resolve) continue;
         const res = await resolveOverbillDispute(db, d.po_number, decision.reason || "auto-resolved");

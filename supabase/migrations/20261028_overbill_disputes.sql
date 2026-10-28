@@ -11,6 +11,7 @@ create table if not exists public.overbill_disputes (
     invoice_number text,
     invoiced_total numeric,
     received_value numeric,
+    received_qty_sum numeric,
     delta numeric,
     disposition text not null default 'held' check (disposition in ('held')),
     status text not null default 'open' check (status in ('open', 'resolved')),

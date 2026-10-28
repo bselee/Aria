@@ -30,7 +30,12 @@
 import { createClient } from "../db";
 import { FinaleClient } from "../finale/client";
 import { loadTrueReceiptQuantities } from "../finale/receipt-quantities";
-import { allocateFreightByWeight, buildFinaleFreightAdjustment, freightLineSkipsLandedCost } from "../finale/freight-adjustment";
+import {
+    allocateFreightByWeight,
+    buildFinaleFreightAdjustment,
+    freightLineSkipsLandedCost,
+    taxLineSkipsLandedCost,
+} from "../finale/freight-adjustment";
 import { isFreightRequiredVendor, freightOnPo } from "../../config/freight-required-vendors";
 
 /** Finale-gentle: pause between per-PO calls. Bursts upset Finale and staff. */
@@ -49,7 +54,6 @@ export interface FreightAlignStats {
     assessed: number;
     appliedVendor: number;
     appliedDestination: number;
-    appliedCarrier: number;
     completed: number;
     skipped: number;
     errors: number;
@@ -87,66 +91,6 @@ interface FinaleOrderDoc {
     orderItemList?: Array<{ productId?: string; quantity?: number; weight?: number }>;
     orderAdjustmentList?: FinaleAdjustmentLine[];
     [key: string]: unknown;
-}
-
-/** One carrier bill from the Billtrust export, the fields the matcher reads. */
-export interface CarrierBill {
-    invoiceNumber: string;
-    shipDate: string; // MM/DD/YYYY
-    terms: string;
-    amountDue: number;
-    bol: string;
-    poNumber: string;
-    vendorName: string | null;
-}
-
-/**
- * Pure carrier-bill match for ONE blocked PO. Joins are the same the weekly
- * reconciler uses: a hard 6-digit PO# on the bill, or a vendor + ship-date
- * window around the PO's receive date when exactly one bill sits in it.
- * Composite PO# fields (freight-account strings like `9226398101-646135168`)
- * are bill numbers, not POs — never matched. COLLECT only.
- */
-export function matchCarrierBillForPo(
-    bills: CarrierBill[],
-    po: string,
-    vendorName: string,
-    receiveDateIso: string | null | undefined,
-): CarrierBill | null {
-    const collect = bills.filter((b) => {
-        if (!/COLLECT/i.test(b.terms)) return false;
-        const pn = String(b.poNumber || "").trim();
-        if (pn && (pn.includes("-") || !/^\d{6}$/.test(pn))) return false; // freight-account composite
-        return true;
-    });
-
-    // Hard PO match first — the printed PO is the primary join.
-    const hard = collect.find((b) => String(b.poNumber || "").trim() === po);
-    if (hard) return hard;
-
-    // Vendor + receive window: receive within [ship, ship+10d].
-    if (!receiveDateIso) return null;
-    const rcv = new Date(receiveDateIso).getTime();
-    if (Number.isNaN(rcv)) return null;
-    const v = vendorName.trim().toLowerCase();
-    const windowed = collect.filter((b) => {
-        if (!b.vendorName) return false;
-        const bv = b.vendorName.toLowerCase();
-        if (!(v && (bv.includes(v) || v.includes(bv)))) return false;
-        const ship = parseUsDateMs(b.shipDate);
-        if (Number.isNaN(ship)) return false;
-        const delta = rcv - ship;
-        return delta >= 0 && delta <= 10 * 86400 * 1000;
-    });
-    return windowed.length === 1 ? windowed[0] : null;
-}
-
-/** MM/DD/YYYY → epoch ms (Invalid Date → NaN). */
-function parseUsDateMs(s: string): number {
-    const m = String(s || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-    if (!m) return NaN;
-    const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
-    return new Date(y, Number(m[1]) - 1, Number(m[2])).getTime();
 }
 
 /** Env kill switch — on by default (Bill authorized autonomous alignment). */
@@ -201,6 +145,20 @@ export function freightLinesHygieneOk(
     const freightLines = orderAdjustmentList.filter((a) => String(a.productPromoUrl || "").includes("/10007"));
     if (freightLines.length === 0) return true; // no freight lines to judge
     return freightLines.every((line) => !freightLineSkipsLandedCost(line as never, orderItemCount));
+}
+
+/**
+ * Tax lines must allocate like freight (ADJ_BY_WEIGHT sized to the raw item
+ * count) or they never reach landed cost — the watcher refuses to apply or
+ * complete on top of unallocated tax (Bill, 2026-10-28).
+ */
+export function taxLinesHygieneOk(
+    orderAdjustmentList: Array<Record<string, unknown>>,
+    orderItemCount: number,
+): boolean {
+    const taxLines = orderAdjustmentList.filter((a) => String(a.productPromoUrl || "").includes("/10008"));
+    if (taxLines.length === 0) return true; // no tax lines to judge
+    return taxLines.every((line) => !taxLineSkipsLandedCost(line as never, orderItemCount));
 }
 
 /**
@@ -292,7 +250,6 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
         assessed: 0,
         appliedVendor: 0,
         appliedDestination: 0,
-        appliedCarrier: 0,
         completed: 0,
         skipped: 0,
         errors: 0,
@@ -323,31 +280,6 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
     const finale = new FinaleClient();
     const nowMs = Date.now();
     let writes = 0;
-    /** Billtrust carrier bills, loaded once on first need. */
-    let carrierBills: CarrierBill[] | null = null;
-
-    const loadCarrierBills = async (): Promise<CarrierBill[]> => {
-        try {
-            const { findLatestBilltrustCsv, parseBilltrustCsv, dedupInboundInvoices } = await import(
-                "../../cli/reconcile-billtrust-freight"
-            );
-            const csv = findLatestBilltrustCsv();
-            if (!csv) return [];
-            return dedupInboundInvoices(parseBilltrustCsv(csv)).map((b) => ({
-                invoiceNumber: b.invoiceNumber,
-                shipDate: b.shipDate,
-                terms: b.terms,
-                amountDue: b.amountDue,
-                bol: b.bol,
-                poNumber: b.poNumber,
-                vendorName: b.vendorName,
-            }));
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.warn(`[freight-auto-align] carrier CSV load failed: ${msg}`);
-            return [];
-        }
-    };
 
     for (const row of candidates.slice(0, MAX_CANDIDATES)) {
         const po = String(row.po_number);
@@ -366,9 +298,11 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
             const freightNow = freightOnPo(receipt.total, receipt.subtotal);
             // Hygiene gate (2026-10-28): never apply or complete on top of a
             // decorated freight line. It must be bare `Freight` + allocation.
-            const hygieneOk = freightLinesHygieneOk(receipt.orderAdjustmentList, receipt.orderItemCount);
+            const hygieneOk =
+                freightLinesHygieneOk(receipt.orderAdjustmentList, receipt.orderItemCount) &&
+                taxLinesHygieneOk(receipt.orderAdjustmentList, receipt.orderItemCount);
             if (!hygieneOk) {
-                stats.blocked.push({ po, reason: "funky freight line — description/allocation hygiene" });
+                stats.blocked.push({ po, reason: "funky adjustment line — description/allocation hygiene" });
                 await new Promise((r) => setTimeout(r, GAP_MS));
                 continue;
             }
@@ -415,42 +349,10 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
                 }
 
                 if (lane.lane === "none") {
-                    // Carrier lane (2026-10-28): the same Billtrust joins the
-                    // weekly reconciler uses, run here for THIS blocked PO.
-                    if (carrierBills === null) carrierBills = await loadCarrierBills();
-                    const carrier = matchCarrierBillForPo(
-                        carrierBills,
-                        po,
-                        String(row.vendor_name || ""),
-                        String(row.receive_date || ""),
-                    );
-                    if (!carrier) {
-                        stats.blocked.push({ po, reason: "no carrier bill matched yet" });
-                        await new Promise((r) => setTimeout(r, GAP_MS));
-                        continue;
-                    }
-                    const applyCarrier = await appendFreightLine(finale, po, carrier.amountDue, doc);
-                    writes++;
-                    if (!applyCarrier.ok) {
-                        stats.errors++;
-                        stats.blocked.push({ po, reason: `carrier apply failed: ${applyCarrier.error}` });
-                        continue;
-                    }
-                    stats.appliedCarrier++;
-                    await sb.from("ap_activity_log").insert({
-                        intent: "FREIGHT_AUTO_ALIGNED",
-                        created_at: new Date().toISOString(),
-                        metadata: {
-                            poNumber: po,
-                            lane: "carrier",
-                            amount: carrier.amountDue,
-                            invoiceNumber: carrier.invoiceNumber,
-                            bol: carrier.bol,
-                        },
-                    });
-                    console.log(
-                        `[freight-auto-align] ${po}: applied carrier freight $${carrier.amountDue.toFixed(2)} (${carrier.invoiceNumber})`,
-                    );
+                    // Carrier lane is owned by the daily mailbox reconciler
+                    // (single writer). The watcher reports blocked until the
+                    // carrier bill lands and is applied there, then completes.
+                    stats.blocked.push({ po, reason: "carrier lane — awaiting mailbox reconciler apply" });
                     await new Promise((r) => setTimeout(r, GAP_MS));
                     continue;
                 }
@@ -564,7 +466,7 @@ export async function runFreightAutoAlign(): Promise<FreightAlignStats> {
     if (stats.assessed > 0) {
         console.log(
             `[freight-auto-align] assessed=${stats.assessed} vendor=${stats.appliedVendor} dest=${stats.appliedDestination} ` +
-                `carrier=${stats.appliedCarrier} completed=${stats.completed} skipped=${stats.skipped} errors=${stats.errors} blocked=${stats.blocked.length}`,
+                `carrier=deferred completed=${stats.completed} skipped=${stats.skipped} errors=${stats.errors} blocked=${stats.blocked.length}`,
         );
     }
     return stats;

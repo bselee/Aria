@@ -42,6 +42,30 @@ describe("shouldAutoResolve", () => {
         expect(d.resolve).toBe(false);
     });
 
+    it("refuses a later bill whose quantities do not match what was delivered", () => {
+        const d = shouldAutoResolve(
+            { poNumber: "PO-1", receivedValue: 1000, receivedQtySum: 50, createdAt: heldAt },
+            [{ total: 600, createdAt: "2026-10-29T09:00:00.000Z", quantitySum: 20 }],
+        );
+        expect(d.resolve).toBe(false);
+    });
+
+    it("resolves when the later bill's quantities equal the delivered sum", () => {
+        const d = shouldAutoResolve(
+            { poNumber: "PO-1", receivedValue: 1000, receivedQtySum: 50, createdAt: heldAt },
+            [{ total: 1000, createdAt: "2026-10-29T09:00:00.000Z", quantitySum: 50 }],
+        );
+        expect(d.resolve).toBe(true);
+    });
+
+    it("falls back to total-only when one side has no quantities", () => {
+        const d = shouldAutoResolve(
+            { poNumber: "PO-1", receivedValue: 1000, receivedQtySum: 50, createdAt: heldAt },
+            [{ total: 1000, createdAt: "2026-10-29T09:00:00.000Z", quantitySum: null }],
+        );
+        expect(d.resolve).toBe(true);
+    });
+
     it("ignores bills that predate the hold", () => {
         const d = shouldAutoResolve(
             { poNumber: "PO-1", receivedValue: 1000, createdAt: heldAt },

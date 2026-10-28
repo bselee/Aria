@@ -37,6 +37,7 @@ import { pathToFileURL } from "url";
 import { FinaleClient } from "../lib/finale/client";
 import {
     buildFinaleFreightAdjustment,
+    buildFinaleTaxAdjustment,
     freightLineSkipsLandedCost,
 } from "../lib/finale/freight-adjustment";
 import { isCollectShipVia, type UlineInvoice } from "./fetch-uline-invoices";
@@ -290,25 +291,19 @@ async function main(): Promise<void> {
         const originalStatus = doc.statusId;
         try {
             const allocLines = await client.freightAllocLines(doc.orderItemList);
-            // Tax is written as one bare line with no allocation: that is how every PO
-            // in the system carries it, pre-existing and untouched.
             const keep = adjs.filter((a) => !isFreightLine(a) && !(WRITE_TAX && isTaxLine(a)));
             // Every freight line is bare `Freight` + ADJ_BY_WEIGHT + a weight allocation
             // sized to the raw item list, or Finale skips the landed-cost roll.
             const built = freightTargets.map((f) =>
                 buildFinaleFreightAdjustment(f.amount, allocate(allocLines, f.amount)),
             );
+            // Tax allocates the same way (2026-10-28): ADJ_BY_WEIGHT sized to the
+            // item list, so it rolls into landed cost with the freight.
             const taxLine =
                 WRITE_TAX && target.tax !== null
-                    ? [
-                          {
-                              amount: target.tax,
-                              description: "Tax",
-                              productPromoUrl: `/${ACCOUNT}/api/productpromo/10008`,
-                          },
-                      ]
+                    ? [buildFinaleTaxAdjustment(target.tax, allocate(allocLines, target.tax))]
                     : [];
-            const newAdjs: any[] = [...keep, ...taxLine, ...built];
+            const newAdjs: Array<Record<string, unknown>> = [...keep, ...taxLine, ...built];
 
             await client.unlockForEditing(doc, po);
             await client.post(`/${ACCOUNT}/api/order/${encodeURIComponent(po)}`, {

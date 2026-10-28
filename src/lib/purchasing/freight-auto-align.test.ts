@@ -9,23 +9,9 @@ import {
     dwellSatisfied,
     completionBlocker,
     sumFreightAdjustments,
-    matchCarrierBillForPo,
     freightLinesHygieneOk,
-    type CarrierBill,
+    taxLinesHygieneOk,
 } from "./freight-auto-align";
-
-function bill(over: Partial<CarrierBill>): CarrierBill {
-    return {
-        invoiceNumber: "1551430904",
-        shipDate: "10/26/2026",
-        terms: "COLLECT",
-        amountDue: 560.2,
-        bol: "BOL-1",
-        poNumber: "",
-        vendorName: null,
-        ...over,
-    };
-}
 
 describe("freightLinesHygieneOk", () => {
     it("passes bare Freight lines with a full allocation", () => {
@@ -68,39 +54,43 @@ describe("freightLinesHygieneOk", () => {
     });
 });
 
-describe("matchCarrierBillForPo", () => {
-    it("matches a hard printed 6-digit PO number", () => {
-        const b = bill({ poNumber: "125429" });
-        expect(matchCarrierBillForPo([b], "125429", "Uline", null)).toBe(b);
+describe("taxLinesHygieneOk", () => {
+    it("passes an allocated Tax line", () => {
+        const adjs = [
+            {
+                description: "Tax",
+                productPromoUrl: "/x/api/productpromo/10008",
+                adjustmentAllocationEnumId: "ADJ_BY_WEIGHT",
+                orderAdjustmentAllocationList: [5.44, 5.44],
+            },
+        ];
+        expect(taxLinesHygieneOk(adjs, 2)).toBe(true);
     });
 
-    it("never matches a freight-account composite PO field", () => {
-        const b = bill({ poNumber: "9226398101-646135168" });
-        expect(matchCarrierBillForPo([b], "125429", "Uline", "2026-10-28T10:00:00-06:00")).toBeNull();
+    it("fails an unallocated Tax line", () => {
+        const adjs = [
+            {
+                description: "Tax",
+                productPromoUrl: "/x/api/productpromo/10008",
+            },
+        ];
+        expect(taxLinesHygieneOk(adjs, 2)).toBe(false);
     });
 
-    it("ignores non-COLLECT bills", () => {
-        const b = bill({ poNumber: "125429", terms: "PPD" });
-        expect(matchCarrierBillForPo([b], "125429", "Uline", null)).toBeNull();
+    it("fails a Tax allocation that misses the item count", () => {
+        const adjs = [
+            {
+                description: "Tax",
+                productPromoUrl: "/x/api/productpromo/10008",
+                adjustmentAllocationEnumId: "ADJ_BY_WEIGHT",
+                orderAdjustmentAllocationList: [9.3],
+            },
+        ];
+        expect(taxLinesHygieneOk(adjs, 2)).toBe(false);
     });
 
-    it("matches a unique vendor bill in the receive window", () => {
-        const b = bill({ shipDate: "10/20/2026", vendorName: "Rootwise Soil Dynamics" });
-        const r = matchCarrierBillForPo([b], "125241", "Rootwise Soil Dynamics", "2026-10-24T10:00:00-06:00");
-        expect(r).toBe(b);
-    });
-
-    it("holds when two bills sit in the window", () => {
-        const b1 = bill({ shipDate: "10/20/2026", invoiceNumber: "A", vendorName: "Rootwise Soil Dynamics" });
-        const b2 = bill({ shipDate: "10/21/2026", invoiceNumber: "B", vendorName: "Rootwise Soil Dynamics" });
-        const r = matchCarrierBillForPo([b1, b2], "125241", "Rootwise Soil Dynamics", "2026-10-24T10:00:00-06:00");
-        expect(r).toBeNull();
-    });
-
-    it("holds when the receive date is outside the window", () => {
-        const b = bill({ shipDate: "10/01/2026", vendorName: "Rootwise Soil Dynamics" });
-        const r = matchCarrierBillForPo([b], "125241", "Rootwise Soil Dynamics", "2026-10-24T10:00:00-06:00");
-        expect(r).toBeNull();
+    it("passes a PO with no tax lines", () => {
+        expect(taxLinesHygieneOk([], 3)).toBe(true);
     });
 });
 

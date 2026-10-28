@@ -359,8 +359,9 @@ describe("ReceivedItemsPanel", () => {
     expect(await screen.findByText(/Freight not on PO — add \$350.00/i)).toBeTruthy();
   });
 
-  it("drops a settled full receipt with a known bill after 7 days", async () => {
+  it("drops a settled full receipt with a known bill at the weekly rollover", async () => {
     stubLocalStorage();
+    // A receive date 9 days back is guaranteed to be in a prior week.
     const old = new Date();
     old.setDate(old.getDate() - 9);
     const oldDate = old.toISOString().slice(0, 19) + "-06:00";
@@ -393,8 +394,53 @@ describe("ReceivedItemsPanel", () => {
     render(<ReceivedItemsPanel />);
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
-    // Default list: settled 9 days ago is gone.
+    // Default list: settled in a prior week is gone (weekly rollover).
     expect(screen.queryByText(/PO-600/i)).toBeNull();
+  });
+
+  it("keeps a settled row through its own settle week", async () => {
+    stubLocalStorage();
+    // 3 days ago is always inside the current or immediately prior Monday week
+    // window only when within the same week; to make the test deterministic,
+    // anchor the receive to the start of the current week (Monday).
+    const now = new Date();
+    const monday = new Date(now);
+    const day = now.getDay();
+    const back = day === 0 ? 6 : day - 1;
+    monday.setDate(monday.getDate() - back);
+    monday.setHours(10, 0, 0, 0);
+    const thisWeekDate = monday.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-601",
+          orderDate: "2026-01-01",
+          receiveDate: thisWeekDate,
+          receiveDateTime: thisWeekDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "Settled Vendor",
+          total: 500,
+          items: [{ productId: "SKU-S", quantity: 10, orderedQuantity: 10, receivedQuantity: 10, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "INV-1", subtotal: 500, freight: 0, tax: 0, total: 500, status: "received" },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    // Settled this week stays in the one list.
+    expect(screen.queryByText(/PO-601/i)).not.toBeNull();
   });
 
   it("shows the invoiced quantity and flags a mismatch against the receipt", async () => {

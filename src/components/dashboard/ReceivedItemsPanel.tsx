@@ -224,7 +224,11 @@ function relativeSku(item: ReceivedPO["items"][number]): string {
 }
 
 /** Junk OCR invoice numbers that must never be printed as a bill identity. */
-const JUNK_BILL_NUMBERS = new Set(["error", "unknown", "null", "nan", "1", "berinvoice"]);
+const JUNK_BILL_NUMBERS = new Set(["error", "unknown", "null", "nan", "1"]);
+
+/** Vendor names that OCR sometimes writes into the invoice-number field.
+ *  Treated as identity junk, not bill numbers (2026-10-28 split). */
+const JUNK_BILL_VENDOR_NAMES = new Set(["berinvoice"]);
 
 /**
  * Canonical bill identifier: `bill 125377 $7,875`, or `bill $2,688` when the
@@ -237,7 +241,7 @@ function billLabel(
     const num = String(mi.invoice_number || "");
     const dollars = `$${Number(mi.total || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
     const clean = num.trim().toLowerCase();
-    if (!clean || JUNK_BILL_NUMBERS.has(clean)) return `bill ${dollars}`;
+    if (!clean || JUNK_BILL_NUMBERS.has(clean) || JUNK_BILL_VENDOR_NAMES.has(clean)) return `bill ${dollars}`;
     return `bill ${num} ${dollars}`;
 }
 
@@ -256,18 +260,26 @@ function daysSince(dateStr: string | undefined | null): number | null {
     return Math.floor(diff / (1000 * 60 * 60 * 24));
 }
 
-/** Weekdays between the timestamp and now. Removal runs on business days,
- *  not calendar days (2026-10-28): a Friday receipt settling Monday is 1 day. */
-function businessDaysSince(dateStr: string | undefined | null): number | null {
+/** Weeks (Monday start, America/Denver) between the timestamp and now.
+ *  Removal runs WEEKLY (Bill, 2026-10-28): a settled row stays visible
+ *  through its settle week and drops at the next weekly rollover. */
+function weeksSinceMonday(dateStr: string | undefined | null): number | null {
     if (!dateStr) return null;
     const d = parseDenverDate(dateStr);
     if (!d) return null;
-    let count = 0;
-    for (const t = new Date(d); t < new Date(); t.setDate(t.getDate() + 1)) {
-        const day = t.getDay();
-        if (day !== 0 && day !== 6) count++;
-    }
-    return count;
+    const mondayOf = (t: Date): number => {
+        const copy = new Date(t);
+        const day = copy.getDay();
+        const back = day === 0 ? 6 : day - 1; // Monday-start week
+        copy.setDate(copy.getDate() - back);
+        copy.setHours(0, 0, 0, 0);
+        return copy.getTime();
+    };
+    const mondayNow = mondayOf(new Date());
+    const mondayThen = mondayOf(d);
+    if (Number.isNaN(mondayThen)) return null;
+    const ms = mondayNow - mondayThen;
+    return Math.floor(ms / (7 * 86400 * 1000));
 }
 
 /**
@@ -740,8 +752,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         }, [fetchReceivings]);
 
     /** One list (2026-10-28): every received PO renders as a row. A settled
-     *  row (full receipt + known bill) leaves the list 7 days after receipt;
-     *  the footer toggle still reaches it. */
+     *  row (full receipt + known bill + freight aligned) leaves the list at
+     *  the weekly rollover after it settles; the footer toggle still reaches
+     *  it. */
     const isRowVisible = (po: ReceivedPO): boolean => {
         if (showAllReceived) return true;
         const lbl = apMap[po.orderId]?.label || "";
@@ -759,8 +772,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             !!po._reconciliation?.matchedInvoice || isBilledUpfrontVendor(po.supplier) || isPaidInAdvanceVendor(po.supplier);
         const isSettled = dynStatus === "full" && hasKnownBill && isFreightAligned(po);
         if (!isSettled) return true;
-        const rcvDays = businessDaysSince(po.receiveDateTime || po.receiveDate);
-        return rcvDays === null || rcvDays < 7;
+        const weeks = weeksSinceMonday(po.receiveDateTime || po.receiveDate);
+        return weeks === null || weeks < 1;
     };
     const visiblePos = pos.filter(isRowVisible);
     const hiddenSettled = pos.length - visiblePos.length;

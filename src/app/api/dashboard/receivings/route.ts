@@ -1115,7 +1115,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         sb
                                             .from('vendor_invoices')
                                             .select('vendor_name')
-                                            .gte('created_at', new Date(Date.now() - 60 * 86400 * 1000).toISOString())
+                                            .gte('created_at', new Date(Date.now() - 90 * 86400 * 1000).toISOString())
                                             .in('vendor_name', patternVendors)
                                             .limit(500),
                                     ]);

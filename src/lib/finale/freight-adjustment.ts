@@ -254,6 +254,53 @@ export function buildFinaleFreightAdjustment(
     };
 }
 
+/** Tax promo constants — Tax must allocate like Freight to reach landed
+ *  cost (Bill, 2026-10-28: "Tax needs fixing and should allocate"). */
+export const FINALE_TAX_PROMO_URL = "/buildasoilorganics/api/productpromo/10008";
+export const FINALE_TAX_DESCRIPTION = "Tax";
+export const FINALE_TAX_ALLOCATION = "ADJ_BY_WEIGHT";
+
+/** A Tax promo line with a weight allocation — the same roll as Freight. */
+export function buildFinaleTaxAdjustment(
+    amount: number,
+    allocation?: number[],
+): FinaleFreightAdjustment {
+    const orderAdjustmentAllocationList =
+        allocation && allocation.length > 0 ? allocation.map(round2) : [round2(amount)];
+    return {
+        amount: round2(amount),
+        description: FINALE_TAX_DESCRIPTION,
+        productPromoUrl: FINALE_TAX_PROMO_URL,
+        adjustmentAllocationEnumId: FINALE_TAX_ALLOCATION,
+        orderAdjustmentAllocationList,
+    };
+}
+
+/**
+ * True when a Tax line misses what it needs to reach landed cost: not the
+ * bare `Tax` description, missing ADJ_BY_WEIGHT, or an allocation list that
+ * does not match the raw item count.
+ */
+export function taxLineSkipsLandedCost(
+    adj: {
+        description?: string | null;
+        productPromoUrl?: string | null;
+        adjustmentAllocationEnumId?: string | null;
+        orderAdjustmentAllocationList?: number[] | null;
+    },
+    orderLineCount: number,
+): boolean {
+    const promo = adj.productPromoUrl ?? "";
+    const desc = (adj.description ?? "").trim();
+    const isTax = promo.includes("/10008") || /^tax\b/i.test(desc);
+    if (!isTax) return false;
+    if (desc !== FINALE_TAX_DESCRIPTION) return true;
+    if (adj.adjustmentAllocationEnumId !== FINALE_TAX_ALLOCATION) return true;
+    const alloc = adj.orderAdjustmentAllocationList;
+    if (!alloc || alloc.length !== orderLineCount) return true;
+    return false;
+}
+
 /** Build a Freight promo line allocated to the current PO's item list. */
 export function freightAdjustmentForPo(
     amount: number,

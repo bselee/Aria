@@ -57,6 +57,7 @@ import {
     type CollectEntry,
 } from "../lib/ltlselect/match";
 import { computeFreightDrift } from "../lib/freight/freight-drift";
+import { createClient } from "../lib/db";
 import {
     findLatestBilltrustCsv,
     parseBilltrustCsv,
@@ -248,6 +249,31 @@ function billtrustToFreightInvoice(bi: BilltrustInvoice): FreightInvoice {
 }
 
 // ── Freight apply (GET → unlock → append/replace → POST → restore) ───────────
+
+/** Persist a RECONCILIATION anchor so the auto-align watcher's 24h dwell is
+ *  real for mailbox-applied freight (2026-10-28). Best-effort — never blocks
+ *  the apply. */
+async function logReconciliationAnchor(poId: string, amount: number, invoiceNumber: string, kind: string): Promise<void> {
+    try {
+        const db = createClient();
+        if (!db) return;
+        await db.from("ap_activity_log").insert({
+            intent: "RECONCILIATION",
+            created_at: new Date().toISOString(),
+            metadata: {
+                orderId: String(poId),
+                poNumber: null,
+                kind,
+                amount,
+                invoiceNumber,
+                source: "fedex-mailbox-reconcile",
+            },
+        });
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[fedex-mailbox] anchor log failed: ${msg}`);
+    }
+}
 
 async function applyFreightToPo(
     finale: FinaleWriteSurface,
@@ -697,6 +723,7 @@ async function main() {
             try {
                 const isMulti = r.vendor ? isMultiDeliveryVendor(r.vendor) : false;
                 await applyFreightToPo(finale, r.finalePoId, r.invoice.amountDue, isMulti);
+                await logReconciliationAnchor(r.finalePoId, r.invoice.amountDue, r.invoice.invoiceNumber, "new");
                 console.log(`   OK PO ${r.finalePoId}: +$${r.invoice.amountDue.toFixed(2)} (Freight)`);
                 await new Promise((res) => setTimeout(res, GAP_MS));
             } catch (err) {
@@ -732,6 +759,7 @@ async function main() {
             if (!r.finalePoId) continue;
             try {
                 await applyFreightToPo(finale, r.finalePoId, r.correctionDelta as number, true);
+                await logReconciliationAnchor(r.finalePoId, r.correctionDelta as number, r.invoice.invoiceNumber, "correction");
                 console.log(`   OK PO ${r.finalePoId}: +$${(r.correctionDelta as number).toFixed(2)} (correction)`);
                 await new Promise((res) => setTimeout(res, GAP_MS));
             } catch (err) {
@@ -752,6 +780,7 @@ async function main() {
             if (!r.finalePoId) continue;
             try {
                 await applyFreightToPo(finale, r.finalePoId, r.invoice.amountDue, false, true);
+                await logReconciliationAnchor(r.finalePoId, r.invoice.amountDue, r.invoice.invoiceNumber, "savings");
                 console.log(`   OK PO ${r.finalePoId}: carrier line → $${r.invoice.amountDue.toFixed(2)} (saved $${Math.abs(r.correctionDelta as number).toFixed(2)})`);
                 await new Promise((res) => setTimeout(res, GAP_MS));
             } catch (err) {
