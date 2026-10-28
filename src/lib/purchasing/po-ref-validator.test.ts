@@ -15,7 +15,7 @@ vi.mock("@/lib/db", () => ({
     createClient: createClientMock,
 }));
 
-import { isPoShaped, validatePoRef } from "./po-ref-validator";
+import { isPoShaped, validatePoRef, resolveDropshipPOByBase, resolveExtractedPOs } from "./po-ref-validator";
 
 describe("isPoShaped", () => {
     it("accepts standard 6-digit Finale POs starting with 1", () => {
@@ -122,5 +122,66 @@ describe("validatePoRef", () => {
         expect(await validatePoRef(null)).toBeNull();
         expect(await validatePoRef("")).toBeNull();
         expect(maybeSingleMock).not.toHaveBeenCalled();
+    });
+});
+
+describe("resolveDropshipPOByBase", () => {
+    beforeEach(() => {
+        createClientMock.mockReset();
+        maybeSingleMock.mockReset();
+        createClientMock.mockReturnValue({
+            from: () => ({ select: () => ({ ilike: () => ({ limit: () => ({ maybeSingle: maybeSingleMock }) }) }) }),
+        });
+    });
+
+    it("resolves a bare 8-digit base to the DB spelling (prefix match)", async () => {
+        maybeSingleMock.mockResolvedValue({ data: { po_number: "23578097A-DropshipPO" }, error: null });
+        expect(await resolveDropshipPOByBase("23578097A")).toBe("23578097A-DropshipPO");
+    });
+
+    it("rejects a non-2-prefixed 8-digit candidate without a DB round-trip", async () => {
+        expect(await resolveDropshipPOByBase("64058931")).toBeNull();
+        expect(maybeSingleMock).not.toHaveBeenCalled();
+    });
+
+    it("returns null when no base row matches (cancelled sales order)", async () => {
+        maybeSingleMock.mockResolvedValue({ data: null, error: null });
+        expect(await resolveDropshipPOByBase("23566017")).toBeNull();
+    });
+
+    it("returns null when the existence lookup errors (fail closed)", async () => {
+        maybeSingleMock.mockResolvedValue({ data: null, error: { message: "db down" } });
+        expect(await resolveDropshipPOByBase("23578097")).toBeNull();
+    });
+});
+
+describe("resolveExtractedPOs", () => {
+    beforeEach(() => {
+        createClientMock.mockReset();
+        maybeSingleMock.mockReset();
+        createClientMock.mockReturnValue({
+            from: () => ({ select: () => ({ ilike: () => ({ limit: () => ({ maybeSingle: maybeSingleMock }) }) }) }),
+        });
+    });
+
+    it("keeps standard 5-7 digit refs untouched (no DB call)", async () => {
+        const r = await resolveExtractedPOs(["125333", "124833"]);
+        expect(r).toEqual(["125333", "124833"]);
+        expect(maybeSingleMock).not.toHaveBeenCalled();
+    });
+
+    it("resolves an 8-digit dropship candidate to its DB spelling", async () => {
+        maybeSingleMock.mockResolvedValue({ data: { po_number: "23581487-S-DropshipPO" }, error: null });
+        expect(await resolveExtractedPOs(["23581487"])).toEqual(["23581487-S-DropshipPO"]);
+    });
+
+    it("resolves the letter form 23578097A to the DB spelling", async () => {
+        maybeSingleMock.mockResolvedValue({ data: { po_number: "23578097A-DropshipPO" }, error: null });
+        expect(await resolveExtractedPOs(["23578097A"])).toEqual(["23578097A-DropshipPO"]);
+    });
+
+    it("drops an 8-digit candidate with no base row (23566017)", async () => {
+        maybeSingleMock.mockResolvedValue({ data: null, error: null });
+        expect(await resolveExtractedPOs(["23566017"])).toEqual([]);
     });
 });

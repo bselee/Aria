@@ -328,6 +328,27 @@ describe("extractPONumbersFromText (label-bounded, Guard 9)", () => {
         expect(extractPONumbersFromText("invoice #130648")).toEqual([]);
         expect(extractPONumbersFromText("Invoice 149915")).toEqual([]);
     });
+
+    it("extracts 8-digit dropship POs from a PO label", () => {
+        expect(extractPONumbersFromText("P.O. Number 23578097A")).toEqual(["23578097A"]);
+        expect(extractPONumbersFromText("PO 23578097A-DropshipPO shipped via UPS 1Z22YV580360242374")).toEqual(["23578097A"]);
+        expect(extractPONumbersFromText("PO 23581487")).toEqual(["23581487"]);
+    });
+
+    it("extracts bare 8-digit dropship refs from AutoPot invoice bodies (no label)", () => {
+        expect(extractPONumbersFromText("BALANCE DUE $189.03 View and pay 23578097A / 23578097A UPS - 1Z22YV580360242374")).toEqual(["23578097A"]);
+        expect(extractPONumbersFromText("View and pay 23581487 / 23581487 UPS - 1Z22YV580358574887")).toEqual(["23581487"]);
+    });
+
+    it("captures a bare 8-digit 235xxxxxxx as a candidate (gate drops it later if no base row)", () => {
+        expect(extractPONumbersFromText("23566017")).toEqual(["23566017"]);
+    });
+
+    it("does not capture rating-estimate refs or non-2-prefixed PROs as bare dropship", () => {
+        expect(extractPONumbersFromText("Reference Number: 278411572-1")).toEqual([]);
+        expect(extractPONumbersFromText("PRO 64058931")).toEqual([]);
+        expect(extractPONumbersFromText("PRO 71473626-1")).toEqual([]);
+    });
 });
 
 describe("detectDocumentaryDelivery (Guard 11 — POD/BOL delivery reconciliation)", () => {

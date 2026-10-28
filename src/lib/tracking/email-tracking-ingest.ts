@@ -34,6 +34,7 @@ import {
 import * as shipmentIntelligence from '@/lib/tracking/shipment-intelligence';
 import { extractBolText } from "./bol-ocr";
 import { createClient } from "@/lib/db";
+import { resolveExtractedPOs } from "@/lib/purchasing/po-ref-validator";
 import { notify } from "@/lib/intelligence/notify";
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -332,9 +333,15 @@ async function processMessage(
     // body text — SKU#/PRO/SO# lines live there. Their PO must come only from
     // the label-bounded subject/body ("PO # 125333"). Non-terminal signals
     // (vendor email, no delivery) extract from the full text as before.
-    const poNumbers = docDelivery?.terminal
+    const rawPoNumbers = docDelivery?.terminal
         ? extractPONumbersFromText(`${subject}\n${body}`)
         : extractPONumbersFromText(fullText);
+
+    // Gate 8-digit dropship candidates on existence: a bare 235xxxxxxx with no
+    // purchase_orders row (cancelled sales order) is dropped, and a real one is
+    // rewritten to the DB spelling ("23578097A" -> "23578097A-DropshipPO") so
+    // the write joins. Standard 5-7 digit refs pass through untouched.
+    const poNumbers = await resolveExtractedPOs(rawPoNumbers);
 
     // --- Tracking number extraction (canonical patterns, ranked) ---
     const extracted = extractTrackingNumbers(fullText);
@@ -773,7 +780,14 @@ export function applyManifestContainment<T extends { po: string | null; inferred
  *
  * Handles:
  *   "PO #124833", "PO-124833", "PO 124833", "P.O.#: 125213",
- *   "Purchase Order # 125376", "71473626-1124833" (Finale vendor-ref format)
+ *   "Purchase Order # 125376", "71473626-1124833" (Finale vendor-ref format),
+ *   "P.O. Number 23578097A" (8-digit dropship + letter), and the bare
+ *   AutoPot form "View and pay 23581487" (8-digit dropship, no label).
+ *
+ * 8-digit dropship candidates (label-bounded or bare) are emitted as raw refs
+ * and gated on existence downstream by resolveExtractedPOs() — shape alone
+ * cannot decide, so a bare 235xxxxxxx that resolves to no purchase_orders row
+ * stays rejected.
  *
  * @exportedForTesting
  */
@@ -783,13 +797,25 @@ export function extractPONumbersFromText(text: string): string[] {
     // PO label forms: "PO", "P.O.", "purchase order" (+ optional "number"/"no").
     // Separator between the label and the digits is any run of spaces/#/:/. /-.
     // The bare `#` and `order <n>` branches are intentionally gone.
+    // 8-digit dropship first (else \d{5,7} eats the 7-digit prefix), then 5-7.
     const poLabel = "(?:P\\.O\\.|\\bPO\\b|\\bpurchase\\s+order\\b)";
     const poPattern = new RegExp(
-        `${poLabel}[\\s#:.\\-]*(?:number|no\\.?)?[\\s#:.\\-]*(\\d{5,7})\\b`,
+        `${poLabel}[\\s#:.\\-]*(?:number|no\\.?)?[\\s#:.\\-]*(\\d{8}[A-Z]?|\\d{5,7})\\b`,
         "gi",
     );
     for (const m of text.matchAll(poPattern)) {
         seen.add(m[1]);
+    }
+
+    // Bare 8-digit dropship refs ("View and pay 23578097A", "23581487 UPS")
+    // carry no PO label. Captured as candidates and gated on existence by
+    // resolveExtractedPOs(); a bare 235xxxxxxx that resolves to nothing stays
+    // rejected (class 11 — carrier P.O. box / Finale SALES_ORDER). Restricted
+    // to the 2-prefixed family so AAA Cooper PROs / B.L. digit-runs never even
+    // become candidates.
+    const bareDropshipMatches = text.match(/\b(2\d{7}[A-Z]?)\b/g) || [];
+    for (const m of bareDropshipMatches) {
+        seen.add(m);
     }
 
     // Finale vendor-ref format: "71473626-1124833" → PO 124833

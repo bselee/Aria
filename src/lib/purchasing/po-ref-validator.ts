@@ -134,3 +134,75 @@ export async function validatePoRef(
     );
     return null;
 }
+
+/**
+ * Resolve an 8-digit dropship base (e.g. "23578097") to the purchase_orders
+ * spelling that carries it (e.g. "23578097A-DropshipPO"). Prefix match, not
+ * exact: the label/bare extractors yield the bare base or the base + a single
+ * trailing letter, while the DB stores the full "2xxxxxxx"-suffix spelling.
+ *
+ * The base is restricted to the 2-prefixed dropship family (`^2\d{7}$`): every
+ * 8-digit dropship PO in purchase_orders starts with 2, so a non-2-prefixed
+ * candidate (an AAA Cooper PRO like "64058931", a B.L. digit-run) is rejected
+ * here without a DB round-trip. A bare 235xxxxxxx that resolves to no row
+ * stays null — that is what keeps class 11 (carrier P.O. box / Finale
+ * SALES_ORDER holding a bare 8-digit) closed.
+ *
+ * @param base  Raw 8-digit candidate base (e.g. "23578097", "23578097A").
+ * @returns     The purchase_orders.po_number spelling, or null when no row's
+ *              base matches (or on DB error — fail closed).
+ */
+export async function resolveDropshipPOByBase(base: string): Promise<string | null> {
+    const prefix = base.slice(0, 8);
+    if (!/^2\d{7}$/.test(prefix)) return null;
+    try {
+        const client = createClient();
+        const { data, error } = await client
+            .from("purchase_orders")
+            .select("po_number")
+            .ilike("po_number", `${prefix}%`)
+            .limit(1)
+            .maybeSingle();
+        if (error) {
+            console.warn(
+                `[po-ref-validator] dropship base lookup failed for ${prefix}: ` +
+                `${error.message || error}`,
+            );
+            return null;
+        }
+        return data?.po_number ?? null;
+    } catch (err: any) {
+        console.warn(
+            `[po-ref-validator] dropship base lookup threw for ${prefix}: ` +
+            `${err?.message || err}`,
+        );
+        return null;
+    }
+}
+
+/**
+ * Gate a list of extracted PO refs before they are written. Standard 5-7 digit
+ * label-bounded refs and Finale vendor-ref 6-digit refs pass through untouched.
+ * An 8-digit dropship candidate (bare base or base + single letter) must resolve
+ * to a purchase_orders base — otherwise it is dropped, so a cancelled sales
+ * order "23566017" with no PO row never becomes a PO ref.
+ *
+ * The resolved value is the DB's own spelling, so the write joins back to the
+ * row (e.g. "23578097A" -> "23578097A-DropshipPO").
+ *
+ * @param poNumbers  Raw refs from an extractor (label-bounded + bare + vendor-ref).
+ * @returns          Resolved refs, de-duplicated; 8-digit candidates with no
+ *                   base are omitted.
+ */
+export async function resolveExtractedPOs(poNumbers: string[]): Promise<string[]> {
+    const out: string[] = [];
+    for (const ref of poNumbers) {
+        if (/^\d{8}[A-Z]?$/i.test(ref)) {
+            const spelling = await resolveDropshipPOByBase(ref.slice(0, 8));
+            if (spelling) out.push(spelling);
+        } else {
+            out.push(ref);
+        }
+    }
+    return Array.from(new Set(out));
+}
