@@ -36,14 +36,14 @@ describe("resolveEmailResponsePolicy", () => {
         expect(p.openResponseTask).toBe(true);
     });
 
-    it("human escalate = task only, no draft stub", () => {
+    it("human escalate = draft stub + task, never auto-send", () => {
         const p = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
         expect(p.action).toBe("ESCALATE_HUMAN");
         expect(p.allowAutoSend).toBe(false);
-        expect(p.createDraft).toBe(false);
+        expect(p.createDraft).toBe(true);
         expect(p.openResponseTask).toBe(true);
         expect(p.labels).toContain("Needs Response");
-        expect(p.labels).not.toContain("Draft Ready");
+        expect(p.labels).toContain("Draft Ready");
     });
 
     it("silent when already in conversation", () => {

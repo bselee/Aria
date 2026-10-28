@@ -108,13 +108,18 @@ export function resolveEmailResponsePolicy(input: ResponsePolicyInput): Response
     }
 
     if (intent === "REQUIRES_HUMAN") {
+        // DECISION(2026-09-30, Hermia ticket 2026-08-19): needs_response MUST always
+        // leave Bill something sendable. The Aug-19 Tanner/CYC miss showed a
+        // task-only branch is invisible: no draft, and the task write could fail
+        // silently, so the email looked handled while nothing was queued.
+        // The stub is never sent — it is a starting point Bill edits.
         return {
             action: "ESCALATE_HUMAN",
             allowAutoSend: false,
-            createDraft: false, // stub "I'll follow up shortly" is worse than nothing
+            createDraft: true,
             openResponseTask: true,
             leaveInInbox: true,
-            labels: ["Needs Response"],
+            labels: ["Needs Response", "Draft Ready"],
             reason: "human_review_required",
         };
     }

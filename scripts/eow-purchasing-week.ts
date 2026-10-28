@@ -21,24 +21,33 @@ import { getAuthenticatedClient } from "../src/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import {
   addDays,
+  boxDimKey,
   excludeManualVendor,
   isPartialFromFinaleReceive,
   isStatement,
   keepSilentVendorDelay,
+  keepUpcomingAmount,
+  lineQtyOf,
   mdFromIso,
   minRunway,
   mondayOf,
   money,
   needByIso,
+  openPricingWins,
   parseVendorDueFromText,
   delayedVendorNote,
   priceVendorName,
+  receiverFromStatusHistory,
   researchHit,
   shortPriceNote,
+  skuListOf,
   vendorReplyOwnText,
+  withQty,
   withinDays,
 } from "../src/lib/purchasing/eow-report";
 import { computeFreightDrift } from "../src/lib/freight/freight-drift";
+import { resolvePoEta } from "../src/lib/purchasing/po-eta";
+import { poolCartonGroups } from "../src/lib/purchasing/carton-pooling";
 
 const NUMERIC = /^\d+$/;
 const TO = "bill.selee@buildasoil.com";
@@ -66,27 +75,7 @@ function esc(s: unknown): string {
     .replace(/>/g, "&gt;");
 }
 
-type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string; desc?: string };
-
-function skuList(items: unknown): string {
-  let arr: unknown = items;
-  if (typeof items === "string") {
-    try {
-      arr = JSON.parse(items);
-    } catch {
-      return "";
-    }
-  }
-  if (!Array.isArray(arr)) return "";
-  const ids = arr
-    .map((x: unknown) => {
-      if (!x || typeof x !== "object") return "";
-      const rec = x as { productId?: unknown; sku?: unknown };
-      return String(rec.productId || rec.sku || "").trim();
-    })
-    .filter(Boolean);
-  return [...new Set(ids)].join(", ");
-}
+type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string; desc?: string; qty?: string; recvQty?: string; recvVariance?: string; placedIso?: string; plannedReceive?: string; etaIsEstimate?: boolean };
 
 /** Shorten a Finale product name for the report. Keeps the product identity
  *  and pack size, drops long brand prefixes and redundant suffix punctuation. */
@@ -100,7 +89,7 @@ function abbrevDesc(name: string): string {
   s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*Cubic\s+Yard\b/gi, " $1cy");
   s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*Quarts?\s*$/i, " $1qt");
   s = s.replace(/\s*:\s*(\d+(?:\.\d+)?)\s*(lb|lbs|gal|oz)\s*$/i, " $1$2");
-  if (s.length > 40) s = s.slice(0, 39).trimEnd() + "…";
+  if (s.length > 32) s = s.slice(0, 31).trimEnd() + "…";
   return s;
 }
 
@@ -134,6 +123,9 @@ function table(headers: string[], rows: string[][], total?: string[]): string {
     Placed: "note", ETA: "eta", Status: "stat", Received: "note",
     "Vendor Response": "note", "Needed by": "note", Note: "note",
     Sent: "note", Issue: "note",
+    Product: "vendor", "Old to New": "desc", "Est. Savings/Yr": "eta",
+    "Received By": "eta", "Recv Qty": "eta", "±": "var",
+    Item: "vendor", Detail: "desc",
   };
   const cols = headers.map((h) => `<col class="${WIDTHS[h] || "note"}">`).join("");
   return `<table>
@@ -155,7 +147,6 @@ function renderHtml(p: {
   end: string;
   committed: Row[];
   received: Row[];
-  unacked: Row[];
   delayed: Row[];
   billVerified: Row[];
   issues: Row[];
@@ -168,8 +159,6 @@ function renderHtml(p: {
     const [, m, d] = iso.split("-");
     return `${Number(m)}/${Number(d)}`;
   };
-  const toCells = (rows: Row[]) =>
-    rows.map((r) => [r.po, r.vendor, r.amount ? money(r.amount) : "", r.note]);
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -185,8 +174,9 @@ function renderHtml(p: {
   th { background: #555; color: #fff; text-align: left; padding: 2px 5px; font-weight: 600; }
   td { padding: 1px 5px; border-bottom: 1px solid #e5e5e5; vertical-align: top; word-wrap: break-word; }
   tr:nth-child(even) td { background: #f8f8f8; }
-  .po { width: 8%; } .vendor { width: 14%; } .sku { width: 8%; } .desc { width: 24%; } .amt { width: 10%; text-align: right; white-space: nowrap; }
-  th.amt { text-align: right; color: #fff; } .note { width: 9%; } .eta { width: 8%; } .stat { width: 12%; }
+  .po { width: 8%; } .vendor { width: 14%; } .sku { width: 15%; } .desc { width: 16%; } .amt { width: 10%; text-align: right; white-space: nowrap; }
+  th.amt { text-align: right; color: #fff; } .note { width: 9%; } .eta { width: 8%; } .stat { width: 14%; }
+  .var { width: 14%; }
   .total-row td { font-weight: 600; background: #eee !important; }
   .keep { page-break-inside: avoid; }
   .foot { font-size: 8pt; color: #666; margin-top: 10px; }
@@ -200,22 +190,17 @@ function renderHtml(p: {
 <div class="keep">
 <h2>POs Committed</h2>
 <p class="summary">${p.committed.length} POs · ${money(sum(p.committed))}</p>
-${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "ETA", "Status"], p.committed.map((r) => [r.po, r.vendor, r.sku || "", r.desc || "", r.amount ? money(r.amount) : "", r.note, r.eta || "", r.status || ""]), ["", "Total", "", "", money(sum(p.committed)), `${p.committed.length} POs`, "", ""])}
+${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "ETA", "Status"], p.committed.map((r) => [r.po, r.vendor, withQty(r.sku || "", r.qty || ""), r.desc || "", r.amount ? money(r.amount) : "", r.note, (r.etaIsEstimate ? "~" : "") + (r.eta || ""), r.status || ""]), ["", "Total", "", "", money(sum(p.committed)), `${p.committed.length} POs`, "", ""])}
 </div>
 <div class="keep">
 <h2>POs Received</h2>
 <p class="summary">${p.received.length} POs · ${money(sum(p.received))}</p>
-${table(["PO", "Vendor", "SKU", "Description", "Amount", "Received"], p.received.map((r) => [r.po, r.vendor, r.sku || "", r.desc || "", r.amount ? money(r.amount) : "", r.note]), ["", "Total", "", "", money(sum(p.received)), `${p.received.length} POs`])}
-</div>
-<div class="keep">
-<h2>POs Not Confirmed</h2>
-<p class="summary">${p.unacked.length ? `${p.unacked.length} POs · ${money(sum(p.unacked))} · no vendor reply within 24 hours` : "All confirmed"}</p>
-${table(["PO", "Vendor", "Amount", "Sent"], toCells(p.unacked))}
+${table(["PO", "Vendor", "SKU", "Description", "Amount", "Received", "Received By", "Status"], p.received.map((r) => [r.po, r.vendor, withQty(r.sku || "", r.qty || ""), r.desc || "", r.amount ? money(r.amount) : "", r.note, r.status || "", r.recvVariance || ""]), ["", "Total", "", "", money(sum(p.received)), `${p.received.length} POs`, "", ""])}
 </div>
 <div class="keep">
 <h2>POs Delayed</h2>
 <p class="summary">${p.delayed.length} POs · ${money(sum(p.delayed))}</p>
-${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "Vendor Response"], p.delayed.map((r) => [r.po, r.vendor, r.sku || "", r.desc || "", r.amount ? money(r.amount) : "", r.placed || "", r.note]))}
+${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "Vendor Response"], p.delayed.map((r) => [r.po, r.vendor, withQty(r.sku || "", r.qty || ""), r.desc || "", r.amount ? money(r.amount) : "", r.placed || "", r.note]))}
 </div>
 <div class="keep">
 <h2>Invoices to Bill.com</h2>
@@ -231,12 +216,18 @@ ${table(["SKU", "Description", "Vendor", "Note"], p.priceUpdates.map((r) => [r.s
 </div>
 <div class="keep">
 <h2>Upcoming Purchases (Estimated)</h2>
-<p class="summary">Next 30 days · ${money(sum(p.upcoming))}</p>
-${table(["SKU", "Description", "Vendor", "Needed by", "Amount"], p.upcoming.map((r) => [r.sku || r.po, r.desc || "", r.vendor, r.note, r.amount ? money(r.amount) : ""]))}
+<p class="summary">Next week estimated · ${money(sum(p.upcoming))}</p>
+${table(["SKU", "Description", "Vendor", "Needed by", "Amount", "Note"], p.upcoming.map((r) => [r.qty ? `${r.sku || r.po} ×${r.qty}` : (r.sku || r.po), r.desc || "", r.vendor, mdFromIso(r.eta || ""), r.amount ? money(r.amount) : "", r.note]))}
 </div>
 <div class="keep">
-<h2>Research</h2>
-${table(["SKU", "Description", "Vendor", "Note"], p.research.map((r) => [r.sku || "", r.desc || "", r.vendor, r.note]))}
+<h2>Research &amp; Pricing Wins</h2>
+${table(
+  ["SKU", "Item", "Vendor", "Detail", "Est. Savings/Yr", "Status"],
+  [
+    ...p.research.map((r) => [r.sku || "", r.desc || "", r.vendor, r.note, "", ""]),
+    ...openPricingWins().map((w) => [w.sku, w.product, w.vendor, w.detail, w.annual, w.status]),
+  ]
+)}
 </div>
 </body></html>`;
 }
@@ -254,18 +245,6 @@ const NEWSLETTER =
 async function gmailClient() {
   const auth = await getAuthenticatedClient("default");
   return GmailApi({ version: "v1", auth });
-}
-
-async function gmailVendorReplied(
-  gmail: Awaited<ReturnType<typeof gmailClient>>,
-  po: string
-): Promise<boolean> {
-  const list = await gmail.users.messages.list({
-    userId: "me",
-    q: `"${po}" -subject:"Purchasing week" -from:me`,
-    maxResults: 4,
-  });
-  return (list.data.messages || []).length > 0;
 }
 
 const FROM_US = /bill\.selee|buildasoil|noreply@mail\.finale|google calendar|calendar-notification/i;
@@ -427,9 +406,12 @@ async function main() {
       return {
         po: p.orderId,
         vendor: p.vendorName || "",
-        sku: skuList(p.items),
+        sku: skuListOf(p.items),
+        qty: lineQtyOf(p.items),
         amount: Number(p.total) || 0,
         note: placed,
+        placedIso: d,
+        plannedReceive: iso(p.receiveDate) || undefined,
       };
     });
 
@@ -475,7 +457,8 @@ async function main() {
     return {
       po: r.po,
       vendor: row?.vendor_name || "",
-      sku: skuList(row?.line_items),
+      sku: skuListOf(row?.line_items),
+      qty: lineQtyOf(row?.line_items),
       amount: r.amount,
       note: r.receiveDate.includes("/")
         ? r.receiveDate.replace(/^(\d{1,2})\/(\d{1,2}).*/, (_, a, b) => `${Number(a)}/${Number(b)}`)
@@ -485,6 +468,69 @@ async function main() {
 
   const receivedPo = new Set(received.map((r) => r.po));
   committed = committed.filter((r) => !receivedPo.has(r.po));
+
+  // Received By: Finale shipment statusIdHistoryList carries the user who
+  // flipped the shipment to SHIPMENT_DELIVERED. ~2 extra Finale calls per
+  // received PO, once a week at 10am Friday — inside rate-limit discipline.
+  for (const r of received) {
+    try {
+      const q = {
+        query: `{ orderViewConnection(first: 1, type: ["PURCHASE_ORDER"], orderId: "${r.po}") {
+          edges { node { shipmentList { shipmentUrl status receiveDate } } } } }`,
+      };
+      const data = await (finale as any).graphql(q, "eow receivedBy");
+      const ships = data?.orderViewConnection?.edges?.[0]?.node?.shipmentList || [];
+      const names = new Set<string>();
+      const recvBySku = new Map<string, number>();
+      for (const s of ships) {
+        if (!s?.shipmentUrl) continue;
+        if (s?.status && !/received|delivered/i.test(String(s.status))) continue;
+        const detail = await (finale as any).get(s.shipmentUrl);
+        const n = receiverFromStatusHistory(detail?.statusIdHistoryList);
+        if (n) names.add(n);
+        for (const line of detail?.shipmentItemList || []) {
+          const pid = String(line?.productId || "");
+          const qty = Number(line?.quantity);
+          if (pid && Number.isFinite(qty) && qty > 0) {
+            recvBySku.set(pid, (recvBySku.get(pid) || 0) + qty);
+          }
+        }
+      }
+      r.status = [...names].join(", ");
+      // Only surface quantity differences — a matching line needs no ink.
+      // On multi-SKU POs, name the SKU: a bare "-2" doesn't say which line.
+      if (recvBySku.size > 0) {
+        const orderedIds = (r.sku || "").split(",").map((s) => s.trim()).filter(Boolean);
+        const orderedQs = (r.qty || "").split(",").map((s) => s.trim());
+        const multi = orderedIds.length > 1;
+        const diffs: Array<{ sku: string; d: number; missing: boolean }> = [];
+        orderedIds.forEach((id, i) => {
+          const ordered = Number(orderedQs[i]);
+          if (!Number.isFinite(ordered) || ordered <= 0) return;
+          const got = recvBySku.get(id) ?? 0;
+          const d = got - ordered;
+          if (d !== 0) diffs.push({ sku: id, d, missing: got === 0 });
+        });
+        r.recvVariance =
+          diffs.length === 0
+            ? "Complete"
+            : diffs
+                .map((x) => {
+                  if (x.missing) {
+                    const n = Math.abs(x.d);
+                    return multi ? `${x.sku} (${n}) missing` : `(${n}) missing`;
+                  }
+                  const signed = `${x.d > 0 ? "+" : ""}${x.d}`;
+                  return multi ? `${x.sku} ${signed}` : signed;
+                })
+                .join(", ");
+      }
+    } catch {
+      /* receiver optional — never block the PDF */
+    }
+  }
+  const recvResolved = received.filter((r) => r.status).length;
+  console.log(`receivedBy resolved ${recvResolved}/${received.length}`);
 
   // Freight drift (booked vs actual): annotate the received PO's own line in
   // place — no separate section. Only POs on the week's received list get the
@@ -519,39 +565,25 @@ async function main() {
       else if (m?.tracking_status_summary) r.status = "In Transit";
       else if (m?.vendor_acknowledged_at) r.status = "Acknowledged";
       else r.status = "Sent";
-      const etaIso = iso(m?.vendor_stated_eta || m?.receive_date);
-      const etaMd =
-        etaIso.length >= 10
-          ? `${Number(etaIso.slice(5, 7))}/${Number(etaIso.slice(8, 10))}`
-          : "";
-      r.eta = etaMd && etaMd !== r.note ? etaMd : "";
+      // ETA — same shared resolution the Active Purchases dashboard uses
+      // (po-eta → leadTimeService). A vendor-stated date still wins because
+      // it is the most direct evidence.
+      const vendorEta = iso(m?.vendor_stated_eta);
+      if (vendorEta) {
+        r.eta = mdFromIso(vendorEta);
+        r.etaIsEstimate = false;
+      } else {
+        const eta = await resolvePoEta({
+          vendorName: r.vendor,
+          orderDate: r.placedIso,
+          plannedReceiveDate: r.plannedReceive,
+          today,
+        });
+        r.eta = mdFromIso(eta.date);
+        r.etaIsEstimate = eta.provenance !== "finale_planned";
+      }
     }
   }
-
-  const unackedQ = await pool.query(`
-    SELECT po_number, vendor_name, COALESCE(total_amount,total,0)::float AS amount,
-           po_sent_verified_at
-    FROM purchase_orders
-    WHERE po_sent_verified_at IS NOT NULL
-      AND po_sent_verified_at <= now() - interval '24 hours'
-      AND vendor_acknowledged_at IS NULL
-      AND vendor_noncomm_at IS NULL
-      AND (receive_date IS NULL OR receive_date::date > CURRENT_DATE)
-      AND COALESCE(status,'') NOT ILIKE '%cancel%'
-      AND COALESCE(lifecycle_stage,'') NOT ILIKE '%cancel%'
-      AND po_number ~ '^[0-9]+$'
-      AND COALESCE(vendor_name,'') !~* 'autopot|printful|evergreen growers|dropship'
-    ORDER BY po_sent_verified_at ASC
-    LIMIT 40
-  `);
-  let unacked: Row[] = unackedQ.rows
-    .filter((r) => NUMERIC.test(String(r.po_number || "")))
-    .map((r) => ({
-    po: r.po_number,
-    vendor: r.vendor_name || "",
-    amount: Number(r.amount) || 0,
-    note: mdFromIso(iso(r.po_sent_verified_at)),
-  }));
 
   const delayedQ = await pool.query(`
     SELECT po_number, vendor_name, COALESCE(total_amount,total,0)::float AS amount,
@@ -601,7 +633,7 @@ async function main() {
   const delayed: Row[] = [];
   for (const r of delayedRows) {
     const eta = iso(r.vendor_stated_eta);
-    const skus = skuList(r.line_items);
+    const skus = skuListOf(r.line_items);
     const rw = minRunway(
       skus.split(",").map((s) => skuRunway.get(s.trim()))
     );
@@ -619,6 +651,7 @@ async function main() {
       po: r.po_number,
       vendor: r.vendor_name || "",
       sku: skus,
+      qty: lineQtyOf(r.line_items),
       amount: Number(r.amount) || 0,
       note: eta ? `Vendor ETA ${mdFromIso(eta)}` : "No update from vendor",
       eta,
@@ -710,38 +743,134 @@ async function main() {
     }));
   }
 
+  // Vendor MOQ floors (vendor_reorder_policies.standard_order_qty).
+  const standardOrderQty = new Map<string, number>();
+  try {
+    const sq = await pool.query(
+      `SELECT vendor_name, standard_order_qty FROM vendor_reorder_policies WHERE standard_order_qty IS NOT NULL`
+    );
+    for (const r of sq.rows) {
+      const n = Number(r.standard_order_qty);
+      if (r.vendor_name && Number.isFinite(n) && n > 0) {
+        standardOrderQty.set(String(r.vendor_name).trim().toLowerCase(), n);
+      }
+    }
+  } catch {
+    /* moq optional */
+  }
+
+  // Cartons are the same physical size under different vendor SKUs (Uline
+  // `S-`, SP USA `SP-`, internal `BOX` builds). Judge them by pooled stock on
+  // hand for the size, never SKU by SKU, or we re-buy a box we already have.
+  const skuName = new Map<string, string>();
+  try {
+    const nr = await pool.query(
+      `SELECT sku, raw_detail->>'name' AS name FROM finale_sku_cache WHERE raw_detail->>'name' IS NOT NULL`
+    );
+    for (const r of nr.rows) skuName.set(String(r.sku), String(r.name));
+  } catch {
+    /* cache optional */
+  }
+
   const upcoming: Row[] = [];
   try {
     const seen = new Set<string>();
+    const seenDims = new Set<string>();
+    const weekOut = addDays(today, 7);
+
+    // The dashboard pools each slot separately (resale, then BOM), so the
+    // report must do the same — pooling both files together would sum the same
+    // SKU's rate twice and invent a shortage. Same helper, same inputs.
+    const cartonNames = Array.from(skuName, ([sku, name]) => ({ sku, name })).filter(
+      (c) => boxDimKey(c.name)
+    );
+    const stockMemo = new Map<string, number | null>();
+    const feeds: Array<{ vendor: string; it: any }> = [];
     for (const name of ["purchasing-resale.json", "purchasing-bom.json"]) {
       const raw = JSON.parse(
         fs.readFileSync(path.join(ARIA, ".aria-cache", "purchasing", name), "utf8")
       );
-      for (const g of raw.value || []) {
+      const groups = (raw.value || []) as any[];
+      const pooledGroups =
+        cartonNames.length > 0
+          ? (
+              await poolCartonGroups(groups as any, {
+                cartonNames,
+                stockFor: async (s) => {
+                  if (stockMemo.has(s)) return stockMemo.get(s) ?? null;
+                  let v: number | null = null;
+                  try {
+                    v = (await finale.getStockLevel(s)) as number | null;
+                  } catch {
+                    v = null;
+                  }
+                  stockMemo.set(s, v);
+                  return v;
+                },
+              })
+            ).groups
+          : groups;
+      for (const g of pooledGroups) {
         for (const it of g.items || []) {
-          const qty = it.suggestedQty || 0;
-          const oo = it.stockOnOrder || 0;
-          const rw = it.adjustedRunwayDays;
-          if (qty <= 0) continue;
-          if (oo > 0) continue;
-          if (rw == null) continue;
-          const sku = String(it.productId || "");
-          const vendor = g.vendorName || it.supplierName || "";
-          if (!sku || seen.has(sku)) continue;
-          if (excludeManualVendor(vendor, sku)) continue;
-          const need = needByIso(today, Number(rw) || 0);
-          if (!withinDays(need, today, 30)) continue;
-          seen.add(sku);
-          upcoming.push({
-            po: sku,
-            vendor,
-            sku,
-            amount: qty * (it.unitPrice || 0),
-            note: mdFromIso(need),
-            eta: need,
-          });
+          feeds.push({ vendor: g.vendorName || it.supplierName || "", it });
         }
       }
+    }
+
+    for (const { vendor, it } of feeds) {
+      const qty0 = it.suggestedQty || 0;
+      const oo = it.stockOnOrder || 0;
+      const rw = it.adjustedRunwayDays;
+      if (qty0 <= 0) continue;
+      if (oo > 0) continue;
+      if (rw == null) continue;
+      const sku = String(it.productId || "");
+      if (!sku || seen.has(sku)) continue;
+      if (excludeManualVendor(vendor, sku)) continue;
+
+      const dimKey = boxDimKey(it.productName || skuName.get(sku) || "");
+      if (dimKey && seenDims.has(dimKey)) continue;
+
+      const lead = Number(it.effectiveLeadTimeDays ?? it.leadTimeDays ?? 21) || 21;
+      // Runway already reflects pooled on-hand for this carton size.
+      const runwayDays = Number(rw) || 0;
+      const need = needByIso(today, runwayDays);
+      // "Next week" means anything that must be ORDERED in the coming week
+      // to land in time. Long-lead items (CWP, quillaja) surface early;
+      // short-lead items surface late. Not a flat wish list.
+      const mustOrder = addDays(need, -lead);
+      if (mustOrder > weekOut) {
+        if (dimKey) seenDims.add(dimKey);
+        continue;
+      }
+
+      let orderQty = qty0;
+      let moq: number | null = null;
+      const floor = standardOrderQty.get(vendor.trim().toLowerCase());
+      if (floor && orderQty < floor) {
+        orderQty = floor;
+        moq = floor;
+      }
+      const amt = orderQty * (it.unitPrice || 0);
+      if (!keepUpcomingAmount(amt)) continue;
+
+      const flags: string[] = [];
+      if (lead >= 30) flags.push(`${lead}d lead`);
+      if (amt >= 2000) flags.push("Large");
+      if (moq) flags.push(`MOQ ${moq.toLocaleString("en-US")}`);
+      if (runwayDays <= 0) flags.push("Out now");
+
+      seen.add(sku);
+      if (dimKey) seenDims.add(dimKey);
+      upcoming.push({
+        po: sku,
+        vendor,
+        sku,
+        qty: Number(orderQty).toLocaleString("en-US"),
+        amount: amt,
+        note: flags.join(" · "),
+        eta: need,
+      });
     }
     upcoming.sort((a, b) => (a.eta || "").localeCompare(b.eta || ""));
   } catch {
@@ -778,12 +907,6 @@ async function main() {
   let research: Row[] = [];
   try {
     const gmail = await gmailClient();
-    const kept: Row[] = [];
-    for (const r of unacked) {
-      if (await gmailVendorReplied(gmail, r.po)) continue;
-      kept.push(r);
-    }
-    unacked = kept;
     for (const r of delayed) {
       const thread = await gmailDelayThread(gmail, r.po);
       r.note = delayedVendorNote({
@@ -836,7 +959,6 @@ async function main() {
     end,
     committed,
     received,
-    unacked,
     delayed,
     billVerified,
     issues,
@@ -853,7 +975,7 @@ async function main() {
   chromePdf(htmlPath, pdfPath);
   console.log(`WROTE ${pdfPath}`);
   console.log(`committed ${committed.length} ${money(committed.reduce((a, r) => a + r.amount, 0))}`);
-  console.log(`received ${received.length} unacked ${unacked.length} delayed ${delayed.length}`);
+  console.log(`received ${received.length} delayed ${delayed.length}`);
 
   if (send) {
     const res = await sendGmailPdfEmail({

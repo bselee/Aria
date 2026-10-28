@@ -2432,6 +2432,39 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
                                                 </button>
                                             </div>
 
+                                            {/* ── Bag variant-family check (2026-10-28, Bill) ── */}
+                                            {group.bagFamilyCheck && group.bagFamilyCheck.length > 0 && (
+                                                <div className="px-4 pb-1.5 flex flex-wrap items-center gap-x-4 gap-y-1">
+                                                    {group.bagFamilyCheck.map(fam => (
+                                                        <span key={fam.family}
+                                                            className="text-[10px] font-mono text-zinc-500 flex items-center gap-1.5"
+                                                            title={`${fam.family} bag variants — fold siblings into this order when flagged`}>
+                                                            <span className="uppercase text-zinc-600">variants·{fam.family}</span>
+                                                            {fam.members.map(m => {
+                                                                const needsOrder = m.decision === "order" || m.decision === "reduce";
+                                                                const runwayLabel = m.runwayDays != null
+                                                                    ? (m.runwayDays >= 10000 ? "1y+" : `${Math.round(m.runwayDays)}d`)
+                                                                    : "?";
+                                                                const triggerDate = m.foldInNow && m.triggerInDays != null
+                                                                    ? new Date(Date.now() + m.triggerInDays * 86400e3)
+                                                                        .toLocaleDateString("en-US", { month: "short", day: "numeric" })
+                                                                    : null;
+                                                                const chip = needsOrder
+                                                                    ? { txt: `${m.sku} ✓ order ${m.suggestedQty}`, cls: "text-amber-300/90" }
+                                                                    : m.foldInNow
+                                                                    ? { txt: `${m.sku} ⟳ add now · triggers ${triggerDate}`, cls: "text-cyan-300/90" }
+                                                                    : m.covered
+                                                                    ? { txt: `${m.sku} on PO`, cls: "text-zinc-600" }
+                                                                    : { txt: `${m.sku} ${runwayLabel} hold`, cls: "text-zinc-500" };
+                                                                return (
+                                                                    <span key={m.sku} className={chip.cls}>{chip.txt}</span>
+                                                                );
+                                                            })}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+
                                             {/* ── Item rows ── */}
                                             {isExpanded && (
                                                 <div className="bg-zinc-950/40 border-t border-zinc-800/30">

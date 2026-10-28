@@ -27,7 +27,16 @@ import {
   parseVendorDueFromText,
   delayedVendorNote,
   daysBetween,
+  openPricingWins,
+  keepUpcomingAmount,
+  prettyUserLogin,
+  receiverFromStatusHistory,
+  poLines,
+  skuListOf,
+  lineQtyOf,
+  withQty,
   withinDays,
+  boxDimKey,
 } from "./eow-report";
 
 describe("eow-report", () => {
@@ -160,5 +169,56 @@ describe("eow-report", () => {
       })
     ).toBe("No reply since 7/23");
     expect(daysBetween("2026-04-29", "2026-10-19")).toBe(173);
+  });
+
+  it("pricing wins stay until resolved and upcoming floor drops trivia", () => {
+    const open = openPricingWins();
+    expect(open.every((w) => !w.resolved)).toBe(true);
+    expect(
+      openPricingWins([{ sku: "X", product: "p", vendor: "V", detail: "d", annual: "$1", status: "s", resolved: true }])
+    ).toEqual([]);
+    expect(keepUpcomingAmount(36)).toBe(false);
+    expect(keepUpcomingAmount(0)).toBe(true);
+    expect(keepUpcomingAmount(133)).toBe(true);
+  });
+
+  it("sums duplicate PO lines and keeps SKU/qty aligned", () => {
+    const items = [
+      { productId: "S-1665", quantity: 1 },
+      { productId: "A", quantity: 3 },
+      { productId: "S-1665", quantity: 2 },
+    ];
+    expect(poLines(items)).toEqual([
+      { id: "S-1665", qty: 3 },
+      { id: "A", qty: 3 },
+    ]);
+    expect(skuListOf(items)).toBe("S-1665, A");
+    expect(lineQtyOf(items)).toBe("3, 3");
+    expect(withQty(skuListOf(items), lineQtyOf(items))).toBe("S-1665 ×3, A ×3");
+    expect(poLines("not json")).toEqual([]);
+    expect(poLines([{ quantity: 5 }])).toEqual([]);
+  });
+
+  it("pools the same carton size across vendor SKUs", () => {
+    // Uline lists 30x15x15, our build lists 15x15x30 — same carton.
+    expect(boxDimKey('Corrugated Boxes - (30"x15"x15") /15')).toBe("15x15x30");
+    expect(boxDimKey('Corrugated Boxes - (15"x15"x30") /15')).toBe("15x15x30");
+    expect(boxDimKey('30"x15"x15" Box Build - 15/Unit')).toBe("15x15x30");
+    expect(boxDimKey("Corrugated Boxes - (24x16x6)")).toBe("6x16x24");
+    expect(boxDimKey("Non-Metallic Handy Box")).toBeNull();
+    expect(boxDimKey("Coconut Water Powder - (20kilo Box - 44lb) Raw")).toBeNull();
+  });
+
+  it("resolves the receiving user from shipment status history", () => {
+    expect(
+      receiverFromStatusHistory([
+        { statusId: null, txStamp: 1792184734, userLoginUrl: "/buildasoilorganics/api/userlogin/nicholas.kubin" },
+        { statusId: "SHIPMENT_DELIVERED", txStamp: 1792184736, userLoginUrl: "/buildasoilorganics/api/userlogin/nicholas.kubin" },
+      ])
+    ).toBe("NK");
+    expect(receiverFromStatusHistory([])).toBe("");
+    expect(receiverFromStatusHistory(null)).toBe("");
+    expect(prettyUserLogin("bill")).toBe("Bill");
+    expect(prettyUserLogin("bill.selee")).toBe("BS");
   });
 });

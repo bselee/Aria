@@ -10,6 +10,7 @@ import { assessPOCommitGuard } from '@/lib/purchasing/po-commit-guard';
 import { evaluateOpenPoDuplicateGuard } from '@/lib/purchasing/po-duplicate-guard';
 import { sanityFlagQty } from '@/lib/purchasing/order-sanity';
 import { classifyVendorOrderCycle, mapRecentPOsToVendorCyclePOs } from '@/lib/purchasing/vendor-order-cycle';
+import { buildBagFamilyChecks } from '@/lib/purchasing/bag-families';
 
 import {
     buildRecentOpenCoverageByProduct,
@@ -459,6 +460,39 @@ export async function GET(req: NextRequest) {
         };
     });
 
+    // ── Bag variant-family checks ─────────────────────────────────────────
+    // When any printed-bag variant is actionable, surface the whole family so
+    // siblings that trigger within the fold-in window can ride the same order
+    // (Bill, 2026-10-28: "always check all variants of these bags"). Members
+    // already covered by an open/draft PO are marked, never flagged fold-in.
+    const groupsWithFamilyChecks = responseGroups.map(g => {
+        const checks = buildBagFamilyChecks(
+            g.items.map(it => {
+                const a = it.assessment as
+                    | { decision?: string; reasonCodes?: string[] }
+                    | undefined;
+                const reasonCodes: string[] = a?.reasonCodes ?? [];
+                const covered =
+                    a?.decision === 'hold' &&
+                    (reasonCodes.includes('on_order_already_covers_need') ||
+                        reasonCodes.includes('recent_draft_exists'));
+                return {
+                    productId: it.productId,
+                    productName: it.productName,
+                    urgency: it.urgency,
+                    decision: a?.decision,
+                    suggestedQty: it.suggestedQty,
+                    runwayDays: it.adjustedRunwayDays ?? it.runwayDays,
+                    leadTimeDays:
+                        (it as { effectiveLeadTimeDays?: number }).effectiveLeadTimeDays ??
+                        it.leadTimeDays,
+                    covered,
+                };
+            }),
+        );
+        return checks.length > 0 ? { ...g, bagFamilyCheck: checks } : g;
+    });
+
     // ── Upcoming-builds digest (next 30 days from calendar forward-demand) ──
     // Compact list for the header panel. Same data the morning Telegram pulls.
     const forwardMap = readForwardDemand(30);
@@ -481,7 +515,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json(
         {
-            groups: responseGroups,
+            groups: groupsWithFamilyChecks,
             cachedAt: new Date(resaleSlot.at || bomSlot.at || Date.now()).toISOString(),
             vendorSummaries: assessment.vendorSummaries,
             mode,

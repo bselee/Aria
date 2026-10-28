@@ -36,6 +36,8 @@ import { writeFile } from 'fs/promises';
 import { join } from 'path';
 
 import { FinaleClient, type PurchasingGroup } from '@/lib/finale/client';
+import { createClient } from '@/lib/db';
+import { poolCartonGroups, type CartonName } from './carton-pooling';
 
 export type CacheSlot = {
     value: PurchasingGroup[] | null;
@@ -360,6 +362,128 @@ export function runScanCycle(reason = 'manual', deps: CycleDeps = defaultCycleDe
 }
 
 /**
+ * Carton index (SKU -> product name) used to pool stock by physical size.
+ *
+ * A dashboard poll must never pay for this: it is read once per hour by the
+ * scan cycle, which is the only writer. A failed read keeps the previous index
+ * rather than disabling pooling for the cycle.
+ */
+let cartonIndex: { at: number; rows: CartonName[] } | null = null;
+const CARTON_INDEX_TTL_MS = 60 * 60 * 1000;
+
+/** Live on-hand lookups for carton siblings, memoized across both pipelines. */
+const cartonStockMemo = new Map<string, { value: number; at: number }>();
+const CARTON_STOCK_TTL_MS = 10 * 60 * 1000;
+
+async function getCartonIndex(): Promise<CartonName[]> {
+    if (cartonIndex && Date.now() - cartonIndex.at < CARTON_INDEX_TTL_MS) {
+        return cartonIndex.rows;
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            const db = createClient();
+            if (!db) break;
+            // JSON-path filter keeps this to ~100 carton SKUs instead of the whole
+            // 2.6k-row cache (PostgREST caps a bare select at 1,000 rows).
+            const { data, error } = await db
+                .from('finale_sku_cache')
+                .select('sku,name:raw_detail->>name')
+                .filter('raw_detail->>name', 'ilike', '%box%');
+            if (error) throw new Error(error.message);
+            const rows = ((data ?? []) as CartonName[]).filter((r) => r?.sku);
+            if (rows.length === 0) throw new Error('empty carton index');
+            cartonIndex = { at: Date.now(), rows };
+            writeCartonIndexToDisk(rows);
+            return rows;
+        } catch (err: unknown) {
+            if (attempt === 0) {
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+                continue;
+            }
+            console.warn('[purchasing/cycle] carton index unavailable:', errText(err));
+        }
+    }
+    // PostgREST times out under scan load. A previously written index still
+    // pools correctly — never disable pooling just because backing off failed.
+    const disk = readCartonIndexFromDisk();
+    if (disk) {
+        cartonIndex = { at: Date.now(), rows: disk };
+        return disk;
+    }
+    return cartonIndex?.rows ?? [];
+}
+
+/** Persist the carton index so a PostgREST outage cannot disable pooling. */
+function writeCartonIndexToDisk(rows: CartonName[]): void {
+    try {
+        mkdirSync(cacheDir(), { recursive: true });
+        writeFileSync(join(cacheDir(), 'carton-index.json'), JSON.stringify({ at: Date.now(), rows }), 'utf8');
+    } catch {
+        // Best effort — the in-memory index still serves this cycle.
+    }
+}
+
+/** Read a previously persisted carton index. */
+function readCartonIndexFromDisk(): CartonName[] | null {
+    try {
+        const parsed = JSON.parse(readFileSync(join(cacheDir(), 'carton-index.json'), 'utf8')) as {
+            rows?: CartonName[];
+        };
+        return Array.isArray(parsed?.rows) && parsed.rows.length > 0 ? parsed.rows : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Recompute carton runway against pooled on-hand for the physical size, so the
+ * board does not order a carton that another vendor SKU already covers.
+ *
+ * Applied in the single writer, so the dashboard slot and the persisted
+ * snapshot the Friday report reads carry identical numbers.
+ *
+ * @param key    Slot being scanned (logging).
+ * @param groups Freshly scanned groups.
+ * @returns      Groups with pooled carton runway, or the originals on failure.
+ */
+async function applyCartonPooling(
+    key: CacheKey,
+    groups: PurchasingGroup[],
+): Promise<PurchasingGroup[]> {
+    try {
+        const cartonNames = await getCartonIndex();
+        if (cartonNames.length === 0) return groups;
+
+        const client = new FinaleClient();
+        const now = Date.now();
+        const outcome = await poolCartonGroups(groups, {
+            cartonNames,
+            stockFor: async (sku: string) => {
+                const hit = cartonStockMemo.get(sku);
+                if (hit && now - hit.at < CARTON_STOCK_TTL_MS) return hit.value;
+                const value = await client.getStockLevel(sku);
+                const n = Number(value);
+                if (Number.isFinite(n)) cartonStockMemo.set(sku, { value: n, at: now });
+                return Number.isFinite(n) ? n : null;
+            },
+        });
+
+        for (const row of outcome.pooled) {
+            if (!row.covered) continue;
+            console.log(
+                `[purchasing/cycle] ${key} carton ${row.dimKey}: ${row.onHand} on hand across ` +
+                `${row.skus.length} SKUs (${row.runwayDays.toFixed(0)}d runway) — no reorder`,
+            );
+        }
+        return outcome.groups;
+    } catch (err: unknown) {
+        // Pooling is an accuracy improvement, never a reason to lose a scan.
+        console.warn(`[purchasing/cycle] ${key} carton pooling failed (using scan values):`, errText(err));
+        return groups;
+    }
+}
+
+/**
  * Refresh one slot inside a cycle, updating memory and the durable snapshot.
  *
  * A failure keeps the previous value (continuity) and is logged, never thrown —
@@ -378,7 +502,7 @@ async function runSlotScan(
     windowKey?: string,
 ): Promise<void> {
     try {
-        const value = await fetcher();
+        const scanned = await fetcher();
         // HERMIA(2026-10-15): never publish an EMPTY BOM over a good one. A pass that
         // could not read the BOMs comes back empty (Finale rate-limits the per-SKU BOM
         // fetch, and getBillOfMaterials() swallows the error into []), and the empty
@@ -386,12 +510,15 @@ async function runSlotScan(
         // from the ordering board. An empty result is indistinguishable from a failed
         // read here, so keep what is on file and say so. Observed live: 0 of 304 board
         // rows were bom-component while this was happening.
-        if (key === 'bom' && value.length === 0 && (slot.value?.length ?? 0) > 0) {
+        if (key === 'bom' && scanned.length === 0 && (slot.value?.length ?? 0) > 0) {
             console.warn(
                 `[purchasing/cycle] bom scan returned nothing while ${(slot.value as PurchasingGroup[]).length} group(s) are on file — keeping the previous BOM snapshot`,
             );
             return;
         }
+        // Same carton size ships under several vendor SKUs; pool before publishing
+        // so the board and the Friday report judge the size, not the SKU.
+        const value = await applyCartonPooling(key, scanned);
         slot.value = value;
         slot.at = Date.now();
         if (windowKey) slot.windowKey = windowKey;

@@ -279,7 +279,7 @@ describe("AcknowledgementAgent", () => {
         expect(recordHumanReviewRequiredMock).not.toHaveBeenCalled();
     });
 
-    it("forces multi-turn conversation threads into human review with labels, no stub draft", async () => {
+    it("forces multi-turn conversation threads into human review with a draft stub + task", async () => {
         queueState.messages = [
             {
                 id: 2,
@@ -299,20 +299,20 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
-        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
+        // DECISION(2026-09-30): needs_response ALWAYS leaves a reviewable draft.
+        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
+        expect(recordEmailDraftPreparedMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                gmailMessageId: "gmail-2",
+                kind: "requires_human",
+                draftId: "draft-opp-1",
+            }),
+        );
         expect(gmailModifyMock).toHaveBeenCalledWith({
             userId: "me",
             id: "gmail-2",
             requestBody: {
                 addLabelIds: expect.arrayContaining(["needs-response-label"]),
-            },
-        });
-        expect(gmailModifyMock).toHaveBeenCalledWith({
-            userId: "me",
-            id: "gmail-2",
-            requestBody: {
-                addLabelIds: expect.not.arrayContaining(["draft-ready-label"]),
             },
         });
         expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith({
@@ -322,6 +322,12 @@ describe("AcknowledgementAgent", () => {
             subject: "RE: Packaging update",
             reason: "conversation_thread",
         });
+        expect(notifyViaTaskMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                sourceId: "email-human:gmail-2",
+                type: "email_needs_response",
+            }),
+        );
         expect(queueState.processedUpdates.some((u) => u.values.status === "needs_response")).toBe(true);
     });
 

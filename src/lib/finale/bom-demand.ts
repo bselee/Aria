@@ -523,8 +523,15 @@ export function mergeIntoGroups(
                     }
 
                     if (combinedItem.dailyRate > 0) {
-                        combinedItem.runwayDays = combinedItem.stockOnHand / combinedItem.dailyRate;
-                        combinedItem.adjustedRunwayDays = (combinedItem.stockOnHand + combinedItem.stockOnOrder) / combinedItem.dailyRate;
+                        // A pooled carton's supply is the whole size across vendors,
+                        // not this SKU's shelf. Using stockOnHand here would show a
+                        // 6-day runway on a row we are deliberately not ordering.
+                        const supplyOnHand = Number.isFinite(combinedItem.pooledOnHand)
+                            ? (combinedItem.pooledOnHand as number)
+                            : combinedItem.stockOnHand;
+                        combinedItem.runwayDays = supplyOnHand / combinedItem.dailyRate;
+                        combinedItem.adjustedRunwayDays =
+                            (supplyOnHand + combinedItem.stockOnOrder) / combinedItem.dailyRate;
                     }
 
                     existing.items[dupIndex] = combinedItem;

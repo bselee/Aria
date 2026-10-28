@@ -18,6 +18,7 @@ import { notifyViaTask } from "./notify-via-task";
 import {
     isSimpleVendorConfirmation,
     composeRoutineDraftBody,
+    composeHumanEscalationDraftStub,
     resolveEmailResponsePolicy,
 } from "./email-response-policy";
 import { isNoResponseNeededFyi } from "./email-draft-voice";
@@ -865,7 +866,11 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     await this.finalizeQueueStatus(m.id, "failed", err.message);
                                 }
                             } else {
-                                // REQUIRES_HUMAN — task + Needs Response. NO draft stub.
+                                // REQUIRES_HUMAN — draft stub + Needs Response + hub task.
+                                // DECISION(2026-09-30, Hermia ticket 2026-08-19): needs_response
+                                // MUST leave a reviewable draft AND an agent_task. The old
+                                // task-only path no-oped on Tanner/CYC (2026-08-19): no draft,
+                                // and the task write was swallowed by an empty catch.
                                 const policy = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
 
                                 try {
@@ -880,12 +885,48 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                     console.error(`     ❌ Failed to record human review signal:`, humanReviewErr.message);
                                 }
 
+                                let escalationDraftId: string | null = null;
+                                if (policy.createDraft && myEmail) {
+                                    const stubBody = composeHumanEscalationDraftStub({
+                                        from: senderEmail,
+                                        subject,
+                                        bodyText,
+                                    });
+                                    escalationDraftId = await this.createReplyDraft({
+                                        gmail,
+                                        to: senderEmail,
+                                        from: myEmail,
+                                        subject,
+                                        inReplyTo: rfcMessageId,
+                                        threadId,
+                                        bodyText: stubBody,
+                                    });
+                                    if (escalationDraftId) {
+                                        try {
+                                            await recordEmailDraftPrepared({
+                                                gmailMessageId,
+                                                threadId,
+                                                fromEmail: senderEmail,
+                                                subject,
+                                                replyBody: stubBody,
+                                                kind: "requires_human",
+                                                draftId: escalationDraftId,
+                                            });
+                                        } catch { /* non-fatal */ }
+                                        console.log(`     📝 Escalation draft stub ready (${escalationDraftId}) — not sent`);
+                                    } else {
+                                        console.error(`     ❌ Escalation draft stub FAILED for ${gmailMessageId} — needs_response has no draft`);
+                                    }
+                                }
+
                                 try {
                                     await this.addMessageLabels(gmail, gmailMessageId, policy.labels.length ? policy.labels : ["Needs Response"]);
                                 } catch { /* best effort */ }
 
+                                // Task creation must be LOUD on failure: a silent miss here is
+                                // how a needs_response email disappears from Bill's queue.
                                 try {
-                                    await notifyViaTask({
+                                    const taskId = await notifyViaTask({
                                         sourceId: `email-human:${gmailMessageId}`,
                                         type: "email_needs_response",
                                         goal: `${senderEmail}: ${subject.slice(0, 80)}`,
@@ -899,17 +940,23 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                                             gmailMessageId,
                                             threadId,
                                             kind: "requires_human",
+                                            draftId: escalationDraftId,
                                             snippet: (snippet || "").slice(0, 120),
                                         },
                                     });
-                                } catch { /* non-fatal */ }
+                                    if (!taskId) {
+                                        console.error(`     ❌ needs_response task NOT created for ${gmailMessageId} (notifyViaTask returned null)`);
+                                    }
+                                } catch (taskErr: any) {
+                                    console.error(`     ❌ needs_response task FAILED for ${gmailMessageId}: ${taskErr?.message ?? taskErr}`);
+                                }
 
                                 requiresHumanBatch.push({
                                     from: senderEmail,
                                     subject,
                                     snippet: (snippet || "").slice(0, 120),
                                 });
-                                console.log(`     ⚠️ Requires human attention — task only, no draft. Leaving in inbox.`);
+                                console.log(`     ⚠️ Requires human attention — draft stub + task. Leaving in inbox.`);
                                 await this.finalizeQueueStatus(m.id, "needs_response", humanReviewReason);
                             }
                         }

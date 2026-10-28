@@ -215,6 +215,9 @@ export interface PurchasingGroup {
     vendorPartyId: string;
     urgency: 'critical' | 'warning' | 'watch' | 'ok';  // worst of all items
     items: PurchasingItem[];
+    /** Bag variant-family checks (attached by the dashboard route when any
+     *  family member is actionable). See bag-families.ts. */
+    bagFamilyCheck?: import('../purchasing/bag-families').BagFamilyCheck[];
 }
 
 export interface FullPO {

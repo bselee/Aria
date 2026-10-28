@@ -19,6 +19,7 @@ import { derivePOSentVerification, type POSentVerification } from "./po-sent-ver
 import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-profile";
 import { normalizeLifecycleStage } from "./po-lifecycle";
 import { isActivePoStatus } from "./active-po-status";
+import { resolvePoEta } from "./po-eta";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
@@ -50,36 +51,6 @@ export interface ActivePurchase extends FullPO {
      * enrichment; degrades gracefully when shipments/invoices are missing.
      */
     movement: PurchaseMovement;
-}
-
-function addDays(dateStr: string, days: number): string {
-    const d = new Date(dateStr);
-    d.setUTCDate(d.getUTCDate() + days);
-    return d.toISOString().split("T")[0];
-}
-
-/**
- * Finale often stores the *planned* reception on PO.receiveDate while status
- * is still Committed. Only use it as ETA when it's still in the future and
- * within a sane window after order (not junk like +120d).
- */
-function normalizePlannedReceiveDate(
-    receiveDate: string | null | undefined,
-    orderDate: string | null | undefined,
-    today: string,
-): string | null {
-    if (!receiveDate) return null;
-    const rd = /^(\d{4}-\d{2}-\d{2})/.exec(receiveDate)?.[1] || null;
-    if (!rd) return null;
-    if (rd <= today) return null; // past = real receipt, handled elsewhere
-    if (orderDate) {
-        const ord = /^(\d{4}-\d{2}-\d{2})/.exec(orderDate)?.[1];
-        if (ord) {
-            const days = (Date.parse(rd) - Date.parse(ord)) / 86_400_000;
-            if (days > 75) return null; // absurd planned date
-        }
-    }
-    return rd;
 }
 
 /**
@@ -382,31 +353,20 @@ export async function loadActivePurchases(
                 // Carry-through lifecycle from cache row when enrichment map misses
                 const cacheStage = (po as any).lifecycleStage as string | null | undefined;
 
-                // Expected ETA early — needed for high-conf amount+past-ETA gate.
-                // Prefer Finale's planned receiveDate when it's in the FUTURE (Committed
-                // POs often carry the planned reception there — not a real receipt yet).
-                // That stops false OVERDUE badges weeks before the planned dock date.
-                let expectedDate: string;
-                let leadProvenance: string;
-                let lt: Awaited<ReturnType<typeof leadTimeService.getForVendor>> | null = null;
+                // Expected ETA — shared resolution (po-eta) so the dashboard and
+                // the weekly report never drift. Prefers Finale's planned
+                // receive, then the shared lead-time service, then 21d.
                 const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
-                const plannedReceive =
-                    normalizePlannedReceiveDate(po.receiveDate || poLifecycleRow?.receive_date, po.orderDate, todayStr);
-
-                if (plannedReceive) {
-                    expectedDate = plannedReceive;
-                    leadProvenance = "Finale planned receive";
-                    if (po.orderDate) {
-                        lt = await leadTimeService.getForVendor(po.vendorName).catch(() => null);
-                    }
-                } else if (po.orderDate) {
-                    lt = await leadTimeService.getForVendor(po.vendorName);
-                    expectedDate = addDays(po.orderDate, lt.days);
-                    leadProvenance = lt.label;
-                } else {
-                    expectedDate = todayStr;
-                    leadProvenance = "21d default";
-                }
+                const eta = await resolvePoEta({
+                    vendorName: po.vendorName,
+                    orderDate: po.orderDate,
+                    plannedReceiveDate: po.receiveDate || poLifecycleRow?.receive_date,
+                    today: todayStr,
+                });
+                const expectedDate = eta.date;
+                const leadProvenance = eta.label;
+                const lt = eta.lead;
+                const plannedReceive = eta.plannedReceive;
 
                 const resolvedReceiveDate = resolvePurchaseOrderReceiptDate({
                     status: po.status,

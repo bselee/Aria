@@ -1,12 +1,14 @@
 /**
- * @file    src/cli/add-house-freight.ts
- * @purpose Add a missing vendor house-charge freight line to existing POs.
+ * @file    src/cli/add-po-freight.ts
+ * @purpose Append a missing freight amount to existing POs, either a vendor house
+ *          charge or the inbound carrier amount.
  *
  *          Uline bills $1.50 of shipping/handling on every FREIGHT COLLECT invoice,
  *          and the carriage itself arrives on the FedEx bill. A collect PO must
- *          therefore carry two Freight lines: 1.50 and the carrier amount. Some older
- *          POs got the carrier amount without the house charge, so they understate
- *          landed cost and do not match the shape every other Uline PO shows.
+ *          therefore carry two Freight lines: 1.50 and the carrier amount. POs have
+ *          gone wrong in both directions: some got the carrier amount without the
+ *          house charge, and some were completed with only the house charge because
+ *          the carrier bill had not landed yet.
  *
  *          Appends a bare `Freight` line with ADJ_BY_WEIGHT and an allocation list
  *          sized to the raw item count, which is what makes it reach landed cost.
@@ -16,9 +18,9 @@
  *          was completed before the edit is re-completed afterwards.
  *
  * Usage:
- *   tsx src/cli/add-house-freight.ts --pos 123820,123835
- *   tsx src/cli/add-house-freight.ts --pos 123820,123835 --live
- *   --amount <n>  house charge to add (default 1.5)
+ *   tsx src/cli/add-po-freight.ts --pos 123820,123835
+ *   tsx src/cli/add-po-freight.ts --pos 123820,123835 --live
+ *   --amount <n>  freight amount to add (default 1.5, the Uline house charge)
  *   --gap <ms>    pause between Finale calls (default 1500)
  *
  * @author  Hermia
@@ -55,11 +57,11 @@ const money = (n: number) => `$${Number(n).toFixed(2)}`;
 
 async function main(): Promise<void> {
     if (!POS.length) {
-        console.error("usage: add-house-freight.ts --pos <csv> [--amount 1.5] [--live]");
+        console.error("usage: add-po-freight.ts --pos <csv> [--amount 1.5] [--live]");
         process.exit(2);
     }
     const client: any = new FinaleClient();
-    console.log(`${POS.length} PO(s) | house charge ${money(AMOUNT)} | mode=${LIVE ? "LIVE" : "report only"}\n`);
+    console.log(`${POS.length} PO(s) | freight ${money(AMOUNT)} | mode=${LIVE ? "LIVE" : "report only"}\n`);
 
     for (const po of POS) {
         const doc: any = await client.getOrderDetails(po);

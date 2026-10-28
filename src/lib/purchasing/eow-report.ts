@@ -249,3 +249,163 @@ export function researchHit(from: string, subject: string, snippet: string): Res
   }
   return null;
 }
+
+// ── Pricing Wins (sourced from Obsidian Operations/Cost-Savings-Wins.md) ──
+// Clear, demonstrable wins only — old price, new price, annualized savings,
+// and whether we have acted. A row stays on the Friday report until Bill
+// marks it resolved here (resolved: true drops it from the PDF).
+export interface PricingWin {
+  sku: string;
+  product: string;
+  /** Vendor we switched to (or are evaluating). */
+  vendor: string;
+  detail: string;
+  annual: string;
+  status: string;
+  resolved?: boolean;
+}
+
+export const PRICING_WINS: PricingWin[] = [
+  {
+    sku: "",
+    product: "Compost (truckload)",
+    vendor: "Seacoast",
+    detail: "Malibu $0.28-0.30/lb to Seacoast $0.1775/lb",
+    annual: "$20k-$25k/yr",
+    status: "Acted - switched, PO 125065",
+  },
+  {
+    sku: "HYG101",
+    product: "Hygro-Thermometer",
+    vendor: "Guangzhou Huaxing",
+    detail: "Amazon $1.95/unit to factory direct $0.50",
+    annual: "$1,471/yr",
+    status: "Acted - first 1,000 units ordered",
+  },
+  {
+    sku: "CFR101",
+    product: "Insect Frass",
+    vendor: "Frassy",
+    detail: "Cornerstone $1.00/lb next load to Frassy $0.167/lb",
+    annual: "~$18,300/yr",
+    status: "Not ordered - OMRI docs + freight pending",
+  },
+  {
+    sku: "CLVR04",
+    product: "Clover Cover Crop Blend",
+    vendor: "Green Cover",
+    detail: "Pulse $3.45/lb to Green Cover $1.74/lb landed",
+    annual: "~$10k/yr",
+    status: "Not ordered - clover % must match spec",
+  },
+];
+
+/** Rows still worth showing: unresolved wins only. */
+export function openPricingWins(wins: PricingWin[] = PRICING_WINS): PricingWin[] {
+  return wins.filter((w) => !w.resolved);
+}
+
+/** Upcoming-purchases realism gate: drop trivial dollar rows (< $100) but
+ *  keep zero-amount rows (price varies by run, e.g. Axiom labels). */
+export function keepUpcomingAmount(amount: number): boolean {
+  return amount === 0 || amount >= 100;
+}
+
+/** "nicholas.kubin" -> "NK" (true initials). Single-word logins get capitalized. */
+export function prettyUserLogin(login: string): string {
+  const base = (login || "").trim();
+  if (!base) return "";
+  const parts = base.split(/[._\-\s]+/).filter(Boolean);
+  if (parts.length >= 2) return parts.map((p) => p[0].toUpperCase()).join("");
+  return base[0].toUpperCase() + base.slice(1);
+}
+
+/** Who received a Finale shipment. Finale's shipment payload has no direct
+ *  receiver field, but statusIdHistoryList entries carry userLoginUrl —
+ *  the SHIPMENT_DELIVERED transition's user is the receiver (verified on
+ *  shipment 125409-1, 2026-10-22). */
+export function receiverFromStatusHistory(
+  history:
+    | Array<{ statusId?: string | null; txStamp?: number; userLoginUrl?: string | null }>
+    | null
+    | undefined
+): string {
+  if (!Array.isArray(history) || history.length === 0) return "";
+  const delivered = history.filter((h) =>
+    /SHIPMENT_DELIVERED|RECEIVED/i.test(String(h?.statusId || ""))
+  );
+  const pool = delivered.length ? delivered : history;
+  const pick = [...pool].sort((a, b) => (b?.txStamp || 0) - (a?.txStamp || 0))[0];
+  const m = String(pick?.userLoginUrl || "").match(/\/userlogin\/([^/?#]+)/);
+  return m ? prettyUserLogin(decodeURIComponent(m[1])) : "";
+}
+
+// ── PO line normalization ──────────────────────────────────────────────
+export interface PoLine {
+  id: string;
+  qty: number;
+}
+
+/**
+ * Normalize PO line items to one entry per SKU.
+ *
+ * Duplicate productIds are SUMMED (Finale POs legitimately carry split lines
+ * for the same product — e.g. PO 124636 has S-1665 twice). Dropping either
+ * occurrence under-reports the quantity in play, so accumulation is required.
+ * First-seen order is preserved so SKU and qty columns stay aligned.
+ */
+export function poLines(items: unknown): PoLine[] {
+  let arr: unknown = items;
+  if (typeof items === "string") {
+    try {
+      arr = JSON.parse(items);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(arr)) return [];
+  const acc = new Map<string, number>();
+  for (const x of arr) {
+    if (!x || typeof x !== "object") continue;
+    const rec = x as { productId?: unknown; sku?: unknown; quantity?: unknown };
+    const id = String(rec.productId || rec.sku || "").trim();
+    if (!id) continue;
+    const q = Number(rec.quantity);
+    acc.set(id, (acc.get(id) || 0) + (Number.isFinite(q) && q > 0 ? q : 0));
+  }
+  return [...acc.entries()].map(([id, qty]) => ({ id, qty }));
+}
+
+/** SKU list, one entry per product, in first-seen order. */
+export function skuListOf(items: unknown): string {
+  return poLines(items).map((l) => l.id).join(", ");
+}
+
+/** Ordered quantity per SKU, aligned 1:1 with skuListOf(). */
+export function lineQtyOf(items: unknown): string {
+  return poLines(items).map((l) => (l.qty > 0 ? String(l.qty) : "")).join(", ");
+}
+
+/**
+ * Canonical carton size key. Defined in `carton-pooling.ts` so the dashboard
+ * scan and this report cannot drift apart; re-exported here for existing callers.
+ */
+export { boxDimKey } from "./carton-pooling";
+
+/**
+ * "AG108" + "10, 1050" -> "AG108 ×10, LY102 ×1050".
+ *
+ * `qty` is a comma-separated list aligned 1:1 with the comma-separated SKUs.
+ * Never pass a thousands-formatted number ("2,000") — it will be read as
+ * two entries and truncated. Use `${sku} ×${qty}` for a single SKU.
+ */
+export function withQty(sku: string, qty: string): string {
+  const ids = (sku || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const qs = (qty || "").split(",").map((s) => s.trim());
+  return ids
+    .map((id, i) => {
+      const q = qs[i];
+      return q ? `${id} ×${q}` : id;
+    })
+    .join(", ");
+}
