@@ -543,5 +543,72 @@ describe("ReceivedItemsPanel", () => {
 
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(await screen.findByText(/Bill exceeds delivery — \$6,000 invoiced vs \$1,200 received/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Draft vendor email/i })).toBeTruthy();
+  });
+
+  it("shows the overbill hold state and resolve action once a dispute is recorded", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-409",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "partial",
+          supplier: "Thrive Probiotics",
+          total: 1500,
+          items: [{ productId: "THC101", quantity: 25, orderedQuantity: 25, receivedQuantity: 8, openQuantity: 17 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            billingPattern: "deliver_and_bill",
+            invoiceVsReceipt: {
+              invoicedTotal: 1500,
+              receivedValue: 1000,
+              invoicedQty: 25,
+              receivedQty: 8,
+              overbilled: true,
+              billed: true,
+            },
+            overbillDispute: {
+              disposition: "held",
+              status: "open",
+              delta: 500,
+              invoicedTotal: 1500,
+              receivedValue: 1000,
+              vendorNotified: true,
+              createdAt: recentDate,
+              resolution: null,
+              balancedNow: false,
+            },
+            matchedInvoice: {
+              invoice_number: "3001",
+              subtotal: 1500,
+              freight: 0,
+              tax: 0,
+              total: 1500,
+              status: "received",
+              line_items: null,
+            },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Overbill \$500 held — pay \$1,000 for delivered\. Vendor notified/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Mark resolved/i })).toBeTruthy();
+    expect(screen.queryByText(/Draft vendor email/i)).toBeNull();
   });
 });

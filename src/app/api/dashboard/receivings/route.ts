@@ -846,6 +846,44 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 }
                             }
 
+                            // ── Open overbill disputes (2026-10-28) ──
+                            // Bill's flow: he does NOT enter an overbill. He
+                            // drafts the vendor an email and pays only for what
+                            // was delivered. The dispute row keeps that state
+                            // until the credit or revised invoice lands.
+                            try {
+                                const { data: disputes } = await sb
+                                    .from('overbill_disputes')
+                                    .select(
+                                        'po_number, vendor_name, invoice_number, invoiced_total, received_value, delta, status, disposition, vendor_notified_at, resolution, created_at',
+                                    )
+                                    .in('po_number', poNumbers)
+                                    .eq('status', 'open')
+                                    .order('created_at', { ascending: false })
+                                    .limit(100);
+                                for (const row of disputes || []) {
+                                    const po = received.find(
+                                        (p: any) => String(p.poNumber || p.orderId) === String((row as any).po_number),
+                                    );
+                                    if (!po) continue;
+                                    const ivr = (po as any)._reconciliation?.invoiceVsReceipt;
+                                    (po as any)._reconciliation.overbillDispute = {
+                                        disposition: (row as any).disposition,
+                                        status: (row as any).status,
+                                        delta: Number((row as any).delta || 0),
+                                        invoicedTotal: Number((row as any).invoiced_total || 0),
+                                        receivedValue: Number((row as any).received_value || 0),
+                                        vendorNotified: !!(row as any).vendor_notified_at,
+                                        createdAt: (row as any).created_at,
+                                        resolution: (row as any).resolution,
+                                        // The receipts now cover the bill — safe to resolve.
+                                        balancedNow: !!ivr && !ivr.overbilled,
+                                    };
+                                }
+                            } catch (dispErr: any) {
+                                console.warn(`[receivings] overbill dispute query failed: ${dispErr?.message || dispErr}`);
+                            }
+
             // ── Recent auto-completions (audit trail for auto-processed) ──
             let recentAutoCompletions: Array<{
                 intent: string;
@@ -1169,6 +1207,126 @@ export async function POST(req: NextRequest) {
             await markVendorFreightPattern(vendorName, pattern);
 
             return NextResponse.json({ marked: true, vendorName, pattern });
+        }
+
+        if (action === 'overbill_disposition') {
+            const { orderId, disposition } = body;
+            if (!orderId || !['draft_vendor', 'resolve'].includes(disposition)) {
+                return NextResponse.json(
+                    { error: 'orderId and disposition (draft_vendor | resolve) required' },
+                    { status: 400 },
+                );
+            }
+            const sb = createClient();
+            if (!sb) return NextResponse.json({ error: 'DB unavailable' }, { status: 500 });
+
+            const { recordOverbillDispute, resolveOverbillDispute, overbillDraftBody } = await import(
+                '@/lib/purchasing/overbill-dispute'
+            );
+
+            if (disposition === 'resolve') {
+                const resolution = body.resolution || 'credit or revised invoice received';
+                const { resolved, error } = await resolveOverbillDispute(sb, orderId, resolution);
+                if (error) return NextResponse.json({ error }, { status: 500 });
+                await sb.from('ap_activity_log').insert({
+                    intent: 'OVERBILL_RESOLVED',
+                    created_at: new Date().toISOString(),
+                    metadata: { poNumber: orderId, resolution },
+                });
+                return NextResponse.json({ resolved, orderId });
+            }
+
+            // draft_vendor: Bill's process — hold the bill, draft the vendor
+            // email (never sent) so the vendor gets a chance to correct, and
+            // enter payment only for what was delivered.
+            const { data: invRows } = await sb
+                .from('vendor_invoices')
+                .select('invoice_number, total, raw_data')
+                .eq('po_number', orderId)
+                .order('created_at', { ascending: false })
+                .limit(1);
+            const inv = ((invRows || [])[0] || null) as any;
+            const invoicedTotal = Number(body.invoicedTotal ?? inv?.total ?? 0);
+            const receivedValue = Number(body.receivedValue ?? 0);
+            const delta = Math.round((Math.max(0, invoicedTotal - receivedValue)) * 100) / 100;
+            if (!(delta > 0)) {
+                return NextResponse.json({ error: 'No positive delta to dispute' }, { status: 400 });
+            }
+
+            const rec = await recordOverbillDispute(sb, {
+                poNumber: orderId,
+                vendorName: body.vendorName ?? null,
+                invoiceNumber: inv?.invoice_number ?? null,
+                invoicedTotal,
+                receivedValue,
+                delta,
+            });
+            if ('error' in rec) return NextResponse.json({ error: rec.error }, { status: 500 });
+
+            // ── Gmail draft (draft-only, never sent) ────────────────────────
+            let draftCreated = false;
+            let draftId: string | null = null;
+            let draftSubject = '';
+            try {
+                const rd = (inv?.raw_data || {}) as Record<string, unknown>;
+                const rawFrom = typeof rd.email_from === 'string' ? String(rd.email_from) : '';
+                const to = (rawFrom.match(/<([^>]+)>/) || [])[1] || (rawFrom.includes('@') ? rawFrom : null);
+                const origSubject = typeof rd.email_subject === 'string' ? String(rd.email_subject) : '';
+                const { getAuthenticatedClient } = await import('@/lib/gmail/auth');
+                const { gmail: GmailApi } = await import('@googleapis/gmail');
+                const auth = await getAuthenticatedClient('default');
+                const gmail = new GmailApi({ auth: auth as any, version: 'v1' });
+                const text = overbillDraftBody({
+                    poNumber: orderId,
+                    vendorName: body.vendorName ?? null,
+                    invoiceNumber: inv?.invoice_number ?? null,
+                    invoicedTotal,
+                    receivedValue,
+                    delta,
+                });
+                draftSubject = `Re: ${origSubject || `Invoice ${inv?.invoice_number || ''}`.trim() || `PO ${orderId}`}`;
+                const headers = [
+                    'From: bill.selee@buildasoil.com',
+                    to ? `To: ${to}` : '',
+                    `Subject: ${draftSubject}`,
+                    'MIME-Version: 1.0',
+                    'Content-Type: text/plain; charset=UTF-8',
+                ]
+                    .filter(Boolean)
+                    .join('\r\n');
+                const raw = Buffer.from(`${headers}\r\n\r\n${text}`, 'utf8').toString('base64url');
+                let threadId: string | undefined;
+                if (to) {
+                    try {
+                        const domain = to.split('@')[1];
+                        const q = `from:${domain} subject:"${origSubject.slice(0, 40)}"`;
+                        const { data: threads } = await gmail.users.threads.list({ userId: 'me', q, maxResults: 3 });
+                        threadId = threads?.threads?.[0]?.id ?? undefined;
+                    } catch { /* thread lookup best-effort */ }
+                }
+                const draft = await gmail.users.drafts.create({
+                    userId: 'me',
+                    requestBody: { message: { raw, ...(threadId ? { threadId } : {}) } },
+                });
+                draftId = draft.data.id ?? null;
+                draftCreated = !!draftId;
+                if (draftCreated) {
+                    await sb
+                        .from('overbill_disputes')
+                        .update({ vendor_notified_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+                        .eq('po_number', orderId)
+                        .eq('status', 'open');
+                }
+            } catch (draftErr: any) {
+                console.warn(`[receivings] overbill vendor draft failed for ${orderId}: ${draftErr?.message || draftErr}`);
+            }
+
+            await sb.from('ap_activity_log').insert({
+                intent: 'OVERBILL_HELD',
+                created_at: new Date().toISOString(),
+                metadata: { poNumber: orderId, invoicedTotal, receivedValue, delta, draftCreated },
+            });
+            return NextResponse.json({ held: true, orderId, delta, draftCreated, draftId, draftSubject });
         }
 
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });

@@ -60,6 +60,18 @@ type ReceivedPO = {
             /** Value of bill lines matching no received PO of the vendor. */
             unmatchedValue?: number;
         } | null;
+        /** Open overbill hold: Bill does not enter the bill; pays for what was delivered. */
+        overbillDispute?: {
+            disposition: string;
+            status: string;
+            delta: number;
+            invoicedTotal: number;
+            receivedValue: number;
+            vendorNotified: boolean;
+            createdAt: string;
+            resolution: string | null;
+            balancedNow: boolean;
+        } | null;
         matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
 };
@@ -370,6 +382,39 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             }
         } catch (e: any) {
             console.error("Complete PO error:", e.message);
+        }
+    }
+
+    /** Overbill hold: record the dispute, draft the vendor email, or resolve. */
+    const [overbillActing, setOverbillActing] = useState<Set<string>>(new Set());
+    async function handleOverbillDisposition(orderId: string, disposition: "draft_vendor" | "resolve") {
+        const po = posRef.current.find((p) => p.orderId === orderId);
+        const ivr = po?._reconciliation?.invoiceVsReceipt;
+        setOverbillActing((prev) => new Set(prev).add(orderId));
+        try {
+            const res = await fetch("/api/dashboard/receivings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    action: "overbill_disposition",
+                    orderId,
+                    disposition,
+                    invoicedTotal: ivr?.invoicedTotal,
+                    receivedValue: ivr?.receivedValue,
+                    vendorName: po?.supplier,
+                }),
+            });
+            const json = await res.json();
+            if (!res.ok) console.error("Overbill disposition failed:", json.error);
+            fetchReceivings(true);
+        } catch (e: any) {
+            console.error("Overbill disposition error:", e.message);
+        } finally {
+            setOverbillActing((prev) => {
+                const next = new Set(prev);
+                next.delete(orderId);
+                return next;
+            });
         }
     }
 
@@ -1200,6 +1245,23 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             },
                                                         };
                                                     }
+                                                    if (rec?.overbillDispute) {
+                                                        // Bill's flow (2026-10-28): he does NOT enter the
+                                                        // overbill. The vendor gets a draft to correct it,
+                                                        // and he pays only for what was delivered.
+                                                        const d = rec.overbillDispute;
+                                                        return {
+                                                            text: d.balancedNow
+                                                                ? `Overbill $${fmtQty(d.delta)} held — deliveries now cover it.${d.vendorNotified ? " Vendor notified." : ""}`
+                                                                : `Overbill $${fmtQty(d.delta)} held — pay $${fmtQty(d.receivedValue)} for delivered.${d.vendorNotified ? " Vendor notified." : ""}`,
+                                                            button: {
+                                                                text: "Mark resolved",
+                                                                tone: "success",
+                                                                loading: overbillActing.has(po.orderId),
+                                                                onClick: () => handleOverbillDisposition(po.orderId, "resolve"),
+                                                            },
+                                                        };
+                                                    }
                                                     if (isPartial && hasOpenQty) {
                                                         const inv = rec?.matchedInvoice;
                                                         if (isBilledUpfrontVendor(po.supplier)) {
@@ -1317,10 +1379,19 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         {/* The invoice covers more than the delivery — the exact
                                                             overbill pattern Bill named (2026-10-28): bill-as-they-deliver
                                                             vendors "almost always over bill us a complete PO". */}
-                                                        {rec?.invoiceVsReceipt?.overbilled && (
-                                                            <div className="mt-1 text-[11px] font-mono text-rose-300">
-                                                                Bill exceeds delivery — ${rec.invoiceVsReceipt.invoicedTotal.toLocaleString()} invoiced vs $
-                                                                {rec.invoiceVsReceipt.receivedValue.toLocaleString()} received. Verify before completing.
+                                                        {rec?.invoiceVsReceipt?.overbilled && !rec?.overbillDispute && (
+                                                            <div className="mt-1 text-[11px] font-mono text-rose-300 flex items-center justify-between gap-2">
+                                                                <span>
+                                                                    Bill exceeds delivery — ${rec.invoiceVsReceipt.invoicedTotal.toLocaleString()} invoiced vs $
+                                                                    {rec.invoiceVsReceipt.receivedValue.toLocaleString()} received.
+                                                                </span>
+                                                                <button
+                                                                    onClick={() => handleOverbillDisposition(po.orderId, "draft_vendor")}
+                                                                    disabled={overbillActing.has(po.orderId)}
+                                                                    className="px-2 py-0.5 rounded text-[10px] font-mono font-semibold border transition-colors disabled:opacity-40 shrink-0 bg-rose-500/20 text-rose-300 border-rose-500/40 hover:bg-rose-500/30"
+                                                                >
+                                                                    {overbillActing.has(po.orderId) ? "…" : "Draft vendor email"}
+                                                                </button>
                                                             </div>
                                                         )}
                                                         {rec?.invoiceVsReceipt?.unmatchedValue && (
