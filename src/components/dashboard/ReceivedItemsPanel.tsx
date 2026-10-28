@@ -6,6 +6,7 @@ import { Package, RefreshCw, ChevronDown } from "lucide-react";
 import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import { isPaidInAdvanceVendor, isBilledUpfrontVendor } from "@/config/paid-in-advance-vendors";
+import { isFreightRequiredVendor } from "@/config/freight-required-vendors";
 import { isDeliverAndBillVendor } from "@/lib/purchasing/deliver-bill-vendors";
 
 type ReceivedPO = {
@@ -224,6 +225,44 @@ function daysSince(dateStr: string | undefined | null): number | null {
     const now = new Date();
     const diff = now.getTime() - d.getTime();
     return Math.floor(diff / (1000 * 60 * 60 * 24));
+}
+
+/** Weekdays between the timestamp and now. Removal runs on business days,
+ *  not calendar days (2026-10-28): a Friday receipt settling Monday is 1 day. */
+function businessDaysSince(dateStr: string | undefined | null): number | null {
+    if (!dateStr) return null;
+    const d = parseDenverDate(dateStr);
+    if (!d) return null;
+    let count = 0;
+    for (const t = new Date(d); t < new Date(); t.setDate(t.getDate() + 1)) {
+        const day = t.getDay();
+        if (day !== 0 && day !== 6) count++;
+    }
+    return count;
+}
+
+/**
+ * Freight already on the PO (Finale truth): total minus the goods subtotal.
+ * Finale carries no freight line until the invoice amount is applied.
+ */
+function poFreightOnPo(po: ReceivedPO): number {
+    if (po.subtotal == null || po.total <= po.subtotal) return 0;
+    return Math.round((po.total - po.subtotal) * 100) / 100;
+}
+
+/**
+ * True when a truck-freight vendor's PO carries its freight. Non-freight
+ * vendors always pass. For the named vendors (Rootwise, Uline, Garys,
+ * International Molasses, Lind Marine...) the PO must hold the freight —
+ * vendor-charged (matched invoice freight) or carrier-added — before the row
+ * may settle or complete (2026-10-28).
+ */
+function isFreightAligned(po: ReceivedPO): boolean {
+    if (!isFreightRequiredVendor(po.supplier)) return true;
+    const onPo = poFreightOnPo(po);
+    if (onPo <= 0) return false;
+    const charged = Number(po._reconciliation?.matchedInvoice?.freight) || 0;
+    return charged - onPo <= 0.5;
 }
 
 /** SKU classes whose delivered weight legitimately varies from the PO. */
@@ -717,13 +756,14 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             dynStatus === "partial" ||
             (po as { receiptStatus?: string }).receiptStatus === "partial";
         if (needsAttention) return true;
-        // Settled = fully received AND the bill is known. Unknown receipt
-        // data is not settled — it stays visible.
+        // Settled = fully received AND the bill is known AND (for truck-freight
+        // vendors) the freight is on the PO. Unknown receipt data is not
+        // settled — it stays visible.
         const hasKnownBill =
             !!po._reconciliation?.matchedInvoice || isBilledUpfrontVendor(po.supplier) || isPaidInAdvanceVendor(po.supplier);
-        const isSettled = dynStatus === "full" && hasKnownBill;
+        const isSettled = dynStatus === "full" && hasKnownBill && isFreightAligned(po);
         if (!isSettled) return true;
-        const rcvDays = daysSince(po.receiveDateTime || po.receiveDate);
+        const rcvDays = businessDaysSince(po.receiveDateTime || po.receiveDate);
         return rcvDays === null || rcvDays < 7;
     };
     const visiblePos = pos.filter(isRowVisible);
@@ -1082,6 +1122,22 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         }
                                                         const orderedTotal = po.items.reduce((sum, i) => sum + (i.orderedQuantity ?? i.quantity), 0);
                                                         return { text: `Partial receipt. ${openTotal.toLocaleString()} of ${fmtQty(orderedTotal)} still open. No bill yet.`, button: undefined };
+                                                    }
+                                                    if (rec?.matchedInvoice && !isFreightAligned(po)) {
+                                                        // Freight leg (2026-10-28): the receipt is full and
+                                                        // the bill is known, but a truck-freight vendor's
+                                                        // freight is not on the PO. The row stays until it
+                                                        // aligns — vendor-charged or carrier-added.
+                                                        const onPo = poFreightOnPo(po);
+                                                        const charged = Number(rec.matchedInvoice.freight) || 0;
+                                                        const add = charged > onPo + 0.5 ? Math.round((charged - onPo) * 100) / 100 : 0;
+                                                        return {
+                                                            text:
+                                                                add > 0
+                                                                    ? `Freight not on PO — add $${add.toFixed(2)}.`
+                                                                    : "Freight not on PO yet.",
+                                                            button: undefined,
+                                                        };
                                                     }
                                                     if (rec?.matchedInvoice) {
                                                         return {

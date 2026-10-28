@@ -19,6 +19,7 @@ import { createClient } from "@/lib/db";
 import { transitionLifecycleState } from "@/lib/purchasing/po-lifecycle";
 import { recordFreightEvidence } from "@/lib/purchasing/vendor-freight-learning";
 import { loadTrueReceiptQuantities, receiptShorts } from "@/lib/finale/receipt-quantities";
+import { isFreightRequiredVendor, freightOnPo } from "@/config/freight-required-vendors";
 import {
     computeInvoicePODiff,
     applyInvoiceModification,
@@ -302,6 +303,28 @@ export async function POST(req: NextRequest) {
                     { error: `Goods not all received — ${detail}`, orderId, shorts },
                     { status: 409 },
                 );
+            }
+
+            // ── Freight gate (2026-10-28) ───────────────────────────────────
+            // Same rule as receivings complete_po: truck-freight vendors must
+            // have their freight ON the PO before it closes.
+            {
+                const { data: poRow } = await createClient()
+                    .from('purchase_orders')
+                    .select('vendor_name')
+                    .eq('po_number', orderId)
+                    .limit(1);
+                const vendorName = String((poRow as any)?.[0]?.vendor_name || '');
+                if (isFreightRequiredVendor(vendorName)) {
+                    const freightNow = freightOnPo(receipt.total, receipt.subtotal);
+                    if (freightNow <= 0.5) {
+                        console.warn(`[po-modify] verify_and_complete refused for ${orderId}: freight not on PO (${vendorName})`);
+                        return NextResponse.json(
+                            { error: 'Freight not on PO — add trucking freight before completing', orderId, freightNow },
+                            { status: 409 },
+                        );
+                    }
+                }
             }
 
             const finale = new FinaleClient();

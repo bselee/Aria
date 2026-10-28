@@ -280,6 +280,85 @@ describe("ReceivedItemsPanel", () => {
     expect(screen.getByText(/PO-801/i)).toBeTruthy();
   });
 
+  it("holds a truck-freight vendor's row until freight is on the PO", async () => {
+    stubLocalStorage();
+    const old = new Date();
+    old.setDate(old.getDate() - 9);
+    const oldDate = old.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-900",
+          orderDate: oldDate,
+          receiveDate: oldDate,
+          receiveDateTime: oldDate,
+          receivedBy: "NK",
+          receiptStatus: "full",
+          supplier: "ULINE",
+          total: 2996,
+          subtotal: 2996,
+          items: [{ productId: "S-4738", quantity: 1000, orderedQuantity: 1000, receivedQuantity: 1000, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "212698005", subtotal: 2996, freight: 0, tax: 0, total: 2996, status: "received" },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    // Freight is not on the PO: the row stays even after 7 business days,
+    // and the state line says why.
+    expect(screen.getByText(/PO-900/i)).toBeTruthy();
+    expect(await screen.findByText(/Freight not on PO yet/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Complete PO/i })).toBeNull();
+  });
+
+  it("names the freight shortfall when the vendor charged it on the bill", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-901",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "JM",
+          receiptStatus: "full",
+          supplier: "Lind Marine",
+          total: 2500,
+          subtotal: 2500,
+          items: [{ productId: "LM101", quantity: 10, orderedQuantity: 10, receivedQuantity: 10, openQuantity: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: { invoice_number: "LM-7", subtotal: 2500, freight: 350, tax: 0, total: 2850, status: "received" },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Freight not on PO — add \$350.00/i)).toBeTruthy();
+  });
+
   it("drops a settled full receipt with a known bill after 7 days", async () => {
     stubLocalStorage();
     const old = new Date();

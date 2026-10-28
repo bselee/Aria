@@ -20,6 +20,10 @@ import {
 export interface TrueReceiptQuantities {
     orderedBySku: Map<string, number>;
     receivedBySku: Map<string, number>;
+    /** PO totals straight from the order doc: freight already on the PO is
+     *  total − subtotal (Finale carries no freight line until applied). */
+    total: number;
+    subtotal: number;
 }
 
 /**
@@ -40,6 +44,8 @@ export async function loadTrueReceiptQuantities(orderId: string): Promise<TrueRe
     const order = (await finale.getOrderDetails(orderId).catch(() => null)) as {
         shipmentUrlList?: unknown[];
         orderItemList?: Array<{ productId?: unknown; quantity?: unknown }>;
+        total?: unknown;
+        subtotal?: unknown;
     } | null;
     if (!order || !Array.isArray(order.shipmentUrlList)) return null;
 
@@ -61,7 +67,7 @@ export async function loadTrueReceiptQuantities(orderId: string): Promise<TrueRe
             }
         }
     }
-    return { orderedBySku, receivedBySku };
+    return { orderedBySku, receivedBySku, total: Number(order.total || 0), subtotal: Number(order.subtotal || 0) };
 }
 
 /**

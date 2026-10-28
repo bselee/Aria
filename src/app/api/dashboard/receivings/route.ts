@@ -20,6 +20,7 @@ import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
 import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
 import { loadTrueReceiptQuantities, receiptShorts } from '@/lib/finale/receipt-quantities';
+import { isFreightRequiredVendor, freightOnPo } from '@/config/freight-required-vendors';
 import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
 import { overbillGracePending } from '@/lib/purchasing/overbill-grace';
 
@@ -1212,6 +1213,23 @@ export async function POST(req: NextRequest) {
                     { error: `Goods not all received — ${detail}`, orderId, shorts },
                     { status: 409 },
                 );
+            }
+
+            // ── Freight gate (2026-10-28) ───────────────────────────────────
+            // Truck-freight vendors (Rootwise, Uline, Garys, International
+            // Molasses, Lind Marine...) must have their freight ON the PO
+            // before the PO closes: "just as invoice aligns, freight should
+            // align as well" — vendor-charged or carrier-added. Finale is the
+            // truth: freight on PO = order total − goods subtotal.
+            if (isFreightRequiredVendor(vendorName)) {
+                const freightNow = freightOnPo(receipt.total, receipt.subtotal);
+                if (freightNow <= 0.5) {
+                    console.warn(`[receivings] complete_po refused for ${orderId}: freight not on PO (${vendorName})`);
+                    return NextResponse.json(
+                        { error: 'Freight not on PO — add trucking freight before completing', orderId, freightNow },
+                        { status: 409 },
+                    );
+                }
             }
 
             const finale = new FinaleClient();
