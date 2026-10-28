@@ -22,6 +22,93 @@ import { recordFreightEvidence } from '@/lib/purchasing/vendor-freight-learning'
 import { assessFreightEvidence } from '@/lib/purchasing/vendor-freight-pattern';
 import type { InvoiceData } from '@/lib/pdf/invoice-parser';
 
+// ── Finale REST payload shapes ─────────────────────────────────────────────
+
+/**
+ * One line on a Finale order document's `orderItemList`, as the REST API
+ * serializes it. Finale is loose about numerics — they may arrive as strings.
+ */
+interface FinaleOrderItem {
+    /** Product/SKU identifier */
+    productId?: string;
+    /** Ordered quantity */
+    quantity?: number | string;
+    /** Unit price on the order */
+    unitPrice?: number | string;
+    /** Finale returns many other per-line fields we never read */
+    [key: string]: unknown;
+}
+
+/**
+ * One fee line on a Finale order document's `orderAdjustmentList`
+ * (freight, tax, tariff, discounts, ...).
+ */
+interface FinaleAdjustmentLine {
+    /** Dollar amount of the adjustment */
+    amount?: number | string;
+    /** Printed description of the adjustment */
+    description?: string;
+    /** Finale product-promo URL that identifies the fee type (e.g. .../10007) */
+    productPromoUrl?: string;
+    /** Allocation of the adjustment across lines/containers */
+    orderAdjustmentAllocationList?: number[];
+    /** Finale returns many other per-adjustment fields we never read */
+    [key: string]: unknown;
+}
+
+/** The supplier party attached to a Finale order document. */
+interface FinaleOrderSupplier {
+    /** Supplier display name (canonical Finale spelling) */
+    name?: string;
+    /** Supplier party URL */
+    partyUrl?: string;
+    /** Finale returns other party fields we never read */
+    [key: string]: unknown;
+}
+
+/**
+ * A Finale order document exactly as `getOrderDetails` returns it — the raw
+ * JSON the GET → modify → POST write path works on. Only the fields this module
+ * reads are narrowed; the rest rides along untouched through the index
+ * signature so the document can be posted back unchanged.
+ */
+interface FinaleOrderDoc {
+    /** Finale status id (ORDER_CREATED / ORDER_LOCKED / ORDER_COMPLETED / ...) */
+    statusId?: string;
+    /** Self URL, shaped `/{accountPath}/api/order/{id}` */
+    orderUrl?: string;
+    /** Order total as Finale reports it */
+    total?: number | string;
+    /** Supplier party */
+    supplier?: FinaleOrderSupplier;
+    /** Ordered lines */
+    orderItemList?: FinaleOrderItem[];
+    /** Fee/adjustment lines (freight lives here) */
+    orderAdjustmentList?: FinaleAdjustmentLine[];
+    /** Everything else in the document (POSTed back verbatim) */
+    [key: string]: unknown;
+}
+
+/**
+ * The GET → unlock → edit → restore lifecycle on FinaleClient. The two status
+ * calls are `protected` on the client class because they belong to its internal
+ * write path, but this reconciler is a caller, not a subclass — so it views them
+ * through this narrow public surface. Same client instance at runtime; the cast
+ * in asPoEditLifecycle() only widens TypeScript visibility (a plain `as` cannot,
+ * because TS keeps the protected flag on the member).
+ */
+interface PoEditLifecycle {
+    /** Unlock a Committed/Completed PO for editing; returns the original statusId */
+    unlockForEditing(currentPO: FinaleOrderDoc, orderId: string): Promise<string>;
+    /** Restore the PO to its pre-edit committed status */
+    restoreOrderStatus(orderId: string, originalStatus: string): Promise<void>;
+}
+
+/** Public view of the client's protected PO edit lifecycle. No runtime effect. */
+function asPoEditLifecycle(finale: FinaleClient): PoEditLifecycle {
+    return finale as unknown as PoEditLifecycle;
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 /**
@@ -168,6 +255,14 @@ function safeNumber(v: unknown): number {
 }
 
 /**
+ * The message of a thrown value, for error strings. Interpolates exactly like
+ * `err.message` did ("undefined" when the thrown value carries no message).
+ */
+function thrownMessage(err: unknown): string {
+    return String((err as { message?: unknown }).message);
+}
+
+/**
  * Sum every freight line on a Finale PO's orderAdjustmentList.
  *
  * Must be a SUM, not the first match. A vendor that ships COLLECT carries two
@@ -175,21 +270,21 @@ function safeNumber(v: unknown): number {
  * was allocated onto the PO. Reading only the first line reports the house charge
  * and hid a five-figure FedEx collect behind a $1.50 "match".
  */
-function extractFreightFromPO(po: any, accountPath: string): number | null {
+function extractFreightFromPO(po: FinaleOrderDoc, accountPath: string): number | null {
     const feeTypeId = FinaleClient.FINALE_FEE_TYPES?.FREIGHT?.id;
     if (!feeTypeId) return null;
 
     const promoUrl = `/${accountPath}/api/productpromo/${feeTypeId}`;
-    const adjustments: any[] = po.orderAdjustmentList || [];
-    const freightLines = adjustments.filter((a: any) => a.productPromoUrl === promoUrl);
+    const adjustments: FinaleAdjustmentLine[] = po.orderAdjustmentList || [];
+    const freightLines = adjustments.filter((a) => a.productPromoUrl === promoUrl);
     if (freightLines.length === 0) return null;
-    return Math.round(freightLines.reduce((sum: number, a: any) => sum + safeNumber(a.amount), 0) * 100) / 100;
+    return Math.round(freightLines.reduce((sum: number, a) => sum + safeNumber(a.amount), 0) * 100) / 100;
 }
 
 /**
  * Find the account path from a PO document (used for constructing promo URLs).
  */
-function getAccountPath(po: any): string {
+function getAccountPath(po: FinaleOrderDoc): string {
     if (po.orderUrl) {
         const parts = po.orderUrl.split('/');
         // orderUrl looks like /{accountPath}/api/order/{id}
@@ -202,9 +297,9 @@ function getAccountPath(po: any): string {
 /**
  * Compute the total from a PO's orderItemList.
  */
-function computePOTotal(po: any): number {
-    const items: any[] = po.orderItemList || [];
-    return items.reduce((sum: number, item: any) => {
+function computePOTotal(po: FinaleOrderDoc): number {
+    const items: FinaleOrderItem[] = po.orderItemList || [];
+    return items.reduce((sum: number, item) => {
         return sum + safeNumber(item.quantity) * safeNumber(item.unitPrice);
     }, 0);
 }
@@ -222,13 +317,13 @@ function computePOTotal(po: any): number {
  */
 export function computeInvoicePODiff(
     invoice: InvoiceData,
-    po: any,
+    po: FinaleOrderDoc,
 ): POInvoiceDiff {
-    const poItems: any[] = po.orderItemList || [];
-    const invoiceLines = (invoice.lineItems || []).filter((l: any) => l.sku || l.description);
+    const poItems: FinaleOrderItem[] = po.orderItemList || [];
+    const invoiceLines = (invoice.lineItems || []).filter((l) => l.sku || l.description);
 
     // Build a map of PO items by productId for O(1) lookup
-    const poItemMap = new Map<string, any>();
+    const poItemMap = new Map<string, FinaleOrderItem>();
     for (const item of poItems) {
         const pid = String(item.productId || '').trim();
         if (pid) poItemMap.set(pid.toLowerCase(), item);
@@ -371,9 +466,11 @@ export async function applyInvoiceModification(
     };
 
     const triggeredBy = request.triggeredBy || DEFAULT_TRIGGER;
+    // Public view of the client's protected unlock/restore lifecycle (no runtime effect)
+    const poEditor = asPoEditLifecycle(finale);
 
     // ── Phase 1: Fetch current PO ──────────────────────────────────────
-    let currentPO: any;
+    let currentPO: FinaleOrderDoc;
     let originalStatus: string = 'ORDER_LOCKED';
     let accountPath: string = 'buildasoilorganics';
 
@@ -384,8 +481,8 @@ export async function applyInvoiceModification(
             return result;
         }
         accountPath = getAccountPath(currentPO);
-    } catch (err: any) {
-        result.errors.push(`Failed to fetch PO ${request.orderId}: ${err.message}`);
+    } catch (err) {
+        result.errors.push(`Failed to fetch PO ${request.orderId}: ${thrownMessage(err)}`);
         return result;
     }
 
@@ -394,9 +491,9 @@ export async function applyInvoiceModification(
 
     // ── Phase 3: Unlock for editing ────────────────────────────────────
     try {
-        originalStatus = await finale.unlockForEditing(currentPO, request.orderId);
-    } catch (err: any) {
-        result.errors.push(`Failed to unlock PO ${request.orderId}: ${err.message}`);
+        originalStatus = await poEditor.unlockForEditing(currentPO, request.orderId);
+    } catch (err) {
+        result.errors.push(`Failed to unlock PO ${request.orderId}: ${thrownMessage(err)}`);
         // Continue — some POs may not need unlocking
     }
 
@@ -422,7 +519,7 @@ export async function applyInvoiceModification(
                 // Only quantity changed — need qty+price with current price
                 // Re-fetch current price from PO
                 const poItem = (currentPO.orderItemList || []).find(
-                    (i: any) => String(i.productId || '').toLowerCase() === adj.productId.toLowerCase(),
+                    (i) => String(i.productId || '').toLowerCase() === adj.productId.toLowerCase(),
                 );
                 const currentPrice = poItem ? safeNumber(poItem.unitPrice) : 0;
                 await finale.updateOrderItemQuantityAndPrice(
@@ -440,8 +537,8 @@ export async function applyInvoiceModification(
                 );
             }
             result.adjustmentsApplied++;
-        } catch (err: any) {
-            result.errors.push(`Failed to adjust ${adj.productId}: ${err.message}`);
+        } catch (err) {
+            result.errors.push(`Failed to adjust ${adj.productId}: ${thrownMessage(err)}`);
         }
     }
 
@@ -459,17 +556,17 @@ export async function applyInvoiceModification(
             );
             result.freightApplied = true;
             freightAfter = request.freightAdjustment!;
-        } catch (err: any) {
-            result.errors.push(`Failed to apply freight adjustment: ${err.message}`);
+        } catch (err) {
+            result.errors.push(`Failed to apply freight adjustment: ${thrownMessage(err)}`);
         }
     }
 
     // ── Phase 6: Restore original PO status ────────────────────────────
     try {
-        await finale.restoreOrderStatus(request.orderId, originalStatus);
+        await poEditor.restoreOrderStatus(request.orderId, originalStatus);
         result.statusRestored = true;
-    } catch (err: any) {
-        result.errors.push(`Failed to restore PO status: ${err.message}`);
+    } catch (err) {
+        result.errors.push(`Failed to restore PO status: ${thrownMessage(err)}`);
     }
 
     // ── Phase 7: Log lifecycle transition → RECONCILED ─────────────────
@@ -489,8 +586,8 @@ export async function applyInvoiceModification(
             },
         );
         result.transitionLogged = true;
-    } catch (err: any) {
-        result.errors.push(`Failed to log lifecycle transition: ${err.message}`);
+    } catch (err) {
+        result.errors.push(`Failed to log lifecycle transition: ${thrownMessage(err)}`);
     }
 
     // ── Phase 8: Record freight evidence ───────────────────────────────
@@ -522,8 +619,8 @@ export async function applyInvoiceModification(
             inboundFreight: assessment.inboundFreight,
         });
         result.freightEvidenceRecorded = true;
-    } catch (err: any) {
-        result.errors.push(`Failed to record freight evidence: ${err.message}`);
+    } catch (err) {
+        result.errors.push(`Failed to record freight evidence: ${thrownMessage(err)}`);
     }
 
     // ── Phase 9: Mark invoice as reconciled in local DB ────────────────
@@ -538,8 +635,8 @@ export async function applyInvoiceModification(
             } else {
                 result.errors.push('No DB client available to mark invoice as reconciled');
             }
-        } catch (err: any) {
-            result.errors.push(`Failed to mark invoice ${request.invoiceId} as reconciled: ${err.message}`);
+        } catch (err) {
+            result.errors.push(`Failed to mark invoice ${request.invoiceId} as reconciled: ${thrownMessage(err)}`);
         }
     }
 

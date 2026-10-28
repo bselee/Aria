@@ -7,7 +7,8 @@ import { createClient as createBrowserClient } from "@/lib/db";
 import { usePurchasingLifecycle } from "@/components/dashboard/command-board/PurchasingLifecycleContext";
 import { isPaidInAdvanceVendor, isBilledUpfrontVendor } from "@/config/paid-in-advance-vendors";
 import { isFreightRequiredVendor } from "@/config/freight-required-vendors";
-import { isDeliverAndBillVendor } from "@/lib/purchasing/deliver-bill-vendors";
+import type { InvoicePODiff } from "@/app/api/dashboard/po-modify/route";
+import type { LineItemAdjustment, ModificationRequest } from "@/lib/purchasing/po-modification";
 
 type ReceivedPO = {
     orderId: string;
@@ -117,10 +118,38 @@ type FreightClass = {
 // Real AP status keyed by Finale orderId
 type ApStatusMap = Record<string, { label: string; cls: string }>;
 
+/** `invoices.discrepancies` jsonb — written either as matcher diffs (field/severity) or fee verdicts (type). */
+type InvoiceDiscrepancy =
+    | { field: string; invoiceValue: unknown; poValue: unknown; delta?: number; severity: "blocking" | "warning" | "info" }
+    | { type: string; feeType?: string; expected?: number; actual?: number; verdict?: string; reason?: string };
+
+/** Row shape from `ap_pending_approvals` (pending-approval list). */
+type PendingApprovalRow = {
+    order_id: string | null;
+    invoice_number: string | null;
+    vendor_name: string | null;
+    status: string;
+};
+
 function parseDenverDate(s: string): Date | null {
     if (!s) return null;
     const d = new Date(s);
     return isNaN(d.getTime()) ? null : d;
+}
+
+/** Message from an unknown thrown value — exactly the `e.message` the panel logged before. */
+function errorMessage(e: unknown): string {
+    if (e instanceof Error) return e.message;
+    if (typeof e === "object" && e !== null && "message" in e) {
+        const m = (e as { message: unknown }).message;
+        if (typeof m === "string") return m;
+    }
+    return String(e);
+}
+
+/** True when the thrown value is a fetch/AbortController abort. */
+function isAbortError(e: unknown): boolean {
+    return typeof e === "object" && e !== null && "name" in e && (e as { name: unknown }).name === "AbortError";
 }
 
 function fmtDateTime(s: string): string {
@@ -312,10 +341,6 @@ function invoiceQtyForItem(
     return null;
 }
 
-function hasPartialLineQuantities(po: ReceivedPO): boolean {
-    return po.items.some(item => item.receivedQuantity !== undefined || item.receivedInWindow !== undefined);
-}
-
 function receiptItemsText(items: Array<{ productId: string; quantity: number }>): string {
     if (items.length === 0) return "receipt recorded; line quantities unavailable";
     return items.map(item => `${item.productId} ×${fmtQty(item.quantity)}`).join(", ");
@@ -330,9 +355,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     const lifecycle = usePurchasingLifecycle();
         const [pos, setPos] = useState<ReceivedPO[]>([]);
         const [matchSuggestions, setMatchSuggestions] = useState<MatchSuggestion[]>([]);
-        const [freightClasses, setFreightClasses] = useState<Record<string, FreightClass>>({});
+        const [, setFreightClasses] = useState<Record<string, FreightClass>>({});
         const [todaySummary, setTodaySummary] = useState<TrackingTodaySummary>(null);
-        const [cachedAt, setCachedAt] = useState<string | null>(null);
         const [apMap, setApMap] = useState<ApStatusMap>({});
         const [loading, setLoading] = useState(true);
         const [refreshing, setRefreshing] = useState(false);
@@ -354,7 +378,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
     /** PO modification state: orderId → expanded & diff data */
     const [modifyingPO, setModifyingPO] = useState<Map<string, {
         loading: boolean;
-        diff?: any;
+        diff?: InvoicePODiff;
         error?: string;
         saving?: boolean;
     }>>(new Map());
@@ -376,21 +400,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
         return lbl === "RECONCILED ±" || lbl === "PENDING";
     }).length;
 
-    async function handleCompletePO(orderId: string, vendorName: string) {
-        try {
-            const res = await fetch("/api/dashboard/receivings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "complete_po", orderId, vendorName }),
-            });
-            if (res.ok) {
-                fetchReceivings(true);
-            }
-        } catch (e: any) {
-            console.error("Complete PO error:", e.message);
-        }
-    }
-
     /** Overbill hold: record the dispute, draft the vendor email, or resolve. */
     const [overbillActing, setOverbillActing] = useState<Set<string>>(new Set());
     async function handleOverbillDisposition(orderId: string, disposition: "draft_vendor" | "resolve") {
@@ -407,14 +416,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     disposition,
                     invoicedTotal: ivr?.invoicedTotal,
                     receivedValue: ivr?.receivedValue,
+                    receivedQty: ivr?.receivedQty,
                     vendorName: po?.supplier,
                 }),
             });
             const json = await res.json();
             if (!res.ok) console.error("Overbill disposition failed:", json.error);
             fetchReceivings(true);
-        } catch (e: any) {
-            console.error("Overbill disposition error:", e.message);
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error("Overbill disposition error:", msg);
         } finally {
             setOverbillActing((prev) => {
                 const next = new Set(prev);
@@ -443,8 +454,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 ...prev,
                 [orderId]: { label: "Approved ✓", cls: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" },
             }));
-        } catch (e: any) {
-            console.error("Approve reconciliation error:", e.message);
+        } catch (e: unknown) {
+            console.error("Approve reconciliation error:", errorMessage(e));
         } finally {
             setApprovingReconcile(prev => {
                 const next = new Set(prev);
@@ -474,17 +485,17 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 next.set(orderId, { loading: false, diff: data.diff, error: undefined });
                 return next;
             });
-        } catch (e: any) {
+        } catch (e: unknown) {
             setModifyingPO(prev => {
                 const next = new Map(prev);
-                next.set(orderId, { loading: false, error: e.message });
+                next.set(orderId, { loading: false, error: errorMessage(e) });
                 return next;
             });
         }
     }
 
     /** Apply PO modifications from the modifier UI. */
-    async function applyPOInvoiceModification(orderId: string, adjustments: any[], freightAdjustment?: number | null) {
+    async function applyPOInvoiceModification(orderId: string, adjustments: LineItemAdjustment[], freightAdjustment?: number | null) {
         setModifyingPO(prev => {
             const next = new Map(prev);
             const existing = next.get(orderId) || { loading: false };
@@ -506,7 +517,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                 if (inv) invoiceId = inv.invoice_number;
             }
 
-            const payload: any = {
+            const payload: ModificationRequest = {
                 orderId,
                 invoiceId,
                 adjustments,
@@ -536,28 +547,13 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             } else {
                 throw new Error(result.errors?.join("; ") || "Modification failed");
             }
-        } catch (e: any) {
+        } catch (e: unknown) {
             setModifyingPO(prev => {
                 const next = new Map(prev);
                 const existing = next.get(orderId) || { loading: false };
-                next.set(orderId, { ...existing, saving: false, error: e.message });
+                next.set(orderId, { ...existing, saving: false, error: errorMessage(e) });
                 return next;
             });
-        }
-    }
-
-    // ── Resend PO email ─────────────────────────────────────────────────────
-    async function resendPOEmail(orderId: string) {
-        try {
-            const res = await fetch("/api/dashboard/active-purchases", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "resend_po_email", orderId }),
-            });
-            if (!res.ok) throw new Error(await res.text());
-            setModifySuccess(`PO ${orderId} email re-sent`);
-        } catch (e: any) {
-            setError(`Resend failed: ${e.message}`);
         }
     }
 
@@ -618,7 +614,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
             .not("po_number", "is", null)
             .order("created_at", { ascending: false })
             .limit(200)
-            .then((res: { data: Array<{ po_number: string; status: string; discrepancies: any[] }> | null }) => {
+            .then((res: { data: Array<{ po_number: string; status: string; discrepancies: InvoiceDiscrepancy[] }> | null }) => {
                 const data = res.data;
                 if (!data) return;
                 const map: ApStatusMap = {};
@@ -658,8 +654,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     .eq("status", "pending")
                     .order("created_at", { ascending: false })
                     .limit(30)
-                    .then(paRes => {
-                        const paData = (paRes as any).data;
+                    .then((paRes: { data: PendingApprovalRow[] | null }) => {
+                        const paData = paRes.data;
                         if (!paData) return;
                         const paMap: ApStatusMap = {};
                         for (const pa of paData) {
@@ -725,10 +721,10 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                     } else if (!hasRows) {
                         setTodaySummary(null);
                     }
-                } catch (e: any) {
+                } catch (e: unknown) {
                     // Keep painted rows on timeout/abort — only surface error when empty
                     if (!posRef.current.length) {
-                        const msg = e?.name === 'AbortError' ? 'Receivings timed out — retry' : e.message;
+                        const msg = isAbortError(e) ? 'Receivings timed out — retry' : errorMessage(e);
                         setError(msg);
                     }
                 } finally {
@@ -1358,6 +1354,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         {/* ── PO Modifier Inline Expansion ── */}
                                                         {modifyingPO.has(po.orderId) && (() => {
                                                         const m = modifyingPO.get(po.orderId)!;
+                                                        /** Reconciliation for this PO — supplies invoiceId to verify/apply. */
+                                                        const rec = po._reconciliation;
                                                         if (m.loading) {
                                                         return (
                                                             <div className="mt-2 px-3 py-3 border border-cyan-500/20 bg-cyan-950/10 rounded">
@@ -1413,7 +1411,6 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         );
                                                         }
                                                         // Has changes: show diff table + apply button
-                                                        const hasVerifiedStep = diff.totalDiff != null && Math.abs(diff.totalDiff) < 0.01;
                                                         return (
                                                         <div className="mt-2 border border-amber-500/30 bg-amber-950/10 rounded overflow-hidden">
                                                             <div className="px-3 py-2 border-b border-amber-500/20 flex items-center justify-between">
@@ -1429,7 +1426,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             </div>
                                                             {/* Per-line-item diff table */}
                                                             <div className="px-3 py-2 space-y-1.5">
-                                                                {diff.lineItems.filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null).map((li: any) => (
+                                                                {diff.lineItems.filter((li) => li.quantityDiff !== null || li.priceDiff !== null).map((li) => (
                                                                     <div key={li.productId} className="flex items-center gap-2 text-[10px] font-mono">
                                                                         <span className="w-16 truncate text-zinc-200 font-semibold">{li.productId}</span>
                                                                         {li.quantityDiff !== null && (
@@ -1468,8 +1465,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                     onClick={e => {
                                                                         e.stopPropagation();
                                                                         const adjustments = diff.lineItems
-                                                                            .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                                                            .map((li: any) => ({
+                                                                            .filter((li) => li.quantityDiff !== null || li.priceDiff !== null)
+                                                                            .map((li) => ({
                                                                                 productId: li.productId,
                                                                                 newQuantity: li.invoiceQuantity ?? undefined,
                                                                                 newUnitPrice: li.invoiceUnitPrice ?? undefined,
@@ -1490,8 +1487,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                             e.stopPropagation();
                                                                             // First apply modifications, then verify & complete
                                                                             const adjustments = diff.lineItems
-                                                                                .filter((li: any) => li.quantityDiff !== null || li.priceDiff !== null)
-                                                                                .map((li: any) => ({
+                                                                                .filter((li) => li.quantityDiff !== null || li.priceDiff !== null)
+                                                                                .map((li) => ({
                                                                                     productId: li.productId,
                                                                                     newQuantity: li.invoiceQuantity ?? undefined,
                                                                                     newUnitPrice: li.invoiceUnitPrice ?? undefined,

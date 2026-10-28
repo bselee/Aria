@@ -13,36 +13,231 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
-import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive, invoiceNumberFromAttachment } from '@/lib/purchasing/invoice-pool';
-import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
+import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive, invoiceNumberFromAttachment, type InvoicePoolRow } from '@/lib/purchasing/invoice-pool';
+import { findPOCandidates, type POCandidate } from '@/lib/purchasing/invoice-po-matcher';
 import { sanitizeOcrPoCandidate } from '@/lib/purchasing/ocr-po-sanitize';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
-import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification } from '@/lib/purchasing/vendor-freight-learning';
-import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
+import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassification, type FreightLearningResult } from '@/lib/purchasing/vendor-freight-learning';
+import type { ReceivedPO } from '@/lib/finale/core-client';
+import type { ReconciliationResult } from '@/lib/finale/reconciler';
+import type { gmail_v1 } from '@googleapis/gmail';
 import { loadTrueReceiptQuantities, receiptShorts } from '@/lib/finale/receipt-quantities';
 import { isFreightRequiredVendor, freightOnPo } from '@/config/freight-required-vendors';
 import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
 import { overbillGracePending } from '@/lib/purchasing/overbill-grace';
 
-// ── In-flight PO reconciliation guard ─────────────────────────────────────
-// Prevents concurrent Finale writes when two browser tabs / bust=1 calls
-// attempt to auto-reconcile the same PO simultaneously.
-// The Set is module-scoped so it resets on server restart / HMR.
-const _reconcilingPOs = new Set<string>();
-
 // ── GET response cache (paint-first) ─────────────────────────────────────
 // HERMIA(2026-08-06): Panel timed out because every GET ran Finale GraphQL
 // + up to 12× findPOCandidates + auto-reconcile Finale writes. Cache the
 // full JSON for 3 minutes so lifecycle paint is ~ms; bust=1 forces rebuild.
+/** One line item on a vendor invoice — raw_data.lineItems or line_items JSONB. */
+interface InvoiceLineItem {
+    sku?: string | null;
+    productId?: string | null;
+    partNumber?: string | null;
+    description?: string | null;
+    qty?: number | null;
+    quantity?: number | null;
+    unit_price?: number | null;
+    ext_price?: number | null;
+}
+
+/** The subset of raw_data JSONB this route reads on a vendor_invoices row. */
+interface InvoiceRawData {
+    lineItems?: InvoiceLineItem[];
+    ocrPoCandidate?: string | null;
+    poNumber?: string | null;
+    orderNumber?: string | null;
+    email_from?: unknown;
+    email_subject?: unknown;
+    source?: string;
+}
+
+/** vendor_invoices row as the receivings panel reads it. */
+interface VendorInvoiceRow extends InvoicePoolRow {
+    id: string;
+    vendor_name: string;
+    invoice_number: string | null;
+    invoice_date: string | null;
+    subtotal: number | null;
+    freight: number | null;
+    tax: number | null;
+    total: number | null;
+    po_number?: string | null;
+    line_items?: string | InvoiceLineItem[] | null;
+    raw_data?: InvoiceRawData | null;
+}
+
+/** A match-pool invoice: a vendor_invoices row plus local-cache provenance. */
+type PoolInvoiceRow = VendorInvoiceRow & { _fromCache?: boolean };
+
+/** A row of the vendor bill pool (queried without a po_number filter). */
+interface VendorBillRow {
+    po_number: string | null;
+    invoice_number: string | null;
+    vendor_name: string | null;
+    total: number | null;
+    line_items: string | InvoiceLineItem[] | null;
+}
+
+/** reconciliation_outcomes row for the received POs. */
+interface ReconciliationOutcomeRow {
+    po_id: string;
+    invoice_id: string | null;
+    outcome: string;
+    created_at: string;
+    resolved_at: string | null;
+}
+
+/** A bill that can be compared against a delivery (linked invoice or covering bill). */
+interface ComparableBill {
+    invoice_number?: string | null;
+    total?: number | null;
+    line_items?: string | InvoiceLineItem[] | null;
+}
+
+/** A vendor bill covering lines of a PO it is not itself linked to. */
+interface CoveringBill extends ComparableBill {
+    invoice_number: string | null;
+    total: number;
+    line_items: string | InvoiceLineItem[] | null;
+}
+
+/** Invoice-vs-delivery comparison stamped on bill-as-they-deliver POs. */
+interface InvoiceVsReceipt {
+    invoicedTotal: number;
+    receivedValue: number;
+    invoicedQty: number;
+    receivedQty: number;
+    overbilled: boolean;
+    gracePending?: boolean;
+    billed: boolean;
+    unmatchedValue?: number;
+}
+
+/** Open overbill dispute stamped on the PO it holds. */
+interface OverbillDisputeStamp {
+    disposition: string;
+    status: string;
+    delta: number;
+    invoicedTotal: number;
+    receivedValue: number;
+    vendorNotified: boolean;
+    vendorDraftId: string | null;
+    createdAt: string;
+    resolution: string | null;
+    balancedNow: boolean;
+}
+
+/** overbill_disputes row (open holds for the received POs). */
+interface OverbillDisputeRow {
+    po_number: string;
+    vendor_name: string | null;
+    invoice_number: string | null;
+    invoiced_total: number | null;
+    received_value: number | null;
+    delta: number | null;
+    status: string;
+    disposition: string;
+    vendor_notified_at: string | null;
+    vendor_draft_id: string | null;
+    resolution: string | null;
+    created_at: string;
+}
+
+/** Reconciliation metadata this route stamps onto each received PO. */
+interface ReceiptReconciliation {
+    invoices: VendorInvoiceRow[];
+    outcomes: ReconciliationOutcomeRow[];
+    hasPendingApproval: boolean;
+    hasAutoApplied: boolean;
+    matchedInvoice: (VendorInvoiceRow & { identityUnknown?: boolean }) | null;
+    billingPattern: 'deliver_and_bill' | null;
+    vendorHasUnlinkedBills?: boolean;
+    coveringBill?: CoveringBill;
+    invoiceVsReceipt?: InvoiceVsReceipt;
+    overbillDispute?: OverbillDisputeStamp;
+    vendorOverbillPattern?: { flagged: number; bills: number };
+}
+
+/** ReceivedPO as this route consumes it: Finale rows carry the PO reference as
+ *  orderId, and every enrichment step stamps reconciliation metadata on. */
+type ReceivedPORow = ReceivedPO & {
+    poNumber?: string;
+    _reconciliation?: ReceiptReconciliation;
+};
+
+/** One line item extracted from a bill for the match suggestions. */
+type ExtractedLineItem = { sku?: string; qty?: number; description?: string };
+
+/** One invoice row in `matchSuggestions` (rendered by the Receivings panel). */
+interface MatchSuggestion {
+    invoiceId: string;
+    invoiceNumber: string | null;
+    vendorName: string;
+    invoiceDate: string | null;
+    invoiceTotal: number | null;
+    candidates: POCandidate[];
+    autoApplyReady: boolean;
+    fromCache: boolean;
+    timedOut?: boolean;
+    invoiceLineItems: ExtractedLineItem[] | null;
+}
+
+/** ap_activity_log.metadata JSONB keys this route reads. */
+interface ApActivityMetadata {
+    poNumber?: string;
+    orderId?: string;
+    invoice?: string;
+    invoiceNumber?: string;
+    vendorName?: string;
+    [key: string]: unknown;
+}
+
+/** ap_activity_log row (the reconciliation audit trail). */
+interface ApActivityLogRow {
+    intent: string;
+    created_at: string;
+    metadata: ApActivityMetadata | null;
+}
+
+/** One row of the recent auto-completions audit trail. */
+interface RecentAutoCompletion {
+    intent: string;
+    poNumber?: string;
+    invoiceNumber?: string;
+    vendorName?: string;
+    createdAt: string;
+    metadata?: ApActivityMetadata | null;
+}
+
+/** ap_pending_approvals row for the PO being approved. */
+interface PendingApprovalRow {
+    id: string;
+    reconciliation_result: ReconciliationResult | null;
+    invoice_number: string | null;
+    status: string;
+}
+
+/** vendor_invoices row read for the overbill vendor draft. */
+interface OverbillInvoiceRow {
+    invoice_number: string | null;
+    total: number | null;
+    raw_data: InvoiceRawData | null;
+}
+
+/** The shape `await createClient().from(…).select(…)` resolves to. */
+type QueryResult<T> = { data: T | null; error: unknown };
+
 type ReceivingsPayload = {
-    received: any[];
+    received: ReceivedPORow[];
     days: number;
     range: string;
     startDate: string;
     asOf: string;
-    matchSuggestions: any[];
-    freightClasses: Record<string, any>;
-    recentAutoCompletions?: any[];
+    matchSuggestions: MatchSuggestion[];
+    freightClasses: Record<string, FreightLearningResult>;
+    recentAutoCompletions?: RecentAutoCompletion[];
     cachedAt?: string;
     cacheAgeMs?: number;
 };
@@ -86,11 +281,11 @@ export function getDenverWeekStart(date: Date): string {
 }
 
 /** Extract line items from a vendor_invoices row's raw_data or cached line_items. */
-function extractLineItems(inv: any): Array<{ sku?: string; qty?: number; description?: string }> | null {
+function extractLineItems(inv: Pick<VendorInvoiceRow, 'raw_data' | 'line_items'>): ExtractedLineItem[] | null {
     // Try raw_data.lineItems first (OCR extraction)
-    const rd = inv.raw_data as Record<string, unknown> | null;
+    const rd = inv.raw_data;
     if (rd?.lineItems && Array.isArray(rd.lineItems) && rd.lineItems.length > 0) {
-        return (rd.lineItems as any[]).map((li: any) => ({
+        return rd.lineItems.map((li) => ({
             sku: li.sku || li.productId || li.partNumber || undefined,
             qty: li.qty ?? li.quantity ?? undefined,
             description: li.description || undefined,
@@ -99,9 +294,9 @@ function extractLineItems(inv: any): Array<{ sku?: string; qty?: number; descrip
     // Fall back to cached line_items JSON string (from invoice_cache)
     if (inv.line_items) {
         try {
-            const parsed = typeof inv.line_items === 'string' ? JSON.parse(inv.line_items) : inv.line_items;
+            const parsed: unknown = typeof inv.line_items === 'string' ? JSON.parse(inv.line_items) : inv.line_items;
             if (Array.isArray(parsed) && parsed.length > 0) {
-                return parsed.map((li: any) => ({
+                return (parsed as InvoiceLineItem[]).map((li) => ({
                     sku: li.sku || li.productId || undefined,
                     qty: li.qty ?? li.quantity ?? undefined,
                     description: li.description || undefined,
@@ -125,8 +320,9 @@ export async function GET(req: NextRequest) {
             ),
         ]);
         return payload;
-    } catch (outerErr: any) {
-        console.warn('[receivings] Route guard caught hang — returning graceful error:', outerErr?.message || outerErr);
+    } catch (outerErr: unknown) {
+        const outerMsg = outerErr instanceof Error ? outerErr.message : String(outerErr);
+        console.warn('[receivings] Route guard caught hang — returning graceful error:', outerMsg);
         // Serve stale cache if we have one rather than empty skeleton
         if (_getCache?.payload?.received?.length) {
             const age = Date.now() - _getCache.at;
@@ -197,17 +393,18 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
         // single-flight background warm-up. See the DECISION block in receivings.ts.
         // Consequence: base GraphQL POs always return promptly even when Finale is
         // rate-limited, and there is no enrichment race left to tune here.
-        let received: any[] = [];
+        let received: ReceivedPORow[] = [];
         try {
             // Soft budget: GraphQL must not eat the whole route timeout.
             received = await Promise.race([
                 finale.getTodaysReceivedPOs(startStr, tomorrowStr),
-                new Promise<any[]>((_, reject) =>
+                new Promise<ReceivedPORow[]>((_, reject) =>
                     setTimeout(() => reject(new Error('getTodaysReceivedPOs soft budget 12s')), 12_000),
                 ),
             ]);
-        } catch (finaleErr: any) {
-            console.warn('[receivings] Finale getTodaysReceivedPOs failed/timeout:', finaleErr?.message || finaleErr);
+        } catch (finaleErr: unknown) {
+            const finaleMsg = finaleErr instanceof Error ? finaleErr.message : String(finaleErr);
+            console.warn('[receivings] Finale getTodaysReceivedPOs failed/timeout:', finaleMsg);
             // Prefer stale received list over empty if cache has one
             if (_getCache?.payload?.received?.length) {
                 received = _getCache.payload.received;
@@ -220,23 +417,23 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
         const sb = createClient();
         if (sb && received.length > 0) {
             const poNumbers = received
-                .map((r: any) => r.poNumber || r.orderId)
+                .map((r) => r.poNumber || r.orderId)
                 .filter(Boolean);
 
             if (poNumbers.length > 0) {
-                const { data: invoices } = await sb
+                const { data: invoices } = (await sb
                     .from('vendor_invoices')
                     .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items')
                     .in('po_number', poNumbers)
-                    .order('created_at', { ascending: false });
+                    .order('created_at', { ascending: false })) as QueryResult<VendorInvoiceRow[]>;
 
-                const { data: outcomes } = await sb
+                const { data: outcomes } = (await sb
                     .from('reconciliation_outcomes')
                     .select('po_id, invoice_id, outcome, outcome_meta, created_at, resolved_at')
                     .in('po_id', poNumbers)
-                    .order('created_at', { ascending: false });
+                    .order('created_at', { ascending: false })) as QueryResult<ReconciliationOutcomeRow[]>;
 
-                const invoiceMap = new Map<string, any[]>();
+                const invoiceMap = new Map<string, VendorInvoiceRow[]>();
                 for (const inv of (invoices || [])) {
                     // Carrier freight archives never satisfy a goods bill. Phantom
                     // rows (OCR "error" identity) STAY in the map — a row with real
@@ -248,7 +445,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     invoiceMap.get(key)!.push(inv);
                 }
 
-                const outcomeMap = new Map<string, any[]>();
+                const outcomeMap = new Map<string, ReconciliationOutcomeRow[]>();
                 for (const oc of (outcomes || [])) {
                     const key = oc.po_id;
                     if (!outcomeMap.has(key)) outcomeMap.set(key, []);
@@ -265,16 +462,16 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     const moneyRow = real
                         ? null
                         : rows
-                            .filter((r: any) => Number(r.total || 0) > 1)
-                            .sort((a: any, b: any) => Number(b.total) - Number(a.total))[0] ?? null;
-                    (po as any)._reconciliation = {
+                            .filter((r) => Number(r.total || 0) > 1)
+                            .sort((a, b) => Number(b.total) - Number(a.total))[0] ?? null;
+                    po._reconciliation = {
                         invoices: rows,
                         outcomes: outcomeMap.get(poNum) || [],
                         hasPendingApproval: (outcomeMap.get(poNum) || []).some(
-                            (o: any) => o.outcome === 'pending_approval' && !o.resolved_at
+                            (o) => o.outcome === 'pending_approval' && !o.resolved_at
                         ),
                         hasAutoApplied: (outcomeMap.get(poNum) || []).some(
-                            (o: any) => o.outcome === 'auto_applied'
+                            (o) => o.outcome === 'auto_applied'
                         ),
                         matchedInvoice: real ?? (moneyRow ? { ...moneyRow, identityUnknown: true } : null),
                         // Vendors that bill per delivery (2026-10-28): the
@@ -287,22 +484,23 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             }
 
             // ── Match suggestions: find unmatched invoices for received PO vendors ──
-            const vendorNames = [...new Set(received.map((r: any) => r.supplier).filter(Boolean))] as string[];
-            let matchSuggestions: any[] = [];
+            const vendorNames = [...new Set(received.map((r) => r.supplier).filter(Boolean))] as string[];
+            const matchSuggestions: MatchSuggestion[] = [];
 
             if (vendorNames.length > 0) {
-                let unmatchedInvoices: any[] = [];
+                let unmatchedInvoices: PoolInvoiceRow[] = [];
                 try {
-                    const { data } = await sb
+                    const { data } = (await sb
                         .from('vendor_invoices')
                         .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, source, source_ref')
                         .is('po_number', null)
                         .in('vendor_name', vendorNames)
                         .order('created_at', { ascending: false })
-                        .limit(40);
+                        .limit(40)) as QueryResult<PoolInvoiceRow[]>;
                     unmatchedInvoices = data || [];
-                } catch (fetchErr: any) {
-                    console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchErr?.message || fetchErr}`);
+                } catch (fetchErr: unknown) {
+                    const fetchMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+                    console.warn(`[receivings] Failed to fetch unmatched invoices: ${fetchMsg}`);
                     unmatchedInvoices = [];
                 }
                 unmatchedInvoices = unmatchedInvoices.filter(
@@ -349,7 +547,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 raw_data: {
                                     lineItems: (() => {
                                         try {
-                                            return JSON.parse(row.line_items || '[]');
+                                            return JSON.parse(row.line_items || '[]') as InvoiceLineItem[];
                                         } catch {
                                             return [];
                                         }
@@ -385,24 +583,25 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 _fromCache: true,
                             });
                     }
-                } catch (cacheErr: any) {
-                    console.warn('[receivings] invoice_cache fallback failed:', cacheErr?.message || cacheErr);
+                } catch (cacheErr: unknown) {
+                    const cacheMsg = cacheErr instanceof Error ? cacheErr.message : String(cacheErr);
+                    console.warn('[receivings] invoice_cache fallback failed:', cacheMsg);
                 }
 
-                const recoveredNumbers = unmatchedInvoices.map((i: any) => i.invoice_number).filter(Boolean);
+                const recoveredNumbers = unmatchedInvoices.map((i) => i.invoice_number).filter(Boolean);
                 if (recoveredNumbers.length > 0) {
-                    const { data: alreadyLinked } = await sb
+                    const { data: alreadyLinked } = (await sb
                         .from('vendor_invoices')
                         .select('invoice_number')
                         .in('invoice_number', recoveredNumbers)
-                        .not('po_number', 'is', null);
-                    const linked = new Set((alreadyLinked || []).map((r: any) => r.invoice_number));
-                    unmatchedInvoices = unmatchedInvoices.filter((i: any) => !linked.has(i.invoice_number));
+                        .not('po_number', 'is', null)) as QueryResult<Array<{ invoice_number: string | null }>>;
+                    const linked = new Set((alreadyLinked || []).map((r) => r.invoice_number));
+                    unmatchedInvoices = unmatchedInvoices.filter((i) => !linked.has(i.invoice_number));
                 }
 
                 if (unmatchedInvoices && unmatchedInvoices.length > 0) {
                                     // HERMIA(2026-08-06): Drop junk invoices before scoring
-                                    unmatchedInvoices = unmatchedInvoices.filter((inv: any) => {
+                                    unmatchedInvoices = unmatchedInvoices.filter((inv) => {
                                         const total = Number(inv.total || 0);
                                         const invNo = String(inv.invoice_number || "").trim();
                                         if (total < 1 && !invNo) return false;
@@ -418,7 +617,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     const toScore = unmatchedInvoices.slice(0, 6);
                                     // Drop dropship-flow invoices before scoring (vendor keyword or known patterns)
                                     const { classifyInvoice } = await import('@/config/invoice-classification');
-                                    const filteredToScore = toScore.filter((inv: any) => {
+                                    const filteredToScore = toScore.filter((inv) => {
                                         const cls = classifyInvoice({
                                             vendorName: inv.vendor_name,
                                             poNumber: inv.raw_data?.ocrPoCandidate || inv.po_number || null,
@@ -456,7 +655,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                                         score: 70,
                                                         reasons: ['OCR PO# candidate'],
                                                         isOpen: true,
-                                                    }],
+                                                    } satisfies POCandidate],
                                                     autoApplyReady: false,
                                                     fromCache: true,
                                                     invoiceLineItems: extractLineItems(inv),
@@ -485,7 +684,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                                 return { inv, status: 'timed_out' as const };
                                             }
                                             return { inv, status: 'scored' as const, result };
-                                        } catch (err: any) {
+                                        } catch (err: unknown) {
                                             return { inv, status: 'error' as const, err };
                                         }
                                     });
@@ -496,7 +695,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         if (sr.status === 'ocr' && sr.ocrSuggestion) {
                                             // Never offer dropship POs as OCR match targets
                                             const ocrCands = (sr.ocrSuggestion.candidates || []).filter(
-                                                (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                                                (c) => !/DropshipPO/i.test(String(c.orderId || '')),
                                             );
                                             if (ocrCands.length === 0) continue;
                                             matchSuggestions.push({ ...sr.ocrSuggestion, candidates: ocrCands });
@@ -518,7 +717,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                             continue;
                                         }
                                         if (sr.status === 'error') {
-                                            console.warn(`[receivings] Match scoring failed for invoice: ${sr.err?.message || sr.err}`);
+                                            const scoreMsg = sr.err instanceof Error ? sr.err.message : String(sr.err);
+                                            console.warn(`[receivings] Match scoring failed for invoice: ${scoreMsg}`);
                                             continue;
                                         }
 
@@ -526,7 +726,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         const result = sr.result!;
                                         // Strip dropship POs from candidates — never match those
                                         result.candidates = (result.candidates || []).filter(
-                                            (c: any) => !/DropshipPO/i.test(String(c.orderId || '')),
+                                            (c) => !/DropshipPO/i.test(String(c.orderId || '')),
                                         );
                                         result.bestMatch = result.candidates[0] || null;
                                         if (result.autoApplyReady && result.bestMatch && /DropshipPO/i.test(result.bestMatch.orderId || '')) {
@@ -565,7 +765,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     [...unlinkedVendors].some(
                                         (u) => (v.length >= 8 && u.includes(v)) || (u.length >= 8 && v.includes(u)),
                                     );
-                                (po as any)._reconciliation.vendorHasUnlinkedBills = hit;
+                                po._reconciliation.vendorHasUnlinkedBills = hit;
                             }
 
                             // ── Vendor bill pool + covering-bill detection (2026-10-27) ──
@@ -577,37 +777,39 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             // price; one hit means the bill covers this PO.
                             const poolCutoff = new Date(Date.now() - 60 * 86400 * 1000).toISOString();
                             const poolOrFilter = vendorNames.map((v) => `vendor_name.ilike.*${v}*`).join(",");
-                            let vendorBillRows: any[] = [];
+                            let vendorBillRows: VendorBillRow[] = [];
                             try {
-                                const { data: billRows } = await sb
+                                const { data: billRows } = (await sb
                                     .from("vendor_invoices")
                                     .select("po_number, invoice_number, vendor_name, total, line_items")
                                     .or(poolOrFilter)
                                     .gte("created_at", poolCutoff)
                                     .order("created_at", { ascending: false })
-                                    .limit(300);
+                                    .limit(300)) as QueryResult<VendorBillRow[]>;
                                 vendorBillRows = billRows || [];
-                            } catch (poolErr: any) {
-                                console.warn(`[receivings] vendor bill pool failed: ${poolErr?.message || poolErr}`);
+                            } catch (poolErr: unknown) {
+                                const poolMsg = poolErr instanceof Error ? poolErr.message : String(poolErr);
+                                console.warn(`[receivings] vendor bill pool failed: ${poolMsg}`);
                             }
                             // Rows linked to a received PO regardless of vendor name:
                             // the OCR "error" vendor on the Miles bill never matches an
                             // ilike filter, but the PO link is exactly the identity that
                             // makes it a candidate for that vendor's sibling POs.
                             try {
-                                const { data: linkedRows } = await sb
+                                const { data: linkedRows } = (await sb
                                     .from("vendor_invoices")
                                     .select("po_number, invoice_number, vendor_name, total, line_items")
-                                    .in("po_number", received.map((r: any) => r.poNumber || r.orderId).filter(Boolean))
+                                    .in("po_number", received.map((r) => r.poNumber || r.orderId).filter(Boolean))
                                     .gte("created_at", poolCutoff)
                                     .order("created_at", { ascending: false })
-                                    .limit(300);
+                                    .limit(300)) as QueryResult<VendorBillRow[]>;
                                 vendorBillRows = vendorBillRows.concat(linkedRows || []);
-                            } catch (linkedErr: any) {
-                                console.warn(`[receivings] linked bill pool failed: ${linkedErr?.message || linkedErr}`);
+                            } catch (linkedErr: unknown) {
+                                const linkedMsg = linkedErr instanceof Error ? linkedErr.message : String(linkedErr);
+                                console.warn(`[receivings] linked bill pool failed: ${linkedMsg}`);
                             }
 
-                            const billPoolByVendor = new Map<string, any[]>();
+                            const billPoolByVendor = new Map<string, VendorBillRow[]>();
                             for (const row of vendorBillRows) {
                                 const rv = String(row.vendor_name || "").toLowerCase().trim();
                                 if (!rv) continue;
@@ -625,11 +827,11 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             }
 
                             for (const po of received) {
-                                const rec = (po as any)._reconciliation;
+                                const rec = po._reconciliation;
                                 if (rec?.matchedInvoice) continue; // bill already named on this row
                                 const v = String(po.supplier || "").toLowerCase().trim();
                                 if (!v) continue;
-                                const pool: any[] = [];
+                                const pool: VendorBillRow[] = [];
                                 for (const row of vendorBillRows) {
                                     const linkedPo = String(row.po_number || "");
                                     const linkedSupplier = supplierByPo.get(linkedPo) || "";
@@ -648,26 +850,26 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 }
                                 if (pool.length === 0) continue;
 
-                                const items = (po.items || []).map((it: any) => ({
+                                const items = (po.items || []).map((it) => ({
                                     ordered: Number(it.orderedQuantity ?? it.quantity ?? 0),
                                     received: it.receivedQuantity !== undefined ? Number(it.receivedQuantity) : null,
                                     unitPrice: Number(it.unitPrice ?? 0),
                                 }));
 
-                                let coveringBill: { invoice_number?: string | null; total?: number } | null = null;
+                                let coveringBill: CoveringBill | null = null;
                                 for (const row of pool) {
-                                    let lines: any[] = [];
+                                    let lines: InvoiceLineItem[] = [];
                                     try {
-                                        const parsed =
+                                        const parsed: unknown =
                                             typeof row.line_items === "string" ? JSON.parse(row.line_items) : row.line_items;
-                                        lines = Array.isArray(parsed) ? parsed : [];
+                                        lines = Array.isArray(parsed) ? (parsed as InvoiceLineItem[]) : [];
                                     } catch { /* not JSON */ }
                                     let hits = 0;
                                     for (const line of lines) {
                                         const q = Number(line?.qty ?? line?.quantity ?? 0);
                                         if (!(q > 0)) continue;
                                         const up = Number(line?.unit_price ?? 0);
-                                        const hit = items.some((it: any) => {
+                                        const hit = items.some((it) => {
                                             const qtyMatch = q === it.ordered || (it.received !== null && q === it.received);
                                             const priceMatch = up > 0 ? Math.abs(up - it.unitPrice) < 0.01 : true;
                                             return qtyMatch && priceMatch;
@@ -705,9 +907,9 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             // items (ordered or received qty + unit price) —
                             // the rest of the bill belongs to sibling POs.
                             for (const po of received) {
-                                const rec = (po as any)._reconciliation;
+                                const rec = po._reconciliation;
                                 if (!rec || !isDeliverAndBillVendor(po.supplier)) continue;
-                                const bills: any[] = [];
+                                const bills: ComparableBill[] = [];
                                 if (rec.matchedInvoice) bills.push(rec.matchedInvoice);
                                 if (
                                     rec.coveringBill &&
@@ -725,11 +927,11 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 });
                                 const billLines: Array<{ qty: number; unit_price: number; ext_price: number }> = [];
                                 for (const b of dedup) {
-                                    let lines: any[] = [];
+                                    let lines: InvoiceLineItem[] = [];
                                     try {
-                                        const parsed =
+                                        const parsed: unknown =
                                             typeof b?.line_items === "string" ? JSON.parse(b.line_items) : b?.line_items;
-                                        lines = Array.isArray(parsed) ? parsed : [];
+                                        lines = Array.isArray(parsed) ? (parsed as InvoiceLineItem[]) : [];
                                     } catch { /* not JSON */ }
                                     for (const l of lines) {
                                         const q = Number(l?.qty ?? l?.quantity ?? 0);
@@ -743,7 +945,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     }
                                 }
 
-                                const items = (po.items || []).map((it: any) => ({
+                                const items = (po.items || []).map((it) => ({
                                     ordered: Number(it.orderedQuantity ?? it.quantity ?? 0),
                                     received: it.receivedQuantity !== undefined ? Number(it.receivedQuantity) : null,
                                     unitPrice: Number(it.unitPrice ?? 0),
@@ -752,7 +954,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 let coveredValue = 0;
                                 let coveredQty = 0;
                                 for (const line of billLines) {
-                                    const hit = items.some((it: any) => {
+                                    const hit = items.some((it) => {
                                         const qtyMatch =
                                             line.qty === it.ordered || (it.received !== null && line.qty === it.received);
                                         const priceMatch =
@@ -807,19 +1009,19 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             // the matched invoice so the review lands on the
                             // bill, not on a guessing sibling.
                             for (const po of received) {
-                                const rec = (po as any)._reconciliation;
+                                const rec = po._reconciliation;
                                 if (!rec || !isDeliverAndBillVendor(po.supplier) || !rec.matchedInvoice) continue;
                                 const vendor = String(po.supplier || "").toLowerCase();
                                 const vendorPos = received.filter(
-                                    (p: any) => String(p.supplier || "").toLowerCase() === vendor,
+                                    (p) => String(p.supplier || "").toLowerCase() === vendor,
                                 );
-                                let lines: any[] = [];
+                                let lines: InvoiceLineItem[] = [];
                                 try {
-                                    const parsed =
+                                    const parsed: unknown =
                                         typeof rec.matchedInvoice?.line_items === "string"
                                             ? JSON.parse(rec.matchedInvoice.line_items)
                                             : rec.matchedInvoice?.line_items;
-                                    lines = Array.isArray(parsed) ? parsed : [];
+                                    lines = Array.isArray(parsed) ? (parsed as InvoiceLineItem[]) : [];
                                 } catch { /* not JSON */ }
                                 let unmatchedValue = 0;
                                 for (const l of lines) {
@@ -827,8 +1029,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     if (!(q > 0)) continue;
                                     const up = Number(l?.unit_price ?? 0);
                                     const ev = Number(l?.ext_price ?? 0) || q * up;
-                                    const hit = vendorPos.some((p: any) =>
-                                        (p.items || []).some((it: any) => {
+                                    const hit = vendorPos.some((p) =>
+                                        (p.items || []).some((it) => {
                                             const ordered = Number(it.orderedQuantity ?? it.quantity ?? 0);
                                             const received =
                                                 it.receivedQuantity !== undefined ? Number(it.receivedQuantity) : null;
@@ -861,7 +1063,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             // was delivered. The dispute row keeps that state
                             // until the credit or revised invoice lands.
                             try {
-                                const { data: disputes } = await sb
+                                const { data: disputes } = (await sb
                                     .from('overbill_disputes')
                                     .select(
                                         'po_number, vendor_name, invoice_number, invoiced_total, received_value, delta, status, disposition, vendor_notified_at, vendor_draft_id, resolution, created_at',
@@ -869,29 +1071,31 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     .in('po_number', poNumbers)
                                     .eq('status', 'open')
                                     .order('created_at', { ascending: false })
-                                    .limit(100);
+                                    .limit(100)) as QueryResult<OverbillDisputeRow[]>;
                                 for (const row of disputes || []) {
                                     const po = received.find(
-                                        (p: any) => String(p.poNumber || p.orderId) === String((row as any).po_number),
+                                        (p) => String(p.poNumber || p.orderId) === String(row.po_number),
                                     );
                                     if (!po) continue;
-                                    const ivr = (po as any)._reconciliation?.invoiceVsReceipt;
-                                    (po as any)._reconciliation.overbillDispute = {
-                                        disposition: (row as any).disposition,
-                                        status: (row as any).status,
-                                        delta: Number((row as any).delta || 0),
-                                        invoicedTotal: Number((row as any).invoiced_total || 0),
-                                        receivedValue: Number((row as any).received_value || 0),
-                                        vendorNotified: !!(row as any).vendor_notified_at,
-                                        vendorDraftId: (row as any).vendor_draft_id || null,
-                                        createdAt: (row as any).created_at,
-                                        resolution: (row as any).resolution,
+                                    const rec = po._reconciliation;
+                                    const ivr = rec?.invoiceVsReceipt;
+                                    rec.overbillDispute = {
+                                        disposition: row.disposition,
+                                        status: row.status,
+                                        delta: Number(row.delta || 0),
+                                        invoicedTotal: Number(row.invoiced_total || 0),
+                                        receivedValue: Number(row.received_value || 0),
+                                        vendorNotified: !!row.vendor_notified_at,
+                                        vendorDraftId: row.vendor_draft_id || null,
+                                        createdAt: row.created_at,
+                                        resolution: row.resolution,
                                         // The receipts now cover the bill — safe to resolve.
                                         balancedNow: !!ivr && !ivr.overbilled,
                                     };
                                 }
-                            } catch (dispErr: any) {
-                                console.warn(`[receivings] overbill dispute query failed: ${dispErr?.message || dispErr}`);
+                            } catch (dispErr: unknown) {
+                                const dispMsg = dispErr instanceof Error ? dispErr.message : String(dispErr);
+                                console.warn(`[receivings] overbill dispute query failed: ${dispMsg}`);
                             }
 
                             // ── Vendor overbill pattern (2026-10-28) ──
@@ -948,25 +1152,18 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
-            let recentAutoCompletions: Array<{
-                intent: string;
-                poNumber?: string;
-                invoiceNumber?: string;
-                vendorName?: string;
-                createdAt: string;
-                metadata?: any;
-            }> = [];
+            let recentAutoCompletions: RecentAutoCompletion[] = [];
             try {
                 const cutoff = new Date(Date.now() - 30 * 86400 * 1000).toISOString(); // 30 days
-                const { data: activityLog } = await sb
+                const { data: activityLog } = (await sb
                     .from('ap_activity_log')
                     .select('intent, created_at, metadata')
                     .in('intent', ['RECONCILIATION_AUTO_APPLIED', 'RECONCILIATION_ERROR'])
                     .gte('created_at', cutoff)
                     .order('created_at', { ascending: false })
-                    .limit(20);
+                    .limit(20)) as QueryResult<ApActivityLogRow[]>;
                 if (activityLog) {
-                    recentAutoCompletions = activityLog.map((row: any) => ({
+                    recentAutoCompletions = activityLog.map((row) => ({
                         intent: row.intent,
                         poNumber: row.metadata?.poNumber || row.metadata?.orderId || '',
                         invoiceNumber: row.metadata?.invoice || row.metadata?.invoiceNumber || '',
@@ -975,8 +1172,10 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         metadata: row.metadata,
                     }));
                 }
-            } catch (completionsErr: any) {
-                console.warn(`[receivings] Failed to fetch recent auto-completions: ${completionsErr?.message || completionsErr}`);
+            } catch (completionsErr: unknown) {
+                const completionsMsg =
+                    completionsErr instanceof Error ? completionsErr.message : String(completionsErr);
+                console.warn(`[receivings] Failed to fetch recent auto-completions: ${completionsMsg}`);
             }
 
             // ── Freight classifications for received PO vendors ──
@@ -985,7 +1184,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         // calls (PostgREST on port 3000), NOT subject to the Finale 500ms
                         // global queue, so real parallelism is achieved here.
                         // HERMIA(2026-08-06): Cap to 12 vendors — full list was burning paint budget.
-                        const freightClasses: Record<string, any> = {};
+                        const freightClasses: Record<string, FreightLearningResult> = {};
                         const vendorsForFreight = vendorNames.slice(0, 12);
                         const fcResults = await mapConcurrent(vendorsForFreight, 8, async (v) => {
                             try {
@@ -994,8 +1193,9 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                     new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
                                 ]);
                                 return { vendor: v, result };
-                            } catch (fcErr: any) {
-                                console.warn(`[receivings] Freight classification failed for ${v}: ${fcErr?.message || fcErr}`);
+                            } catch (fcErr: unknown) {
+                                const fcMsg = fcErr instanceof Error ? fcErr.message : String(fcErr);
+                                console.warn(`[receivings] Freight classification failed for ${v}: ${fcMsg}`);
                                 return { vendor: v, result: undefined };
                             }
                         });
@@ -1020,8 +1220,8 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         // 60s — the background warm-up fills quantities within
                         // ~50s and the next poll must paint them, not replay
                         // "unknown" for 3 minutes.
-                        const hasAnyReceivedQty = (received || []).some((p: any) =>
-                            (p.items || []).some((i: any) => i.receivedQuantity !== undefined),
+                        const hasAnyReceivedQty = (received || []).some((p) =>
+                            (p.items || []).some((i) => i.receivedQuantity !== undefined),
                         );
                         const cacheAt = hasAnyReceivedQty ? Date.now() : Date.now() - (GET_CACHE_TTL_MS - 60_000);
                         _getCache = { at: cacheAt, key: cacheKey, payload };
@@ -1046,9 +1246,10 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     return NextResponse.json(emptyPayload, {
                         headers: { 'Cache-Control': 'no-store', 'X-Receivings-Cache': 'miss-empty' },
                     });
-                } catch (err: any) {
-                    console.error('Receivings API error:', err.message);
-                    return NextResponse.json({ error: err.message }, { status: 500 });
+                } catch (err: unknown) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    console.error('Receivings API error:', message);
+                    return NextResponse.json({ error: message }, { status: 500 });
                 }
             }
 
@@ -1082,15 +1283,15 @@ export async function POST(req: NextRequest) {
             //   3. Only if Finale accepts the write, record 'reconciled' in the DB.
             // A failure at step 2 returns 4xx/5xx so the operator sees it,
             // instead of a green tick over an unposted correction.
-            const { data: approval } = await sb
+            const { data: approval } = (await sb
                 .from('ap_pending_approvals')
                 .select('id, reconciliation_result, invoice_number, status')
                 .eq('order_id', orderId)
                 .order('created_at', { ascending: false })
                 .limit(1)
-                .maybeSingle();
+                .maybeSingle()) as QueryResult<PendingApprovalRow>;
 
-            const reconciliationResult = (approval as any)?.reconciliation_result;
+            const reconciliationResult = approval?.reconciliation_result;
 
             if (!reconciliationResult) {
                 // Nothing to post. Refuse rather than mark the PO reconciled.
@@ -1112,7 +1313,7 @@ export async function POST(req: NextRequest) {
             try {
                 const { applyReconciliation } = await import('@/lib/finale/reconciler');
                 const finaleClient = new FinaleClient();
-                const applyResult = await applyReconciliation(reconciliationResult as any, finaleClient);
+                const applyResult = await applyReconciliation(reconciliationResult, finaleClient);
                 appliedCount = applyResult.applied.length;
 
                 if (applyResult.errors.length > 0) {
@@ -1127,12 +1328,13 @@ export async function POST(req: NextRequest) {
                         { status: 502 },
                     );
                 }
-            } catch (err: any) {
-                console.error(`[receivings/approve] Finale apply failed for ${orderId}:`, err?.message);
+            } catch (err: unknown) {
+                const applyMsg = err instanceof Error ? err.message : String(err);
+                console.error(`[receivings/approve] Finale apply failed for ${orderId}:`, applyMsg);
                 return NextResponse.json(
                     {
                         error: 'Failed to apply reconciliation to Finale',
-                        detail: err?.message ?? String(err),
+                        detail: applyMsg,
                         orderId,
                         applied: false,
                     },
@@ -1141,7 +1343,7 @@ export async function POST(req: NextRequest) {
             }
 
             // Step 3: Finale accepted the write — now it is true to say reconciled.
-            const approvalId = (approval as any)?.id;
+            const approvalId = approval?.id;
             if (approvalId) {
                 await sb
                     .from('ap_pending_approvals')
@@ -1319,13 +1521,13 @@ export async function POST(req: NextRequest) {
             // draft_vendor: Bill's process — hold the bill, draft the vendor
             // email (never sent) so the vendor gets a chance to correct, and
             // enter payment only for what was delivered.
-            const { data: invRows } = await sb
+            const { data: invRows } = (await sb
                 .from('vendor_invoices')
                 .select('invoice_number, total, raw_data')
                 .eq('po_number', orderId)
                 .order('created_at', { ascending: false })
-                .limit(1);
-            const inv = ((invRows || [])[0] || null) as any;
+                .limit(1)) as QueryResult<OverbillInvoiceRow[]>;
+            const inv = (invRows || [])[0] || null;
             const invoicedTotal = Number(body.invoicedTotal ?? inv?.total ?? 0);
             const receivedValue = Number(body.receivedValue ?? 0);
             const delta = Math.round((Math.max(0, invoicedTotal - receivedValue)) * 100) / 100;
@@ -1340,6 +1542,7 @@ export async function POST(req: NextRequest) {
                 invoicedTotal,
                 receivedValue,
                 delta,
+                receivedQtySum: body.receivedQty != null ? Number(body.receivedQty) : null,
             });
             if ('error' in rec) return NextResponse.json({ error: rec.error }, { status: 500 });
 
@@ -1348,14 +1551,18 @@ export async function POST(req: NextRequest) {
             let draftId: string | null = null;
             let draftSubject = '';
             try {
-                const rd = (inv?.raw_data || {}) as Record<string, unknown>;
+                const rd: InvoiceRawData = inv?.raw_data || {};
                 const rawFrom = typeof rd.email_from === 'string' ? String(rd.email_from) : '';
                 const to = (rawFrom.match(/<([^>]+)>/) || [])[1] || (rawFrom.includes('@') ? rawFrom : null);
                 const origSubject = typeof rd.email_subject === 'string' ? String(rd.email_subject) : '';
                 const { getAuthenticatedClient } = await import('@/lib/gmail/auth');
                 const { gmail: GmailApi } = await import('@googleapis/gmail');
                 const auth = await getAuthenticatedClient('default');
-                const gmail = new GmailApi({ auth: auth as any, version: 'v1' });
+                // googleapis declares the entry point as a factory function, but the
+                // runtime object is the API constructor and this call has always used
+                // `new` (which is what binds `this` for the endpoint context).
+                const GmailApiCtor = GmailApi as unknown as new (options: gmail_v1.Options) => gmail_v1.Gmail;
+                const gmail = new GmailApiCtor({ auth, version: 'v1' });
                 const text = overbillDraftBody();
                 draftSubject = `Re: ${origSubject || `Invoice ${inv?.invoice_number || ''}`.trim() || `PO ${orderId}`}`;
                 const headers = [
@@ -1394,8 +1601,9 @@ export async function POST(req: NextRequest) {
                         .eq('po_number', orderId)
                         .eq('status', 'open');
                 }
-            } catch (draftErr: any) {
-                console.warn(`[receivings] overbill vendor draft failed for ${orderId}: ${draftErr?.message || draftErr}`);
+            } catch (draftErr: unknown) {
+                const draftMsg = draftErr instanceof Error ? draftErr.message : String(draftErr);
+                console.warn(`[receivings] overbill vendor draft failed for ${orderId}: ${draftMsg}`);
             }
 
             await sb.from('ap_activity_log').insert({
@@ -1407,8 +1615,9 @@ export async function POST(req: NextRequest) {
         }
 
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });
-    } catch (err: any) {
-        console.error('Receivings POST error:', err.message);
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('Receivings POST error:', message);
+        return NextResponse.json({ error: message }, { status: 500 });
     }
 }
