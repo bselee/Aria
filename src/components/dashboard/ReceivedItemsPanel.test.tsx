@@ -392,6 +392,7 @@ describe("ReceivedItemsPanel", () => {
             hasPendingApproval: false,
             hasAutoApplied: false,
             billingPattern: "deliver_and_bill",
+            vendorOverbillPattern: { flagged: 6, bills: 10 },
             coveringBill: { invoice_number: "error", total: 2688 },
             invoiceVsReceipt: {
               invoicedTotal: 1344,
@@ -414,6 +415,8 @@ describe("ReceivedItemsPanel", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(await screen.findByText(/Bill \$2,688 covers this PO's lines \(\$1,344\)/i)).toBeTruthy();
     expect(screen.queryByText(/Bill exceeds delivery/i)).toBeNull();
+    // Item 6: the vendor pattern chip names the history
+    expect(screen.getByText(/overbilled 6\/10 bills/i)).toBeTruthy();
   });
 
   it("says bill in AP instead of awaiting when the vendor has unlinked bills", async () => {
@@ -544,6 +547,57 @@ describe("ReceivedItemsPanel", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect(await screen.findByText(/Bill exceeds delivery — \$6,000 invoiced vs \$1,200 received/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Draft vendor email/i })).toBeTruthy();
+    // Item 4: the per-line diff renders without a click (SKU appears in both
+    // the header chip and the expanded detail block).
+    expect(screen.getAllByText(/BASLPE102/).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("softens a same-day overbill into a grace line with no action", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-410",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          receivedBy: "NK",
+          receiptStatus: "partial",
+          supplier: "Cowoco",
+          total: 1500,
+          items: [{ productId: "CW101", quantity: 25, orderedQuantity: 25, receivedQuantity: 10, openQuantity: 15 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            billingPattern: "deliver_and_bill",
+            invoiceVsReceipt: {
+              invoicedTotal: 1500,
+              receivedValue: 600,
+              invoicedQty: 25,
+              receivedQty: 10,
+              overbilled: false,
+              gracePending: true,
+              billed: true,
+            },
+            matchedInvoice: null,
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByText(/Bill \$1,500 vs \$600 received — settles after today/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Draft vendor email/i })).toBeNull();
+    expect(screen.queryByText(/Bill exceeds delivery/i)).toBeNull();
   });
 
   it("shows the overbill hold state and resolve action once a dispute is recorded", async () => {
@@ -584,6 +638,7 @@ describe("ReceivedItemsPanel", () => {
               invoicedTotal: 1500,
               receivedValue: 1000,
               vendorNotified: true,
+              vendorDraftId: "r-1234567890",
               createdAt: recentDate,
               resolution: null,
               balancedNow: false,
@@ -610,5 +665,8 @@ describe("ReceivedItemsPanel", () => {
     expect(await screen.findByText(/Overbill \$500 held — pay \$1,000 for delivered\. Vendor notified/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Mark resolved/i })).toBeTruthy();
     expect(screen.queryByText(/Draft vendor email/i)).toBeNull();
+    // One click to the draft (item 1)
+    const draftLink = screen.getByRole("link", { name: /Open vendor draft in Gmail/i });
+    expect(draftLink.getAttribute("href")).toContain("#drafts/r-1234567890");
   });
 });

@@ -57,6 +57,8 @@ type ReceivedPO = {
             receivedQty: number;
             overbilled: boolean;
             billed: boolean;
+            /** Same-day grace: comparison shown softly, flag waits for tomorrow. */
+            gracePending?: boolean;
             /** Value of bill lines matching no received PO of the vendor. */
             unmatchedValue?: number;
         } | null;
@@ -68,10 +70,13 @@ type ReceivedPO = {
             invoicedTotal: number;
             receivedValue: number;
             vendorNotified: boolean;
+            vendorDraftId?: string | null;
             createdAt: string;
             resolution: string | null;
             balancedNow: boolean;
         } | null;
+        /** Vendor overbill history: N holds vs M recent bills (2026-10-28). */
+        vendorOverbillPattern?: { flagged: number; bills: number } | null;
         matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
     };
 };
@@ -1138,14 +1143,29 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     {billLabel(po._reconciliation.coveringBill)}
                                                 </span>
                                             )}
+                                            {po._reconciliation?.vendorOverbillPattern &&
+                                                po._reconciliation.vendorOverbillPattern.flagged > 0 && (
+                                                    <span className="text-[10px] font-mono text-amber-300/70">
+                                                        overbilled {po._reconciliation.vendorOverbillPattern.flagged}/
+                                                        {po._reconciliation.vendorOverbillPattern.bills} bills
+                                                    </span>
+                                                )}
                                             {po.items.length > 3 && (
                                                 <span className="text-xs font-mono text-zinc-500">
                                                     +{po.items.length - 3} more
                                                 </span>
                                             )}
                                         </div>
-                                        {/* For PARTIAL receipts: show per-item detail breakdown */}
-                                        {getDynamicReceiptStatus(po) === "partial" && po.items.length > 0 && (
+                                        {/* Per-item detail: partial receipts AND rows whose bill
+                                            disagrees with the delivery. The diff is the decision —
+                                            it must be visible without a click (2026-10-28). */}
+                                        {(() => {
+                                            const ivr = po._reconciliation?.invoiceVsReceipt;
+                                            const showDiff =
+                                                getDynamicReceiptStatus(po) === "partial" ||
+                                                ivr?.overbilled ||
+                                                (ivr?.unmatchedValue ?? 0) > 0;
+                                            return showDiff && po.items.length > 0 && (
                                             <div className="mt-1.5 space-y-0.5">
                                                 {po.items.map((item) => {
                                                     const ordered = item.orderedQuantity ?? item.quantity;
@@ -1191,7 +1211,8 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     );
                                                 })}
                                             </div>
-                                        )}
+                                            );
+                                        })()}
                                         {po.receiptHistory && po.receiptHistory.length > 0 && (
                                             <div className="mt-1 space-y-0.5 border-l border-amber-500/30 pl-2">
                                                 {po.receiptHistory.map((receipt, index) => (
@@ -1379,6 +1400,12 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         {/* The invoice covers more than the delivery — the exact
                                                             overbill pattern Bill named (2026-10-28): bill-as-they-deliver
                                                             vendors "almost always over bill us a complete PO". */}
+                                                        {rec?.invoiceVsReceipt?.gracePending && !rec?.overbillDispute && (
+                                                            <div className="mt-1 text-[11px] font-mono text-amber-300/90">
+                                                                Bill ${rec.invoiceVsReceipt.invoicedTotal.toLocaleString()} vs $
+                                                                {rec.invoiceVsReceipt.receivedValue.toLocaleString()} received — settles after today.
+                                                            </div>
+                                                        )}
                                                         {rec?.invoiceVsReceipt?.overbilled && !rec?.overbillDispute && (
                                                             <div className="mt-1 text-[11px] font-mono text-rose-300 flex items-center justify-between gap-2">
                                                                 <span>
@@ -1398,6 +1425,21 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             <div className="mt-1 text-[11px] font-mono text-rose-300">
                                                                 Bill line covers nothing delivered — $
                                                                 {rec.invoiceVsReceipt.unmatchedValue.toLocaleString()}. Verify against receipts.
+                                                            </div>
+                                                        )}
+
+                                                        {/* One click to the vendor draft (2026-10-28): review and
+                                                            send without hunting through Drafts. */}
+                                                        {rec?.overbillDispute?.vendorDraftId && (
+                                                            <div className="mt-1 text-[11px] font-mono">
+                                                                <a
+                                                                    href={`https://mail.google.com/mail/u/0/#drafts/${rec.overbillDispute.vendorDraftId}`}
+                                                                    target="_blank"
+                                                                    rel="noopener noreferrer"
+                                                                    className="text-blue-400 hover:text-blue-300 underline underline-offset-2 decoration-blue-500/30"
+                                                                >
+                                                                    Open vendor draft in Gmail
+                                                                </a>
                                                             </div>
                                                         )}
 

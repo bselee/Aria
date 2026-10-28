@@ -15,6 +15,7 @@ create table if not exists public.overbill_disputes (
     disposition text not null default 'held' check (disposition in ('held')),
     status text not null default 'open' check (status in ('open', 'resolved')),
     vendor_notified_at timestamptz,
+    vendor_draft_id text,
     resolution text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()

@@ -20,8 +20,40 @@ import {
   money,
   renderOverdueHtml,
   runLabel,
+  type HeldDispute,
 } from "../src/lib/ap/overdue-bills";
 import { sendGmailPdfEmail } from "../src/lib/gmail/send-email";
+import { createClient } from "../src/lib/db";
+
+/** Open overbill holds from the local data plane (best-effort: report still
+ *  renders without them when PostgREST is down). */
+async function fetchOpenOverbillDisputes(): Promise<HeldDispute[]> {
+  try {
+    const db = createClient();
+    if (!db) return [];
+    const { data } = await db
+      .from("overbill_disputes")
+      .select(
+        "po_number, vendor_name, invoice_number, invoiced_total, received_value, delta, vendor_notified_at, created_at",
+      )
+      .eq("status", "open")
+      .order("created_at", { ascending: true })
+      .limit(50);
+    return ((data || []) as Array<Record<string, unknown>>).map((r) => ({
+      poNumber: String(r.po_number || ""),
+      vendorName: String(r.vendor_name || ""),
+      invoiceNumber: r.invoice_number ? String(r.invoice_number) : null,
+      invoicedTotal: Number(r.invoiced_total || 0),
+      receivedValue: Number(r.received_value || 0),
+      delta: Number(r.delta || 0),
+      vendorNotified: !!r.vendor_notified_at,
+      createdAt: String(r.created_at || ""),
+    }));
+  } catch (err) {
+    console.warn(`[overdue-bills] held-dispute fetch failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
 
 const ARIA = path.resolve(__dirname, "..");
 const REPORTS = path.join(ARIA, "reports");
@@ -69,16 +101,18 @@ async function main(): Promise<void> {
 
   const csvText = fs.readFileSync(csvPath, "utf8");
   const paymentsCsv = paymentsPath ? fs.readFileSync(paymentsPath, "utf8") : undefined;
+  const heldDisputes = await fetchOpenOverbillDisputes();
   const model = buildOverdueModel(
     csvText,
     asOf,
     path.basename(csvPath),
     new Date().toLocaleString("en-US", { timeZone: "America/Denver" }),
     paymentsCsv,
+    heldDisputes,
   );
 
-  if (model.overdue.length === 0) {
-    console.log("No overdue bills. Nothing to report.");
+  if (model.overdue.length === 0 && model.heldDisputes.length === 0) {
+    console.log("No overdue bills and no held overbills. Nothing to report.");
     return;
   }
 

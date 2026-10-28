@@ -68,6 +68,18 @@ export interface PaymentRun {
 }
 
 /** Everything the renderer needs. */
+export interface HeldDispute {
+  poNumber: string;
+  vendorName: string;
+  invoiceNumber: string | null;
+  invoicedTotal: number;
+  receivedValue: number;
+  delta: number;
+  vendorNotified: boolean;
+  createdAt: string;
+}
+
+/** Everything the renderer needs. */
 export interface OverdueModel {
   asOf: string;
   source: string;
@@ -88,6 +100,8 @@ export interface OverdueModel {
     unappliedCount: number;
     totalUnapplied: number;
   } | null;
+  /** Open overbill holds: not entered, pay only what was delivered. */
+  heldDisputes: HeldDispute[];
   runs: PaymentRun[];
   buckets: { bucket: AgingBucket; count: number; amount: number }[];
   vendors: { vendor: string; count: number; amount: number; oldestDue: string }[];
@@ -484,6 +498,7 @@ export function buildOverdueModel(
   source: string,
   generatedAt: string,
   paymentsCsv?: string,
+  heldDisputes: HeldDispute[] = [],
 ): OverdueModel {
   const parsed = parseBillsCsv(csvText);
   const allocation = paymentsCsv ? applyPayments(parsed, parsePaymentsCsv(paymentsCsv), asOf) : null;
@@ -543,6 +558,7 @@ export function buildOverdueModel(
       : null,
     totalOverdue: sumAmount(overdue),
     totalOverdueIncludingExcluded: sumAmount(allOverdue),
+    heldDisputes,
     runs: buildPaymentPlan(allOverdue, asOf, bills, 3),
     buckets: agingBuckets(overdue),
     vendors: vendorTotals(overdue),
@@ -710,6 +726,35 @@ export function renderOverdueHtml(model: OverdueModel): string {
     `<p class="run-detail">“New due” = bills in the export that come due between the prior run and this one; that is the cash to keep on hand on top of catch-up.</p>`,
   );
   parts.push(`</div>`);
+
+  // Held overbills — do not pay yet (2026-10-28)
+  if (model.heldDisputes.length > 0) {
+    parts.push(`<div class="keep"><h2>Held Overbills — Do Not Pay Yet</h2>`);
+    parts.push(
+      `<p class="summary">These bills are NOT entered in Bill.com. Pay only what was delivered. A credit or revised invoice resolves the hold.</p>`,
+    );
+    parts.push(`<table>
+  <col class="bill-vendor"><col class="bill-inv"><col class="bill-due"><col class="bill-amt"><col class="bill-amt"><col class="bill-amt"><col class="bill-inv">
+  <thead><tr><th>Vendor</th><th>PO</th><th>Invoice #</th><th class="amt">Billed</th><th class="amt">Delivered</th><th class="amt">Hold</th><th>Since</th></tr></thead>
+  <tbody>`);
+    for (const d of model.heldDisputes) {
+      parts.push(
+        `<tr><td>${esc(d.vendorName)}</td><td>${esc(d.poNumber)}</td><td>${esc(
+          d.invoiceNumber || "—",
+        )}</td><td class="amt">${money(d.invoicedTotal)}</td><td class="amt">${money(
+          d.receivedValue,
+        )}</td><td class="amt">${money(d.delta)}</td><td>${d.createdAt.slice(0, 10)}${
+          d.vendorNotified ? " · notified" : ""
+        }</td></tr>`,
+      );
+    }
+    parts.push(
+      `<tr class="total-row"><td>Total held</td><td></td><td></td><td></td><td></td><td class="amt">${money(
+        model.heldDisputes.reduce((a, d) => a + d.delta, 0),
+      )}</td><td></td></tr>`,
+    );
+    parts.push(`</tbody></table></div>`);
+  }
 
   // Detail, oldest first
   parts.push(`<div><h2>Past Due — Oldest First</h2>`);

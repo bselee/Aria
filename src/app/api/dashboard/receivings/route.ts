@@ -21,6 +21,7 @@ import { recordFreightEvidence, markVendorFreightPattern, getVendorFreightClassi
 import { reconcileInvoiceToPO, applyReconciliation } from '@/lib/finale/reconciler';
 import { loadTrueReceiptQuantities, receiptShorts } from '@/lib/finale/receipt-quantities';
 import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
+import { overbillGracePending } from '@/lib/purchasing/overbill-grace';
 
 // ── In-flight PO reconciliation guard ─────────────────────────────────────
 // Prevents concurrent Finale writes when two browser tabs / bust=1 calls
@@ -780,13 +781,20 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 }
                                 receivedValue = Math.round(receivedValue * 100) / 100;
                                 coveredValue = Math.round(coveredValue * 100) / 100;
+                                const rawOverbilled =
+                                    coveredValue > 0 && receivedValue > 0 && coveredValue > receivedValue * 1.05 + 5;
+                                // Same-day grace (2026-10-28): the receipt is
+                                // stamped today — the delivery day has not
+                                // settled. Show the comparison softly; the
+                                // hard flag waits for tomorrow.
+                                const grace = rawOverbilled && overbillGracePending(po.receiveDateTime || po.receiveDate);
                                 rec.invoiceVsReceipt = {
                                     invoicedTotal: coveredValue,
                                     receivedValue,
                                     invoicedQty: coveredQty,
                                     receivedQty,
-                                    overbilled:
-                                        coveredValue > 0 && receivedValue > 0 && coveredValue > receivedValue * 1.05 + 5,
+                                    overbilled: rawOverbilled && !grace,
+                                    gracePending: rawOverbilled && grace,
                                     billed: coveredValue > 0,
                                 };
                             }
@@ -855,7 +863,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 const { data: disputes } = await sb
                                     .from('overbill_disputes')
                                     .select(
-                                        'po_number, vendor_name, invoice_number, invoiced_total, received_value, delta, status, disposition, vendor_notified_at, resolution, created_at',
+                                        'po_number, vendor_name, invoice_number, invoiced_total, received_value, delta, status, disposition, vendor_notified_at, vendor_draft_id, resolution, created_at',
                                     )
                                     .in('po_number', poNumbers)
                                     .eq('status', 'open')
@@ -874,6 +882,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                         invoicedTotal: Number((row as any).invoiced_total || 0),
                                         receivedValue: Number((row as any).received_value || 0),
                                         vendorNotified: !!(row as any).vendor_notified_at,
+                                        vendorDraftId: (row as any).vendor_draft_id || null,
                                         createdAt: (row as any).created_at,
                                         resolution: (row as any).resolution,
                                         // The receipts now cover the bill — safe to resolve.
@@ -882,6 +891,53 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 }
                             } catch (dispErr: any) {
                                 console.warn(`[receivings] overbill dispute query failed: ${dispErr?.message || dispErr}`);
+                            }
+
+                            // ── Vendor overbill pattern (2026-10-28) ──
+                            // These vendors overbill repeatedly. Show the
+                            // pattern itself on their rows: N holds in the
+                            // last 90 days against M bills in the last 60.
+                            try {
+                                const patternVendors = vendorNames.filter((v) => isDeliverAndBillVendor(v));
+                                if (patternVendors.length > 0) {
+                                    const [disputeRes, billRes] = await Promise.all([
+                                        sb
+                                            .from('overbill_disputes')
+                                            .select('vendor_name')
+                                            .gte('created_at', new Date(Date.now() - 90 * 86400 * 1000).toISOString())
+                                            .in('vendor_name', patternVendors)
+                                            .limit(200),
+                                        sb
+                                            .from('vendor_invoices')
+                                            .select('vendor_name')
+                                            .gte('created_at', new Date(Date.now() - 60 * 86400 * 1000).toISOString())
+                                            .in('vendor_name', patternVendors)
+                                            .limit(500),
+                                    ]);
+                                    const flagCount = new Map<string, number>();
+                                    for (const r of (disputeRes.data || []) as any[]) {
+                                        const v = String(r.vendor_name || '');
+                                        if (v) flagCount.set(v, (flagCount.get(v) || 0) + 1);
+                                    }
+                                    const billCount = new Map<string, number>();
+                                    for (const r of (billRes.data || []) as any[]) {
+                                        const v = String(r.vendor_name || '');
+                                        if (v) billCount.set(v, (billCount.get(v) || 0) + 1);
+                                    }
+                                    for (const po of received) {
+                                        if (!isDeliverAndBillVendor(po.supplier)) continue;
+                                        const flagged = flagCount.get(po.supplier) || 0;
+                                        const bills = billCount.get(po.supplier) || 0;
+                                        if (flagged > 0) {
+                                            (po as any)._reconciliation.vendorOverbillPattern = {
+                                                flagged,
+                                                bills,
+                                            };
+                                        }
+                                    }
+                                }
+                            } catch (patErr: any) {
+                                console.warn(`[receivings] vendor overbill pattern failed: ${patErr?.message || patErr}`);
                             }
 
             // ── Recent auto-completions (audit trail for auto-processed) ──
@@ -1276,14 +1332,7 @@ export async function POST(req: NextRequest) {
                 const { gmail: GmailApi } = await import('@googleapis/gmail');
                 const auth = await getAuthenticatedClient('default');
                 const gmail = new GmailApi({ auth: auth as any, version: 'v1' });
-                const text = overbillDraftBody({
-                    poNumber: orderId,
-                    vendorName: body.vendorName ?? null,
-                    invoiceNumber: inv?.invoice_number ?? null,
-                    invoicedTotal,
-                    receivedValue,
-                    delta,
-                });
+                const text = overbillDraftBody();
                 draftSubject = `Re: ${origSubject || `Invoice ${inv?.invoice_number || ''}`.trim() || `PO ${orderId}`}`;
                 const headers = [
                     'From: bill.selee@buildasoil.com',
@@ -1313,7 +1362,11 @@ export async function POST(req: NextRequest) {
                 if (draftCreated) {
                     await sb
                         .from('overbill_disputes')
-                        .update({ vendor_notified_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+                        .update({
+                            vendor_notified_at: new Date().toISOString(),
+                            vendor_draft_id: draftId,
+                            updated_at: new Date().toISOString(),
+                        })
                         .eq('po_number', orderId)
                         .eq('status', 'open');
                 }

@@ -29,6 +29,7 @@ const EXPECTED_JOBS = [
     "issue-orchestrator",
     "expire-stale-approvals",
     "vendor-lead-time-tracker",
+    "overbill-auto-resolve",
 ];
 
 beforeAll(async () => {

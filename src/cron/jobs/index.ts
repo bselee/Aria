@@ -1378,6 +1378,26 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Overbill hold auto-resolve — closes a held overbill when a later bill for
+// the same PO lands at or below the delivered value (the vendor's revision
+// or credit). Never resolves on a bill that still exceeds the delivery.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "overbill-auto-resolve",
+    schedule: "15 9-17 * * 1-5",
+    onFail: "log",
+    description: "Close held overbills when a revised bill covers only what was delivered.",
+    handler: async () => {
+        const { autoResolveBalancedDisputes } = await import("@/lib/purchasing/overbill-dispute");
+        const result = await autoResolveBalancedDisputes();
+        if (result.resolved > 0) {
+            console.log(`[overbill-auto-resolve] resolved=${result.resolved}, skipped=${result.skipped}`);
+        }
+    },
+    budget: { durationMs: 60_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DB Retention: Reclaim disk from email_inbox_queue and cron_runs nightly.
 // Runs at 3:00 AM MT (low-activity window). VACUUM FULL on a local dev DB
 // completes in < 1 second; on production replica it needs a maintenance window.

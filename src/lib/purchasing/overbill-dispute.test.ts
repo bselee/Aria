@@ -3,18 +3,11 @@
  * @purpose Tests for the overbill hold flow and the vendor draft voice.
  */
 import { describe, it, expect } from "vitest";
-import { overbillDraftBody } from "./overbill-dispute";
+import { overbillDraftBody, shouldAutoResolve } from "./overbill-dispute";
 
 describe("overbillDraftBody", () => {
     it("uses Bill's verbatim voice — grace first, no figures in the email", () => {
-        const body = overbillDraftBody({
-            poNumber: "125409",
-            vendorName: "Thrive Probiotics",
-            invoiceNumber: "3001",
-            invoicedTotal: 1500,
-            receivedValue: 1000,
-            delta: 500,
-        });
+        const body = overbillDraftBody();
         expect(body).toBe(
             "Hey- Noticed the delivery did not match up with the invoice. What would you like to do?",
         );
@@ -23,15 +16,40 @@ describe("overbillDraftBody", () => {
     });
 
     it("is short with no em or double dashes (Bill voice)", () => {
-        const body = overbillDraftBody({
-            poNumber: "125379",
-            vendorName: "Miles Filippelli",
-            invoiceNumber: "error",
-            invoicedTotal: 2688,
-            receivedValue: 1344,
-            delta: 1344,
-        });
+        const body = overbillDraftBody();
         expect(body.split(/\s+/).length).toBeLessThanOrEqual(45);
         expect(body).not.toMatch(/—|--/);
+    });
+});
+
+describe("shouldAutoResolve", () => {
+    const heldAt = "2026-10-28T10:00:00.000Z";
+
+    it("resolves when a later bill lands at or below the delivered value", () => {
+        const d = shouldAutoResolve(
+            { poNumber: "PO-1", receivedValue: 1000, createdAt: heldAt },
+            [{ total: 1000, createdAt: "2026-10-29T09:00:00.000Z" }],
+        );
+        expect(d.resolve).toBe(true);
+        expect(d.reason).toContain("auto");
+    });
+
+    it("never resolves on a later bill that still exceeds the delivery", () => {
+        const d = shouldAutoResolve(
+            { poNumber: "PO-1", receivedValue: 1000, createdAt: heldAt },
+            [{ total: 1500, createdAt: "2026-10-29T09:00:00.000Z" }],
+        );
+        expect(d.resolve).toBe(false);
+    });
+
+    it("ignores bills that predate the hold", () => {
+        const d = shouldAutoResolve(
+            { poNumber: "PO-1", receivedValue: 1000, createdAt: heldAt },
+            [
+                { total: 500, createdAt: "2026-10-27T09:00:00.000Z" },
+                { total: 800, createdAt: "2026-10-26T09:00:00.000Z" },
+            ],
+        );
+        expect(d.resolve).toBe(false);
     });
 });
