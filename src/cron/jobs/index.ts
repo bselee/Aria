@@ -1398,6 +1398,24 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Freight auto-align (2026-10-28): assess truck-freight vendors' POs, apply
+// vendor-charged or Destination freight that is missing, and complete the PO
+// once every leg aligns. Carrier (FedEx) freight stays with the weekly
+// mailbox reconciler. Silent ops: logs + ap_activity_log only, no Slack.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "freight-auto-align",
+    schedule: "0 10,15 * * 1-5",
+    onFail: "log",
+    description: "Apply missing vendor/Destination freight and complete aligned truck-freight POs.",
+    handler: async () => {
+        const { runFreightAutoAlign } = await import("@/lib/purchasing/freight-auto-align");
+        await runFreightAutoAlign();
+    },
+    budget: { durationMs: 8 * 60_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DB Retention: Reclaim disk from email_inbox_queue and cron_runs nightly.
 // Runs at 3:00 AM MT (low-activity window). VACUUM FULL on a local dev DB
 // completes in < 1 second; on production replica it needs a maintenance window.

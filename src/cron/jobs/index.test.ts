@@ -30,6 +30,7 @@ const EXPECTED_JOBS = [
     "expire-stale-approvals",
     "vendor-lead-time-tracker",
     "overbill-auto-resolve",
+    "freight-auto-align",
 ];
 
 beforeAll(async () => {
