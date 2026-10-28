@@ -526,6 +526,7 @@ async function enrichInvoiceForPoMatch(args: {
     const { upsertVendorInvoice } = await import("@/lib/storage/vendor-invoices");
     const { uploadPDF } = await import("@/lib/storage/supabase-storage");
     const { upsertInvoiceCache } = await import("@/lib/storage/purchasing-cache");
+    const { validatePoRef } = await import("@/lib/purchasing/po-ref-validator");
 
     let rawText = (args.ocrHint || "").trim();
     // Photo/scanned invoices need vision OCR — pdf-parse alone is near-empty
@@ -576,6 +577,18 @@ async function enrichInvoiceForPoMatch(args: {
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
         if (m) norm.poNumber = m[1].padStart(5, "0");
+    }
+
+    // (c) PO-ref validation: null any ref that is neither Finale-shaped nor in
+    // purchase_orders, so a freight "ADV ORDER 4798" never becomes a phantom PO.
+    // The rejected string is logged inside validatePoRef as a document trace;
+    // the null then flows to every downstream write (bridge, matched_po_number,
+    // invoice_cache, vendor_invoices).
+    if (norm.poNumber) {
+        norm.poNumber = await validatePoRef(
+            norm.poNumber,
+            `gmail=${args.gmailMessageId} pdf=${args.pdfFilename}`,
+        );
     }
 
     // ── WS2 (2026-08-05): bridge invoice tracking → shipments ──

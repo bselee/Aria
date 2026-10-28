@@ -21,6 +21,24 @@ describe("extractPOByRegex", () => {
 
         expect(extractPOByRegex("Invoice text with no direct PO label", tables)).toBe("124547");
     });
+
+    it("rejects a PO candidate on a shipment-context line (ADV ORDER)", () => {
+        expect(extractPOByRegex("ADV ORDER # 124547\nTotal $100.00")).toBeNull();
+    });
+
+    it("rejects a candidate whose label line above is shipment-context (B.L.)", () => {
+        expect(extractPOByRegex("B.L. P.O. Number\n124547")).toBeNull();
+    });
+
+    it("keeps goods-vendor PO labels (Your Order No. / Customer Ref)", () => {
+        expect(extractPOByRegex("Your Order No. 124547\nTotal $50.00")).toBe("124547");
+        expect(extractPOByRegex("Customer Ref 124547\nTotal $50.00")).toBe("124547");
+    });
+
+    it("keeps explicit PO labels (P.O. NUMBER / Purchase Order #)", () => {
+        expect(extractPOByRegex("P.O. NUMBER 125213")).toBe("125213");
+        expect(extractPOByRegex("Purchase Order # 125376")).toBe("125376");
+    });
 });
 
 describe("parseInvoice", () => {

@@ -27,6 +27,7 @@ import {
     upsertShipmentEvidence,
     normalizePoString,
 } from "@/lib/tracking/shipment-intelligence";
+import { validatePoRef } from "@/lib/purchasing/po-ref-validator";
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -118,10 +119,17 @@ export async function bridgeInvoiceTrackingToShipments(
     }
 
     // 2. Resolve PO: explicit invoice parse wins, then OCR, then null (orphan-safe).
-    const poNumber =
+    const resolvedPo =
         normalizePoString(args.poNumber) ||
         extractPONumberFromText(ocrText) ||
         null;
+    // Validate against Finale shape / purchase_orders before linking — a freight
+    // "ADV ORDER 4798" must never become a PO. Rejection nulls the PO (fails
+    // open), so the shipment still links at 0.75 as an orphan.
+    const poNumber = await validatePoRef(
+        resolvedPo,
+        `source=${args.source} ref=${args.sourceRef}`,
+    );
     const confidence = poNumber ? PO_CONFIDENCE : NO_PO_CONFIDENCE;
 
     // 3. Upsert each unique hit. When an LTL carrier is detected in the text

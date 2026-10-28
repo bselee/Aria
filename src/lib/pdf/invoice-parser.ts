@@ -81,7 +81,7 @@ Extract ALL fields from the invoice with exact values — do not round or interp
 ## Other fields
 
 - Payment terms: exact text as written (Net 30, 2/10 Net 30, Due on Receipt, etc.)
-- **PO numbers**: Look in ALL of these locations — dedicated "PO Number" field, "Customer Reference", "Reference", "Your Ref", "Memo", "Notes", "Order #", and header text. Many vendors put the PO in a memo/reference field, not a labeled PO box. If multiple candidate numbers exist, prefer the one that looks like a Finale PO (4+ digits, numeric).
+- **PO numbers**: A PO is OUR purchase order to the vendor. Look for it under labels "PO Number", "P.O.", "Purchase Order", "Customer PO", "Your Order #", "Customer Reference", "Your Ref", "Memo", or "Notes" — many vendors put the PO in a memo/reference field rather than a labeled PO box. Numbers under "Order #", "Reference", "REF", "B.L.", "BOL", "PRO", "ADV ORDER", or "SO#" are shipment/customer-order references, NOT purchase orders — never treat them as a PO. Prefer the candidate shaped like a Finale PO (6 digits starting with 1, e.g. 125257; or an 8-digit dropship number starting with 2). If the only numeric candidates sit on lines labelled Order/REF/B.L./BOL/PRO/ADV ORDER/SO#, return poNumber: null — do not fall through to another number on the page.
 - **Tracking numbers**: Scan the ENTIRE invoice text for tracking numbers — they often appear unlabeled in shipping sections, at the bottom of the page, or in small-print reference lines. Common formats: UPS (starts with "1Z"), FedEx (12 or 15 digits, often starting "96"), USPS (20-22 digits starting 94/91/82), DHL (10 digits), and freight PRO numbers. Also look for labels like "TRK#", "TRK", or "TRACK#" that may prefix a tracking number. Extract ALL found tracking numbers — the system deduplicates. Also check for a "Ship Date" anywhere in the document.
 - BOL numbers, PRO numbers
 - Due date: calculate from invoice date + terms if not explicitly stated
@@ -276,16 +276,72 @@ const PO_LABEL_PATTERNS: RegExp[] = [
     /(?:Memo|Notes?|Customer\s+Ref(?:erence)?)\s*[:.]?\s*(\d{4,})/i,
 ];
 
+// ── Shipment-context exclusion (freight refs are not POs) ─────────────────
+//
+// Freight/carrier documents (AAA Cooper statements, BOLs, LTL bills) carry
+// numbers under labels like "Order #", "Ref #", "PRO", "B.L.", "BOL",
+// "ADV ORDER". Those are shipment/customer-order references, NOT purchase
+// orders. A PO candidate sitting on (or directly beneath) a line bearing one
+// of these tokens is rejected, even when a permissive label pattern (e.g.
+// "Your Order", "Reference", "Memo") would otherwise match it. Goods vendors
+// (Uline "Your Order No.", Coats "Customer Ref") are unaffected because their
+// lines carry none of these tokens.
+const SHIPMENT_CONTEXT_RE =
+    /\b(?:PRO|B\.?\s*L\.?|BOL|TRAILER|STATEMENT)\b|\bSO\s*#?|\bADV\s+ORDER\b|\bINVOICE\s+DATE\b/i;
+
+function isShipmentContextLine(line: string): boolean {
+    return SHIPMENT_CONTEXT_RE.test(line);
+}
+
+/**
+ * True when the PO candidate at `candidateIndex` in `rawText` sits on a line
+ * (or the line directly above it, for the value-below-label layout) that is
+ * shipment-context. Used to reject freight references before they become POs.
+ */
+function candidateInShipmentContext(rawText: string, candidateIndex: number): boolean {
+    const before = rawText.slice(0, candidateIndex);
+    const lineStart = before.lastIndexOf("\n") + 1;
+    const rest = rawText.slice(candidateIndex);
+    const nlRel = rest.indexOf("\n");
+    const lineEnd = nlRel === -1 ? rawText.length : candidateIndex + nlRel;
+    const currentLine = rawText.slice(lineStart, lineEnd);
+    if (isShipmentContextLine(currentLine)) return true;
+
+    // value-below-label: the label (and any shipment token) is on the line above
+    if (lineStart > 0) {
+        const aboveStart = rawText.slice(0, lineStart - 1).lastIndexOf("\n") + 1;
+        const aboveLine = rawText.slice(aboveStart, lineStart - 1);
+        if (isShipmentContextLine(aboveLine)) return true;
+    }
+    return false;
+}
+
+/** Index of the captured candidate value within its full regex match. */
+function candidateIndex(match: RegExpMatchArray): number {
+    const full = match[0];
+    const value = match[1];
+    return (match.index ?? 0) + full.indexOf(value);
+}
+
 /**
  * Extract PO number from raw text using deterministic regex patterns.
  * Returns the first match found, or null if no PO pattern is detected.
  * Also searches table data if provided (PO# often lives in a table cell).
+ * Shipment-context candidates (freight refs) are skipped.
  */
 export function extractPOByRegex(rawText: string, tables?: string[][]): string | null {
-    // Search raw text first — same-line patterns
+    // Search raw text first — same-line patterns, skipping shipment-context refs
     for (const pattern of PO_LABEL_PATTERNS) {
-        const match = rawText.match(pattern);
-        if (match?.[1]) return match[1];
+        const global = new RegExp(
+            pattern.source,
+            pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g",
+        );
+        for (const match of rawText.matchAll(global)) {
+            const candidate = match[1];
+            if (!candidate) continue;
+            if (candidateInShipmentContext(rawText, candidateIndex(match))) continue;
+            return candidate;
+        }
     }
 
     // Header-row pattern: PO label on one line (possibly with other headers),
@@ -301,8 +357,12 @@ export function extractPOByRegex(rawText: string, tables?: string[][]): string |
         // Next non-empty line should contain the PO value as first token
         const nextLine = afterHeader.split("\n").find(l => l.trim().length > 0);
         if (nextLine) {
-            const firstToken = nextLine.trim().match(/^(\d{4,})/);
-            if (firstToken?.[1]) return firstToken[1];
+            if (isShipmentContextLine(headerLine) || isShipmentContextLine(nextLine)) {
+                // freight header (e.g. "SHIP DATE") — not a PO layout
+            } else {
+                const firstToken = nextLine.trim().match(/^(\d{4,})/);
+                if (firstToken?.[1]) return firstToken[1];
+            }
         }
     }
 
@@ -311,8 +371,16 @@ export function extractPOByRegex(rawText: string, tables?: string[][]): string |
         // Catches "P.O. Number | 124547" on a single row.
         const tableText = tables.map(row => row.join(" ").replace(/\|/g, " ")).join("\n");
         for (const pattern of PO_LABEL_PATTERNS) {
-            const match = tableText.match(pattern);
-            if (match?.[1]) return match[1];
+            const global = new RegExp(
+                pattern.source,
+                pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g",
+            );
+            for (const match of tableText.matchAll(global)) {
+                const candidate = match[1];
+                if (!candidate) continue;
+                if (candidateInShipmentContext(tableText, candidateIndex(match))) continue;
+                return candidate;
+            }
         }
 
         // Strategy B: Header-value pattern — label in one row, value in the next.
@@ -328,6 +396,7 @@ export function extractPOByRegex(rawText: string, tables?: string[][]): string |
                 // Found a PO-labeled column — grab the value from the next row
                 const valueCells = table[r + 1].split(/\s*\|\s*/);
                 const valueCell = valueCells[colIdx]?.trim();
+                if (!valueCell || isShipmentContextLine(valueCell)) continue;
                 const numMatch = valueCell?.match(/^(\d{4,})/);
                 if (numMatch?.[1]) return numMatch[1];
             }

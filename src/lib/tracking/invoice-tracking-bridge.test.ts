@@ -15,8 +15,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // vi.hoisted runs before vi.mock factories (vitest hoists vi.mock above all
 // top-level consts — a plain `const mock = vi.fn()` would be in the TDZ when
 // the factory executes). See skill: vitest-mock-patterns.
-const { upsertShipmentEvidenceMock } = vi.hoisted(() => ({
+const { upsertShipmentEvidenceMock, validatePoRefMock } = vi.hoisted(() => ({
     upsertShipmentEvidenceMock: vi.fn(),
+    validatePoRefMock: vi.fn(),
 }));
 
 vi.mock("@/lib/tracking/shipment-intelligence", async (importOriginal) => {
@@ -26,6 +27,10 @@ vi.mock("@/lib/tracking/shipment-intelligence", async (importOriginal) => {
         upsertShipmentEvidence: upsertShipmentEvidenceMock,
     };
 });
+
+vi.mock("@/lib/purchasing/po-ref-validator", () => ({
+    validatePoRef: validatePoRefMock,
+}));
 
 import {
     bridgeInvoiceTrackingToShipments,
@@ -80,6 +85,10 @@ describe("isLtlShapedNumber", () => {
 describe("bridgeInvoiceTrackingToShipments", () => {
     beforeEach(() => {
         upsertShipmentEvidenceMock.mockReset();
+        validatePoRefMock.mockReset();
+        // Identity: validatePoRef accepts whatever it is given (the validator's
+        // own correctness is covered in po-ref-validator.test.ts).
+        validatePoRefMock.mockImplementation(async (ref: string | null) => ref);
         // Echo the input tracking number so result.trackingNumbers reflects
         // what was actually upserted (mirrors upsertShipmentEvidence return).
         upsertShipmentEvidenceMock.mockImplementation(async (input: { trackingNumber: string }) => ({
@@ -135,6 +144,23 @@ describe("bridgeInvoiceTrackingToShipments", () => {
         expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(
             expect.objectContaining({ poNumber: "98765", confidence: 0.92 }),
         );
+    });
+
+    it("nulls a PO ref rejected by the validator and stores an orphan at 0.75", async () => {
+        validatePoRefMock.mockResolvedValue(null);
+
+        const result = await bridgeInvoiceTrackingToShipments(
+            makeArgs({
+                ocrText: "ADV ORDER 4798\nUPS Ground Tracking: 1Z999AA10123456784",
+                poNumber: "4798",
+            }),
+        );
+
+        expect(validatePoRefMock).toHaveBeenCalledWith("4798", expect.any(String));
+        expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(
+            expect.objectContaining({ poNumber: null, confidence: 0.75 }),
+        );
+        expect(result.upserted).toBe(1);
     });
 
     it("stores tracking with null PO at 0.75 confidence when no PO anywhere", async () => {
