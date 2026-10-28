@@ -78,4 +78,7 @@ export const ARTWORK_LINK_SEED: ArtworkLinkSeed[] = [
     { componentSku: 'GNS19', artworkSku: 'Gnarbar09', vendor: 'Axiom Print', note: 'Label - (GnarBar-Milled - 44lb) Front' },
     // 3.0 soil poly bag (Colorful)
     { componentSku: '3.0BAGCP', artworkSku: 'LOSOLY3', vendor: 'Colorful Packaging Ltd', note: '25L poly bag for 1 Cu Ft 3.0 soil' },
+    // BAS Light 1 Cu Ft printed bag — product → bag SKU via BASLIGHT102's BOM
+    // (sheet SKU "BASLight" is a truncated casing of BASLIGHT102)
+    { componentSku: 'LIGHTBAGCF', artworkSku: 'BASLight', vendor: 'Colorful Packaging Ltd', note: 'Poly Bag Light Soil 25L; BASLIGHT102 BOM component' },
 ];

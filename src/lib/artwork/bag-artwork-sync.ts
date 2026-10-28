@@ -186,8 +186,10 @@ async function fetchCachedNames(skus: string[]): Promise<Map<string, string>> {
 }
 
 /**
- * BOM discovery for sheet SKUs the curated seed does not cover: pull the
- * Finale BOM, then keep components whose name says bag or label.
+ * BOM discovery for sheet SKUs the curated seed does not cover: resolve the
+ * canonical Finale SKU (case-insensitive — sheet SKUs can carry wrong casing,
+ * e.g. "Gnarbar01" vs GnarBar01), pull its BOM, then keep components whose
+ * name says bag or label.
  */
 async function resolveBomLinks(unlinked: string[]): Promise<Array<{ componentSku: string; artworkSku: string; source: 'bom'; vendor: string }>> {
     if (unlinked.length === 0) return [];
@@ -195,9 +197,22 @@ async function resolveBomLinks(unlinked: string[]): Promise<Array<{ componentSku
     const client = new FinaleClient();
     for (const sku of unlinked) {
         try {
-            const bom = await client.getBillOfMaterials(sku);
+            // Canonical SKU resolution: exact, then case-insensitive. The
+            // product maps to its bag/label SKU through the Finale BOM.
+            let canonical = sku;
+            try {
+                const db = createClient();
+                const { data: exact } = await db.from('finale_sku_cache').select('sku').eq('sku', sku);
+                if (!exact || (exact as unknown[]).length === 0) {
+                    const { data: ci } = await db.from('finale_sku_cache').select('sku').filter('sku', 'ilike', sku);
+                    if (ci && (ci as unknown[]).length === 1) canonical = (ci as Array<{ sku: string }>)[0].sku;
+                }
+            } catch {
+                // Canonical lookup is best-effort; fall through with the raw SKU.
+            }
+            const bom = await client.getBillOfMaterials(canonical);
             if (bom.length === 0) {
-                console.log(`[bag-artwork] no BOM for ${sku} — left unlinked`);
+                console.log(`[bag-artwork] no BOM for ${sku} (canonical: ${canonical}) — left unlinked`);
                 continue;
             }
             const comps = bom.map((b) => b.componentSku);
@@ -434,7 +449,6 @@ export async function syncBagArtwork(opts: { live?: boolean } = {}): Promise<Art
     }
     const bomTargets = unlinked.filter((s) => !recentAttempts.has(s.toUpperCase()));
     const bomLinks = await resolveBomLinks(bomTargets);
-
     // Persist the attempt so the next sync does not re-BOM the same SKUs
     // every week (Finale calls). Retry after 7 days in case a BOM was added.
     const attemptRows = bomTargets.map((s) => ({ artwork_sku: s, tried_at: now }));
@@ -445,8 +459,6 @@ export async function syncBagArtwork(opts: { live?: boolean } = {}): Promise<Art
     for (const b of bomLinks) {
         linkRows.push({ component_sku: b.componentSku, artwork_sku: b.artworkSku, link_source: 'bom', vendor: b.vendor || null, note: 'Finale BOM discovery' });
     }
-    const bomSkuSet = new Set(bomLinks.map((b) => b.artworkSku.toUpperCase()));
-    const finalUnlinked = unlinked.filter((s) => !bomSkuSet.has(s.toUpperCase()));
 
     if (linkRows.length > 0) {
         // Dedupe on the composite key — one component may serve several
@@ -461,6 +473,17 @@ export async function syncBagArtwork(opts: { live?: boolean } = {}): Promise<Art
         });
         const { error: linkErr } = await db.from('bag_artwork_link').upsert(deduped, { onConflict: 'component_sku,artwork_sku' });
         if (linkErr) console.warn('[bag-artwork] link upsert failed:', linkErr.message);
+    }
+
+    // Unlinked = sheet SKUs with no link row in the DB. Read the DB, not this
+    // run's discoveries — links found by earlier syncs persist here.
+    let finalUnlinked = unlinked;
+    try {
+        const { data: dbLinks } = await db.from('bag_artwork_link').select('artwork_sku');
+        const linkedSet = new Set(((dbLinks ?? []) as Array<{ artwork_sku: string }>).map((l) => l.artwork_sku.toUpperCase()));
+        finalUnlinked = [...new Set(current.map((r) => r.artworkSku))].filter((s) => !linkedSet.has(s.toUpperCase())).sort();
+    } catch (err) {
+        console.warn('[bag-artwork] DB link read failed; reporting this-run unlinked:', (err as Error).message);
     }
 
     // Completion alerts: art flipped to complete AND component runway < 180d.
