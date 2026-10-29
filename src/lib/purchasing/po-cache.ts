@@ -6,6 +6,14 @@
  * @created 2026-07-16
  * @updated 2026-07-16 — probe + timeout; fire-and-forget cache write
  * @deps    @/lib/db, @/lib/finale/client
+ *
+ * CONTRACT (HERMIA 2026-10-29): this cache stores Finale PO FACTS only
+ * (dates, vendor, status, line items). Purchasing POLICY fields —
+ * finishedGoodsCoverageDays / combinedRunwayDays — are DERIVED per scan in
+ * policy-candidates.buildPurchasingCandidate from the scan's
+ * item.feedsFinishedGoods, and must never become cache columns here. A cached
+ * coverage number would be served as if it were a Finale fact long after the
+ * shelf moved, which is exactly the Gap 6 / Gap 13 failure mode.
  */
 
 import type { FinaleClient, FullPO } from "../finale/client";
@@ -121,6 +129,12 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
     await flush(withoutRecv);
 }
 
+function dateOnly(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const m = value.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : null;
+}
+
 /** Latest past shipment receiveDate (YYYY-MM-DD), or null. Canceled legs are
  *  excluded: a canceled leg's date is not receipt evidence (125394-1 Canceled). */
 function maxPastShipmentReceiveDate(
@@ -155,7 +169,10 @@ export async function readCachedPos(daysBack = 60): Promise<FullPO[]> {
         if (error || !data || data.length === 0) return [];
 
         return data.map((row: any) => {
-            let items: Array<{ productId: string; quantity: number }> = [];
+            // HERMIA(2026-10-29): typed as FullPO["items"], not {productId, quantity}.
+            // The narrow type let cache consumers "lose" unitPrice at compile time
+            // (Gap 13): the value survives JSON.parse, but nothing could read it.
+            let items: FullPO["items"] = [];
             try {
                 const parsed = typeof row.line_items === "string"
                     ? JSON.parse(row.line_items)
@@ -171,8 +188,17 @@ export async function readCachedPos(daysBack = 60): Promise<FullPO[]> {
                             status: row.status || "",
                             total: Number(row.total) || Number(row.total_amount) || 0,
                             receiveDate: row.receive_date ? new Date(row.receive_date).toISOString().split("T")[0] : null,
+                            // HERMIA(2026-10-29): restore the quoted delivery date. cacheFinalePos
+                            // stores it as required_date, but the reconstruction never read it
+                            // back, so every cache-served PO claimed expectedDate: undefined and
+                            // ETA logic fell through to "no plan on file". Slice, never Date():
+                            // a naive Denver date through toISOString() can shift a day (Gap 6).
+                            expectedDate: dateOnly(row.required_date),
                             items,
-                            itemList: { edges: items.map((i: any) => ({ node: { product: { productId: i.productId }, quantity: i.quantity } })) },
+                            // unitPrice/remainingQty carried into the GraphQL-shaped itemList too:
+                            // the cache is the only PO source when Finale is down, and a line
+                            // without its price is a line nobody can audit (Gap 13).
+                            itemList: { edges: items.map((i: any) => ({ node: { product: { productId: i.productId }, quantity: i.quantity, unitPrice: i.unitPrice, productUnitsRemainingToBeShipped: i.remainingQty } })) },
                             supplier: { name: row.vendor_name || "" },
                             orderUrl: "",
                             shipmentList: [],
