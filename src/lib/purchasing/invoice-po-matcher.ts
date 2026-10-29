@@ -36,6 +36,7 @@ import {
     productIdsFromPoLines,
     skusFromInvoiceLines,
 } from "@/lib/purchasing/uline-invoice-repair";
+import type { PoMatchMethod } from "@/lib/purchasing/po-match-provenance";
 
 export { sanitizeOcrPoCandidate };
 
@@ -116,6 +117,9 @@ export interface POCandidate {
     score: number;
     reasons: string[];
     isOpen: boolean;
+    /** How this candidate was produced (provenance only — never affects score).
+     *  Set by findPOCandidates on every candidate it returns. */
+    matchMethod?: PoMatchMethod;
 }
 
 export interface MatchResult {
@@ -328,6 +332,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                     isOpen: ["open", "partial", "committed", "locked"].includes(
                         String(row.status || "").toLowerCase()
                     ),
+                    matchMethod: "exact_po",
                 };
                 return {
                     invoice,
@@ -505,6 +510,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                         dateScore.reason,
                     ],
                     isOpen: true,
+                    matchMethod: "fast_path",
                 };
                 return {
                     invoice,
@@ -622,6 +628,11 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             total = Math.max(total, vendorScore.score + dateScore.score);
         }
 
+        // Provenance: the human-confirmed vendor→PO pair is its own tier; every
+        // other candidate out of this loop is a vendor+date (and maybe amount)
+        // guess. A withheld confirm boost falls back to vendor_date on purpose.
+        const matchMethod: PoMatchMethod = confirmedMatchReason ? "confirmed" : "vendor_date";
+
         // Minimum bar: need at least a vendor match + something else
         if (total < MIN_SCORE_FOR_SUGGESTION) continue;
         // For auto-apply, require non-zero amount match
@@ -651,6 +662,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             score: total,
             reasons,
             isOpen: ["open", "partial"].includes((po.status || "").toLowerCase()),
+            matchMethod,
         });
     }
 
@@ -697,6 +709,10 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                     const reason = `exact Uline SKU match: ${hit.matchedSkus.join(", ")}`;
                     const existing = candidates.find((c) => c.orderId === hit.poNumber);
                     if (existing) {
+                        // Relabel only when the SKU hit is at least as strong as
+                        // what the candidate already was (a 95 confirmed hit
+                        // stays 'confirmed').
+                        if (existing.score < 90) existing.matchMethod = "sku_exact";
                         existing.score = Math.max(existing.score, 90);
                         if (!existing.reasons.some((r) => r.includes("exact Uline SKU match"))) {
                             existing.reasons.push(reason);
@@ -713,6 +729,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                             isOpen: ["open", "partial", "committed", "locked"].includes(
                                 hit.status.toLowerCase(),
                             ),
+                            matchMethod: "sku_exact",
                         });
                     }
                 }
@@ -786,6 +803,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                         isOpen: ["open", "partial", "committed", "locked"].includes(
                             String(row.status || "").toLowerCase()
                         ),
+                        matchMethod: "exact_po",
                     };
                     candidates.push(exactMatch);
                 }
@@ -795,6 +813,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
         if (exactMatch) {
             exactMatch.score = 100;
+            exactMatch.matchMethod = "exact_po";
             if (!exactMatch.reasons.some((r) => r.includes("exact OCR PO match"))) {
                 exactMatch.reasons.push(`exact OCR PO match: ${sanitizedOcrPo}`);
             }

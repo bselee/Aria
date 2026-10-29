@@ -12,6 +12,11 @@ import { KNOWN_DROPSHIP_KEYWORDS } from '@/config/dropship-vendors';
 import { classifyInvoice, type InvoiceClassification } from '@/config/invoice-classification';
 import { resolveStatus, isPendingStatus, type ResolvedStatus } from './resolve-status';
 import { findPOCandidates } from '@/lib/purchasing/invoice-po-matcher';
+import {
+  confirmedPairKey,
+  inferLinkedPoMatchMethod,
+  type PoMatchMethod,
+} from '@/lib/purchasing/po-match-provenance';
 import { isPhantomInvoiceRow } from '@/lib/purchasing/invoice-pool';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -23,6 +28,8 @@ export interface POCandidate {
   invoiceDate: string | null;
   score: number;
   remainingBalance: number;
+  /** How the matcher produced this candidate (provenance, not confidence tuning). */
+  matchMethod?: PoMatchMethod;
 }
 
 export type InvoiceQueueItem = {
@@ -54,6 +61,11 @@ export type InvoiceQueueItem = {
      *  (invoice-po-matcher) via multi-delivery-match.ts or primary scorer.
      *  Optional — UI will gracefully degrade when absent. */
     poCandidates?: POCandidate[];
+    /** Provenance of the EXISTING link on a matched row — 'exact_po' when the
+     *  printed PO equals the linked PO, 'confirmed' when a human confirmed the
+     *  vendor→PO pair, otherwise 'unknown' (verify). Absent on unmatched rows,
+     *  where each poCandidates chip carries its own matchMethod. */
+    matchMethod?: PoMatchMethod | null;
     /** Whether the invoice total matches the matched PO total within tolerance.
      *  Used by UI to style Approve as primary "Confirm match" in matched_unreconciled. */
     amountMatchesPo?: boolean;
@@ -414,6 +426,7 @@ export async function GET(req: NextRequest) {
                         invoiceDate: c.orderDate || null,
                         score: c.score,
                         remainingBalance: c.total, // full PO total as upper bound; multi-delivery refines later
+                        matchMethod: c.matchMethod,
                     }));
                 } catch (e: any) {
                     console.warn(`[invoice-queue] findPOCandidates failed for ${inv.invoiceNumber}: ${e?.message || e}`);
@@ -421,6 +434,37 @@ export async function GET(req: NextRequest) {
                 }
                 return inv;
             });
+        }
+
+        // ── Provenance for rows that already have a PO attached ──────────────
+        // A matched row used to read "→ PO 124904" with no clue whether the
+        // document named that PO or Aria guessed it. Derive it from data we
+        // already hold — the printed PO and the human-confirmed vendor→PO
+        // table — without re-running the matcher (no scoring change).
+        const linkedRows = invoices.filter((i) => i.poNumber && !(i.poCandidates?.length));
+        if (linkedRows.length > 0) {
+            let confirmedPairs: Set<string> | null = null;
+            try {
+                const { data: confirmedRows } = await db
+                    .from("confirmed_po_matches")
+                    .select("vendor_name, po_number");
+                confirmedPairs = new Set<string>();
+                for (const row of (confirmedRows || []) as any[]) {
+                    const key = confirmedPairKey(row?.vendor_name, row?.po_number);
+                    if (key) confirmedPairs.add(key);
+                }
+            } catch (e: any) {
+                console.warn(`[invoice-queue] confirmed_po_matches read failed: ${e?.message || e}`);
+            }
+            for (const inv of linkedRows) {
+                inv.matchMethod = inferLinkedPoMatchMethod({
+                    poNumber: inv.poNumber,
+                    vendorName: inv.vendorName,
+                    ocrPoCandidate: inv.ocrPoCandidate,
+                    ocrOrderCandidate: inv.ocrOrderCandidate,
+                    confirmedPairs,
+                });
+            }
         }
 
         // amountMatchesPo for matched_unreconciled (within 2% of PO total)

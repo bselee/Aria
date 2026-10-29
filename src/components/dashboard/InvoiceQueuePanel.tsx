@@ -4,6 +4,7 @@ import React from "react";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { Receipt, ChevronDown, ChevronRight, Check, X, AlertCircle, Loader2 } from "lucide-react";
 import type { InvoiceQueueItem, InvoiceQueueStats, InvoiceQueueResponse } from "@/app/api/dashboard/invoice-queue/route";
+import { PO_MATCH_METHOD_LABELS, isSolidMatchMethod, type PoMatchMethod } from "@/lib/purchasing/po-match-provenance";
 
 /** Threshold in days: pending items older than this are considered stale */
 const STALE_THRESHOLD_DAYS = 7;
@@ -31,6 +32,28 @@ function fmtShortDate(dateStr: string | null): string {
 }
 
 type StatusKey = "auto_approved" | "needs_approval" | "rejected" | "duplicate" | "unmatched" | "short_shipment_hold" | "matched_unreconciled";
+
+/** Provenance chip for an invoice→PO link (2026-10-29): shows HOW the link was
+ *  made — exact PO / confirmed / vendor+date / fast path / unverified — so a
+ *  human sees which matches are solid vs "Aria's best guess, verify". */
+function MatchMethodChip({ method }: { method?: PoMatchMethod | null }) {
+    if (!method) return null;
+    const m = PO_MATCH_METHOD_LABELS[method];
+    const color = isSolidMatchMethod(method)
+        ? "text-emerald-400/90 border-emerald-500/30 bg-emerald-500/10"
+        : method === "unknown"
+            ? "text-zinc-500 border-zinc-600/40 bg-zinc-500/10"
+            : "text-amber-400/90 border-amber-500/30 bg-amber-500/10";
+    return (
+        <span
+            data-match-method={method}
+            title={m.title}
+            className={`inline-flex items-center px-1 py-0.5 rounded text-[9px] font-mono border ${color}`}
+        >
+            {m.label}
+        </span>
+    );
+}
 
 const STATUS_CFG: Record<StatusKey, { dot: string; label: string; pulse: boolean }> = {
   auto_approved: { dot: "bg-emerald-500", label: "AUTO", pulse: false },
@@ -741,6 +764,7 @@ export default function InvoiceQueuePanel() {
                           → PO {inv.poNumber}
                         </span>
                       )}
+                      <MatchMethodChip method={inv.matchMethod} />
                       {inv.dollarImpact !== null && inv.dollarImpact !== 0 && (
                         <span
                           className={`text-[10px] font-mono shrink-0 ${inv.dollarImpact >= 0 ? "text-emerald-400" : "text-red-400"}`}
@@ -959,6 +983,7 @@ export default function InvoiceQueuePanel() {
                                       {pc.score != null && (
                                         <span className="text-cyan-400/50">· {pc.score}%</span>
                                       )}
+                                      <MatchMethodChip method={pc.matchMethod} />
                                       <button
                                         onClick={(e) => { e.stopPropagation(); handleApplyPOCandidate(inv.id, pc.poNumber); }}
                                         disabled={isApplying}
@@ -1068,6 +1093,7 @@ export default function InvoiceQueuePanel() {
                       <span className="text-[12px] font-mono text-blue-400 tabular-nums">
                         PO {inv.poNumber}
                       </span>
+                      <MatchMethodChip method={inv.matchMethod} />
                       <span className={`text-[10px] font-mono ${amtMatch ? "text-emerald-400" : "text-amber-400/80"}`}>
                         {amtMatch ? "✓ $ matches PO" : "review $ vs PO"}
                       </span>
