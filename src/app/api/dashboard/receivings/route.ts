@@ -13,7 +13,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { FinaleClient } from '@/lib/finale/client';
 import { createClient } from '@/lib/db';
-import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive, invoiceNumberFromAttachment, type InvoicePoolRow } from '@/lib/purchasing/invoice-pool';
+import { firstRealInvoice, isPhantomInvoiceRow, isCarrierFreightArchive, isSelfReferentialIdentity, invoiceNumberFromAttachment, type InvoicePoolRow } from '@/lib/purchasing/invoice-pool';
 import { findPOCandidates, type POCandidate } from '@/lib/purchasing/invoice-po-matcher';
 import { sanitizeOcrPoCandidate } from '@/lib/purchasing/ocr-po-sanitize';
 import { transitionLifecycleState } from '@/lib/purchasing/po-lifecycle';
@@ -518,14 +518,24 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         .filter((r) => Number(r.total || 0) > 1)
                         .sort((a, b) => Number(b.total) - Number(a.total))[0] ?? null;
                     const realTotal = Number(real?.total || 0);
-                    const matchedInvoice = real && realTotal > 0
+                    // HERMIA(2026-10-29): a self-referential identity ("PO125393"
+                    // linked to PO 125393) cannot verify an invoice number — the
+                    // row may be a real bill, but it wears no invoice identity.
+                    const selfReferential = (row: typeof real): boolean =>
+                        !!row && isSelfReferentialIdentity(row.invoice_number, poNum);
+                    const matchedInvoice = real && realTotal > 0 && !selfReferential(real)
                         ? real
-                        : positiveRows[0]
-                            ?? (real
-                                ? { ...real, identityUnknown: true }
+                        : positiveRows.find((r) => !selfReferential(r))
+                            ?? (real && !selfReferential(real)
+                                ? real
                                 : moneyRow
                                     ? { ...moneyRow, identityUnknown: true }
-                                    : null);
+                                    : real || moneyRow
+                                        ? { ...(real ?? moneyRow)!, identityUnknown: true }
+                                        : null);
+                    if (matchedInvoice && isSelfReferentialIdentity(matchedInvoice.invoice_number, poNum)) {
+                        matchedInvoice.identityUnknown = true;
+                    }
                     po._reconciliation = {
                         invoices: rows,
                         outcomes: outcomeMap.get(poNum) || [],

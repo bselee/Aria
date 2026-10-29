@@ -143,6 +143,23 @@ export function isCarrierFreightArchive(row: InvoicePoolRow | null | undefined):
 }
 
 /**
+ * True when the row's "invoice number" is just its own PO number wearing a
+ * PO prefix ("PO125393" linked to PO 125393). Live population 2026-10-29:
+ * three BuildASoil-LLC rows. That is a self-reference, not a vendor identity —
+ * the row may still be a real bill, but it cannot verify an invoice number.
+ */
+export function isSelfReferentialIdentity(
+    invoiceNumber: string | null | undefined,
+    poNumber: string | null | undefined,
+): boolean {
+    const inv = String(invoiceNumber ?? "").trim();
+    const po = String(poNumber ?? "").replace(/\D/g, "");
+    if (!inv || po.length < 4) return false;
+    if (!/^p\.?o\.?[\s#.-]*\d+$/i.test(inv)) return false;
+    return inv.replace(/\D/g, "").endsWith(po);
+}
+
+/**
  * True when the row is a phantom document: it cannot act as an invoice leg,
  * a match candidate, or a review item.
  *
