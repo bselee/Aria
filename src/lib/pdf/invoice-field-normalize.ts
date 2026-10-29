@@ -19,9 +19,7 @@ import { extractGoodsLinesFromInvoiceText } from "./invoice-text-lines";
  * editor/patcher that folds a literal CRLF cannot silently break this module —
  * a real newline inside a regex literal is a SyntaxError that takes out every
  * import of this file, including the tests of unrelated modules.
- * Matches 
-\n, \n, 
-.
+ * Matches CRLF, CR, or LF runs.
  */
 const SPLIT_LINE_RE = new RegExp("[" + String.fromCharCode(13) + String.fromCharCode(10) + "]+");
 
