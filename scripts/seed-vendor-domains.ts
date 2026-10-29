@@ -1,7 +1,7 @@
 // Seed vendor_profiles.vendor_domains from evidence, so vendor-scoped PO
 // inference stops falling back to "any vendor" for senders we can identify.
 //
-// Rules (all measured, see scripts/_probe-domain-seeds2.ts):
+// Rules (all measured, see scripts/_archive/_probe-domain-seeds2.ts):
 //  - candidate = a sender domain whose PDF-named vendors are ALL the same vendor
 //    after normalization (case/punctuation/LLC-INC-CO-LTD suffix stripped)
 //  - the vendor must already have a vendor_profiles row — this script never
