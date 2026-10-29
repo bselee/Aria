@@ -699,7 +699,15 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
     protected async unlockForEditing(currentPO: any, orderId: string): Promise<string> {
         const originalStatus = currentPO.statusId;
 
-        if ((originalStatus === "ORDER_LOCKED" || originalStatus === "ORDER_COMPLETED") && currentPO.actionUrlEdit) {
+        // A completed order no longer serves its /edit action URL — POSTing it
+        // returns Finale 404 "Order Not Found" (125429/125379, 2026-10-29).
+        // Completion needs no reopen, and line edits on a completed PO must be
+        // refused upstream, so skip the unlock instead of throwing.
+        if (originalStatus === "ORDER_COMPLETED") {
+            return originalStatus;
+        }
+
+        if (originalStatus === "ORDER_LOCKED" && currentPO.actionUrlEdit) {
             await this.post(currentPO.actionUrlEdit, {});
             // Re-fetch after unlocking — status and available actions change
             const unlocked = await (this as any).getOrderDetails(orderId);

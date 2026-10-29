@@ -1214,7 +1214,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                             button: undefined,
                                                         };
                                                     }
-                                                    if (rec?.matchedInvoice) {
+                                                    if (rec?.matchedInvoice && !rec.matchedInvoice.identityUnknown) {
                                                         return {
                                                             text: `${receiptLead}. Verify ${billLabel(rec.matchedInvoice)} against the PO.`,
                                                             button: {
@@ -1222,6 +1222,16 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 tone: "success",
                                                                 onClick: () => toggleModifier(po.orderId, rec!.matchedInvoice!.invoice_number),
                                                             },
+                                                        };
+                                                    }
+                                                    if (rec?.matchedInvoice?.identityUnknown) {
+                                                        // The bill's identity failed the phantom/shape
+                                                        // guard (OCR 'error', header word, junk number).
+                                                        // Completing against an unverifiable bill is how
+                                                        // phantom invoices get paid — verify first.
+                                                        return {
+                                                            text: `${receiptLead}. Bill identity unverified (${billLabel(rec.matchedInvoice)}) — verify against the PDF before completing.`,
+                                                            button: undefined,
                                                         };
                                                     }
                                                     if (rec?.coveringBill) {
@@ -1394,7 +1404,7 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 <span className="text-zinc-500">{rec.matchedInvoice.invoice_number}</span>
                                                                 {rec.matchedInvoice.pdf_storage_path && (
                                                                     <a
-                                                                        href={`/api/storage/invoice-pdf?id=${encodeURIComponent(rec.matchedInvoice.invoice_number)}`}
+                                                                        href={`/api/storage/invoice-pdf?invoice=${encodeURIComponent(rec.matchedInvoice.invoice_number)}`}
                                                                         target="_blank"
                                                                         rel="noopener noreferrer"
                                                                         onClick={e => e.stopPropagation()}

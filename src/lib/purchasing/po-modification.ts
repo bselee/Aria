@@ -490,6 +490,14 @@ export async function applyInvoiceModification(
     const freightBefore = extractFreightFromPO(currentPO, accountPath);
 
     // ── Phase 3: Unlock for editing ────────────────────────────────────
+    if (currentPO.statusId === "ORDER_COMPLETED") {
+        // Editing a completed PO would 404 on every write (the /edit action
+        // URL is gone). Refuse with an actionable message instead.
+        result.errors.push(
+            `PO ${request.orderId} is already COMPLETED in Finale — reopen it there before applying invoice changes`,
+        );
+        return result;
+    }
     try {
         originalStatus = await poEditor.unlockForEditing(currentPO, request.orderId);
     } catch (err) {

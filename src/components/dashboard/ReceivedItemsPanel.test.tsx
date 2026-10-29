@@ -503,7 +503,10 @@ describe("ReceivedItemsPanel", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     expect((await screen.findAllByText(/bill \$2,688/i)).length).toBeGreaterThan(0);
     expect(screen.queryByText(/Awaiting vendor invoice/i)).toBeNull();
-    expect(screen.getByText(/Verify bill \$2,688 against the PO/i)).toBeTruthy();
+    expect(screen.getByText(/Bill identity unverified/i)).toBeTruthy();
+    expect(screen.getByText(/verify against the PDF before completing/i)).toBeTruthy();
+    // An unverifiable bill must never offer Complete (phantom-bill guard).
+    expect(screen.queryByText("Complete PO")).toBeNull();
   });
 
   it("names a covering bill on a sibling PO with no linked invoice", async () => {
