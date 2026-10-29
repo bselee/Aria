@@ -9,7 +9,7 @@
 
 import { leadTimeService } from "../builds/lead-time-service";
 import type { FinaleClient, FullPO } from "../finale/client";
-import { createClient, probePostgrest } from "../db";
+import { createClient } from "../db";
 import { loadPOCompletionSignalIndex } from "./po-completion-loader";
 import { derivePOCompletionState, type POCompletionState } from "./po-completion-state";
 import { derivePurchaseMovement, type PurchaseMovement } from "./active-purchases-movement";
@@ -72,10 +72,9 @@ export async function loadActivePurchases(
     const uniqueVendors = [...new Set(pos.map(p => p.vendorName).filter(Boolean))];
     await Promise.all(uniqueVendors.map(v => leadTimeService.getForVendor(v))).catch(() => undefined);
 
-    const dbHealthy = await probePostgrest(2000);
-    const db = dbHealthy ? createClient() : null;
-    if (!dbHealthy) {
-        console.warn("[active-purchases] PostgREST unhealthy — Finale-only mode");
+    const db = createClient();
+    if (!db) {
+        console.warn("[active-purchases] createClient returned null - Finale-only mode");
     }
 
     const vendorMap = new Map<string, { typical_tracking_source?: string; orders_email?: string; vendor_emails?: string[] }>();
@@ -152,6 +151,10 @@ export async function loadActivePurchases(
                         .select("po_number, sent_at, committed_at, sent_to_email, triggered_by, gmail_message_id")
                         .in("po_number", chunk),
                 ]);
+
+                if (poRes.error) {
+                    console.warn("[active-purchases] purchase_orders read failed:", poRes.error.message);
+                }
 
                 for (const dp of poRes.data || []) {
                     trackingMap.set(dp.po_number, dp.tracking_numbers || []);
