@@ -844,4 +844,179 @@ describe("ReceivedItemsPanel", () => {
     const draftLink = screen.getByRole("link", { name: /Open vendor draft in Gmail/i });
     expect(draftLink.getAttribute("href")).toContain("#drafts/r-1234567890");
   });
+
+  // ── WS4: the row is a verdict, not just "invoice matched" ──────────────────
+  it("shows READY when the 3-way gate passes with no variance", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-501",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          supplier: "Uline",
+          total: 175,
+          subtotal: 175,
+          items: [{ productId: "S-17888", quantity: 14, orderedQuantity: 14, receivedQuantity: 14, unitPrice: 12.5 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: {
+              invoice_number: "215047605",
+              subtotal: 175,
+              freight: 0,
+              tax: 0,
+              total: 175,
+              status: "received",
+              line_items: null,
+            },
+            threeWay: {
+              verdict: "matched",
+              canComplete: true,
+              bucket: [],
+              variances: [],
+              totalDollarImpact: 0,
+              summary: "3-way match clean — PO, receipt, and invoice agree across 1 line(s).",
+              incompleteReason: null,
+              unmatchedInvoiceLines: 0,
+            },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByTestId("threeway-ready")).toBeTruthy();
+    expect(screen.getByText("READY")).toBeTruthy();
+  });
+
+  it("names the itemized 3-way variance instead of leaving the row as matched", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-502",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          supplier: "Organic AG",
+          total: 163,
+          subtotal: 163,
+          items: [{ productId: "OMP102", quantity: 1, orderedQuantity: 1, receivedQuantity: 1, unitPrice: 163 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: {
+              invoice_number: "1105-A",
+              subtotal: 1105,
+              freight: 0,
+              tax: 0,
+              total: 1105,
+              status: "received",
+              line_items: null,
+            },
+            threeWay: {
+              verdict: "exception",
+              canComplete: false,
+              bucket: ["price"],
+              variances: [
+                {
+                  bucket: "price",
+                  blocking: true,
+                  count: 1,
+                  dollarImpact: 942,
+                  messages: ["OMP102: PO $163.00/unit vs invoice $1105.00/unit (577.9% variance)."],
+                  source: "line",
+                },
+              ],
+              totalDollarImpact: 942,
+              summary: "3-way match FAILED — 1 blocking discrepancy ($942.00 impact).",
+              incompleteReason: null,
+              unmatchedInvoiceLines: 0,
+            },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    const chip = await screen.findByTestId("threeway-chip-price");
+    expect(chip.textContent).toContain("price");
+    expect(chip.textContent).toContain("$942");
+    expect(screen.queryByTestId("threeway-ready")).toBeNull();
+  });
+
+  it("never shows READY when the PO price side is unknown (cannot verify)", async () => {
+    stubLocalStorage();
+    const recent = new Date();
+    const recentDate = recent.toISOString().slice(0, 19) + "-06:00";
+    stubFetch({
+      received: [
+        {
+          orderId: "PO-503",
+          orderDate: recentDate,
+          receiveDate: recentDate,
+          receiveDateTime: recentDate,
+          supplier: "Uline",
+          total: 175,
+          subtotal: 175,
+          items: [{ productId: "S-17888", quantity: 14, orderedQuantity: 14, receivedQuantity: 14, unitPrice: 0 }],
+          finaleUrl: "https://example.com/po",
+          _reconciliation: {
+            invoices: [],
+            outcomes: [],
+            hasPendingApproval: false,
+            hasAutoApplied: false,
+            matchedInvoice: {
+              invoice_number: "215047606",
+              subtotal: 175,
+              freight: 0,
+              tax: 0,
+              total: 175,
+              status: "received",
+              line_items: null,
+            },
+            threeWay: {
+              verdict: "incomplete",
+              canComplete: false,
+              bucket: [],
+              variances: [],
+              totalDollarImpact: 0,
+              summary: "Cannot 3-way match — the PO carries no unit prices to compare the bill against.",
+              incompleteReason: "po_prices_missing",
+              unmatchedInvoiceLines: 0,
+            },
+          },
+        },
+      ],
+      days: 14,
+      asOf: "2026-04-01",
+    });
+
+    render(<ReceivedItemsPanel />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(await screen.findByTestId("threeway-incomplete")).toBeTruthy();
+    expect(screen.getByText(/3-way: PO has no prices/i)).toBeTruthy();
+    expect(screen.queryByText("READY")).toBeNull();
+  });
 });

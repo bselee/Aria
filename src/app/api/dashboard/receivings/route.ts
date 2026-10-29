@@ -25,6 +25,7 @@ import { loadTrueReceiptQuantities, receiptShorts } from '@/lib/finale/receipt-q
 import { isFreightRequiredVendor, freightOnPo } from '@/config/freight-required-vendors';
 import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
 import { overbillGracePending } from '@/lib/purchasing/overbill-grace';
+import { buildReceivingsThreeWay, type ReceivingsThreeWay, type ThreeWayInvoiceLine } from '@/lib/purchasing/receivings-three-way';
 
 // ── GET response cache (paint-first) ─────────────────────────────────────
 // HERMIA(2026-08-06): Panel timed out because every GET ran Finale GraphQL
@@ -158,6 +159,13 @@ interface ReceiptReconciliation {
     invoiceVsReceipt?: InvoiceVsReceipt;
     overbillDispute?: OverbillDisputeStamp;
     vendorOverbillPattern?: { flagged: number; bills: number };
+    /**
+     * 3-way verdict (WS4, 2026-10-29): ordered vs received vs billed per line
+     * plus a bucketed variance, so the row says READY or names the one thing
+     * that differs — instead of "invoice matched" meaning nothing more than
+     * "a vendor_invoices row points at this PO".
+     */
+    threeWay?: ReceivingsThreeWay;
 }
 
 /** ReceivedPO as this route consumes it: Finale rows carry the PO reference as
@@ -305,6 +313,42 @@ function extractLineItems(inv: Pick<VendorInvoiceRow, 'raw_data' | 'line_items'>
         } catch { /* not JSON */ }
     }
     return null;
+}
+
+/**
+ * Parse `vendor_invoices.line_items` (OCR JSONB or JSON string) into the shape
+ * the 3-way stamp needs. Read-only — never re-OCR and never fetch Finale.
+ */
+function invoiceLinesForThreeWay(
+    inv: Pick<VendorInvoiceRow, 'line_items'> | null | undefined,
+): ThreeWayInvoiceLine[] {
+    if (!inv?.line_items) return [];
+    let parsed: unknown = inv.line_items;
+    if (typeof parsed === 'string') {
+        try {
+            parsed = JSON.parse(parsed);
+        } catch {
+            return [];
+        }
+    }
+    if (!Array.isArray(parsed)) return [];
+    const out: ThreeWayInvoiceLine[] = [];
+    for (const raw of parsed as InvoiceLineItem[]) {
+        const qty = Number(raw?.qty ?? raw?.quantity ?? 0);
+        const unitPrice = Number(raw?.unit_price ?? 0);
+        const extPrice = raw?.ext_price === null || raw?.ext_price === undefined
+            ? null
+            : Number(raw.ext_price);
+        out.push({
+            sku: raw?.sku ?? null,
+            productId: raw?.productId ?? null,
+            description: raw?.description ?? null,
+            qty: Number.isFinite(qty) ? qty : 0,
+            unitPrice: Number.isFinite(unitPrice) ? unitPrice : 0,
+            extPrice: extPrice !== null && Number.isFinite(extPrice) ? extPrice : null,
+        });
+    }
+    return out;
 }
 
 export async function GET(req: NextRequest) {
@@ -498,6 +542,52 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         // the whole PO.
                         billingPattern: isDeliverAndBillVendor(po.supplier) ? "deliver_and_bill" : null,
                     };
+                }
+
+                // ── 3-way verdict (WS4, 2026-10-29) ──────────────────────────
+                // Every received PO with a matched bill gets ordered vs received
+                // vs billed per line plus a bucketed variance. BULK DATA ONLY:
+                // `po.items` already carries unitPrice from the bulk GraphQL
+                // query and the matched invoice carries its OCR lines — a
+                // per-PO getOrderDetails here would queue on Finale's 500ms
+                // serial interval and the 20s route guard would drop the whole
+                // enrichment. Pure CPU, no I/O.
+                for (const po of received) {
+                    const rec = po._reconciliation;
+                    if (!rec?.matchedInvoice) continue;
+                    try {
+                        const items = (po.items || []).map((it) => ({
+                            productId: String(it.productId || ""),
+                            orderedQty: Number(it.orderedQuantity ?? it.quantity ?? 0),
+                            receivedQty:
+                                it.receivedQuantity === undefined || it.receivedQuantity === null
+                                    ? null
+                                    : Number(it.receivedQuantity),
+                            unitPrice: Number(it.unitPrice ?? 0),
+                        }));
+                        // Finale has no freight field on a PO: freight = total − subtotal.
+                        const poFreight =
+                            po.subtotal !== null && po.subtotal !== undefined && Number(po.subtotal) > 0
+                                ? Number(po.total || 0) - Number(po.subtotal)
+                                : null;
+                        rec.threeWay = buildReceivingsThreeWay({
+                            orderId: String(po.orderId),
+                            items,
+                            invoiceLines: invoiceLinesForThreeWay(rec.matchedInvoice),
+                            invoice: {
+                                freight: rec.matchedInvoice.freight,
+                                tax: rec.matchedInvoice.tax,
+                                total: rec.matchedInvoice.total,
+                            },
+                            poFreight,
+                            hasReceipt: Boolean(po.receiveDate || (po.receiptHistory?.length ?? 0) > 0),
+                        });
+                    } catch (twErr: unknown) {
+                        // Never let one bad row blank the panel; the absence of a
+                        // stamp is honest, a fabricated verdict is not.
+                        const msg = twErr instanceof Error ? twErr.message : String(twErr);
+                        console.warn(`[receivings] 3-way stamp failed for ${po.orderId}: ${msg}`);
+                    }
                 }
             }
 
