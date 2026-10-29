@@ -519,6 +519,19 @@ async function enrichInvoiceForPoMatch(args: {
      * id from forwardInvoiceOnce; falls back to the message id if absent.
      */
     rowId?: number;
+    /**
+     * Dropship / carrier-bill lanes: run the full field extraction (vendor,
+     * invoice #, total, freight, printed PO) but never invent a PO link.
+     *
+     * KAIZEN(2026-10-28): dropship previously skipped this function ENTIRELY
+     * via skipReconciliation, so 125 dropship forwards kept raw text with
+     * ocr_vendor_name / ocr_total / matched_po_number all NULL — invisible to
+     * reconciliation and to freight review. Skipping PO *matching* must not
+     * mean skipping PO *reading*: a printed P.O. NO. is a fact about the
+     * document, and Bill's 2026-07-27 decision excludes dropship from
+     * auto-matching, not from being read.
+     */
+    suppressAutoPoLink?: boolean;
 }): Promise<void> {
     const { extractPDF } = await import("@/lib/pdf/extractor");
     const { parseInvoice } = await import("@/lib/pdf/invoice-parser");
@@ -545,8 +558,30 @@ async function enrichInvoiceForPoMatch(args: {
     // Vendor hint precedence: caller hint > DTE regex > sender display name.
     // The email From is the one identity the OCR can never corrupt — when a
     // parse fails to "error", the sender name is the honest fallback.
-    const senderName = String(args.emailFrom || "").split("<")[0].replace(/["']/g, "").trim();
-    const senderVendor = senderName && !senderName.includes("@") && !/^(no-?reply|accounts payable|ap|billing|invoice)/i.test(senderName)
+    //
+    // KAIZEN(2026-10-28): email_from is frequently angle-only ("<maris@evergreen
+    // growers.com>") — 49 of 1,045 forwards. `split("<")[0]` is then an EMPTY
+    // string, so senderVendor was undefined and the row landed with
+    // ocr_vendor_name = NULL even though the text names the vendor. Treat the
+    // address local-part/domain as the fallback identity in that case.
+    const fromRaw = String(args.emailFrom || "");
+    const addrMatch = fromRaw.match(/<([^>]+)>/);
+    const addrOnly = (addrMatch?.[1] ?? fromRaw).trim();
+    let senderName = fromRaw.split("<")[0].replace(/["']/g, "").trim();
+    if (!senderName && addrOnly.includes("@")) {
+        // "evergreengrowers.com" -> "Evergreengrowers"; strip role mailboxes so
+        // orders@/ap@ don't become the vendor name, and refuse payment/notification
+        // proxies outright — quickbooks@notification.intuit.com otherwise yields a
+        // vendor literally named "Notification".
+        const domain = (addrOnly.split("@")[1] ?? "").toLowerCase();
+        const core = domain.split(".")[0];
+        const PROXY_DOMAIN = /(?:^|\.)(?:intuit\.com|sosinventory\.com|billtrust\.com|bill\.com|paypal\.com|stripe\.com)$/i;
+        const ROLE_CORE = /^(no-?reply|do-?not-?reply|accounts?|ap|billing|invoice|orders?|mail|info|admin|notification|notifications|quickbooks|noreply|support|service|team)$/i;
+        if (core && !ROLE_CORE.test(core) && !PROXY_DOMAIN.test(domain)) {
+            senderName = core;
+        }
+    }
+    const senderVendor = senderName && !senderName.includes("@") && !/^(no-?reply|accounts payable|ap|billing|invoice|orders?|notification)$/i.test(senderName)
         ? senderName.replace(/\b\w/g, (c) => c.toUpperCase())
         : undefined;
     let vendorHint =
@@ -626,7 +661,12 @@ async function enrichInvoiceForPoMatch(args: {
     // and link to current PO for that vendor." When the document carries no
     // usable PO reference, link the invoice to the vendor's current open PO
     // at ingest time instead of leaving it for the 30-minute batch matcher.
-    if (!norm.poNumber && norm.total > 0) {
+    //
+    // Suppressed on dropship/carrier lanes: this is an INFERRED link, and
+    // inventing one on a flow-through document would attribute a dropship
+    // shipment to an unrelated open PO — the exact false-reconciliation class
+    // we are cleaning up. A printed PO ref is still honoured above.
+    if (!norm.poNumber && norm.total > 0 && !args.suppressAutoPoLink) {
         try {
             const { findCurrentPoForInvoice } = await import("@/lib/purchasing/invoice-delivery-link");
             const decision = await findCurrentPoForInvoice({
@@ -686,6 +726,13 @@ async function enrichInvoiceForPoMatch(args: {
                    ELSE COALESCE(?, matched_po_number)
                  END,
                  reconciliation_status = CASE
+                   -- Dropship/carrier lane: matched_po_number records the printed
+                   -- PO, but the status must stay untouched so
+                   -- runReconciliationHandoff's dropship auto-complete still
+                   -- claims the row (it only selects status IS NULL/''). Without
+                   -- this arm, writing PO_CANDIDATE here would strand every
+                   -- dropship row out of auto-complete forever.
+                   WHEN ? = 1 THEN reconciliation_status
                    WHEN ? = 1 AND reconciliation_status = 'PO_CANDIDATE'
                    THEN 'PO_UNMATCHED'
                    WHEN ? IS NOT NULL AND (reconciliation_status IS NULL OR reconciliation_status = '' OR reconciliation_status = 'PO_UNMATCHED')
@@ -706,6 +753,7 @@ async function enrichInvoiceForPoMatch(args: {
             // against `= 1`; pass a literal 1/0.
             poRefRejected ? 1 : 0,
             norm.poNumber,
+            args.suppressAutoPoLink ? 1 : 0,
             poRefRejected ? 1 : 0,
             norm.poNumber,
             norm.poNumber
@@ -1847,7 +1895,15 @@ export async function runLocalApForward(opts?: {
                     // Vision/OCR + vendor_invoices so Receivings can PO-match.
                     // Photo invoices need LLM OCR (pdf-parse returns ~0 text).
                     // Non-fatal: Bill.com already has the bill.
-                    if (!skipReconciliation) {
+                    //
+                    // KAIZEN(2026-10-28): this block used to be skipped entirely
+                    // when skipReconciliation was set (dropship vendors), which
+                    // left 125 dropship forwards with raw text but NULL vendor,
+                    // total and matched_po_number — so a $152.77 dropship invoice
+                    // against an $89.00 PO could not even be seen. Extraction now
+                    // always runs; suppressAutoPoLink keeps the inferred current-PO
+                    // link (and drop-ship auto-complete semantics) off that lane.
+                    {
                         try {
                             await enrichInvoiceForPoMatch({
                                 gmailMessageId,
@@ -1863,6 +1919,7 @@ export async function runLocalApForward(opts?: {
                                 // Authoritative row key — never gmail_message_id
                                 // alone (multi-attachment emails overwrite each other).
                                 rowId: once.claimId,
+                                suppressAutoPoLink: skipReconciliation,
                             });
                         } catch (enrichErr: any) {
                             console.warn(

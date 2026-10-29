@@ -255,8 +255,17 @@ function linesOnSameRow(rows: string[]): { goods: InvoiceTextLine[]; freightAndT
 }
 
 function findPo(text: string): string | null {
+    // Standard Finale POs are "1" + 5 digits. Dropship POs are a bare 8-digit
+    // sales-order base ("2" + 7 digits, e.g. 23580437) that resolves to a
+    // "-DropshipPO" row downstream. The old pattern only accepted the 6-digit
+    // shape, so every dropship invoice printed as bare P.O. NO. 23580437
+    // extracted nothing (Evergreen 151185 and 125 sibling rows). Digit-run
+    // length is bounded and word-terminated so a longer run cannot capture a
+    // truncated prefix.
     const match = text.match(/\bP\.?\s*O\.?\s*(?:number|num|no|#)?\s*:?\s*#?\s*(1\d{5})\b/i)
-        || text.match(/\bPO\s*#\s*(1\d{5})\b/i);
+        || text.match(/\bPO\s*#\s*(1\d{5})\b/i)
+        || text.match(/\bP\.?\s*O\.?\s*(?:number|num|no|#)?\s*:?\s*#?\s*(2\d{7})\b/i)
+        || text.match(/\bPO\s*#\s*(2\d{7})\b/i);
     return match?.[1] ?? null;
 }
 

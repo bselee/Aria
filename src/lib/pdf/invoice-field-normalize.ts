@@ -14,6 +14,17 @@
 import type { InvoiceData } from "./invoice-parser";
 import { extractGoodsLinesFromInvoiceText } from "./invoice-text-lines";
 
+/**
+ * Line splitter. Built from char codes rather than a regex literal so an
+ * editor/patcher that folds a literal CRLF cannot silently break this module —
+ * a real newline inside a regex literal is a SyntaxError that takes out every
+ * import of this file, including the tests of unrelated modules.
+ * Matches 
+\n, \n, 
+.
+ */
+const SPLIT_LINE_RE = new RegExp("[" + String.fromCharCode(13) + String.fromCharCode(10) + "]+");
+
 const BAD_SENTINELS = new Set([
     "",
     "unknown",
@@ -54,6 +65,7 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
     total: number | null;
     invoiceDate: string | null;
     vendorHint: string | null;
+    freight: number | null;
 } {
     const text = rawText || "";
     let invoiceNumber: string | null = null;
@@ -96,16 +108,21 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         }
     }
 
-    // PO: dedicated field or bare 5–6 digit Finale-style after P.O. NUMBER
+    // PO: dedicated field, bare Finale-style after P.O. NUMBER, or a dropship
+    // 8-digit sales-order base ("2" + 7 digits) that resolves to a
+    // "-DropshipPO" row via validatePoRef/resolveDropshipPOByBase. The 8-digit
+    // arm is last so a standard 6-digit PO always wins on a document carrying
+    // both, and digit runs are bounded so a longer run cannot capture a prefix.
     const poPatterns = [
-        /P\.?\s*O\.?\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(\d{4,6})\b/i,
-        /PURCHASE\s+ORDER\s*#?\s*[:#\-]?\s*(\d{4,6})\b/i,
+        /P\.?\s*O\.?\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(1\d{5})\b/i,
+        /PURCHASE\s+ORDER\s*#?\s*[:#\-]?\s*(1\d{5})\b/i,
         /(?:^|\n)\s*#?(12\d{3,4})\b/, // Finale POs often 12xxxx
+        /P\.?\s*O\.?\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(2\d{7})\b/i,
     ];
     for (const re of poPatterns) {
         const m = text.match(re);
         if (m?.[1]) {
-            poNumber = m[1].padStart(5, "0");
+            poNumber = /^2\d{7}$/.test(m[1]) ? m[1] : m[1].padStart(5, "0");
             break;
         }
     }
@@ -143,7 +160,34 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         vendorHint = "Down to Earth Worms";
     }
 
-    return { invoiceNumber, poNumber, total, invoiceDate, vendorHint };
+    // Freight: a shipping/S&H line with a money amount. Evergreen prints
+    // "Shipping-FedExS/H - FedEx Tracking #<n>1ea56.7756.77" — glued OCR with
+    // no spaces — and their "Insulation" line can glue onto the same physical
+    // line, so the LAST amount is NOT the freight (it is the insulation, $7.00).
+    //
+    // Rule: anchor on the shipping LABEL, slice everything after it, then take
+    // the FIRST price-like amount. A `(?<!\d)` lookbehind rejects amounts that
+    // are really the tail of a longer digit run — that is how a tracking number
+    // bleeding into the price ("...9104156.77") is refused outright rather than
+    // silently read as freight.
+    //
+    // No label, no freight: this feeds variance review, and a guessed number is
+    // worse than a blank.
+    let freight: number | null = null;
+    const labelRe = /\b(?:shipping|freight|s\s*\/?\s*h)\b/i;
+    const lines = text.split(SPLIT_LINE_RE);
+    const freightLine = lines.find((l) => labelRe.test(l) && /\d+\.\d{2}/.test(l));
+    if (freightLine) {
+        const at = freightLine.search(labelRe);
+        const tail = at >= 0 ? freightLine.slice(at) : freightLine;
+        const amounts = [...tail.matchAll(/(?<![\d.])(\d{1,3}(?:,\d{3})*\.\d{2})/g)].map((m) =>
+            Number(m[1].replace(/,/g, "")),
+        );
+        const first = amounts.find((n) => n > 0 && n < 100000);
+        if (first != null) freight = first;
+    }
+
+    return { invoiceNumber, poNumber, total, invoiceDate, vendorHint, freight };
 }
 
 function looksLikeDate(s: string): boolean {
@@ -196,9 +240,21 @@ export function normalizeInvoiceForDb(
         vendorName = "Down to Earth Worms";
     }
 
-    const freight = Number(parsed?.freight) || 0;
+    // Freight / tax / subtotal: the LLM parse wins when it produced a value;
+    // the OCR line-scan is the fallback. Without this wiring `fb.freight` was
+    // dead code — extractInvoiceFieldsFromOcrText computed a freight figure
+    // that normalizeInvoiceForDb never read, which is why every Evergreen
+    // vendor_invoices row carried freight=0 and the dropship variance
+    // ($56.77 S/H + $7.00 insulation) was invisible to review.
+    let freight = Number(parsed?.freight) || 0;
+    if (!freight && fb.freight != null) freight = fb.freight;
     const tax = Number(parsed?.tax) || 0;
-    const subtotal = Number(parsed?.subtotal) || 0;
+    let subtotal = Number(parsed?.subtotal) || 0;
+    // Derive subtotal only when the pieces are present and it reconciles —
+    // never to make a number look tidy.
+    if (!subtotal && total > 0 && freight > 0 && total - freight - tax > 0) {
+        subtotal = Math.round((total - freight - tax) * 100) / 100;
+    }
     const lineItems = Array.isArray(parsed?.lineItems)
         ? parsed!.lineItems!.map((li: any) => ({
               sku: String(li.sku || ""),

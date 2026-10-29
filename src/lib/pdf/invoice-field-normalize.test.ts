@@ -48,6 +48,91 @@ describe("cleanInvoiceField", () => {
 });
 
 describe("extractInvoiceFieldsFromOcrText", () => {
+    // Real OCR text from ap@ forwards row 1141 (Evergreen invoice 151185).
+    // The PO is printed as a bare 8-digit sales-order base in a combined
+    // "Approval CodeP.O. NO." header block. The 6-digit-only pattern matched
+    // nothing, so vendor/PO came back null on 125 dropship forwards.
+    const EVERGREEN_DROPSHIP_OCR = `Invoice
+Date
+10/27/2026
+Invoice #
+151185
+Bill To:
+BuildASoil LLC
+5016 N Townsend Ave
+Montrose, CO 81401
+Ship To:
+Tyler Cooper
+2267 SPLIT ROCK DR
+COLORADO SPGS, CO 80919-3077 USA
+Evergreen Growers Supply, LLC.
+Approval CodeP.O. NO.
+23580437
+Terms
+Net 30
+Due Date
+11/26/2026
+Shipping-FedExS/H - FedEx Tracking #5204849091041ea56.7756.77
+InsulationInsulation for hot or cold weather1ea7.007.00
+Total
+$152.77`;
+
+    it("extracts a bare 8-digit dropship PO base (Evergreen 151185)", () => {
+        const f = extractInvoiceFieldsFromOcrText(EVERGREEN_DROPSHIP_OCR);
+        expect(f.poNumber).toBe("23580437");
+        expect(f.invoiceNumber).toBe("151185");
+        expect(f.total).toBe(152.77);
+        expect(f.invoiceDate).toBe("2026-10-27");
+    });
+
+    it("still prefers a standard 6-digit PO over an 8-digit base", () => {
+        const both = `P.O. NUMBER\n125257\nSales Order\n23580437\nTotal\n$10.00`;
+        expect(extractInvoiceFieldsFromOcrText(both).poNumber).toBe("125257");
+    });
+
+    it("does not truncate a longer digit run into a fake PO", () => {
+        // 9-digit run must not yield the first 8 as a PO.
+        const long = `P.O. NO.\n235804371\nTotal\n$10.00`;
+        expect(extractInvoiceFieldsFromOcrText(long).poNumber).toBeNull();
+    });
+
+    it("extracts freight from the real Evergreen 151185 layout", () => {
+        const f = extractInvoiceFieldsFromOcrText(EVERGREEN_DROPSHIP_OCR);
+        expect(f.freight).toBe(56.77);
+    });
+
+    it("takes freight, not the insulation amount, when OCR glues them on one line", () => {
+        // aria-purchasing: last-plausible would return 7.00 (insulation).
+        const glued = [
+            "P.O. NO.",
+            "23580437",
+            "Shipping-FedExS/H - FedEx Tracking #5204849091041ea56.7756.77Insulation1ea7.007.00",
+            "Total",
+            "$152.77",
+        ].join("\n");
+        expect(extractInvoiceFieldsFromOcrText(glued).freight).toBe(56.77);
+    });
+
+    it("refuses freight when the tracking number bleeds into the amount", () => {
+        // "…9104156.777.00" — 56.77 is not recoverable, so null beats a guess.
+        const bleed = [
+            "P.O. NO.",
+            "23580437",
+            "Shipping-FedExS/H - FedEx Tracking #520484909104156.777.00",
+            "Total",
+            "$152.77",
+        ].join("\n");
+        expect(extractInvoiceFieldsFromOcrText(bleed).freight).toBeNull();
+    });
+
+    it("wires OCR freight into normalizeInvoiceForDb and derives subtotal", () => {
+        const n = normalizeInvoiceForDb(null, EVERGREEN_DROPSHIP_OCR, {});
+        expect(n.freight).toBe(56.77);
+        expect(n.total).toBe(152.77);
+        // 152.77 - 56.77 freight - 0 tax = 96.00 (goods 89.00 + 7.00 insulation)
+        expect(n.subtotal).toBe(96);
+    });
+
     it("pulls inv# PO total date from DTE photo OCR", () => {
         const f = extractInvoiceFieldsFromOcrText(DTE_OCR);
         expect(f.invoiceNumber).toBe("1682");
