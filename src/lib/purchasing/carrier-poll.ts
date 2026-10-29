@@ -38,6 +38,11 @@ export async function pollActiveShipments(): Promise<CarrierPollOutcome[]> {
         .eq('active', true)
         .is('delivered_at', null)
         .or(`last_checked_at.is.null,last_checked_at.lte.${cutoff}`)
+        // Oldest-checked first. Without an explicit order the same first page is
+        // returned on every run while the backlog behind it is never reached —
+        // and with MAX_SHIPMENTS_PER_RUN below the backlog size, a poll that does
+        // not advance starves the tail permanently.
+        .order('last_checked_at', { ascending: true, nullsFirst: true })
         .limit(MAX_SHIPMENTS_PER_RUN);
     if (error) {
         console.error('[carrier-poll] query failed:', error.message);
@@ -110,9 +115,36 @@ export async function pollActiveShipments(): Promise<CarrierPollOutcome[]> {
                 action: 'error',
                 error: err?.message ?? String(err),
             });
+        } finally {
+            // Stamp the attempt whether it succeeded or not. This is the only
+            // thing that moves a row out of the `last_checked_at.is.null` set;
+            // without it every row qualifies forever, the 2h cooldown never
+            // applies, and the poll re-reads the same page until the process
+            // dies. A failed stamp is logged rather than swallowed, because a
+            // silent one silently restores that starvation.
+            await stampChecked(supabase, s.id);
         }
         await new Promise(r => setTimeout(r, PACE_MS));
     }
 
     return outcomes;
+}
+
+/**
+ * Record that we attempted this shipment, so the 2h cooldown applies to it.
+ *
+ * Deliberately not part of upsertShipmentEvidence: that writer describes the
+ * carrier's verdict, this describes our own attempt, and a no_data or error
+ * result still deserves the cooldown.
+ */
+async function stampChecked(supabase: any, id: string): Promise<void> {
+    try {
+        const { error } = await supabase
+            .from('shipments')
+            .update({ last_checked_at: new Date().toISOString() })
+            .eq('id', id);
+        if (error) console.warn(`[carrier-poll] could not stamp last_checked_at for ${id}: ${error.message}`);
+    } catch (err: any) {
+        console.warn(`[carrier-poll] could not stamp last_checked_at for ${id}: ${err?.message ?? String(err)}`);
+    }
 }
