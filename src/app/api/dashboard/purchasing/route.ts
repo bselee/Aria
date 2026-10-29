@@ -18,6 +18,10 @@ import {
     partitionOpenPOsByAnomaly,
     isAnomalousOpenPo,
     anomalousCoverNote,
+    findAgedSilentOpenPo,
+    agedPoBlockReason,
+    AGED_PO_BLOCK_DAYS,
+    type AgedPoFacts,
 } from '@/lib/purchasing/ordering-po-coverage';
 import { DEFAULT_LEAD_TIME_DAYS } from '@/lib/constants';
 
@@ -264,6 +268,51 @@ export async function GET(req: NextRequest) {
 
     const recentCoverageByProduct = buildRecentOpenCoverageByProduct(recentPOs);
     const vendorCyclePOs = mapRecentPOsToVendorCyclePOs(recentPOs);
+
+    // ── Aged-PO commit blocker (WS6.2) ─────────────────────────────────────
+    // A SKU with an open PO more than AGED_PO_BLOCK_DAYS past issue, no tracking
+    // and no receipt, must not get a second PO committed on top of it. All the
+    // facts needed are on purchase_orders, so read them ONCE for every open PO
+    // named on any row — never per row. Fail open: no facts means no block.
+    const openPoNumbers = new Set<string>();
+    for (const group of assessment.groups) {
+        for (const line of group.items) {
+            const ids = [
+                ...(line.item.openPOs ?? []).map(po => po?.orderId),
+                ...(recentCoverageByProduct.get(line.item.productId)?.allHits ?? []).map(hit => hit.orderId),
+            ];
+            for (const id of ids) {
+                // Finale 6-digit POs only: a marketplace/dropship id has no
+                // purchase_orders row to read and is not chasable in Finale.
+                if (id && /^\d{6}$/.test(String(id))) openPoNumbers.add(String(id));
+            }
+        }
+    }
+    const agedPoFactsByNumber = new Map<string, AgedPoFacts>();
+    if (openPoNumbers.size > 0) {
+        try {
+            const db = createClient();
+            if (db) {
+                const { data: poRows, error: poFactsErr } = await db
+                    .from('purchase_orders')
+                    .select('po_number, issue_date, tracking_numbers, receive_date')
+                    .in('po_number', Array.from(openPoNumbers).slice(0, 500));
+                if (poFactsErr) {
+                    console.warn('[purchasing/route] aged-PO facts read failed:', poFactsErr.message);
+                }
+                for (const row of (poRows ?? []) as Array<Record<string, any>>) {
+                    agedPoFactsByNumber.set(String(row.po_number), {
+                        issueDate: row.issue_date,
+                        trackingNumbers: row.tracking_numbers,
+                        receiveDate: row.receive_date,
+                    });
+                }
+            }
+        } catch (err: any) {
+            console.warn('[purchasing/route] aged-PO facts read threw:', err?.message ?? err);
+        }
+    }
+
     const responseGroups = assessment.groups.map(group => {
         const vendorCycle = classifyVendorOrderCycle({
             vendorPartyId: group.vendorPartyId,
@@ -395,6 +444,31 @@ export async function GET(req: NextRequest) {
                 };
             }
             const isHold = assessment.decision === 'hold' || assessment.decision === 'manual_review';
+
+            // ── Aged-PO commit blocker (WS6.2) ────────────────────────────────
+            // The row is actionable (not held by cover) and one of its open POs is
+            // >AGED_PO_BLOCK_DAYS old with no tracking and no receipt: committing a
+            // second PO now would pile supply on top of a PO nobody can account for.
+            // PO 125283 (900 x RAP101, issued 9/9, silent since) is the case this
+            // exists for. Held rows are already off the board — leave them alone.
+            const agedPoBlock = isHold
+                ? null
+                : findAgedSilentOpenPo(mergedOpenPOs, agedPoFactsByNumber);
+            const agedReason = agedPoBlock ? agedPoBlockReason(agedPoBlock) : '';
+            const baseGuard = assessPOCommitGuard(line);
+            // A hard block keeps its decision (no qty / no rate) but still carries the
+            // reason; anything else becomes 'review' — never 'commit'.
+            const commitGuard = agedReason
+                ? {
+                    ...baseGuard,
+                    decision: baseGuard.decision === 'block' ? ('block' as const) : ('review' as const),
+                    blockReasons: [...baseGuard.blockReasons, agedReason],
+                    summary: baseGuard.decision === 'block'
+                        ? `Blocked: ${[...baseGuard.blockReasons, agedReason].join(', ')}`
+                        : `Review: ${agedReason}`,
+                }
+                : baseGuard;
+
             const displaySuggested = isHold
                 ? 0
                 : (assessment.recommendedQty > 0 ? assessment.recommendedQty : line.item.suggestedQty);
@@ -429,7 +503,10 @@ export async function GET(req: NextRequest) {
                 suggestedQty: displaySuggested,
                 candidate: line.candidate,
                 assessment,
-                commitGuard: assessPOCommitGuard(line),
+                commitGuard,
+                ...(agedPoBlock
+                    ? { agedPoBlock: { orderId: agedPoBlock.orderId, ageDays: agedPoBlock.ageDays, reason: agedReason } }
+                    : {}),
                 draftPO: draftPOInfo,
                 urgency: displayUrgency,
                 // The scan's stale explanation refers to cover we just excluded; when an

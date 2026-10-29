@@ -308,3 +308,92 @@ export function anomalousCoverNote(anomalous: Array<{ orderId?: string; ageDays:
         : `${newest.ageDays}-${oldest.ageDays}d`;
     return `Anomaly: ${ordered.length} POs open ${span} (oldest #${oldest.orderId}), never received; not counted as cover. Assess in Finale.`;
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// AGED SILENT PO → COMMIT BLOCKER (WS6.2)
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * An open PO this many days past its issue date, with no tracking and no
+ * receipt, stops being cover and becomes a question a human has to answer
+ * before the SKU is ordered again.
+ *
+ * DECISION(2026-10-29, Bill): "more than 14 days past issue with no tracking
+ * and no receipt flips the recommendation to review." One edit if the bar moves.
+ *
+ * Why 14 and not the 45d anomaly floor: the anomaly floor decides whether a PO
+ * still counts as *cover*. This decides whether we are willing to *commit a
+ * second PO on top of one nobody can account for*. At 14 days a domestic vendor
+ * that acknowledged has usually shipped or explained; silence is the signal.
+ */
+export const AGED_PO_BLOCK_DAYS = 14;
+
+/** Ordering-side facts about an open PO, read once per request from purchase_orders. */
+export type AgedPoFacts = {
+    /** Finale issue date (`issue_date`); preferred over the payload's orderDate. */
+    issueDate?: string | null;
+    /** `tracking_numbers` — any non-empty entry means the vendor shipped something. */
+    trackingNumbers?: string[] | null;
+    /** `receive_date` — set (past or future) means a receipt is on the record. */
+    receiveDate?: string | null;
+};
+
+export type AgedSilentOpenPo = { orderId: string; ageDays: number };
+
+/**
+ * Is one open PO aged AND silent? Returns the age when it blocks, else null.
+ *
+ * Aged: more than AGED_PO_BLOCK_DAYS past the issue date (falls back to the
+ * payload's orderDate when the DB row has none).
+ * Silent: no tracking numbers AND no receive date.
+ *
+ * Fails OPEN on missing evidence: no facts row, no parseable date, an unknown
+ * tracking shape → not a blocker. Absence of evidence about a PO is not
+ * evidence that the PO is dead, and a false block stops real ordering.
+ */
+export function isAgedSilentOpenPo(
+    po: { orderId: string; orderDate?: string } | null | undefined,
+    facts: AgedPoFacts | null | undefined,
+    now: number = Date.now(),
+): AgedSilentOpenPo | null {
+    if (!po?.orderId || !facts) return null;
+    if (Array.isArray(facts.trackingNumbers) && facts.trackingNumbers.some(n => String(n ?? "").trim())) {
+        return null;
+    }
+    if (facts.receiveDate) return null;
+    const age = poAgeDays(facts.issueDate ?? po.orderDate, now);
+    if (age === null || age <= AGED_PO_BLOCK_DAYS) return null;
+    return { orderId: String(po.orderId), ageDays: age };
+}
+
+/**
+ * Oldest aged-silent open PO for a SKU, or null. The oldest one is the blocker
+ * worth naming: it is the one that has been rotting longest.
+ *
+ * @param openPOs  The row's merged open POs (GraphQL + recent-PO overlay).
+ * @param factsById po_number → facts, from ONE batched purchase_orders read.
+ * @param now      Clock override for tests.
+ */
+export function findAgedSilentOpenPo<T extends { orderId: string; orderDate?: string }>(
+    openPOs: T[] | null | undefined,
+    factsById: Map<string, AgedPoFacts> | Record<string, AgedPoFacts> | null | undefined,
+    now: number = Date.now(),
+): AgedSilentOpenPo | null {
+    if (!openPOs?.length || !factsById) return null;
+    const lookup = (id: string): AgedPoFacts | undefined =>
+        factsById instanceof Map ? factsById.get(id) : factsById[id];
+    let worst: AgedSilentOpenPo | null = null;
+    for (const po of openPOs) {
+        const hit = isAgedSilentOpenPo(po, lookup(String(po?.orderId)), now);
+        if (hit && (!worst || hit.ageDays > worst.ageDays)) worst = hit;
+    }
+    return worst;
+}
+
+/**
+ * The blockReason text on the ordering row. Names the PO, its age, the missing
+ * evidence, and the two ways out — so the row is actionable without a tooltip.
+ */
+export function agedPoBlockReason(po: AgedSilentOpenPo): string {
+    return `resolve PO ${po.orderId} first (open ${po.ageDays}d, no tracking): chase or cancel`;
+}

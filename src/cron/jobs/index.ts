@@ -1668,3 +1668,36 @@ defineJob({
     },
     budget: { durationMs: 120_000 },
 });
+
+// WS6.1 (docs/plans/2026-10-29-aria-dashboard-hardening.md) — the "vendor
+// acked but never shipped" gap: POs with a verified ack and zero tracking were
+// invisible to po-followup-watcher (unacked only), vendor-escalation (unacked
+// only) and po-overdue-followup (needs a past receive date). PO 125283 sat
+// 48 days silent. 8:25 keeps it out of the 8:15 daily-summary herd.
+// Output lands on the dashboard row (needs_human_review + last_movement_summary);
+// this job sends NO Telegram/Slack message.
+defineJob({
+    name: "po-ship-status-followup",
+    schedule: "25 8 * * 1-5",
+    onFail: "log",
+    description:
+        "Weekday 8:25 AM: flag acked-but-never-shipped POs on the dashboard (needs_human_review + last_movement_summary) and draft an in-thread ship-status request for the 7-30d window. Never sends email; never reports to Telegram/Slack.",
+    handler: async () => {
+        const { runShipStatusFollowup } = await import(
+            "@/lib/purchasing/po-ship-status-followup"
+        );
+        const outcomes = await runShipStatusFollowup();
+        const drafted = outcomes.filter((o) => o.action === "drafted");
+        const flagged = outcomes.filter((o) => o.action === "flagged");
+        if (drafted.length > 0 || flagged.length > 0) {
+            console.log(
+                `[po-ship-status-followup] drafted=${drafted.length} (${drafted
+                    .map((o) => o.poNumber)
+                    .join(",")}) flagged=${flagged.length} (${flagged
+                    .map((o) => o.poNumber)
+                    .join(",")})`,
+            );
+        }
+    },
+    budget: { durationMs: 300_000 },
+});

@@ -6,9 +6,13 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+    AGED_PO_BLOCK_DAYS,
     PO_ANOMALY_FLOOR_DAYS,
+    agedPoBlockReason,
     anomalousCoverNote,
     buildRecentOpenCoverageByProduct,
+    findAgedSilentOpenPo,
+    isAgedSilentOpenPo,
     isAnomalousOpenPo,
     isDraftOrderingStatus,
     isOpenOrderingStatus,
@@ -264,5 +268,122 @@ describe("aged-PO anomaly", () => {
         expect(anomalousCoverNote([{ orderId: "125016", ageDays: 112 }]))
             .toBe("Anomaly: PO #125016 open 112d, never received; not counted as cover. Assess in Finale.");
         expect(anomalousCoverNote([])).toBe("");
+    });
+});
+
+describe("aged silent PO commit blocker (WS6.2)", () => {
+    // Fixed clock: 2026-10-29 12:00Z. Ages are exact because the dates are
+    // emitted at 00:00Z, so the 14d boundary cannot drift with time of day.
+    const NOW = Date.parse("2026-10-29T12:00:00Z");
+    const daysAgoIso = (n: number): string =>
+        new Date(NOW - n * 86_400_000).toISOString().slice(0, 10) + "T00:00:00";
+
+    const po = (orderId = "125283", orderDate?: string) => ({ orderId, orderDate });
+
+    it("keeps the 14-day bar as a single named constant", () => {
+        expect(AGED_PO_BLOCK_DAYS).toBe(14);
+    });
+
+    it("does not block at exactly 14 days, blocks at 15", () => {
+        // Boundary is strict (> 14), so a PO issued 14 days ago is still in window.
+        expect(isAgedSilentOpenPo(po("125283"), { issueDate: daysAgoIso(14) }, NOW)).toBeNull();
+        expect(isAgedSilentOpenPo(po("125283"), { issueDate: daysAgoIso(15) }, NOW))
+            .toEqual({ orderId: "125283", ageDays: 15 });
+    });
+
+    it("blocks the real case: 125283 issued 9/9, no tracking, no receipt", () => {
+        // issue_date from purchase_orders: 2026-09-09T00:00:00-06:00
+        const hit = isAgedSilentOpenPo(
+            po("125283", "9/9/2026"),
+            { issueDate: "2026-09-09T00:00:00-06:00", trackingNumbers: [], receiveDate: null },
+            NOW,
+        );
+        expect(hit).toEqual({ orderId: "125283", ageDays: 50 });
+        expect(agedPoBlockReason(hit!))
+            .toBe("resolve PO 125283 first (open 50d, no tracking): chase or cancel");
+    });
+
+    it("treats missing/empty/blank tracking_numbers as still silent", () => {
+        for (const trackingNumbers of [null, undefined, [], ["", "   "]]) {
+            expect(isAgedSilentOpenPo(
+                po(), { issueDate: daysAgoIso(20), trackingNumbers, receiveDate: null }, NOW,
+            )).toEqual({ orderId: "125283", ageDays: 20 });
+        }
+    });
+
+    it("never blocks a PO that has any tracking number", () => {
+        expect(isAgedSilentOpenPo(
+            po(), { issueDate: daysAgoIso(60), trackingNumbers: ["1Z2914E20328399847"] }, NOW,
+        )).toBeNull();
+    });
+
+    it("never blocks a PO with a receive date, however old", () => {
+        expect(isAgedSilentOpenPo(
+            po(), { issueDate: daysAgoIso(120), trackingNumbers: [], receiveDate: "2026-09-30" }, NOW,
+        )).toBeNull();
+        // A future receive date is still a receipt on the record.
+        expect(isAgedSilentOpenPo(
+            po(), { issueDate: daysAgoIso(120), receiveDate: "2026-11-15" }, NOW,
+        )).toBeNull();
+    });
+
+    it("prefers issue_date and falls back to the payload orderDate", () => {
+        // issue_date wins: 30d beats a 3d payload date.
+        expect(isAgedSilentOpenPo(
+            po("125283", daysAgoIso(3)), { issueDate: daysAgoIso(30), trackingNumbers: [] }, NOW,
+        )).toEqual({ orderId: "125283", ageDays: 30 });
+        // No issue_date on the row → the payload date decides.
+        expect(isAgedSilentOpenPo(
+            po("125283", daysAgoIso(15)), { issueDate: null, trackingNumbers: [] }, NOW,
+        )).toEqual({ orderId: "125283", ageDays: 15 });
+    });
+
+    it("fails open on missing evidence (no facts row, no date, no id)", () => {
+        // No purchase_orders row for this PO → nothing known → no block.
+        expect(isAgedSilentOpenPo(po(), null, NOW)).toBeNull();
+        expect(isAgedSilentOpenPo(po(), undefined, NOW)).toBeNull();
+        // No parseable date anywhere → age unknown → no block.
+        expect(isAgedSilentOpenPo(po(), { trackingNumbers: [] }, NOW)).toBeNull();
+        expect(isAgedSilentOpenPo(po("", undefined), { issueDate: daysAgoIso(30) }, NOW)).toBeNull();
+        expect(isAgedSilentOpenPo(null, { issueDate: daysAgoIso(30) }, NOW)).toBeNull();
+        expect(isAgedSilentOpenPo(po(), { issueDate: "not a date", trackingNumbers: [] }, NOW)).toBeNull();
+    });
+
+    it("picks the oldest aged-silent PO on the row (Map and Record lookups)", () => {
+        const openPOs = [
+            { orderId: "125400", quantity: 100, orderDate: "10/20/2026" },
+            { orderId: "125283", quantity: 900, orderDate: "9/9/2026" },
+            { orderId: "125500", quantity: 50, orderDate: "10/26/2026" },
+        ];
+        const facts = {
+            "125400": { issueDate: daysAgoIso(9), trackingNumbers: [] as string[] },
+            "125283": { issueDate: daysAgoIso(50), trackingNumbers: [] as string[] },
+            // fresh, so not aged at all
+            "125500": { issueDate: daysAgoIso(3), trackingNumbers: [] as string[] },
+        };
+        expect(findAgedSilentOpenPo(openPOs, facts, NOW))
+            .toEqual({ orderId: "125283", ageDays: 50 });
+        expect(findAgedSilentOpenPo(openPOs, new Map(Object.entries(facts)), NOW))
+            .toEqual({ orderId: "125283", ageDays: 50 });
+    });
+
+    it("returns null when no PO on the row is aged AND silent", () => {
+        expect(findAgedSilentOpenPo([], { "125283": {} }, NOW)).toBeNull();
+        expect(findAgedSilentOpenPo(null, { "125283": {} }, NOW)).toBeNull();
+        expect(findAgedSilentOpenPo([{ orderId: "125283" }], null, NOW)).toBeNull();
+        // Aged but tracked.
+        expect(findAgedSilentOpenPo(
+            [{ orderId: "125283" }],
+            { "125283": { issueDate: daysAgoIso(50), trackingNumbers: ["1Z999"] } },
+            NOW,
+        )).toBeNull();
+        // Silent but fresh.
+        expect(findAgedSilentOpenPo(
+            [{ orderId: "125600" }],
+            { "125600": { issueDate: daysAgoIso(2), trackingNumbers: [] } },
+            NOW,
+        )).toBeNull();
+        // No facts row for any open PO → fail open.
+        expect(findAgedSilentOpenPo([{ orderId: "125283" }], {}, NOW)).toBeNull();
     });
 });

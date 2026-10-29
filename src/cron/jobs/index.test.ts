@@ -31,6 +31,7 @@ const EXPECTED_JOBS = [
     "vendor-lead-time-tracker",
     "overbill-auto-resolve",
     "freight-auto-align",
+    "po-ship-status-followup",
 ];
 
 beforeAll(async () => {

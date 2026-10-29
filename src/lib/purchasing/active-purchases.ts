@@ -20,6 +20,12 @@ import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-prof
 import { normalizeLifecycleStage } from "./po-lifecycle";
 import { isActivePoStatus } from "./active-po-status";
 import { resolvePoEta } from "./po-eta";
+import {
+    PENDING_REORDER_LOOKBACK_DAYS,
+    derivePendingReordersBySku,
+    findPendingReorder,
+    type PendingReorder,
+} from "./pending-reorder";
 
 export interface ActivePurchase extends FullPO {
     expectedDate: string;
@@ -51,6 +57,12 @@ export interface ActivePurchase extends FullPO {
      * enrichment; degrades gracefully when shipments/invoices are missing.
      */
     movement: PurchaseMovement;
+    /**
+     * WS6.3 cross-panel SKU link: an Ordering recommendation for a SKU on this
+     * PO that has never been drafted. The row then says "resolve this PO first"
+     * AND "reorder pending 900 RAP101". Absent when nothing is pending.
+     */
+    pendingReorder?: PendingReorder;
 }
 
 /**
@@ -84,6 +96,8 @@ export async function loadActivePurchases(
     const lifecycleMap = new Map<string, Record<string, any>>();
     const poSendMap = new Map<string, Array<Record<string, any>>>();
     const invoiceMap = new Map<string, { status: string; id: string; hasDiscrepancies: boolean; total?: number }>();
+    /** SKU → undrafted Ordering recommendation (WS6.3). Empty when nothing is pending. */
+    let pendingReorderBySku = new Map<string, PendingReorder>();
         const finaleReceiptActivity = new Set<string>();
         let completionSignals: Awaited<ReturnType<typeof loadPOCompletionSignalIndex>> = new Map();
 
@@ -164,6 +178,31 @@ export async function loadActivePurchases(
                     if (!poSendMap.has(row.po_number)) poSendMap.set(row.po_number, []);
                     poSendMap.get(row.po_number)!.push(row);
                 }
+            }
+
+            // ── WS6.3 cross-panel SKU link ────────────────────────────────
+            // An UNDRAFTED recommendation (`resulting_po_number IS NULL`) is the
+            // Ordering pane saying "this SKU needs another PO". When that SKU
+            // also sits on an Active PO, the row must carry both facts:
+            // "resolve PO 125283 first" and "reorder pending 900 RAP101".
+            // One bounded read, not one per PO. The scan rewrites a snapshot for
+            // every SKU each run, so the newest rows name everything currently
+            // pending; the lookback keeps long-dead recs from becoming noise.
+            try {
+                const sinceIso = new Date(Date.now() - PENDING_REORDER_LOOKBACK_DAYS * 86400_000).toISOString();
+                const { data: recRows, error: recErr } = await db
+                    .from("qty_recommendations")
+                    .select("product_id, recommended_qty, recommended_at")
+                    .is("resulting_po_number", null)
+                    .gte("recommended_at", sinceIso)
+                    .order("recommended_at", { ascending: false })
+                    .limit(1000);
+                if (recErr) {
+                    console.warn("[active-purchases] pending-reorder read failed:", recErr.message);
+                }
+                pendingReorderBySku = derivePendingReordersBySku(recRows ?? []);
+            } catch (recErr: any) {
+                console.warn("[active-purchases] pending-reorder read threw:", recErr?.message || recErr);
             }
 
             const shipments = await listShipmentsForPurchaseOrders(poNumbers);
@@ -458,6 +497,10 @@ export async function loadActivePurchases(
 
         const vendorProfile = vendorMap.get(po.vendorName?.toLowerCase());
 
+        // WS6.3 — does one of this PO's SKUs have an undrafted recommendation?
+        // Additive: absent when nothing is pending, so existing rows are unchanged.
+        const pendingReorder = findPendingReorder(po.items, pendingReorderBySku);
+
                 const movement = derivePurchaseMovement({
                     shipments: shipments.map((shipment) => ({
                         tracking_number: shipment.tracking_number,
@@ -504,6 +547,7 @@ export async function loadActivePurchases(
             invoiceId: invoiceInfo?.id || undefined,
             hasDiscrepancies: invoiceInfo?.hasDiscrepancies || false,
             movement,
+            ...(pendingReorder ? { pendingReorder } : {}),
         });
     }
 
