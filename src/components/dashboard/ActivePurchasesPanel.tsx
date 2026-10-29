@@ -89,6 +89,12 @@ type ActivePurchase = {
 type ApiResponse = {
     purchases: ActivePurchase[];
     cachedAt: string;
+    /**
+     * Tables whose local PostgREST enrichment read failed for this request
+     * (WS5.2). Non-empty means blank tracking/ack/lifecycle cells are missing
+     * data, not "nothing happened" — the panel says so in a slim strip.
+     */
+    degraded?: string[];
     error?: string;
 };
 
@@ -445,6 +451,9 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
     const [accuracy, setAccuracy] = useState<string | null>(null);
     const [cachedAt, setCachedAt] = useState("");
+    // Local enrichment reads that failed for the last fetch (WS5.2). Rendered as
+    // a slim strip so a blank tracking/ack cell is never mistaken for a fact.
+    const [degraded, setDegraded] = useState<string[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -579,6 +588,7 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
             const fetched = data.purchases || [];
             setPurchases(fetched);
             setCachedAt(data.cachedAt || "");
+            setDegraded(Array.isArray(data.degraded) ? data.degraded : []);
 
             // Surface the latest tracking-accuracy number (2026-10-28) —
             // a light best-effort read so arrivals confidence is visible.
@@ -990,6 +1000,17 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "rotate-180" : ""}`} />
                 </button>
             </div>
+
+            {/* WS5.2 — degraded enrichment strip. A blank tracking/ack/lifecycle
+                cell is otherwise indistinguishable from a failed PostgREST read. */}
+            {!effectivelyCollapsed && degraded.length > 0 && (
+                <div
+                    className="px-3 py-0.5 border-b border-zinc-800/50 bg-zinc-900/40 text-[10px] font-mono text-zinc-500 truncate"
+                    title={`Local enrichment reads failed (${degraded.join(", ")}). Blank tracking / ack / lifecycle cells mean "no data read", not "no data".`}
+                >
+                    enrichment degraded: {degraded.join(", ")}
+                </div>
+            )}
 
             {/* Accounting status — Active Purchases (separate from Ordering / Receivings) */}
             {!effectivelyCollapsed && !loading && purchases.length > 0 && (

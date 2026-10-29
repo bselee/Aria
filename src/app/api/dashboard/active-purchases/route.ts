@@ -3,6 +3,7 @@ import { FinaleClient } from "@/lib/finale/client";
 import { loadActivePurchases, type ActivePurchase } from "@/lib/purchasing/active-purchases";
 import { getCachedOrFresh } from "@/lib/purchasing/po-cache";
 import { loadDraftedPORecSummaries } from "@/lib/purchasing/calibration";
+import { loadPOTruth } from "@/lib/purchasing/po-truth";
 import { createClient } from "@/lib/db";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
@@ -55,10 +56,27 @@ export async function GET(req: Request) {
             console.warn("[active-purchases] rec links skipped:", e?.message || e);
         }
 
+        // WS5.2 — PO-truth degraded channel. Every local read that fails is named
+        // here, so the panel says "enrichment degraded: purchase_orders" instead of
+        // rendering blank tracking/ack/lifecycle columns as if they were true.
+        // Never fatal: the Finale-sourced rows above are already the answer.
+        let degraded: string[] = [];
+        try {
+            const truth = await loadPOTruth(createClient(), activePos.map(po => po.orderId));
+            degraded = truth.degraded;
+        } catch (truthErr: any) {
+            degraded = ["po_truth"];
+            console.warn("[active-purchases] po-truth read failed:", truthErr?.message || truthErr);
+        }
+        if (degraded.length > 0) {
+            console.warn(`[active-purchases] enrichment degraded: ${degraded.join(", ")}`);
+        }
+
         return NextResponse.json({
             purchases: enriched,
             cachedAt: new Date().toISOString(),
             fromCache,
+            degraded,
         });
 
     } catch (err: any) {

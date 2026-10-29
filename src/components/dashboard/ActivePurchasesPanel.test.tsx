@@ -286,4 +286,34 @@ describe("ActivePurchasesPanel movement badge strip", () => {
         await waitFor(() => expect(screen.getByText(/invoice tracking needs link/i)).toBeTruthy());
         expect(screen.getByText("INV AP")).toBeTruthy();
     });
+
+    // WS5.2 — a failed local read must be visible, not a silent blank column.
+    it("renders the degraded-enrichment strip naming the failed tables", async () => {
+        stubLocalStorage();
+        stubFetch({
+            purchases: [makePurchase({})],
+            cachedAt: "2026-04-05T00:00:00.000Z",
+            degraded: ["purchase_orders"],
+        });
+
+        render(<ActivePurchasesPanel embedded />);
+
+        await waitFor(() =>
+            expect(screen.getByText(/enrichment degraded: purchase_orders/)).toBeTruthy()
+        );
+    });
+
+    it("renders no degraded strip when every read succeeded", async () => {
+        stubLocalStorage();
+        stubFetch({
+            purchases: [makePurchase({})],
+            cachedAt: "2026-04-05T00:00:00.000Z",
+            degraded: [],
+        });
+
+        render(<ActivePurchasesPanel embedded />);
+
+        await waitFor(() => expect(screen.getByText("Active Purchases")).toBeTruthy());
+        expect(screen.queryByText(/enrichment degraded/)).toBeNull();
+    });
 });
