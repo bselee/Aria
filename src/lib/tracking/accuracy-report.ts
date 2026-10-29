@@ -96,11 +96,17 @@ export async function runTrackingAccuracyReport(): Promise<TrackingAccuracyRepor
         };
 
         const report = buildAccuracyReport(snap);
-        await db.from("ap_activity_log").insert({
+        const { error } = await db.from("ap_activity_log").insert({
             intent: "TRACKING_ACCURACY_REPORT",
+            email_from: "",
+            email_subject: "",
+            action_taken: "generated",
             created_at: new Date().toISOString(),
             metadata: report,
         });
+        if (error) {
+            console.warn(`[tracking-accuracy] log insert failed: ${error.message}`);
+        }
         console.log(`[tracking-accuracy] ${report.summary}`);
         return report;
     } catch (err) {

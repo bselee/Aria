@@ -259,6 +259,9 @@ async function logReconciliationAnchor(poId: string, amount: number, invoiceNumb
         if (!db) return;
         await db.from("ap_activity_log").insert({
             intent: "RECONCILIATION",
+            email_from: "",
+            email_subject: "",
+            action_taken: "reconciled",
             created_at: new Date().toISOString(),
             metadata: {
                 orderId: String(poId),

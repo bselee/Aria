@@ -2,7 +2,7 @@ import { createClient } from "@/lib/db";
 import { withAdvisoryLock } from "@/lib/purchasing/advisory-lock";
 import { isSalesOrderVariantPoRef } from "@/lib/purchasing/po-ref-validator";
 import { FinaleClient } from "@/lib/finale/client";
-import { upsertTrackingLocal, syncTrackingToPostgREST, getTrackingLocal, registerTrackingForPolling } from "@/lib/storage/tracking-cache";
+import { upsertTrackingLocal, getTrackingLocal, registerTrackingForPolling } from "@/lib/storage/tracking-cache";
 import {
     carrierUrl,
     detectCarrier,

@@ -138,11 +138,12 @@ export function getStaleTrackings(staleMinutes: number = 60): CachedShipment[] {
 }
 
 /** Tiered staleness for the poll loop (2026-10-28). Soon-arriving and
- *  exception rows poll most often; the long tail drains on a 12h cadence. */
+ *  exception rows poll most often; the long tail drains on a 24h cadence
+ *  (12h under-provisioned the cap: 1,544 rows / 12h ≈ 129/h > cap 120/h). */
 export interface PollTiers {
     tier1: CachedShipment[]; // out_for_delivery / exception / ETA today-tomorrow, stale > 30m
     tier2: CachedShipment[]; // in_transit with an ETA, stale > 4h
-    tier3: CachedShipment[]; // everything else active, stale > 12h
+    tier3: CachedShipment[]; // everything else active, stale > 24h
 }
 
 export function getStaleTrackingsTiered(nowMs: number = Date.now()): PollTiers {
@@ -150,7 +151,7 @@ export function getStaleTrackingsTiered(nowMs: number = Date.now()): PollTiers {
     const now = new Date(nowMs).toISOString();
     const t30 = new Date(nowMs - 30 * 60_000).toISOString();
     const t4h = new Date(nowMs - 4 * 3600_000).toISOString();
-    const t12h = new Date(nowMs - 12 * 3600_000).toISOString();
+    const t24h = new Date(nowMs - 24 * 3600_000).toISOString();
     const rows = db.prepare(
         `SELECT * FROM shipments_cache
          WHERE (status_category IS NULL OR status_category != 'delivered')
@@ -172,7 +173,7 @@ export function getStaleTrackingsTiered(nowMs: number = Date.now()): PollTiers {
             if (!checked || checked < t30) tier1.push(row);
         } else if (row.estimated_delivery_at != null) {
             if (!checked || checked < t4h) tier2.push(row);
-        } else if (!checked || checked < t12h) {
+        } else if (!checked || checked < t24h) {
             tier3.push(row);
         }
     }
@@ -253,17 +254,8 @@ export async function writePollResultToShipments(
 }
 
 /**
- * Enqueue a tracking record for async sync to PostgREST via the unified sync queue.
- * Fire-and-forget — never blocks the caller.
- */
-export async function syncTrackingToPostgREST(record: CachedShipment): Promise<void> {
-    const { enqueueSync } = await import("./sync-queue");
-    await enqueueSync("tracking_info", record.tracking_number, "upsert", record as unknown as Record<string, unknown>);
-}
-
-/**
  * Refresh a single tracking number from carrier API, write to local cache,
- * then async sync to PostgREST.
+ * then write the result into the board's `shipments` table.
  */
 export async function refreshAndCacheTracking(trackingNumber: string): Promise<CachedShipment | null> {
     try {
@@ -277,9 +269,6 @@ export async function refreshAndCacheTracking(trackingNumber: string): Promise<C
             estimatedDeliveryAt: status.estimated_delivery_at,
             deliveredAt: status.delivered_at,
         });
-
-        // Fire-and-forget sync to PostgREST
-        syncTrackingToPostgREST(record).catch(() => {});
 
         // Live writeback into the board's `shipments` table (2026-10-28).
         // Best-effort, never blocks or breaks the poll.

@@ -443,6 +443,7 @@ export type ActivePurchasesPanelProps = {
 export default function ActivePurchasesPanel({ embedded = false }: ActivePurchasesPanelProps = {}) {
     const lifecycle = usePurchasingLifecycle();
     const [purchases, setPurchases] = useState<ActivePurchase[]>([]);
+    const [accuracy, setAccuracy] = useState<string | null>(null);
     const [cachedAt, setCachedAt] = useState("");
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -578,6 +579,15 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
             const fetched = data.purchases || [];
             setPurchases(fetched);
             setCachedAt(data.cachedAt || "");
+
+            // Surface the latest tracking-accuracy number (2026-10-28) —
+            // a light best-effort read so arrivals confidence is visible.
+            fetch("/api/dashboard/tracking/accuracy")
+                .then(r => (r.ok ? r.json() : null))
+                .then((j: { latest?: { summary?: string } | null } | null) => {
+                    if (j?.latest?.summary) setAccuracy(j.latest.summary);
+                })
+                .catch(() => undefined);
 
             // Fetch legs for all active POs in one call
             if (fetched.length > 0) {
@@ -1049,6 +1059,12 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                                                     </div>
                                                                 </div>
                                                             )}
+                                                            {/* ── Tracking accuracy readout (2026-10-28) — the number Bill asked for ── */}
+                                                            {!loading && !error && accuracy && (
+                                                                <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/10 text-[10px] font-mono text-zinc-500">
+                                                                    <span className="text-zinc-600">accuracy ·</span> {accuracy}
+                                                                </div>
+                                                            )}
                                                             {/* ── Stage FilterChips Row ── */}
                                                             {!loading && !error && purchases.length > 0 && (!embedded || showStageFilters || filterStage) && (
                                                                 <div className="px-3 py-1 border-b border-zinc-800/30 bg-zinc-950/20 flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -1314,8 +1330,10 @@ export default function ActivePurchasesPanel({ embedded = false }: ActivePurchas
                                                 </span>
                                             )}
                                             {!po.isReceived && (() => {
-                                                const due = po.etaProfile?.expectedDate || po.expectedDate;
-                                                const days = due ? dayDiff(due, new Date().toISOString().slice(0, 10)) : null;
+                                                const due = po.movement?.primaryEta
+                                                    ? denverDay(po.movement.primaryEta)
+                                                    : (po.etaProfile?.expectedDate || po.expectedDate);
+                                                const days = due ? dayDiff(due, denverDay(new Date().toISOString())) : null;
                                                 const label = days == null ? "no ETA" : days < 0 ? `${-days}d overdue` : days === 0 ? "due today" : `due in ${days}d`;
                                                 const tone = days == null ? "text-zinc-500" : days < 0 ? "text-rose-300" : days <= 7 ? "text-amber-300" : "text-zinc-400";
                                                 return <span className={`text-[10px] font-mono shrink-0 ${tone}`}>{label}</span>;

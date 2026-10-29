@@ -104,10 +104,16 @@ describe("getStaleTrackingsTiered", () => {
         expect(tiers.tier1).toHaveLength(1);
     });
 
-    it("puts the long tail on a 12h cadence", () => {
-        cachedRows = [row({ last_checked_at: new Date(NOW - 13 * 3600_000).toISOString() })];
+    it("puts the long tail on a 24h cadence", () => {
+        cachedRows = [row({ last_checked_at: new Date(NOW - 25 * 3600_000).toISOString() })];
         const tiers = getStaleTrackingsTiered(NOW);
         expect(tiers.tier3).toHaveLength(1);
+    });
+
+    it("does not tier3 a 13h-stale long-tail row (24h cadence)", () => {
+        cachedRows = [row({ last_checked_at: new Date(NOW - 13 * 3600_000).toISOString() })];
+        const tiers = getStaleTrackingsTiered(NOW);
+        expect(tiers.tier3).toHaveLength(0);
     });
 });
 

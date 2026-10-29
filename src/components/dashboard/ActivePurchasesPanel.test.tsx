@@ -27,6 +27,17 @@ function stubFetch(purchasesPayload: any) {
         if (u.includes("/api/dashboard/vendor-reliability")) {
             return Promise.resolve({ ok: true, json: () => Promise.resolve({ rows: [] }) });
         }
+        if (u.includes("/api/dashboard/tracking/accuracy")) {
+            return Promise.resolve({
+                ok: true,
+                json: () =>
+                    Promise.resolve({
+                        latest: {
+                            summary: "tracking accuracy: delivered7d=0 etaCoverage=0% onTime=n/a stale24h=0% ofd=0",
+                        },
+                    }),
+            });
+        }
         // PostgREST at-risk index and anything else — empty result
         return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [], error: null }) });
     }));
@@ -123,7 +134,19 @@ describe("ActivePurchasesPanel movement badge strip", () => {
 
     await waitFor(() => expect(screen.getByText(/TRACK 1Z99/)).toBeTruthy());
     expect(screen.getByText(/Arriving/i)).toBeTruthy();
-    expect(screen.getByText(/today/)).toBeTruthy();
+    expect(screen.getByText(/today 2:15 PM/)).toBeTruthy();
+  });
+
+  it("shows the tracking accuracy readout once loaded", async () => {
+    stubLocalStorage();
+    stubFetch({
+      purchases: [makePurchase({ isReceived: false })],
+      cachedAt: new Date().toISOString(),
+    });
+
+    render(<ActivePurchasesPanel embedded />);
+
+    await waitFor(() => expect(screen.getByText(/accuracy ·/)).toBeTruthy());
   });
 
   it("shows DELIVERED · need receive when carrier delivered but Finale not received", async () => {
