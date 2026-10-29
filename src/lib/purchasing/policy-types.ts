@@ -21,7 +21,8 @@ export type PurchasingReasonCode =
     | "runway_healthy"
     | "residual_reorder"
     | "micro_velocity_noise"
-    | "runway_below_lead";
+    | "runway_below_lead"
+    | "unit_price_missing";
 
 export interface PurchasingAssessmentMetrics {
     directDemand: number;

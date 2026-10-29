@@ -376,6 +376,29 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
         }
     }
 
+    // HERMIA(2026-10-29): a reorder we are about to commit must have a real
+    // supplier unit price. `finale/purchasing.ts` emits `unitPrice: 0` when the
+    // supplier has no stored price, and an auto-draft built on $0 would price a
+    // PO at zero. Never ORDER on a missing price — surface it for review.
+    if (!(input.unitPrice > 0)) {
+        const label =
+            input.unitPrice === undefined || input.unitPrice === null
+                ? "missing"
+                : `$${Number(input.unitPrice).toFixed(2)}`;
+        return createPurchasingAssessment({
+            vendorName: input.vendorName,
+            productId: input.productId,
+            decision: "manual_review",
+            recommendedQty: orderQty,
+            confidence: "medium",
+            reasonCodes: ["unit_price_missing"],
+            explanation:
+                `Review: no usable supplier unit price on file (${label}) for a ${fmtQty(orderQty)} reorder. ` +
+                `Set the supplier cost in Finale before drafting — a $0 line would price the PO at zero.`,
+            metrics: m(),
+        });
+    }
+
     const orderMeta = buildOrderExplanation(input, orderQty);
     return createPurchasingAssessment({
         vendorName: input.vendorName,
