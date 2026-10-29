@@ -1701,3 +1701,22 @@ defineJob({
     },
     budget: { durationMs: 300_000 },
 });
+
+defineJob({
+    name: "awaiting-invoice-sweep",
+    schedule: "0 9 * * *",
+    onFail: "log",
+    description:
+        "Daily 9am: for received POs with no matched invoice, search Gmail (default + ap) by PO number (not from:vendor) and mark invoice_state=in_gmail_unmatched when a bill is already sitting in the inbox. Read-only + a state flag; never sends email, never reports to Telegram/Slack.",
+    handler: async () => {
+        const { sweepAwaitingInvoices } = await import("@/lib/purchasing/awaiting-invoice-sweep");
+        const report = await sweepAwaitingInvoices();
+        if (report.findings.length > 0 || report.errors.length > 0) {
+            console.log(
+                `[awaiting-invoice-sweep] candidates=${report.candidates} searched=${report.searched} ` +
+                    `findings=${report.findings.length} errors=${report.errors.length}`,
+            );
+        }
+    },
+    budget: { durationMs: 300_000 },
+});
