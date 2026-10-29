@@ -30,6 +30,12 @@ import {
     loadVendorAliases,
 } from "@/lib/purchasing/vendor-name-normalize";
 import { sanitizeOcrPoCandidate } from "@/lib/purchasing/ocr-po-sanitize";
+import {
+    isUlineVendorName,
+    exactSkuOverlap,
+    productIdsFromPoLines,
+    skusFromInvoiceLines,
+} from "@/lib/purchasing/uline-invoice-repair";
 
 export { sanitizeOcrPoCandidate };
 
@@ -202,6 +208,88 @@ function extractSearchTerms(vendorName: string): string[] {
         .split(/[\s,.\/\|\-]+/)
         .map(w => w.trim())
         .filter(w => w.length > 2 && !stopWords.has(w.toLowerCase()));
+}
+
+/**
+ * Shape of a `purchase_orders` row as consumed by {@link scoreUlineSkuCandidates}
+ * (and by the Uline exact-SKU fallback in the batch matcher).
+ */
+export type UlineSkuPoRow = {
+    po_number?: string | null;
+    vendor_name?: string | null;
+    issue_date?: string | null;
+    total_amount?: number | string | null;
+    total?: number | string | null;
+    status?: string | null;
+    line_items?: unknown;
+};
+
+/**
+ * Score PO rows for a Uline invoice by EXACT SKU overlap when the document
+ * carries no usable Finale PO.
+ *
+ * Uline bills print the PO jammed into the customer-number header and an
+ * 8-digit `ORDER #` that is a Uline web order, so neither is a Finale PO. The
+ * goods are then the identity: Uline line items carry `S-xxxxx` / `H-xxxx`
+ * SKUs that ARE Finale productIds on `purchase_orders.line_items[].productId`.
+ *
+ * EXACT string equality only (case/whitespace normalized) — `S-4738` on a PO
+ * must never match `S-473824` on an invoice; those are different products.
+ *
+ * Pure function: the caller supplies already vendor-matched PO rows (the
+ * matcher selects `po_number, vendor_name, issue_date, total_amount, status,
+ * line_items` for the vendor-matched list itself).
+ *
+ * @param invoiceSkus SKUs printed on the invoice lines.
+ * @param poRows      purchase_orders rows carrying `line_items`.
+ * @returns           hits with >= 1 exact SKU, best (most hits) first.
+ */
+export function scoreUlineSkuCandidates(
+    invoiceSkus: Iterable<string | null | undefined>,
+    poRows: UlineSkuPoRow[],
+): Array<{
+    poNumber: string;
+    vendorName: string;
+    orderDate: string;
+    total: number;
+    status: string;
+    matchedSkus: string[];
+}> {
+    const skus = [...invoiceSkus];
+    if (skus.length === 0) return [];
+
+    const hits: Array<{
+        poNumber: string;
+        vendorName: string;
+        orderDate: string;
+        total: number;
+        status: string;
+        matchedSkus: string[];
+    }> = [];
+
+    for (const po of poRows || []) {
+        const poNumber = String(po?.po_number ?? "").trim();
+        if (!poNumber || /DropshipPO$/i.test(poNumber)) continue;
+        // Defensive: the SKU column proves goods identity only for the vendor
+        // that printed it. A PO from another vendor that happens to carry the
+        // same productId is not this bill's PO.
+        if (!isUlineVendorName(po.vendor_name)) continue;
+
+        const matchedSkus = exactSkuOverlap(skus, productIdsFromPoLines(po.line_items));
+        if (matchedSkus.length === 0) continue;
+
+        hits.push({
+            poNumber,
+            vendorName: po.vendor_name || "",
+            orderDate: String(po.issue_date || ""),
+            total: Number(po.total_amount || po.total || 0),
+            status: String(po.status || "unknown"),
+            matchedSkus,
+        });
+    }
+
+    hits.sort((a, b) => b.matchedSkus.length - a.matchedSkus.length);
+    return hits;
 }
 
 /**
@@ -573,11 +661,90 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
     }
 
+    // ── Uline exact-SKU fallback (2026-10-29) ─────────────────────────────
+    // A Uline bill prints the Finale PO jammed into the customer-number header
+    // (`9897269125429`) and an 8-digit `ORDER #` that is a Uline web order, not
+    // a PO. When OCR did not recover a 12xxxx-shaped Finale PO, the goods are
+    // the identity: exact SKU overlap against `purchase_orders.line_items[]`
+    // (see scoreUlineSkuCandidates). findPOCandidates never selects line_items
+    // in its vendor search, and POs under the 50-point bar are otherwise
+    // absent from `candidates`, so the line data is fetched here for the
+    // vendor-matched list. Exact equality only — `S-4738` must never match
+    // `S-473824`.
+    let ulineSkuWinner: string | null = null;
+    const ulineLane = isUlineVendorName(invoice.vendorName) || isUlineVendorName(invoice.senderName);
+    const printedFinalePo = printedPo && /^12\d{4}$/.test(printedPo) ? printedPo : null;
+    if (ulineLane && !printedFinalePo) {
+        const invoiceSkus = skusFromInvoiceLines(invoice.lineItems ?? []);
+        const vendorPoNumbers = [
+            ...new Set(
+                (pos || []).map((p) => String(p?.po_number ?? "").trim()).filter(Boolean),
+            ),
+        ].slice(0, 40);
+        if (invoiceSkus.length > 0 && vendorPoNumbers.length > 0) {
+            try {
+                const { data: poLineRows, error: poLineErr } = await db
+                    .from("purchase_orders")
+                    .select("po_number, vendor_name, issue_date, total_amount, total, status, line_items")
+                    .in("po_number", vendorPoNumbers);
+                if (poLineErr) {
+                    console.warn(
+                        `[invoice-po-matcher] Uline SKU line read failed: ${poLineErr.message}`,
+                    );
+                }
+                const skuHits = scoreUlineSkuCandidates(invoiceSkus, (poLineRows || []) as UlineSkuPoRow[]);
+                for (const hit of skuHits) {
+                    const reason = `exact Uline SKU match: ${hit.matchedSkus.join(", ")}`;
+                    const existing = candidates.find((c) => c.orderId === hit.poNumber);
+                    if (existing) {
+                        existing.score = Math.max(existing.score, 90);
+                        if (!existing.reasons.some((r) => r.includes("exact Uline SKU match"))) {
+                            existing.reasons.push(reason);
+                        }
+                    } else {
+                        candidates.push({
+                            orderId: hit.poNumber,
+                            vendorName: hit.vendorName,
+                            orderDate: hit.orderDate,
+                            total: hit.total,
+                            status: hit.status,
+                            score: 90,
+                            reasons: [reason, "Uline invoice with no Finale PO printed"],
+                            isOpen: ["open", "partial", "committed", "locked"].includes(
+                                hit.status.toLowerCase(),
+                            ),
+                        });
+                    }
+                }
+                // One exact-SKU PO is conclusive; several means the same SKU
+                // recurs across POs and a human should pick.
+                if (skuHits.length === 1) ulineSkuWinner = skuHits[0].poNumber;
+                if (skuHits.length > 0) {
+                    console.log(
+                        `[invoice-po-matcher] Uline SKU fallback: ${invoiceSkus.join(", ")} → ` +
+                            skuHits.map((h) => `${h.poNumber}(${h.matchedSkus.join("/")})`).join(", "),
+                    );
+                }
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.warn(
+                    `[invoice-po-matcher] Uline SKU fallback failed: ${msg}`,
+                );
+            }
+        }
+    }
+
     candidates.sort((a, b) => b.score - a.score);
     const bestMatch = candidates.length > 0 ? candidates[0] : null;
     let autoApplyReady = candidates.length === 1
         && bestMatch!.score >= AUTO_APPLY_THRESHOLD
         && invoice.total > 0;
+
+    // The exact-SKU winner is high-confidence when it is also the top candidate
+    // and the bill carries a real amount.
+    if (ulineSkuWinner && invoice.total > 0 && candidates[0]?.orderId === ulineSkuWinner) {
+        autoApplyReady = true;
+    }
 
     // Never auto-apply dropship POs — out of AP purview (Bill 2026-07-27).
     const isDropshipPo = (po: string) => /DropshipPO$/i.test(po || "");
@@ -800,6 +967,9 @@ export async function batchMatchUnmatchedInvoices(): Promise<{
             freight: Number(inv.freight || 0),
             tax: Number(inv.tax || 0),
             total: Number(inv.total || 0),
+            // SKU-level identity for the Uline lane: a Uline bill prints no
+            // usable Finale PO, so exact SKU overlap is the fallback key.
+            lineItems: Array.isArray(inv.line_items) ? inv.line_items : [],
             ocrPoCandidate: inv.raw_data?.poNumber || null,
             ocrOrderCandidate: inv.raw_data?.orderRef || inv.raw_data?.orderNumber || null,
             senderName: senderDisplayName(inv.raw_data?.email_from),

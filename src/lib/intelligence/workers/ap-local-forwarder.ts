@@ -52,6 +52,11 @@ import { isStatementSubject, isStatementAttachment } from "@/lib/intelligence/ap
 import { isQuoteOrSpecName, isQuoteOrSpecText } from "@/lib/intelligence/ap/quote-spec-gate";
 import { applyMessageLabelPolicy } from "@/lib/intelligence/gmail-policy";
 import {
+    ulineInvoiceNumber,
+    ulinePoFromRaw,
+    isUlineVendorName,
+} from "@/lib/purchasing/uline-invoice-repair";
+import {
     imageBufferToPdf,
     imageFilenameToPdf,
     isInvoiceImagePart,
@@ -631,6 +636,53 @@ async function enrichInvoiceForPoMatch(args: {
     if (!norm.poNumber) {
         const m = args.emailSubject.match(/(?:PO|P\.?O\.?|Purchase\s+Order)\s*#?\s*-?(\d{4,6})/i);
         if (m) norm.poNumber = m[1].padStart(5, "0");
+    }
+
+    // ── Uline identity repair (2026-10-29, WS3.4) ─────────────────────────
+    // A Uline invoice prints the Finale PO jammed into the customer-number
+    // header (`9897269125429` = customer 9897269 + PO 125429) and labels the
+    // bill `INVOICE #: 215047605`; its 8-digit `ORDER #` is a Uline web order,
+    // never a Finale PO. OCR reading the wrong line stored
+    // `ocr_invoice_number = "BERINVOICE"` and the web order as the PO on 5 of
+    // 6 recent forwards, so no Uline receipt ever linked to its PO and three
+    // sat at "awaiting invoice" with the real invoice at score 70.
+    //
+    // Repair BEFORE the PO-ref validator below: the validator then sees the
+    // printed 12xxxx PO and accepts it, and no downstream write ever carries
+    // "BERINVOICE". A leftover 8-digit web order is deliberately LEFT in
+    // place when the raw text yields nothing — validatePoRef rejects it and
+    // clears any stale matched_po_number, which is the honest outcome.
+    const ulineDocument =
+        isUlineVendorName(norm.vendorName) ||
+        isUlineVendorName(vendorHint) ||
+        isUlineVendorName(senderName) ||
+        /uline[_\s-]?invoice/i.test(args.pdfFilename || "");
+    if (ulineDocument) {
+        const storedInvoiceNumber = String(norm.invoiceNumber ?? "").trim();
+        if (!storedInvoiceNumber || !/\d/.test(storedInvoiceNumber)) {
+            const repairedInvoiceNumber = ulineInvoiceNumber(rawText, args.pdfFilename);
+            if (repairedInvoiceNumber) {
+                console.log(
+                    `   [AP-Local] Uline invoice# repaired: ${JSON.stringify(storedInvoiceNumber || null)} → ${repairedInvoiceNumber}`,
+                );
+            } else {
+                console.warn(
+                    `   [AP-Local] Uline invoice# not recoverable (was ${JSON.stringify(storedInvoiceNumber || null)}) — storing null, never a header word`,
+                );
+            }
+            norm.invoiceNumber = repairedInvoiceNumber;
+        }
+
+        const storedPoNumber = String(norm.poNumber ?? "").trim();
+        if (!storedPoNumber || /^\d{8}$/.test(storedPoNumber)) {
+            const printedPo = ulinePoFromRaw(rawText);
+            if (printedPo) {
+                console.log(
+                    `   [AP-Local] Uline PO repaired: ${JSON.stringify(storedPoNumber || null)} → ${printedPo} (printed on invoice)`,
+                );
+                norm.poNumber = printedPo;
+            }
+        }
     }
 
     // (c) PO-ref validation: null any ref that is neither Finale-shaped nor in
