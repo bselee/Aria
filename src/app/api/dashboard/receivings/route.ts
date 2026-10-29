@@ -26,6 +26,7 @@ import { isFreightRequiredVendor, freightOnPo } from '@/config/freight-required-
 import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
 import { overbillGracePending } from '@/lib/purchasing/overbill-grace';
 import { buildReceivingsThreeWay, type ReceivingsThreeWay, type ThreeWayInvoiceLine } from '@/lib/purchasing/receivings-three-way';
+import { coversPosForInvoice, isPoCoveredByMultiPoBill, type BillPoLink } from '@/lib/purchasing/bill-po-links';
 
 // ── GET response cache (paint-first) ─────────────────────────────────────
 // HERMIA(2026-08-06): Panel timed out because every GET ran Finale GraphQL
@@ -152,7 +153,13 @@ interface ReceiptReconciliation {
     outcomes: ReconciliationOutcomeRow[];
     hasPendingApproval: boolean;
     hasAutoApplied: boolean;
-    matchedInvoice: (VendorInvoiceRow & { identityUnknown?: boolean }) | null;
+    matchedInvoice: (VendorInvoiceRow & { identityUnknown?: boolean; coversPos?: string[] }) | null;
+    /**
+     * Gap 24 (2026-10-29): every PO this matched bill covers, when it covers
+     * more than one. Mirrors `matchedInvoice.coversPos` for consumers that only
+     * read the reconciliation object.
+     */
+    coversPos?: string[];
     billingPattern: 'deliver_and_bill' | null;
     vendorHasUnlinkedBills?: boolean;
     coveringBill?: CoveringBill;
@@ -173,6 +180,9 @@ interface ReceiptReconciliation {
 type ReceivedPORow = ReceivedPO & {
     poNumber?: string;
     _reconciliation?: ReceiptReconciliation;
+    /** invoice_state from purchase_orders (awaiting-invoice-sweep, 2026-10-29):
+     *  null when never swept or the column predates the migration. */
+    invoice_state?: string | null;
 };
 
 /** One line item extracted from a bill for the match suggestions. */
@@ -236,6 +246,106 @@ interface OverbillInvoiceRow {
 
 /** The shape `await createClient().from(…).select(…)` resolves to. */
 type QueryResult<T> = { data: T | null; error: unknown };
+
+/** Columns the receivings panel reads off a `vendor_invoices` row. */
+const VENDOR_INVOICE_COLUMNS =
+    'po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items';
+
+/** What `loadBillPoLinks` hands the enrichment loop. */
+interface BillPoLinkSet {
+    /** Every link row touching this page: the PO's own links plus each bill's siblings. */
+    all: BillPoLink[];
+    /** po_number → the ids of every bill that covers it. */
+    byPo: Map<string, string[]>;
+}
+
+/**
+ * Read `bill_po_links` for the POs on this page (Gap 24, 2026-10-29).
+ *
+ * Two reads, because one is not enough: the first finds bills linked to a PO on
+ * screen, the second finds every OTHER PO those bills cover — without it a
+ * multi-PO bill still only names the sibling that happened to be passed in.
+ *
+ * Never throws: a missing table (migration not yet applied) or a PostgREST error
+ * degrades to "no links", which is exactly what the panel showed before this
+ * table existed. Links are an enrichment, never a precondition.
+ */
+async function loadBillPoLinks(
+    sb: ReturnType<typeof createClient>,
+    poNumbers: string[],
+): Promise<BillPoLinkSet> {
+    const empty: BillPoLinkSet = { all: [], byPo: new Map() };
+    try {
+        const { data: direct } = (await sb
+            .from('bill_po_links')
+            .select('vendor_invoice_id, po_number')
+            .in('po_number', poNumbers)) as QueryResult<BillPoLink[]>;
+        if (!direct || direct.length === 0) return empty;
+
+        const invoiceIds = [...new Set(direct.map((l) => String(l.vendor_invoice_id || '')).filter(Boolean))];
+        let all: BillPoLink[] = direct;
+        if (invoiceIds.length > 0) {
+            const { data: siblings } = (await sb
+                .from('bill_po_links')
+                .select('vendor_invoice_id, po_number')
+                .in('vendor_invoice_id', invoiceIds)) as QueryResult<BillPoLink[]>;
+            if (siblings && siblings.length > 0) {
+                // Union by (bill, PO): the same link may arrive in both reads.
+                const seen = new Set(direct.map((l) => `${l.vendor_invoice_id}|${String(l.po_number).trim()}`));
+                all = [...direct];
+                for (const s of siblings) {
+                    const key = `${s.vendor_invoice_id}|${String(s.po_number).trim()}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    all.push(s);
+                }
+            }
+        }
+
+        const byPo = new Map<string, string[]>();
+        for (const l of all) {
+            const po = String(l.po_number || '').trim();
+            const billId = String(l.vendor_invoice_id || '');
+            if (!po || !billId) continue;
+            if (!byPo.has(po)) byPo.set(po, []);
+            const ids = byPo.get(po)!;
+            if (!ids.includes(billId)) ids.push(billId);
+        }
+        return { all, byPo };
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[receivings] bill_po_links read failed (links ignored):', msg);
+        return empty;
+    }
+}
+
+/**
+ * Read `purchase_orders.invoice_state` for the received POs on this page
+ * (awaiting-invoice-sweep, 2026-10-29). Degrades to an empty map on a missing
+ * column (42703 — the migration not yet applied) so the panel never blanks.
+ */
+async function loadInvoiceStates(
+    sb: ReturnType<typeof createClient>,
+    poNumbers: string[],
+): Promise<Map<string, string>> {
+    const empty = new Map<string, string>();
+    if (poNumbers.length === 0) return empty;
+    try {
+        const { data } = (await sb
+            .from('purchase_orders')
+            .select('po_number, invoice_state')
+            .in('po_number', poNumbers)) as QueryResult<Array<{ po_number: string; invoice_state: string | null }>>;
+        const out = new Map<string, string>();
+        for (const r of data ?? []) {
+            if (r.invoice_state) out.set(String(r.po_number), r.invoice_state);
+        }
+        return out;
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[receivings] invoice_state read failed (ignored):', msg);
+        return empty;
+    }
+}
 
 type ReceivingsPayload = {
     received: ReceivedPORow[];
@@ -467,9 +577,17 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
             if (poNumbers.length > 0) {
                 const { data: invoices } = (await sb
                     .from('vendor_invoices')
-                    .select('po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items')
+                    .select(VENDOR_INVOICE_COLUMNS)
                     .in('po_number', poNumbers)
                     .order('created_at', { ascending: false })) as QueryResult<VendorInvoiceRow[]>;
+
+                // Gap 24 (2026-10-29): a bill that covers several POs is linked
+                // to each of them. `vendor_invoices.po_number` names only one.
+                const billLinks = await loadBillPoLinks(sb, poNumbers);
+
+                // Awaiting-invoice state (2026-10-29): distinguish "vendor hasn't
+                // billed" from "bill sitting in Gmail, never ingested".
+                const invoiceStates = await loadInvoiceStates(sb, poNumbers);
 
                 const { data: outcomes } = (await sb
                     .from('reconciliation_outcomes')
@@ -487,6 +605,52 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     const key = inv.po_number;
                     if (!invoiceMap.has(key)) invoiceMap.set(key, []);
                     invoiceMap.get(key)!.push(inv);
+                }
+
+                // Gap 24 (2026-10-29): name the bill on EVERY PO it covers, not
+                // only the one `po_number` happens to hold. A linked bill whose
+                // legacy po_number is a sibling (or null) is invisible to the
+                // query above, so its POs read "awaiting vendor invoice" even
+                // though the bill is in hand. Fetch the linked rows the query
+                // missed, then hang each of them off every PO the link names.
+                if (billLinks.byPo.size > 0) {
+                    const invoiceById = new Map<string, VendorInvoiceRow>();
+                    for (const inv of (invoices || [])) invoiceById.set(String(inv.id), inv);
+
+                    const linkedIds = [...new Set([...billLinks.byPo.values()].flat())];
+                    const unreadIds = linkedIds.filter((id) => !invoiceById.has(id));
+                    if (unreadIds.length > 0) {
+                        const { data: linkedRows } = (await sb
+                            .from('vendor_invoices')
+                            .select(VENDOR_INVOICE_COLUMNS)
+                            .in('id', unreadIds)) as QueryResult<VendorInvoiceRow[]>;
+                        for (const row of (linkedRows || [])) {
+                            invoiceById.set(String(row.id), row);
+                        }
+                    }
+
+                    for (const [linkedPo, ids] of billLinks.byPo) {
+                        const rows = invoiceMap.get(linkedPo) ?? [];
+                        const already = new Set(rows.map((r) => String(r.id)));
+                        for (const id of ids) {
+                            if (already.has(id)) continue;
+                            const row = invoiceById.get(id);
+                            if (!row) {
+                                // A link naming a bill we could not read is a data
+                                // problem, not coverage — say so, claim nothing.
+                                if (isPoCoveredByMultiPoBill(linkedPo, billLinks.all)) {
+                                    console.warn(
+                                        `[receivings] bill ${id} covers PO ${linkedPo} but its vendor_invoices row is missing — PO still reads awaiting invoice`,
+                                    );
+                                }
+                                continue;
+                            }
+                            if (isCarrierFreightArchive(row)) continue;
+                            rows.push(row);
+                            already.add(id);
+                        }
+                        if (rows.length > 0) invoiceMap.set(linkedPo, rows);
+                    }
                 }
 
                 const outcomeMap = new Map<string, ReconciliationOutcomeRow[]>();
@@ -536,6 +700,13 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                     if (matchedInvoice && isSelfReferentialIdentity(matchedInvoice.invoice_number, poNum)) {
                         matchedInvoice.identityUnknown = true;
                     }
+                    // Gap 24 (2026-10-29): a bill that names several POs must
+                    // name them ON the row, so "bill 125377 covers PO 125429 +
+                    // 125430" reads where the bill is shown. Only stamped when
+                    // there is more than one — a single-PO bill needs no note.
+                    const coversPos = matchedInvoice ? coversPosForInvoice(matchedInvoice, billLinks.all) : [];
+                    const multiPoBill = coversPos.length > 1;
+                    if (matchedInvoice && multiPoBill) matchedInvoice.coversPos = coversPos;
                     po._reconciliation = {
                         invoices: rows,
                         outcomes: outcomeMap.get(poNum) || [],
@@ -546,12 +717,18 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             (o) => o.outcome === 'auto_applied'
                         ),
                         matchedInvoice,
+                        coversPos: multiPoBill ? coversPos : undefined,
                         // Vendors that bill per delivery (2026-10-28): the
                         // panel must treat a partial receipt as the normal
                         // shape and compare the bill to the DELIVERY, not to
                         // the whole PO.
                         billingPattern: isDeliverAndBillVendor(po.supplier) ? "deliver_and_bill" : null,
                     };
+                    // Awaiting-invoice state (2026-10-29): null = never swept /
+                    // column predates the migration; 'awaiting_vendor' = no bill
+                    // yet; 'in_gmail_unmatched' = the bill is in the inbox but
+                    // never ingested (the panel shows a distinct badge).
+                    po.invoice_state = invoiceStates.get(poNum) ?? null;
                 }
 
                 // ── 3-way verdict (WS4, 2026-10-29) ──────────────────────────

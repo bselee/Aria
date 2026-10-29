@@ -78,7 +78,9 @@ type ReceivedPO = {
         } | null;
         /** Vendor overbill history: N holds vs M recent bills (2026-10-28). */
         vendorOverbillPattern?: { flagged: number; bills: number } | null;
-        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
+        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; /** Gap 24: every PO this bill covers, when it covers more than one. */ coversPos?: string[]; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
+        /** Gap 24: mirror of `matchedInvoice.coversPos` for rec-only readers. */
+        coversPos?: string[];
         /**
          * 3-way verdict (WS4, 2026-10-29): ordered vs received vs billed, with a
          * bucketed variance. `canComplete` is the READY gate — the row shows
@@ -266,6 +268,21 @@ function billLabel(
 function capFirst(s: string): string {
     if (!s) return s;
     return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * ` covers PO 125429 + 125430` when one bill covers several POs, else "".
+ *
+ * Gap 24 (2026-10-29): a multi-PO bill must be nameable on each PO it pays for,
+ * so the row says which siblings this bill also covers instead of leaving them
+ * looking like separate, unbilled deliveries.
+ */
+function multiPoCoversNote(
+    inv: { coversPos?: string[] | null } | null | undefined,
+): string {
+    const pos = (inv?.coversPos ?? []).map((p) => String(p || "").trim()).filter(Boolean);
+    if (pos.length < 2) return "";
+    return ` covers PO ${pos.join(" + ")}`;
 }
 
 /** Short, honest label for a leg that exists on paper but cannot be compared. */
@@ -1014,11 +1031,17 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     </span>
                                                 );
                                             })}
-                                            {po._reconciliation?.matchedInvoice && (
-                                                <span className="text-[10px] font-mono text-cyan-300/90">
-                                                    {billLabel(po._reconciliation.matchedInvoice)}
-                                                </span>
-                                            )}
+                                            {po._reconciliation?.matchedInvoice && (() => {
+                                                const inv = po._reconciliation.matchedInvoice;
+                                                // Gap 24: "bill 125377 $7,875 covers PO 125429 + 125430".
+                                                const covers = multiPoCoversNote(inv);
+                                                return (
+                                                    <span className="text-[10px] font-mono text-cyan-300/90">
+                                                        {billLabel(inv)}
+                                                        {covers && <span className="text-cyan-200/70">{covers}</span>}
+                                                    </span>
+                                                );
+                                            })()}
                                             {/* WS4: the verdict sits next to the bill it judges. */}
                                             {po._reconciliation?.matchedInvoice && (
                                                 <ThreeWayChips tw={po._reconciliation.threeWay} />

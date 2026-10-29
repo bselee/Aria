@@ -127,6 +127,7 @@ function resetTables() {
     fakeTables.reconciliation_outcomes = [];
     fakeTables.overbill_disputes = [];
     fakeTables.ap_activity_log = [];
+    fakeTables.bill_po_links = [];
 }
 
 describe("dashboard receivings route", () => {
@@ -261,5 +262,70 @@ describe("dashboard receivings route", () => {
         const body = await response.json();
 
         expect(body.received[0]._reconciliation.threeWay).toBeUndefined();
+    });
+
+    // ── Gap 24: one bill, several POs ────────────────────────────────────────
+    it("names a multi-PO bill on every PO it covers, and reports coversPos", async () => {
+        getTodaysReceivedPOsMock.mockResolvedValue([
+            receivedPO({
+                orderId: "125429",
+                supplier: "Miles",
+                total: 1344,
+                subtotal: 1344,
+                items: [{ productId: "S-17888", quantity: 14, orderedQuantity: 14, receivedQuantity: 14, unitPrice: 96 }],
+            }),
+            receivedPO({
+                orderId: "125430",
+                supplier: "Miles",
+                total: 1344,
+                subtotal: 1344,
+                items: [{ productId: "S-17900", quantity: 10, orderedQuantity: 10, receivedQuantity: 10, unitPrice: 134.4 }],
+            }),
+        ]);
+        // The bill's legacy po_number names PO 125429 only — exactly the bug.
+        fakeTables.vendor_invoices = [
+            matchedInvoice({
+                id: "inv-multi",
+                po_number: "125429",
+                invoice_number: "M-100",
+                subtotal: 2688,
+                total: 2688,
+                line_items: JSON.stringify([
+                    { sku: "S-17888", qty: 14, unit_price: 96 },
+                    { sku: "S-17900", qty: 10, unit_price: 134.4 },
+                ]),
+            }),
+        ];
+        fakeTables.bill_po_links = [
+            { vendor_invoice_id: "inv-multi", po_number: "125429" },
+            { vendor_invoice_id: "inv-multi", po_number: "125430" },
+        ];
+
+        const response = await GET(new Request("http://localhost/api/dashboard/receivings?bust=1"));
+        const body = await response.json();
+
+        const [first, second] = body.received;
+        // The sibling PO is NOT awaiting an invoice any more.
+        expect(second._reconciliation.matchedInvoice).toBeTruthy();
+        expect(second._reconciliation.matchedInvoice.invoice_number).toBe("M-100");
+        // Both rows name every covered PO.
+        for (const row of [first, second]) {
+            expect(row._reconciliation.matchedInvoice.coversPos).toEqual(["125429", "125430"]);
+            expect(row._reconciliation.coversPos).toEqual(["125429", "125430"]);
+        }
+    });
+
+    it("leaves a single-PO bill without coversPos (no note for the normal case)", async () => {
+        getTodaysReceivedPOsMock.mockResolvedValue([receivedPO()]);
+        fakeTables.vendor_invoices = [matchedInvoice()];
+        fakeTables.bill_po_links = [{ vendor_invoice_id: "inv-1", po_number: "125429" }];
+
+        const response = await GET(new Request("http://localhost/api/dashboard/receivings?bust=1"));
+        const body = await response.json();
+
+        const rec = body.received[0]._reconciliation;
+        expect(rec.matchedInvoice.invoice_number).toBe("215047605");
+        expect(rec.matchedInvoice.coversPos).toBeUndefined();
+        expect(rec.coversPos).toBeUndefined();
     });
 });
