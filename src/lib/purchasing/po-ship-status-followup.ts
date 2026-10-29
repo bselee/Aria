@@ -20,7 +20,13 @@
  *              reports. The output of this stage lands on the DASHBOARD ROW —
  *              `needs_human_review` + `last_movement_summary` on purchase_orders.
  *
- *          Two thresholds, deliberately different:
+ *          Three thresholds, deliberately different:
+ *
+ *            NO-TRACKING-AFTER-ACK (dashboard flag, 5d): the same "acked, no
+ *            tracking, open" shape, surfaced EARLY so the row carries the
+ *            problem while the ship date can still be fixed. Flag only — never
+ *            drafts. Excludes dropship + paid-in-advance vendors (they never
+ *            send tracking), see isNoTrackingAfterAckCandidate.
  *
  *            CANDIDATE (dashboard flag): acked >= 7d, no tracking, no real
  *            invoice, no receipt within 3d, still open. NO upper age bound —
@@ -34,9 +40,12 @@
  *
  * @author  Hermia
  * @created 2026-08-20
- * @updated 2026-10-29 — ported to aria/20260924-ops (WS6.1), dashboard-row output
+ * @updated 2026-10-29 — ported to aria/20260924-ops (WS6.1), dashboard-row output;
+ *          2026-10-29 — added the 5d "no tracking after ack" early-flag trigger
+ *          (NO_TRACKING_AFTER_ACK_DAYS) reusing the same dashboard surface.
  * @deps    @/lib/db, @/lib/gmail/auth, @googleapis/gmail,
  *          @/lib/carriers/tracking-service (buildFollowUpEmail),
+ *          @/config/paid-in-advance-vendors (isPaidInAdvanceVendor),
  *          ./po-sender (lookupVendorOrderEmail), ./po-lifecycle
  */
 
@@ -44,6 +53,7 @@ import { createClient } from "@/lib/db";
 import { getAuthenticatedClient } from "@/lib/gmail/auth";
 import { gmail as GmailApi } from "@googleapis/gmail";
 import { buildFollowUpEmail } from "@/lib/carriers/tracking-service";
+import { isPaidInAdvanceVendor } from "@/config/paid-in-advance-vendors";
 import { lookupVendorOrderEmail } from "./po-sender";
 import { transitionLifecycleState } from "./po-lifecycle";
 
@@ -51,6 +61,22 @@ import { transitionLifecycleState } from "./po-lifecycle";
 
 /** Ask only after the vendor has had this long since acknowledging. */
 export const MIN_DAYS_SINCE_ACK = 7;
+
+/**
+ * Early-warning threshold for the "acked but no tracking" trigger.
+ *
+ * Deliberately SHORTER than MIN_DAYS_SINCE_ACK: at 5 days a vendor who accepted
+ * the PO and has not produced a tracking number is already overdue to be
+ * chased (a normal LTL/parcel shipment gets a label within a couple of days).
+ * This trigger only FLAGS the dashboard row — it never drafts an email. The
+ * draft window still opens at MIN_DAYS_SINCE_ACK so we don't put "where's the
+ * tracking?" on a thread the vendor acked on Monday.
+ *
+ * Why separate from MIN_DAYS_SINCE_ACK rather than just lowering it: the 7d
+ * value is the draft gate and is covered by regression tests tied to real PO
+ * history; lowering it would start emailing vendors a day after they replied.
+ */
+export const NO_TRACKING_AFTER_ACK_DAYS = 5;
 
 /**
  * Email-draft window. Beyond this the PO is still flagged on the dashboard but
@@ -146,8 +172,13 @@ export interface CandidateVerdict {
         | "noncomm"
         | "received"
         | "terminal_status"
-        | "receipt_scheduled_soon";
+        | "receipt_scheduled_soon"
+        | "dropship"
+        | "paid_in_advance";
 }
+
+/** Which trigger surfaced a scanned candidate. */
+export type ShipFollowupTrigger = "ship_status" | "no_tracking_after_ack";
 
 // ── Pure predicates (unit-tested, DB/Gmail-free) ──────────────────────────
 
@@ -159,6 +190,16 @@ export interface CandidateVerdict {
  */
 export function isFinalePoNumber(poNumber: string | null | undefined): boolean {
     return /^(po-?)?\d{6}$/i.test(String(poNumber ?? "").trim());
+}
+
+/**
+ * Vendors that ship direct to the customer / marketplace and never hand us a
+ * tracking number — the same pattern po-followup-watcher and vendor-escalation
+ * already use to skip dropships. Exported so the "chase for tracking" triggers
+ * share one definition instead of three copies.
+ */
+export function isDropshipVendor(vendorName: string | null | undefined): boolean {
+    return DROPSHIP_PATTERN.test(String(vendorName ?? ""));
 }
 
 /**
@@ -229,6 +270,85 @@ export function isShipStatusCandidate(
         const rMs = new Date(po.receive_date).getTime();
         if (!isNaN(rMs) && rMs < nowMs) return { ok: false, reason: "received" };
         // Receipt scheduled within the next few days = goods are landing.
+        if (!isNaN(rMs) && rMs - nowMs <= RECEIPT_SOON_DAYS * 86_400_000) {
+            return { ok: false, reason: "receipt_scheduled_soon" };
+        }
+    }
+
+    return { ok: true };
+}
+
+/**
+ * "No tracking after ack" trigger — the early-warning sibling of
+ * isShipStatusCandidate.
+ *
+ * Tracking coverage is ~13% ETA / ~97% stale, and the dominant failure mode is
+ * a PO the vendor ACKNOWLEDGED and then went quiet on. A PO with a vendor ack
+ * but an empty tracking_numbers array (and not received) is the signal to chase;
+ * this predicate fires at NO_TRACKING_AFTER_ACK_DAYS (5) instead of waiting the
+ * full MIN_DAYS_SINCE_ACK (7) draft window, so the dashboard row carries the
+ * problem while there is still time to fix the ship date.
+ *
+ * Qualifies when ALL hold:
+ *   1. vendor_acknowledged_at set and parseable
+ *   2. acked at least NO_TRACKING_AFTER_ACK_DAYS ago
+ *   3. tracking_numbers empty
+ *   4. no tracking request made AFTER the ack (same semantics as the 7d
+ *      predicate: a pre-ack stamp is po-followup-watcher's L1 receipt check)
+ *   5. vendor not marked noncomm
+ *   6. status not received and not terminal (closed/cancelled/completed/void)
+ *   7. no receipt landed or scheduled inside RECEIPT_SOON_DAYS
+ *   8. not a dropship vendor (never sends tracking)
+ *   9. not a paid-in-advance vendor (goods ship on our payment, tracking is
+ *      handled off-thread — chasing produces noise, not shipments)
+ *
+ * Pure: row + clock only, no DB/Gmail. Never drafts — the caller flags.
+ */
+export function isNoTrackingAfterAckCandidate(
+    po: Pick<
+        ShipStatusCandidate,
+        | "vendor_name"
+        | "vendor_acknowledged_at"
+        | "tracking_numbers"
+        | "tracking_requested_at"
+        | "vendor_noncomm_at"
+        | "receive_date"
+        | "status"
+    >,
+    nowMs: number = Date.now(),
+): CandidateVerdict {
+    if (isDropshipVendor(po.vendor_name)) return { ok: false, reason: "dropship" };
+    if (isPaidInAdvanceVendor(po.vendor_name)) {
+        return { ok: false, reason: "paid_in_advance" };
+    }
+
+    if (po.tracking_requested_at) {
+        const reqMs = new Date(po.tracking_requested_at).getTime();
+        const ackMs = po.vendor_acknowledged_at
+            ? new Date(po.vendor_acknowledged_at).getTime()
+            : NaN;
+        const isReceiptCheckStamp = !isNaN(reqMs) && !isNaN(ackMs) && reqMs <= ackMs;
+        if (!isReceiptCheckStamp) return { ok: false, reason: "already_requested" };
+    }
+
+    const daysAcked = daysSinceAck(po.vendor_acknowledged_at, nowMs);
+    if (daysAcked === null) return { ok: false, reason: "no_ack" };
+    if (daysAcked < NO_TRACKING_AFTER_ACK_DAYS) return { ok: false, reason: "too_early" };
+
+    if (Array.isArray(po.tracking_numbers) && po.tracking_numbers.length > 0) {
+        return { ok: false, reason: "has_tracking" };
+    }
+    if (po.vendor_noncomm_at) return { ok: false, reason: "noncomm" };
+
+    const status = (po.status ?? "").toLowerCase();
+    if (status === "received") return { ok: false, reason: "received" };
+    if (status && TERMINAL_STATUS_PATTERN.test(status)) {
+        return { ok: false, reason: "terminal_status" };
+    }
+
+    if (po.receive_date) {
+        const rMs = new Date(po.receive_date).getTime();
+        if (!isNaN(rMs) && rMs < nowMs) return { ok: false, reason: "received" };
         if (!isNaN(rMs) && rMs - nowMs <= RECEIPT_SOON_DAYS * 86_400_000) {
             return { ok: false, reason: "receipt_scheduled_soon" };
         }
@@ -371,7 +491,11 @@ async function resolvePOThread(gmail: any, poNumber: string): Promise<POThreadRe
 
 /**
  * Land the follow-up on the dashboard row. Bill's rule: no Telegram/Slack.
- * Idempotent — a row already stamped by this stage is not rewritten every tick.
+ * Idempotent for an unchanged row — a row already carrying this stage's exact
+ * summary text is not rewritten on every tick. The text embeds the ack age and
+ * the run date, so a later run (more days acked) DOES refresh it; a frozen
+ * "acked 5d ago" on a 40-day-old PO is exactly the stale-signal problem this
+ * stage exists to remove.
  */
 export async function flagPoOnDashboard(
     db: any,
@@ -395,9 +519,10 @@ export async function flagPoOnDashboard(
     if (
         existing &&
         alreadyFlaggedByShipStatus(existing) &&
+        existing.last_movement_summary === summary &&
         (existing.needs_human_review === wantReview || !wantReview)
     ) {
-        return; // already stamped by an earlier run
+        return; // already stamped by an earlier run with this exact text
     }
     const { error } = await db
         .from("purchase_orders")
@@ -418,6 +543,8 @@ export interface ScannedCandidate {
     po: ShipStatusCandidate;
     daysAcked: number;
     draftWorthy: boolean;
+    /** Which trigger surfaced this row. Early rows flag only, never draft. */
+    trigger: ShipFollowupTrigger;
 }
 
 /**
@@ -435,7 +562,10 @@ export async function scanShipStatusCandidates(
     opts: { nowMs?: number; limit?: number } = {},
 ): Promise<ScannedCandidate[]> {
     const now = opts.nowMs ?? Date.now();
-    const minAck = new Date(now - MIN_DAYS_SINCE_ACK * 86_400_000).toISOString();
+    // The read window opens at the EARLIER trigger (no-tracking-after-ack, 5d)
+    // so the early-warning rows are loaded too; the 7d draft gate is enforced by
+    // isShipStatusCandidate per row, not by the query.
+    const minAck = new Date(now - NO_TRACKING_AFTER_ACK_DAYS * 86_400_000).toISOString();
     const lookback = new Date(now - CANDIDATE_LOOKBACK_DAYS * 86_400_000).toISOString();
     const maxRows = Math.min(opts.limit ?? MAX_ROWS_SCANNED, MAX_ROWS_SCANNED);
 
@@ -490,9 +620,22 @@ export async function scanShipStatusCandidates(
     }
     if (rows.length === 0) return [];
 
-    const candidateRows = rows.filter(
-        (row) => isFinalePoNumber(row.po_number) && isShipStatusCandidate(row, now).ok,
-    );
+    const candidateRows: ShipStatusCandidate[] = [];
+    const triggerByPo = new Map<string, ShipFollowupTrigger>();
+    for (const row of rows) {
+        if (!isFinalePoNumber(row.po_number)) continue;
+        if (isShipStatusCandidate(row, now).ok) {
+            candidateRows.push(row);
+            triggerByPo.set(row.po_number, "ship_status");
+            continue;
+        }
+        // 5-6d acked + no tracking: advertise the row early. Drafts stay gated
+        // at MIN_DAYS_SINCE_ACK inside the loop.
+        if (isNoTrackingAfterAckCandidate(row, now).ok) {
+            candidateRows.push(row);
+            triggerByPo.set(row.po_number, "no_tracking_after_ack");
+        }
+    }
     if (candidateRows.length === 0) return [];
 
     // Invoice leg: only a POSITIVE total proves the vendor billed (WS2.4).
@@ -525,11 +668,17 @@ export async function scanShipStatusCandidates(
 
     return candidateRows
         .filter((row) => !invoiced.has(row.po_number))
-        .map((row) => ({
-            po: row,
-            daysAcked: daysSinceAck(row.vendor_acknowledged_at, now) ?? 0,
-            draftWorthy: shouldDraftShipStatus(row, now),
-        }));
+        .map((row) => {
+            const trigger = triggerByPo.get(row.po_number) ?? "ship_status";
+            return {
+                po: row,
+                daysAcked: daysSinceAck(row.vendor_acknowledged_at, now) ?? 0,
+                // Early rows are never draft-worthy: the draft window is the
+                // existing 7-30d gate, unchanged by this trigger.
+                draftWorthy: trigger === "ship_status" && shouldDraftShipStatus(row, now),
+                trigger,
+            };
+        });
 }
 
 // ── Main entry ────────────────────────────────────────────────────────────
@@ -538,6 +687,7 @@ export async function scanShipStatusCandidates(
  * Run the ship-status follow-up stage.
  *
  * Per candidate (acked, no tracking, no real invoice, not received):
+ *   0. 5-6d acked (early trigger): flag the dashboard row only, no email.
  *   1. Mark the dashboard row (needs_human_review + last_movement_summary).
  *   2. Inside the draft window only: resolve the PO thread + vendor email,
  *      re-check freshness, create a Gmail DRAFT in-thread, stamp
@@ -569,8 +719,45 @@ export async function runShipStatusFollowup(opts?: {
     for (const candidate of candidates) {
         const row = candidate.po;
 
-        if (DROPSHIP_PATTERN.test(row.vendor_name ?? "")) {
+        if (isDropshipVendor(row.vendor_name)) {
             outcomes.push({ poNumber: row.po_number, action: "skipped_dropship" });
+            continue;
+        }
+
+        // ── Early "no tracking after ack" trigger: flag only, never draft ──
+        // The row is actionable at 5 days, but the email window still opens at
+        // MIN_DAYS_SINCE_ACK — a "where's the tracking?" draft on a thread the
+        // vendor acked on Monday is noise. Same dashboard surface, same
+        // idempotence stamp; only the reason differs.
+        if (candidate.trigger === "no_tracking_after_ack") {
+            const earlyReason =
+                `acked ${candidate.daysAcked}d, no tracking, no invoice — flagged early ` +
+                `(draft window opens at ${MIN_DAYS_SINCE_ACK}d)`;
+            if (dryRun) {
+                outcomes.push({
+                    poNumber: row.po_number,
+                    action: "flagged",
+                    reason: `dry-run: would flag — ${earlyReason}`,
+                });
+                continue;
+            }
+            try {
+                await flagPoOnDashboard(db, row.po_number, {
+                    daysAcked: candidate.daysAcked,
+                    needsHumanReview: true,
+                    nowMs: now,
+                });
+            } catch (flagErr) {
+                console.warn(
+                    `[po-ship-status] ${row.po_number} early flag write threw:`,
+                    flagErr instanceof Error ? flagErr.message : flagErr,
+                );
+            }
+            outcomes.push({
+                poNumber: row.po_number,
+                action: "flagged",
+                reason: earlyReason,
+            });
             continue;
         }
 

@@ -13,12 +13,15 @@ import {
     CANDIDATE_LOOKBACK_DAYS,
     MAX_DAYS_SINCE_ACK,
     MIN_DAYS_SINCE_ACK,
+    NO_TRACKING_AFTER_ACK_DAYS,
     SHIP_STATUS_SUMMARY_PREFIX,
     alreadyFlaggedByShipStatus,
     daysSinceAck,
     flagPoOnDashboard,
     hasRealInvoice,
+    isDropshipVendor,
     isFinalePoNumber,
+    isNoTrackingAfterAckCandidate,
     isShipStatusCandidate,
     scanShipStatusCandidates,
     shouldDraftShipStatus,
@@ -30,6 +33,7 @@ const DAY = 86_400_000;
 
 function basePo(overrides: Record<string, unknown> = {}) {
     return {
+        vendor_name: "Rapid Packaging",
         vendor_acknowledged_at: new Date(NOW - 10 * DAY).toISOString(), // acked 10d ago
         tracking_numbers: [],
         tracking_requested_at: null,
@@ -285,6 +289,146 @@ describe("isShipStatusCandidate", () => {
     });
 });
 
+describe("isNoTrackingAfterAckCandidate (5d early trigger)", () => {
+    it("threshold sits between a normal ship lag and the draft window", () => {
+        expect(NO_TRACKING_AFTER_ACK_DAYS).toBe(5);
+        expect(NO_TRACKING_AFTER_ACK_DAYS).toBeLessThan(MIN_DAYS_SINCE_ACK);
+    });
+
+    it("qualifies a PO acked 5d ago with no tracking and not received", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ vendor_acknowledged_at: new Date(NOW - NO_TRACKING_AFTER_ACK_DAYS * DAY).toISOString() }),
+                NOW,
+            ),
+        ).toEqual({ ok: true });
+    });
+
+    it("still qualifies through the 6d day of the early band", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ vendor_acknowledged_at: new Date(NOW - 6 * DAY).toISOString() }),
+                NOW,
+            ),
+        ).toEqual({ ok: true });
+    });
+
+    it("keeps qualifying an aged silent PO (PO 125283 shape)", () => {
+        expect(isNoTrackingAfterAckCandidate(po125283(), NOW)).toEqual({ ok: true });
+    });
+
+    it("rejects an ack younger than the threshold", () => {
+        const fresh = new Date(NOW - (NO_TRACKING_AFTER_ACK_DAYS - 1) * DAY).toISOString();
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_acknowledged_at: fresh }), NOW).reason,
+        ).toBe("too_early");
+    });
+
+    it("rejects no ack / unparseable ack", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_acknowledged_at: null }), NOW).reason,
+        ).toBe("no_ack");
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_acknowledged_at: "not-a-date" }), NOW).reason,
+        ).toBe("no_ack");
+    });
+
+    it("rejects a PO that already has tracking", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ tracking_numbers: ["1Z999AA10123456784"] }),
+                NOW,
+            ).reason,
+        ).toBe("has_tracking");
+    });
+
+    it("rejects received and terminal POs", () => {
+        expect(isNoTrackingAfterAckCandidate(basePo({ status: "Received" }), NOW).reason).toBe(
+            "received",
+        );
+        expect(isNoTrackingAfterAckCandidate(basePo({ status: "Closed" }), NOW).reason).toBe(
+            "terminal_status",
+        );
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ receive_date: new Date(NOW - DAY).toISOString() }),
+                NOW,
+            ).reason,
+        ).toBe("received");
+    });
+
+    it("rejects a receipt scheduled inside the 3-day window", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ receive_date: new Date(NOW + 2 * DAY).toISOString() }),
+                NOW,
+            ).reason,
+        ).toBe("receipt_scheduled_soon");
+    });
+
+    // ── Exclusions: these vendors never hand us tracking ──────────────────
+    it("excludes dropship vendors", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_name: "Autopot USA" }), NOW).reason,
+        ).toBe("dropship");
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ vendor_name: "Horticulture Lighting Group" }),
+                NOW,
+            ).reason,
+        ).toBe("dropship");
+    });
+
+    it("excludes paid-in-advance vendors", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_name: "Sustainable Village" }), NOW).reason,
+        ).toBe("paid_in_advance");
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_name: "Cen-Tec Systems" }), NOW).reason,
+        ).toBe("paid_in_advance");
+        expect(
+            isNoTrackingAfterAckCandidate(basePo({ vendor_name: "Colorful Packaging" }), NOW).reason,
+        ).toBe("paid_in_advance");
+    });
+
+    it("excludes vendor-noncomm rows and prior tracking requests", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ vendor_noncomm_at: new Date(NOW - 2 * DAY).toISOString() }),
+                NOW,
+            ).reason,
+        ).toBe("noncomm");
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({ tracking_requested_at: new Date(NOW - 4 * DAY).toISOString() }),
+                NOW,
+            ).reason,
+        ).toBe("already_requested");
+    });
+
+    it("does not treat a pre-ack receipt-check stamp as a tracking request", () => {
+        expect(
+            isNoTrackingAfterAckCandidate(
+                basePo({
+                    vendor_acknowledged_at: new Date(NOW - 6 * DAY).toISOString(),
+                    tracking_requested_at: new Date(NOW - 8 * DAY).toISOString(),
+                }),
+                NOW,
+            ),
+        ).toEqual({ ok: true });
+    });
+});
+
+describe("isDropshipVendor", () => {
+    it("matches the shared dropship pattern", () => {
+        expect(isDropshipVendor("Autopot USA")).toBe(true);
+        expect(isDropshipVendor("Printful")).toBe(true);
+        expect(isDropshipVendor("AC Infinity")).toBe(true);
+        expect(isDropshipVendor("Rapid Packaging")).toBe(false);
+        expect(isDropshipVendor(null)).toBe(false);
+    });
+});
+
 describe("shouldDraftShipStatus (email window)", () => {
     it("drafts inside the 7-30d window", () => {
         expect(
@@ -386,6 +530,36 @@ describe("dashboard-row output", () => {
         expect(update).not.toHaveBeenCalled();
     });
 
+    it("refreshes a summary whose ack age has moved (a frozen day count is a stale signal)", async () => {
+        const db = makeDb({
+            purchase_orders: {
+                rows: [
+                    {
+                        po_number: "125283",
+                        needs_human_review: true,
+                        last_movement_summary: silentPoSummary(5, NOW),
+                    },
+                ],
+            },
+        });
+        const update = vi.fn();
+        const original = db.from;
+        db.from = (table: string) => {
+            const builder = original(table);
+            if (table === "purchase_orders") {
+                const origUpdate = builder.update;
+                builder.update = (payload: Record<string, unknown>) => {
+                    update(payload);
+                    return origUpdate(payload);
+                };
+            }
+            return builder;
+        };
+        await flagPoOnDashboard(db, "125283", { daysAcked: 12, nowMs: NOW });
+        expect(update).toHaveBeenCalledTimes(1);
+        expect(update.mock.calls[0][0].last_movement_summary).toContain("acked 12d ago");
+    });
+
     it("writes needs_human_review + summary on a fresh row", async () => {
         const db = makeDb({
             purchase_orders: {
@@ -459,6 +633,61 @@ describe("scanShipStatusCandidates", () => {
     it("returns [] on a read error instead of throwing", async () => {
         const db = makeDb({
             purchase_orders: { rows: [], error: { message: "42703 column does not exist" } },
+        });
+        expect(await scanShipStatusCandidates(db, { nowMs: NOW })).toEqual([]);
+    });
+
+    it("surfaces a 6d acked no-tracking PO on the early trigger (flag, no draft)", async () => {
+        const db = makeDb({
+            purchase_orders: {
+                rows: [
+                    po125283({
+                        vendor_acknowledged_at: new Date(NOW - 6 * DAY).toISOString(),
+                    }),
+                ],
+            },
+            vendor_invoices: { rows: [] },
+        });
+        const found = await scanShipStatusCandidates(db, { nowMs: NOW });
+        expect(found).toHaveLength(1);
+        expect(found[0].trigger).toBe("no_tracking_after_ack");
+        expect(found[0].draftWorthy).toBe(false);
+    });
+
+    it("tags a 10d acked PO on the original ship-status trigger (draft window open)", async () => {
+        const db = makeDb({
+            purchase_orders: {
+                rows: [
+                    po125283({
+                        vendor_acknowledged_at: new Date(NOW - 10 * DAY).toISOString(),
+                    }),
+                ],
+            },
+            vendor_invoices: { rows: [] },
+        });
+        const found = await scanShipStatusCandidates(db, { nowMs: NOW });
+        expect(found).toHaveLength(1);
+        expect(found[0].trigger).toBe("ship_status");
+        expect(found[0].draftWorthy).toBe(true);
+    });
+
+    it("never surfaces dropship or paid-in-advance POs on the early trigger", async () => {
+        const db = makeDb({
+            purchase_orders: {
+                rows: [
+                    po125283({
+                        po_number: "125500",
+                        vendor_name: "Autopot USA",
+                        vendor_acknowledged_at: new Date(NOW - 6 * DAY).toISOString(),
+                    }),
+                    po125283({
+                        po_number: "125501",
+                        vendor_name: "Sustainable Village",
+                        vendor_acknowledged_at: new Date(NOW - 6 * DAY).toISOString(),
+                    }),
+                ],
+            },
+            vendor_invoices: { rows: [] },
         });
         expect(await scanShipStatusCandidates(db, { nowMs: NOW })).toEqual([]);
     });
