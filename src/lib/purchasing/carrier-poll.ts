@@ -61,8 +61,12 @@ export async function pollActiveShipments(): Promise<CarrierPollOutcome[]> {
             const newCat = status.category ?? null;
             const newDisp = status.display ?? null;
             const newEta = status.estimated_delivery_at ?? null;
+            // `delivered` is terminal — never invent a timestamp the carrier did
+            // not supply. A delivered result with no delivered_at stays null
+            // (truthful); substituting now() writes an unrecoverable fabricated
+            // delivery instant (the 64058937 class).
             const newDelivered = newCat === 'delivered'
-                ? (status.delivered_at ?? new Date().toISOString())
+                ? (status.delivered_at ?? null)
                 : null;
 
             const changed = newCat !== s.status_category || newDisp !== s.status_display || !!newDelivered;

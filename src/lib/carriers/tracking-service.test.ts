@@ -8,6 +8,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
 import {
     detectCarrier,
     extractTrackingNumbers,
@@ -22,6 +24,10 @@ import {
     buildFollowUpEmail,
     TRACKING_PATTERNS,
 } from './tracking-service';
+
+const AAA_BARE_CHROME_FIXTURE = fileURLToPath(
+    new URL('../../../scripts/fixtures/aaa-pro-bare-chrome-page.txt', import.meta.url),
+);
 
 const REAL_VENDOR_EMAILS = {
     thirstyEarthUpsShipstation: `
@@ -293,6 +299,31 @@ describe('parseTrackingContent', () => {
 
     it('should return null for empty string', () => {
         expect(parseTrackingContent('')).toBeNull();
+    });
+
+    it('parses the AAA Cooper delivered block — exact instant + POD signature', () => {
+        const page = [
+            'Pickup Date : 10/15/2026 Delivery Date Time : 10/21/2026 14:53',
+            'Status : Delivered Signed For : Ben For real-time',
+            '2026-10-21 14:53 Delivered To Consignee In SAN DIEGO, CA',
+        ].join(' ');
+        const result = parseTrackingContent(page);
+        expect(result?.category).toBe('delivered');
+        // 14:53 PDT (America/Los_Angeles, DST) → 21:53 UTC. The carrier's own
+        // instant, never a synthesized now().
+        expect(result?.delivered_at).toBe('2026-10-21T21:53:00.000Z');
+        expect(result?.signed_for).toBe('Ben');
+        expect(result?.display).toContain('signed Ben');
+    });
+
+    it('returns null for the AAA Cooper bare chrome (throttle) page — silence is not a status', () => {
+        const bare = readFileSync(AAA_BARE_CHROME_FIXTURE, 'utf8');
+        expect(parseTrackingContent(bare)).toBeNull();
+    });
+
+    it('does not claim delivered when "Delivered" appears only in chrome (no Tracing block)', () => {
+        const chrome = 'AAA Cooper Transportation Pro Tracking Results Transit Times Delivered In Transit days in transit';
+        expect(parseTrackingContent(chrome)).toBeNull();
     });
 });
 

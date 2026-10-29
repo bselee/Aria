@@ -27,6 +27,7 @@ export interface TrackingStatus {
     public_url?: string;
     estimated_delivery_at?: string;
     delivered_at?: string;
+    signed_for?: string;
 }
 
 // ──────────────────────────────────────────────────
@@ -424,15 +425,105 @@ export function carrierUrl(trackingNumber: string): string {
 // STATUS PARSING (pure function — no network calls)
 // ──────────────────────────────────────────────────
 
+// AAA Cooper destination state → IANA timezone. The carrier page prints the
+// delivery wall time in the destination's local zone ("Delivered To Consignee
+// In SAN DIEGO, CA"), so the exact UTC instant requires this map. An unknown
+// state is refused rather than guessed — a wrong offset is worse than a null
+// timestamp.
+const AAA_STATE_TZ: Record<string, string> = {
+    KY: "America/Kentucky/Louisville", CA: "America/Los_Angeles", CO: "America/Denver",
+    TX: "America/Chicago", FL: "America/New_York", OR: "America/Los_Angeles",
+    WA: "America/Los_Angeles", NV: "America/Los_Angeles", AZ: "America/Phoenix",
+    NY: "America/New_York", PA: "America/New_York", IL: "America/Chicago",
+    OH: "America/New_York", MI: "America/Detroit", GA: "America/New_York",
+    NC: "America/New_York", TN: "America/Chicago", MO: "America/Chicago",
+    MN: "America/Chicago", UT: "America/Denver", ID: "America/Denver",
+    MT: "America/Denver", NM: "America/Denver", VA: "America/New_York",
+    MD: "America/New_York", MA: "America/New_York", NJ: "America/New_York",
+    WI: "America/Chicago", IN: "America/Indiana/Indianapolis",
+};
+
+/**
+ * Convert a destination-local wall time in `zone` to its UTC ISO instant.
+ * Iteratively converges on the UTC ms whose local representation equals the
+ * given wall clock (correct across DST boundaries).
+ */
+function zonedToUtc(y: number, mo: number, d: number, h: number, mi: number, zone: string): string {
+    let guess = Date.UTC(y, mo - 1, d, h, mi, 0);
+    for (let i = 0; i < 3; i++) {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone: zone,
+            year: "numeric", month: "2-digit", day: "2-digit",
+            hour: "2-digit", minute: "2-digit", hour12: false,
+        }).formatToParts(new Date(guess));
+        const g = (t: string) => Number(parts.find((p) => p.type === t)!.value);
+        const asIfUtc = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour") % 24, g("minute"), 0);
+        const want = Date.UTC(y, mo - 1, d, h, mi, 0);
+        const delta = want - asIfUtc;
+        if (delta === 0) break;
+        guess += delta;
+    }
+    return new Date(guess).toISOString();
+}
+
+// AAA Cooper delivered block — the date PRECEDES the word "Delivered":
+//   Delivery Date Time : 10/21/2026 14:53   Status : Delivered   Signed For : Ben
+//   2026-10-21 14:53  Delivered To Consignee In SAN DIEGO, CA
+const AAA_DELIVERED_RE =
+    /Delivery\s+Date\s+Time\s*:\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*Status\s*:\s*Delivered\b/i;
+const AAA_SIGNED_RE = /Signed\s+For\s*:\s*([A-Za-z .'-]+?)\s+For\s+real-time/i;
+const AAA_DEST_RE = /Delivered\s+To\s+Consignee\s+In\s+([A-Za-z .'-]+),\s*([A-Z]{2})\b/i;
+
 /**
  * Parse delivery status from carrier page text using regex — no LLM.
  * Pure function: input text, output status or null.
  */
 export function parseTrackingContent(content: string): TrackingStatus | null {
+    // AAA Cooper throttle/silence (Guard 12): the bare chrome page still prints
+    // the brand and menu chrome but omits the "Tracing Information" data block.
+    // Without that block there is no shipment data — reading it as "in transit"
+    // (its "days in transit" legend) reports late shipments the carrier never
+    // answered. No Tracing block → no claim.
+    if (/AAA Cooper Transportation/i.test(content) && !/Tracing Information/i.test(content)) {
+        return null;
+    }
+
+    // AAA Cooper delivered — the date precedes "Delivered", so the generic
+    // /delivered\s+(?:on\s+)?<date>/ below never matches it. Capture the carrier's
+    // own instant (destination-local, timezone-resolved) and the POD signature.
+    const aaaDelivered = content.match(AAA_DELIVERED_RE);
+    if (aaaDelivered) {
+        const [, mo, d, y, h, mi] = aaaDelivered;
+        const signed = content.match(AAA_SIGNED_RE)?.[1]?.trim() || undefined;
+        const dest = content.match(AAA_DEST_RE);
+        const zone = dest ? AAA_STATE_TZ[dest[2]] : undefined;
+        const deliveredAt = zone
+            ? zonedToUtc(Number(y), Number(mo), Number(d), Number(h), Number(mi), zone)
+            : undefined;
+        const day = `${Number(mo)}/${Number(d)}`;
+        return {
+            category: 'delivered',
+            display: signed ? `Delivered ${day} — signed ${signed}` : `Delivered ${day}`,
+            delivered_at: deliveredAt,
+            signed_for: signed,
+        };
+    }
+
+    // For an AAA Cooper page, `delivered` must come from the structured block
+    // above (date + Status) or the consignee trace line. A bare occurrence of the
+    // word is chrome, a status legend, or another shipment's row on an
+    // AllAccounts page — and `delivered` is terminal in the monotonic writer, so
+    // a false positive here cannot be corrected automatically. Prefer silence.
+    const isAaaPage = /AAA Cooper Transportation/i.test(content);
+    const aaaConsigneeDelivered = /Delivered\s+To\s+Consignee\s+In/i.test(content);
+    const deliveredAllowed = !isAaaPage || aaaConsigneeDelivered;
+
     // Delivered — check first; most definitive
-    const deliveredDate = content.match(
-        /delivered\s+(?:on\s+)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{4})/i
-    );
+    const deliveredDate = deliveredAllowed
+        ? content.match(
+              /delivered\s+(?:on\s+)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{4})/i,
+          )
+        : null;
     if (deliveredDate) {
         const deliveredAt = new Date(`${deliveredDate[1]} 17:00:00 UTC`);
         return {
@@ -441,7 +532,8 @@ export function parseTrackingContent(content: string): TrackingStatus | null {
             delivered_at: Number.isNaN(deliveredAt.getTime()) ? undefined : deliveredAt.toISOString(),
         };
     }
-    if (/\bdelivered\b/i.test(content)) return { category: 'delivered', display: 'Delivered' };
+    if (deliveredAllowed && /\bdelivered\b/i.test(content))
+        return { category: 'delivered', display: 'Delivered' };
 
     // Out for delivery
     if (/out\s+for\s+delivery/i.test(content))
