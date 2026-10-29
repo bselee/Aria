@@ -771,10 +771,15 @@ export async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise
         // A dashed "-S…-DropshipPO" ref is a Finale SALES_ORDER variant with no
         // PURCHASE_ORDER counterpart — the push would 404. Keep the local write
         // above and skip Finale only, with a distinct log line so the skip is
-        // observable and not mistaken for a swallowed error. `poNumber` here is
-        // the bare purchase_orders.po_number spelling — never "PO-"-prefixed
-        // (zero live dropship rows carry a prefix) — so the ^2\d{7} anchor in
-        // isSalesOrderVariantPoRef is safe.
+        // observable and not mistaken for a swallowed error.
+        //
+        // `poNumber` is never "PO-"-prefixed: extractPONumbersFromText emits only
+        // digits (its capture groups sit inside the digit run, labels outside),
+        // and resolveExtractedPOs rewrites a bare base to a stored
+        // purchase_orders.po_number via resolveDropshipPOByRef — never a
+        // constructed string. So the ^2\d{7} anchor in isSalesOrderVariantPoRef
+        // is safe. This breaks only if a caller starts passing a constructed ref
+        // (one production caller today: line 1050).
         if (isSalesOrderVariantPoRef(poNumber)) {
             console.log(`[tracking-sync] PO ${poNumber} is a sales-order variant (no Finale PO) — local tracking written, Finale push skipped`);
         } else {
