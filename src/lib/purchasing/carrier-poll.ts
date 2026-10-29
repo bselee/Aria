@@ -37,6 +37,14 @@ export async function pollActiveShipments(): Promise<CarrierPollOutcome[]> {
         .select('id, tracking_number, status_category, status_display, last_checked_at, delivered_at, po_numbers, vendor_names')
         .eq('active', true)
         .is('delivered_at', null)
+        // A row can be terminal by category ('delivered') while its delivered_at
+        // is still null — the carrier said "delivered" but supplied no timestamp.
+        // Exclude it by category too, else it is re-polled every 2h forever for a
+        // cosmetic date that will never arrive. Keep status_category.is.null in
+        // the poll set: a null category is a not-yet-polled row, and a bare
+        // `.neq('status_category','delivered')` would ALSO drop nulls (SQL
+        // three-valued logic), starving first-time polls.
+        .or(`status_category.is.null,status_category.neq.delivered`)
         .or(`last_checked_at.is.null,last_checked_at.lte.${cutoff}`)
         // Oldest-checked first. Without an explicit order the same first page is
         // returned on every run while the backlog behind it is never reached —

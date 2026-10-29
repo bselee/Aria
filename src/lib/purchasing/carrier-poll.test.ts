@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
     orderArgs: null as any,
     updates: [] as any[],
     updateError: null as string | null,
+    orFilters: [] as string[],
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -24,7 +25,10 @@ vi.mock("@/lib/db", () => ({
                 const chain: any = {
                     eq: () => chain,
                     is: () => chain,
-                    or: () => chain,
+                    or: (filter: string) => {
+                        state.orFilters.push(filter);
+                        return chain;
+                    },
                     order: (col: string, opts: any) => {
                         state.orderArgs = { col, opts };
                         return chain;
@@ -188,6 +192,25 @@ describe("carrier-poll starvation guards", () => {
         try {
             await pollActiveShipments();
             expect(state.orderArgs).toEqual({ col: "last_checked_at", opts: { ascending: true, nullsFirst: true } });
+        } finally {
+            setTimeoutSpy.mockRestore();
+        }
+    });
+
+    it("excludes delivered-by-category rows (terminal even with a null timestamp) but keeps null categories", async () => {
+        state.orFilters = [];
+        state.updates = [];
+        state.ships = [ship()];
+        state.tracking = { category: "in_transit", display: "In transit", delivered_at: null };
+        const setTimeoutSpy = fakeTimers();
+        try {
+            await pollActiveShipments();
+            // Terminal by category, not only by timestamp: a 'delivered' row with
+            // delivered_at NULL must leave the poll set. The null branch is what
+            // keeps a not-yet-polled (null-category) row in the set — a bare
+            // `.neq('status_category','delivered')` would drop it too (SQL 3VL)
+            // and starve first-time polls.
+            expect(state.orFilters).toContain("status_category.is.null,status_category.neq.delivered");
         } finally {
             setTimeoutSpy.mockRestore();
         }
