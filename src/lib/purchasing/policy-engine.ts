@@ -29,6 +29,9 @@ export interface PurchasingCandidateInput {
     stockOnOrder: number;
     adjustedRunwayDays: number | null;
     finishedGoodsCoverageDays: number | null;
+    /** Raw runway counting the packed-FG shelf as supply (2026-10-29). Null
+     *  when no feed carries FG stock — the legacy runway alone then applies. */
+    combinedRunwayDays?: number | null;
     leadTimeDays: number | null;
     suggestedQty: number;
     orderIncrementQty: number | null;
@@ -227,6 +230,12 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
 
     const effectiveQty = deriveEffectiveOrderQty(input);
     const healthyFgCoverage = hasHealthyFinishedGoodsCoverage(input.finishedGoodsCoverageDays);
+    // Combined runway counts the packed-FG shelf as supply (Bill 2026-10-29:
+    // packed FG is already-bought raw — the WDG101/WDG104 overbuy class).
+    const combinedHealthy =
+        input.combinedRunwayDays != null &&
+        Number.isFinite(input.combinedRunwayDays) &&
+        input.combinedRunwayDays >= orderPointDays(input);
 
     if (isPackOverbuy(input, effectiveQty)) {
         return createPurchasingAssessment({
@@ -259,7 +268,10 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
         });
     }
 
-    if (bomDemand > 0 && directDemand === 0 && healthyFgCoverage) {
+    if (healthyFgCoverage && (directDemand === 0 || combinedHealthy)) {
+        const combinedNote = input.combinedRunwayDays != null
+            ? ` Combined runway with the packed shelf: ${fmtDays(input.combinedRunwayDays)}.`
+            : "";
         return createPurchasingAssessment({
             vendorName: input.vendorName,
             productId: input.productId,
@@ -269,7 +281,7 @@ export function assessPurchasingCandidate(input: PurchasingCandidateInput): Purc
             reasonCodes: ["fg_coverage_sufficient", "bom_demand_suppressed"],
             explanation:
                 `Hold: finished goods have ≥${HEALTHY_FINISHED_GOODS_COVERAGE_DAYS}d coverage ` +
-                `(${fmtDays(input.finishedGoodsCoverageDays)}). BOM pull is suppressed.`,
+                `(${fmtDays(input.finishedGoodsCoverageDays)}). BOM pull is suppressed.` + combinedNote,
             metrics: m(),
         });
     }

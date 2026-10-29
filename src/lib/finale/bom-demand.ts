@@ -8,6 +8,10 @@ export interface FGVelocity {
     name: string;
     dailySalesRate: number;
     bom: Array<{ componentSku: string; quantity: number }>;
+    /** Packed FG units on the shelf (2026-10-29). Packed FG is already-bought
+     *  raw (Bill): the order screen must not treat the next build as imminent
+     *  demand while a full build's output sits packed. Null when unknown. */
+    stockOnHand?: number | null;
 }
 
 export interface ComponentDemand {
@@ -18,7 +22,43 @@ export interface ComponentDemand {
         name: string;
         dailySalesRate: number;
         qtyPerUnit: number;
+        stockOnHand?: number | null;
     }>;
+}
+
+/**
+ * Packed-shelf credit for a raw/BOM component, from its FG feeds.
+ *
+ * WHY(2026-10-29): BAS Auto sized WDG101 at "order 22" while 420 packed WDG104 +
+ * 11 cases of WDG204 sat on the rack — packed FG is already-bought raw. Aria must
+ * count that shelf: coverageDays = the soonest-stocked-out FG it feeds;
+ * packedRawEquivalent = FG units × raw-units-per-FG-unit; fgDrivenDailyRaw = the
+ * FG sell-through expressed in raw units/day. All null when no feed carries stock.
+ */
+export function derivePackedShelfCredit(
+    feeds: Array<{ dailySalesRate: number; qtyPerUnit?: number; stockOnHand?: number | null }>,
+): { coverageDays: number | null; packedRawEquivalent: number | null; fgDrivenDailyRaw: number | null } {
+    let packedRaw = 0;
+    let fgDriven = 0;
+    const covers: number[] = [];
+    for (const f of feeds) {
+        const stock = f.stockOnHand ?? null;
+        const per = f.qtyPerUnit ?? null;
+        if (stock != null && Number.isFinite(stock) && per != null && Number.isFinite(per) && per > 0) {
+            packedRaw += stock * per;
+            if (f.dailySalesRate > 0) {
+                fgDriven += f.dailySalesRate * per;
+                covers.push(stock / f.dailySalesRate);
+            }
+        } else if (stock != null && Number.isFinite(stock) && f.dailySalesRate > 0) {
+            covers.push(stock / f.dailySalesRate);
+        }
+    }
+    return {
+        coverageDays: covers.length > 0 ? Math.min(...covers) : null,
+        packedRawEquivalent: packedRaw > 0 ? packedRaw : null,
+        fgDrivenDailyRaw: fgDriven > 0 ? fgDriven : null,
+    };
 }
 
 // ── Pure computation ───────────────────────────────────────────────────────
@@ -69,6 +109,7 @@ export function computeComponentBurnRates(fgVelocities: FGVelocity[]): Map<strin
                 name: root.name,
                 dailySalesRate: root.dailySalesRate,
                 qtyPerUnit: qtyPerRootUnit,
+                stockOnHand: root.stockOnHand ?? null,
             };
             if (existing) {
                 existing.totalBurnRate += flowRate;

@@ -2344,6 +2344,16 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     const activity = await this.getProductActivity(sku, daysBack);
                     const dailySalesRate = activity.soldQty / daysBack;
 
+                    // HERMIA(2026-10-29): packed-shelf credit. Packed FG is
+                    // already-bought raw (Bill, WDG101/WDG104) — the order
+                    // screen must know how long the packed shelf covers sales
+                    // before treating the next build's raw pull as imminent
+                    // demand. One GraphQL read per SELLING FG; non-selling FGs
+                    // contribute no cover signal and skip the call.
+                    const fgStock = dailySalesRate > 0
+                        ? await this.getStockLevel(sku).catch(() => null)
+                        : null;
+
                     // DECISION(2026-05-12): Don't gate on FG sales rate. Components
                     // surface based on their own receipt velocity (primary signal),
                     // so build-ahead/contract FGs that never show retail sales still
@@ -2356,7 +2366,7 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                     // network round-trip — was doubling Finale traffic per FG SKU.
                     const fgDetail = await this.lookupProduct(sku);
                     const name: string = fgDetail?.name || sku;
-                    fgVelocities.push({ sku, name, dailySalesRate, bom });
+                    fgVelocities.push({ sku, name, dailySalesRate, bom, stockOnHand: fgStock });
                 } catch (err: any) {
                     console.error(`[bom-demand] FG ${sku} failed:`, err.message);
                 }
@@ -2628,6 +2638,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
                             name: fg.name,
                             dailySalesRate: fg.dailySalesRate,
                             buildsWorth: Math.round(buildsWorth * 10) / 10,
+                            // HERMIA(2026-10-29): packed-shelf credit inputs —
+                            // the policy engine derives finishedGoodsCoverageDays
+                            // and a combined runway from these.
+                            qtyPerUnit: fg.qtyPerUnit,
+                            stockOnHand: fg.stockOnHand ?? null,
                         };
                     });
 

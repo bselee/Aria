@@ -192,6 +192,10 @@ export interface PurchasingItem {
         name: string;
         dailySalesRate: number;
         buildsWorth: number;
+        /** Raw units per one FG unit (BOM explosion, 2026-10-29). */
+        qtyPerUnit?: number;
+        /** Packed FG units on the shelf — already-bought raw (2026-10-29). */
+        stockOnHand?: number | null;
     }>;
     totalBurnRate?: number;
     medianPOGapDays?: number;

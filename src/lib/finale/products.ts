@@ -239,6 +239,23 @@ export class FinaleProductsClient extends FinaleCoreClient {
                 // the cached bulk-list response — supplier info, status, lead
                 // time, etc. all live there. Without this, ~50 components
                 // silently dropped from bom-demand / Purchasing Intelligence.
+                // HERMIA(2026-10-29): a renamed product keeps its CREATION slug
+                // in productUrl while exposing the new productId (WDG101 →
+                // legacy slug AQUA101). Resolve the slug via GraphQL FIRST —
+                // it is one precise call and restores stock history/REST access
+                // for every renamed SKU, not just those in the bulk list.
+                try {
+                    const slug = await this.resolveProductUrlSlug(sku.trim());
+                    if (slug && slug !== sku.trim()) {
+                        const data = await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(slug)}`);
+                        const product = await this.parseProductDetail(data);
+                        product.openPOs = await (this as any).findCommittedPOsForProduct(sku.trim());
+                        void upsertSkuCache(trimmedSku, product);
+                        return product;
+                    }
+                } catch (slugErr: any) {
+                    console.warn(`[finale] lookupProduct: ${sku} slug resolution failed: ${slugErr instanceof Error ? slugErr.message : slugErr}`);
+                }
                 try {
                     const synthetic = await this.lookupProductFromListCache(sku.trim());
                     if (synthetic) {
@@ -483,6 +500,47 @@ export class FinaleProductsClient extends FinaleCoreClient {
      * @param   productId - Finale product SKU
      * @returns On-hand quantity, or null if not tracked
      */
+    /**
+     * Resolve the REST slug for a product id. A renamed product keeps its
+     * creation slug in `productUrl` while exposing the new productId
+     * (WDG101 → legacy slug AQUA101, 2026-10-29). Cached per process —
+     * renames are rare, so one GraphQL read per SKU, ever.
+     *
+     * @param   productId - the CURRENT Finale productId
+     * @returns the URL slug to use for /api/product/<slug>, or null
+     */
+    async resolveProductUrlSlug(productId: string): Promise<string | null> {
+        const key = productId.trim();
+        if (_productSlugCache.has(key)) return _productSlugCache.get(key) ?? null;
+        try {
+            const query = {
+                query: `{
+                    productViewConnection(first: 1, productId: "${key}") {
+                        edges { node { productUrl } }
+                    }
+                }`,
+            };
+            const res = await fetch(`${this.apiBase}/${this.accountPath}/api/graphql`, {
+                method: 'POST',
+                headers: { Authorization: this.authHeader, 'Content-Type': 'application/json' },
+                body: JSON.stringify(query),
+            });
+            if (res.ok) {
+                const result = await res.json();
+                const node = result.data?.productViewConnection?.edges?.[0]?.node;
+                const url: string | null = node?.productUrl ?? null;
+                const slug = url ? url.split('/').pop() || null : null;
+                _productSlugCache.set(key, slug);
+                return slug;
+            }
+            _productSlugCache.set(key, null);
+            return null;
+        } catch {
+            _productSlugCache.set(key, null);
+            return null;
+        }
+    }
+
     async getStockLevel(productId: string): Promise<number | null> {
         // Primary: GraphQL productViewConnection (reliable)
         try {

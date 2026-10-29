@@ -1,5 +1,6 @@
 import type { PurchasingItem } from "../finale/client";
 import type { PurchasingCandidateInput } from "./policy-engine";
+import { derivePackedShelfCredit } from "../finale/bom-demand";
 
 export interface PurchasingCandidate extends PurchasingCandidateInput {
     vendorPartyId: string;
@@ -41,6 +42,22 @@ export function buildPurchasingCandidate(
     const stockOnOrder = Math.max(item.stockOnOrder ?? 0, 0);
     const dailyForRunway = Math.max(item.dailyRate ?? 0, directDemand + bomDemand, 0.0001);
     const stockOnHand = item.stockOnHand ?? 0;
+
+    // HERMIA(2026-10-29): packed-shelf credit. Packed FG on the rack is
+    // already-bought raw (Bill, WDG101/WDG104): derive FG coverage and a
+    // combined runway (raw shelf + packed-FG shelf, FG sell-through demand)
+    // so the policy engine can hold a buy the vendor's portal would over-order.
+    const shelfCredit = derivePackedShelfCredit(item.feedsFinishedGoods ?? []);
+    let combinedRunwayDays: number | null = null;
+    if (shelfCredit.packedRawEquivalent !== null) {
+        const combinedDaily = Math.max(
+            item.dailyRate ?? 0,
+            directDemand + (shelfCredit.fgDrivenDailyRaw ?? 0),
+            0.0001,
+        );
+        combinedRunwayDays = (stockOnHand + shelfCredit.packedRawEquivalent) / combinedDaily;
+    }
+
     let adjustedRunwayDays: number | null = Number.isFinite(item.adjustedRunwayDays)
         ? item.adjustedRunwayDays
         : null;
@@ -61,7 +78,8 @@ export function buildPurchasingCandidate(
         stockOnHand,
         stockOnOrder,
         adjustedRunwayDays,
-        finishedGoodsCoverageDays: context.finishedGoodsCoverageDays ?? null,
+        finishedGoodsCoverageDays: context.finishedGoodsCoverageDays ?? shelfCredit.coverageDays,
+        combinedRunwayDays,
         leadTimeDays: Number.isFinite(item.effectiveLeadTimeDays ?? item.leadTimeDays)
             ? (item.effectiveLeadTimeDays ?? item.leadTimeDays)
             : null,
