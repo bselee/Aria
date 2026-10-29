@@ -177,8 +177,12 @@ describe("runAutoMatchUnmatched", () => {
     });
 
     it("skips when no PO candidates found", async () => {
+        // Vendor name must NOT be a phantom marker ("Unknown Vendor" normalizes
+        // to the junk name "unknownvendor", so isPhantomInvoiceRow drops the
+        // row and loadUnmatched returns 0 rows). This fixture exercises a real
+        // invoice whose vendor simply has no open PO.
         const qInv = mockQuery([
-            { id: "inv-1", invoice_number: "INV-001", vendor_name: "Unknown Vendor",
+            { id: "inv-1", invoice_number: "INV-001", vendor_name: "NoMatch Supply Co",
               total: 500, subtotal: 450, freight: 25, tax: 25,
               invoice_date: "2026-07-15", created_at: "2026-07-15T10:00:00Z",
               po_number: null, no_po_required: false, status: "unmatched" },

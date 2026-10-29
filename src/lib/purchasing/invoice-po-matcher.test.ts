@@ -403,6 +403,16 @@ describe("findPOCandidates with Tier A auto-match", () => {
             total_amount: null,
             total: 500,
             status: "open",
+        }, {
+            // Second open PO so the 2026-10-28 single-open-PO fast path
+            // (score 85, early return) does not short-circuit Tier A-2.
+            // Outside the ±14d window, so it is not a tight candidate.
+            po_number: "PO-AUTOPOT-OLD",
+            vendor_name: "AutoPot USA",
+            issue_date: "2026-06-01",
+            total_amount: null,
+            total: 900,
+            status: "open",
         }]);
 
         const result = await findPOCandidates(invoice);
@@ -468,7 +478,17 @@ describe("findPOCandidates with Tier A auto-match", () => {
             vendor_name: "Miles Filippelli",
             issue_date: "2026-07-10",
             total_amount: null,
-            total: 500,
+            // Must cover the $525 invoice or the confirmed-match cover guard
+            // withholds the boost. A second open PO (unrelated vendor) keeps
+            // the single-open-PO fast path from returning early at 85.
+            total: 600,
+            status: "open",
+        }, {
+            po_number: "PO-OTHER-1",
+            vendor_name: "Unrelated Supply",
+            issue_date: "2026-07-01",
+            total_amount: null,
+            total: 2000,
             status: "open",
         }], [{
             vendor_name: "Miles Filippelli",
