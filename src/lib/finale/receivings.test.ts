@@ -268,6 +268,65 @@ describe("receivings helpers", () => {
         ]);
     });
 
+    it("keeps a canceled shipment leg out of receiptHistory and received quantities", () => {
+        // 125394 live shapes: the canceled leg's REST doc has no `status`, only
+        // statusId SHIPMENT_CANCELLED, no receiveDate, and no DELIVERED event —
+        // so the date helper falls back to createdDate and the leg used to
+        // render as a phantom receipt while its 2 units counted as received.
+        const enriched = enrichReceivedPurchaseOrdersWithShipmentDetails([
+            {
+                orderId: "125394",
+                orderDate: "2026-10-19",
+                receiveDate: "2026-10-29",
+                receiveDateTime: "2026-10-29",
+                receivedBy: null,
+                receiptStatus: "partial",
+                supplier: "Vendor",
+                total: 100,
+                items: [{ productId: "SKU-A", quantity: 10 }],
+                finaleUrl: "https://example.test/finale-order",
+            },
+        ], {
+            "125394": [
+                {
+                    shipmentId: "626292",
+                    statusId: "SHIPMENT_DELIVERED",
+                    receiveDate: "2026-10-29T18:00:00",
+                    receivedByName: "NK",
+                    statusIdHistoryList: [
+                        { statusId: null, txStamp: 1793288249 },
+                        { statusId: "SHIPMENT_DELIVERED", txStamp: 1793288280 },
+                    ],
+                    itemList: [{ productId: "SKU-A", quantityReceived: "8" }],
+                },
+                {
+                    shipmentId: "622959",
+                    statusId: "SHIPMENT_CANCELLED",
+                    cancelDate: "2026-10-25T10:00:00",
+                    createdDate: "2026-10-19T09:00:00",
+                    statusIdHistoryList: [
+                        { statusId: null, txStamp: 1791469579 },
+                        { statusId: "SHIPMENT_CANCELLED", txStamp: 1792429196 },
+                    ],
+                    itemList: [{ productId: "SKU-A", quantityReceived: "2" }],
+                },
+            ],
+        }, ["u-626292", "u-622959"], { "125394": ["u-626292", "u-622959"] });
+
+        expect(enriched[0]?.receiptHistory).toHaveLength(1);
+        expect(enriched[0]?.receiptHistory?.[0]?.shipmentId).toBe("626292");
+        expect(enriched[0]?.items).toEqual([
+            {
+                productId: "SKU-A",
+                quantity: 10,
+                orderedQuantity: 10,
+                receivedQuantity: 8,
+                receivedInWindow: 8,
+                openQuantity: 2,
+            },
+        ]);
+    });
+
     it("resolves the receiver from the DELIVERED event userLoginUrl", () => {
         expect(getShipmentReceiverName({
             statusIdHistoryList: [

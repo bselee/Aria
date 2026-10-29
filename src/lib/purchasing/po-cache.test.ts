@@ -117,6 +117,76 @@ describe("po-cache vendorPartyId propagation", () => {
     });
 });
 
+describe("po-cache canceled shipment legs", () => {
+    let mockDb: ReturnType<typeof makeMockDb>;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockDb = makeMockDb();
+        (probePostgrest as any).mockResolvedValue(true);
+        (createClient as any).mockReturnValue(mockDb);
+    });
+
+    // Fixed far-past offsets so the Denver "today" comparison never flips.
+    const daysAgo = (n: number): string =>
+        new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+
+    it("ignores a canceled leg's receiveDate when the PO has a real received leg", async () => {
+        // 125394 shape: 125394-1 Canceled carries a stale date, 125394-2 Received
+        // carries the real one. The canceled date is NEWER, so including it
+        // would poison the cached receive_date.
+        const pos: FullPO[] = [
+            {
+                orderId: "125394",
+                vendorName: "Vendor",
+                vendorPartyId: null,
+                orderDate: daysAgo(20),
+                expectedDate: null,
+                receiveDate: null,
+                status: "Committed",
+                total: 100,
+                items: [],
+                finaleUrl: "",
+                shipments: [
+                    { shipmentId: "125394-1", status: "Canceled", receiveDate: daysAgo(2), shipDate: null },
+                    { shipmentId: "125394-2", status: "Received", receiveDate: daysAgo(5), shipDate: null },
+                ],
+            },
+        ];
+
+        await cacheFinalePos(pos);
+
+        const upsertArg = mockDb.upsert.mock.calls[0][0];
+        expect(upsertArg[0].receive_date).toBe(daysAgo(5));
+    });
+
+    it("writes no receive_date at all when the only dated leg is canceled", async () => {
+        const pos: FullPO[] = [
+            {
+                orderId: "125500",
+                vendorName: "Vendor",
+                vendorPartyId: null,
+                orderDate: daysAgo(20),
+                expectedDate: null,
+                receiveDate: null,
+                status: "Committed",
+                total: 100,
+                items: [],
+                finaleUrl: "",
+                shipments: [
+                    { shipmentId: "125500-1", status: "Canceled", receiveDate: daysAgo(3), shipDate: null },
+                ],
+            },
+        ];
+
+        await cacheFinalePos(pos);
+
+        const upsertArg = mockDb.upsert.mock.calls[0][0];
+        expect(upsertArg[0].po_number).toBe("125500");
+        expect("receive_date" in upsertArg[0]).toBe(false);
+    });
+});
+
 function makeSelectDb() {
     const calls: {
         select?: unknown[];

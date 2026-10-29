@@ -16,6 +16,7 @@ import {
     getShipmentLineProductId,
     getShipmentLineQuantity,
 } from "./core-client";
+import { isCanceledShipmentLeg } from "./shipment-status";
 
 export interface TrueReceiptQuantities {
     orderedBySku: Map<string, number>;
@@ -28,6 +29,28 @@ export interface TrueReceiptQuantities {
     orderItemCount: number;
     /** Raw adjustments, for the freight-line hygiene gate (2026-10-28). */
     orderAdjustmentList: Array<Record<string, unknown>>;
+}
+
+/**
+ * Add one shipment leg's line quantities into a per-SKU receipt map.
+ *
+ * @purpose Canceled legs carry quantities (the lines were committed before the
+ *          leg was canceled) but no goods arrived — summing them let a short PO
+ *          pass the Complete gate (125394-1 Canceled counted toward 125394).
+ *          Null/unreadable legs contribute nothing.
+ */
+export function accumulateShipmentReceipts(
+    receivedBySku: Map<string, number>,
+    shipment: Record<string, unknown> | null | undefined,
+): void {
+    if (!shipment || isCanceledShipmentLeg(shipment)) return;
+    for (const line of getShipmentLineContainers(shipment)) {
+        const productId = getShipmentLineProductId(line);
+        const qty = getShipmentLineQuantity(line);
+        if (productId && qty > 0) {
+            receivedBySku.set(productId, (receivedBySku.get(productId) || 0) + qty);
+        }
+    }
 }
 
 /**
@@ -62,14 +85,7 @@ export async function loadTrueReceiptQuantities(orderId: string): Promise<TrueRe
     const receivedBySku = new Map<string, number>();
     for (const url of order.shipmentUrlList) {
         const shipment = (await finale.getShipmentDetails(String(url)).catch(() => null)) as Record<string, unknown> | null;
-        if (!shipment) continue;
-        for (const line of getShipmentLineContainers(shipment)) {
-            const productId = getShipmentLineProductId(line);
-            const qty = getShipmentLineQuantity(line);
-            if (productId && qty > 0) {
-                receivedBySku.set(productId, (receivedBySku.get(productId) || 0) + qty);
-            }
-        }
+        accumulateShipmentReceipts(receivedBySku, shipment);
     }
     return {
         orderedBySku,

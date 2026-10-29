@@ -10,6 +10,7 @@
 
 import type { FinaleClient, FullPO } from "../finale/client";
 import { createClient } from "../db";
+import { isCanceledShipmentLeg } from "../finale/shipment-status";
 import { CACHE_ACTIVE_STATUS_VALUES } from "./active-po-status";
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -120,13 +121,15 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
     await flush(withoutRecv);
 }
 
-/** Latest past shipment receiveDate (YYYY-MM-DD), or null. */
+/** Latest past shipment receiveDate (YYYY-MM-DD), or null. Canceled legs are
+ *  excluded: a canceled leg's date is not receipt evidence (125394-1 Canceled). */
 function maxPastShipmentReceiveDate(
     shipments: FullPO["shipments"] | undefined,
 ): string | null {
     if (!shipments?.length) return null;
     const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
     const past = shipments
+        .filter((s) => !isCanceledShipmentLeg(s))
         .map((s) => (s.receiveDate || "").slice(0, 10))
         .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && d <= today);
     if (past.length === 0) return null;

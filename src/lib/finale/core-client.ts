@@ -11,6 +11,7 @@
  */
 
 import { MAX_COOLDOWN_MS, nextCooldownMs, parseRetryAfterMs } from "./rate-limit-backoff";
+import { isCanceledShipmentLeg } from "./shipment-status";
 
 // ──────────────────────────────────────────────────────────────────────────
 // BASE TYPES
@@ -841,7 +842,11 @@ export function enrichReceivedPurchaseOrdersWithShipmentDetails(
 ): ReceivedPO[] {
     const warmUrls = new Set(knownShipmentUrls);
     return orders.map((order) => {
-        const shipmentDetails = shipmentDetailsByOrderId[order.orderId] || [];
+        // Canceled legs are not receipts (125394-1 Canceled): they carry no
+        // DELIVERED event, so receipt-date helpers fall back to createdDate and
+        // the leg renders as a phantom receipt row AND inflates receivedBySku.
+        const shipmentDetails = (shipmentDetailsByOrderId[order.orderId] || [])
+            .filter((shipment) => !isCanceledShipmentLeg(shipment));
         const shipmentReceipts = shipmentDetails
             .map((shipment) => ({
                 shipmentId: String(shipment?.shipmentId || ""),
