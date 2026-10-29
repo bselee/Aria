@@ -41,6 +41,23 @@ describe("isJunkInvoiceNumber", () => {
         expect(isJunkInvoiceNumber("")).toBe(false);
         expect(isJunkInvoiceNumber(null)).toBe(false);
     });
+    it("flags header words (zero digits, short) — live: BERINVOICE, SALES, NO, PAGE", () => {
+        expect(isJunkInvoiceNumber("BERINVOICE")).toBe(true);
+        expect(isJunkInvoiceNumber("SALES")).toBe(true);
+        expect(isJunkInvoiceNumber("NO")).toBe(true);
+        expect(isJunkInvoiceNumber("PAGE")).toBe(true);
+    });
+    it("keeps alphanumeric invoice cores that carry digits (KM-098970 class)", () => {
+        expect(isJunkInvoiceNumber("KM-098970")).toBe(false);
+        expect(isJunkInvoiceNumber("APUS-248361")).toBe(false);
+        expect(isJunkInvoiceNumber("INV134857")).toBe(false);
+    });
+    it("flags date-shaped numbers — OCR of 10/22/2026 collapsing to 10,222,026", () => {
+        expect(isJunkInvoiceNumber("10,222,026")).toBe(true);
+        expect(isJunkInvoiceNumber("9,172,026")).toBe(true);
+        // A real comma-free number of the same digits is still an identity.
+        expect(isJunkInvoiceNumber("10222026")).toBe(false);
+    });
 });
 
 describe("isPhantomInvoiceRow", () => {
@@ -54,6 +71,17 @@ describe("isPhantomInvoiceRow", () => {
         // survive (2026-10-27 regression: this row was rejected, blanking the
         // whole Receivings panel).
         expect(isPhantomInvoiceRow({ vendor_name: null, invoice_number: "9488427" })).toBe(false);
+    });
+    it("flags empty documents — a named vendor alone is not a document (2026-10-29)", () => {
+        // Live queue phantoms: no number, $0 total, no lines.
+        expect(isPhantomInvoiceRow({ vendor_name: "Jax", invoice_number: null, total: 0 })).toBe(true);
+        expect(isPhantomInvoiceRow({ vendor_name: "Federal ID# 36-3684738", invoice_number: null, total: 0 })).toBe(true);
+        expect(isPhantomInvoiceRow({ vendor_name: "AAA Cooper Transportation", invoice_number: "", total: 0, line_items: [] })).toBe(true);
+    });
+    it("keeps a named vendor with a positive total even when the number is unreadable", () => {
+        expect(isPhantomInvoiceRow({ vendor_name: "Miles", invoice_number: "9232026", total: 2310 })).toBe(false);
+        expect(isPhantomInvoiceRow({ vendor_name: "Miles", invoice_number: null, total: 2310 })).toBe(false);
+        expect(isPhantomInvoiceRow({ vendor_name: "Miles", invoice_number: null, total: 0, line_items: [{ sku: "X" }] })).toBe(false);
     });
 });
 
@@ -73,6 +101,11 @@ describe("isCarrierFreightArchive", () => {
     it("flags FedEx / Billtrust CSV archives", () => {
         expect(isCarrierFreightArchive({ source_ref: "FEDEX_4174571_20261020155330_0.csv" })).toBe(true);
         expect(isCarrierFreightArchive({ source_ref: "fedex-csv-FEDEX_1.csv" })).toBe(true);
+    });
+    it("flags LTL Select and Bill.com carrier refs (2026-10-29)", () => {
+        // Live: LTL Select bill 300093120787 was named as PO 125393's invoice.
+        expect(isCarrierFreightArchive({ source_ref: "ltlselect-6ac545352fae7c6b0f18c27f" })).toBe(true);
+        expect(isCarrierFreightArchive({ source_ref: "billcom:123" })).toBe(true);
     });
     it("keeps goods invoices", () => {
         expect(isCarrierFreightArchive({ source_ref: "gmail-abc", vendor_name: "Rootwise Soil Dynamics" })).toBe(false);

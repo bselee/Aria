@@ -85,13 +85,31 @@ export function isJunkVendorName(vendorName: string | null | undefined): boolean
 }
 
 /**
+ * Date-shaped "invoice numbers": OCR of `10/22/2026` collapsed into
+ * `10,222,026`. A date is not an invoice identity — two different invoices
+ * from the same vendor in the same month would both read as "10,222,026".
+ */
+const DATE_SHAPED_INVOICE_RE = /^\d{1,2},\d{3},\d{3}$/;
+
+/**
  * True when an invoice number is an extraction-failure marker. An EMPTY
  * invoice number is not junk by itself — a photo invoice with an unreadable
  * number is still a real document; its vendor name decides.
+ *
+ * Header-word rule (2026-10-29): a value with ZERO digits is a form label the
+ * OCR jammed into the number field — live evidence `BERINVOICE`, `SALES`,
+ * `NO`, `PAGE`, `error`. Alphanumeric invoice cores that DO carry digits
+ * (`KM-098970`, `APUS-248361`) are real identities and stay.
  */
 export function isJunkInvoiceNumber(invoiceNumber: string | null | undefined): boolean {
     if (invoiceNumber == null) return false;
-    return JUNK_INVOICE_NUMBERS.has(norm(invoiceNumber));
+    const n = norm(invoiceNumber);
+    // Empty stays non-junk — a photo invoice with an unreadable number is real.
+    if (!n) return false;
+    if (JUNK_INVOICE_NUMBERS.has(n)) return true;
+    if (DATE_SHAPED_INVOICE_RE.test(n)) return true;
+    if (!/\d/.test(n) && n.length < 12) return true;
+    return false;
 }
 
 /** A vendor_invoices-shaped row (only the fields the pool cares about). */
@@ -100,27 +118,52 @@ export interface InvoicePoolRow {
     invoice_number?: string | null;
     source?: string | null;
     source_ref?: string | null;
+    /** Bill amount. Reads `total` (vendor_invoices) — used by the shape guard. */
+    total?: number | string | null;
+    /** Line items, when selected. A document with lines is a document. */
+    line_items?: unknown;
 }
 
 /**
- * FedEx / Billtrust CSV archives are carrier freight, not goods invoices.
- * They belong on the freight reconcile path (reconcile-billtrust-freight /
- * reconcile-fedex), never in the PO match pool. source_ref is
- * `FEDEX_*.csv` (Billtrust archive) or `fedex-csv-*` (FBO archive).
+ * Carrier freight archives are not goods invoices. They belong on the freight
+ * reconcile path (reconcile-billtrust-freight / reconcile-fedex), never in the
+ * PO match pool. source_ref shapes seen live:
+ *   - `FEDEX_*.csv`     (Billtrust archive)
+ *   - `fedex-csv-*`     (FBO archive)
+ *   - `ltlselect-*`     (LTL Select carrier invoice export — 2026-10-29:
+ *                        PO 125393 was named by 300093120787, an LTL Select
+ *                        freight bill, as its matched invoice)
+ *   - `billcom:*`       (Bill.com-native bill ref; carrier lane, not a PO bill)
  */
 export function isCarrierFreightArchive(row: InvoicePoolRow | null | undefined): boolean {
     if (!row) return false;
     const ref = String(row.source_ref ?? "");
-    return /^FEDEX_/i.test(ref) || /^fedex-csv-/i.test(ref);
+    return /^FEDEX_/i.test(ref) || /^fedex-csv-/i.test(ref)
+        || /^ltlselect-/i.test(ref) || /^billcom:/i.test(ref);
 }
 
 /**
  * True when the row is a phantom document: it cannot act as an invoice leg,
  * a match candidate, or a review item.
+ *
+ * Two independent failure shapes:
+ *   1. Identity junk — vendor name or invoice number is an ingest/OCR marker.
+ *   2. Empty document — no invoice number AND no positive total AND no line
+ *      items. Live phantoms of this shape: vendor `Jax` (no number, $0, no
+ *      lines) and `Federal ID# 36-3684738` (the Uline FED ID line parsed as a
+ *      vendor). A named vendor alone is NOT enough to keep a row: those two
+ *      carry a vendor string and nothing else. A legitimate named vendor with
+ *      a real number or a positive total passes.
  */
 export function isPhantomInvoiceRow(row: InvoicePoolRow | null | undefined): boolean {
     if (!row) return true;
-    return isJunkVendorName(row.vendor_name) || isJunkInvoiceNumber(row.invoice_number);
+    if (isJunkVendorName(row.vendor_name) || isJunkInvoiceNumber(row.invoice_number)) return true;
+    const hasNumber = !!(row.invoice_number && String(row.invoice_number).trim().length > 0);
+    const totalNum = Number(row.total ?? 0);
+    const hasTotal = Number.isFinite(totalNum) && totalNum > 0;
+    const hasLines = Array.isArray(row.line_items) && row.line_items.length > 0;
+    if (!hasNumber && !hasTotal && !hasLines) return true;
+    return false;
 }
 
 /**

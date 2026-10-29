@@ -454,16 +454,34 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
 
                 for (const po of received) {
                     const poNum = po.poNumber || po.orderId;
-                    // First real invoice wins; if every row is phantom-named but
-                    // one carries real money, surface it with identityUnknown so
-                    // the panel names the bill instead of "awaiting vendor invoice".
+                    // Invoice leg selection (2026-10-29): a row whose total is
+                    // zero is a real document with an unreadable amount, NOT a
+                    // bill that satisfies the leg. Letting it through made PO
+                    // 125378 (Novelty) and 125331 (Intl Molasses) read as
+                    // "matched, $0" instead of "amount unknown, review".
+                    // Prefer a positive-total sibling when one exists; else keep
+                    // the zero-total row but flag identityUnknown so the panel
+                    // says so. If every row is phantom-NAMED but one carries
+                    // real money, surface that one with identityUnknown too —
+                    // the panel must name the bill rather than "awaiting vendor
+                    // invoice".
                     const rows = invoiceMap.get(poNum) || [];
                     const real = firstRealInvoice(rows);
-                    const moneyRow = real
-                        ? null
-                        : rows
-                            .filter((r) => Number(r.total || 0) > 1)
-                            .sort((a, b) => Number(b.total) - Number(a.total))[0] ?? null;
+                    const positiveRows = rows
+                        .filter((r) => !isPhantomInvoiceRow(r) && Number(r.total || 0) > 0)
+                        .sort((a, b) => Number(b.total) - Number(a.total));
+                    const moneyRow = rows
+                        .filter((r) => Number(r.total || 0) > 1)
+                        .sort((a, b) => Number(b.total) - Number(a.total))[0] ?? null;
+                    const realTotal = Number(real?.total || 0);
+                    const matchedInvoice = real && realTotal > 0
+                        ? real
+                        : positiveRows[0]
+                            ?? (real
+                                ? { ...real, identityUnknown: true }
+                                : moneyRow
+                                    ? { ...moneyRow, identityUnknown: true }
+                                    : null);
                     po._reconciliation = {
                         invoices: rows,
                         outcomes: outcomeMap.get(poNum) || [],
@@ -473,7 +491,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                         hasAutoApplied: (outcomeMap.get(poNum) || []).some(
                             (o) => o.outcome === 'auto_applied'
                         ),
-                        matchedInvoice: real ?? (moneyRow ? { ...moneyRow, identityUnknown: true } : null),
+                        matchedInvoice,
                         // Vendors that bill per delivery (2026-10-28): the
                         // panel must treat a partial receipt as the normal
                         // shape and compare the bill to the DELIVERY, not to
