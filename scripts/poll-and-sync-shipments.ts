@@ -44,7 +44,13 @@ if (!trackings.length) {
                 console.log(`${t}: carrier returned nothing — left as ${s.status_category}`);
             } else {
                 const delivered =
-                    status.category === "delivered" ? (status.delivered_at ?? new Date().toISOString()) : null;
+                    status.category === "delivered" ? (status.delivered_at ?? null) : null;
+                if (status.category === "delivered" && !delivered) {
+                    // The LTL page prints "Delivery Date Time : 10/26/2026 09:25"
+                    // and the parser does not read it. Do NOT substitute now():
+                    // a fabricated delivery timestamp is unrecoverable evidence.
+                    console.log(`${t}: WARNING carrier says delivered but gave no date — leaving delivered_at null`);
+                }
                 console.log(
                     `${t}: carrier ${status.category} / ${status.display}${delivered ? ` / delivered ${delivered}` : ""}`,
                 );
