@@ -8,6 +8,27 @@ import {
     getShipmentReceiptDateTime,
     getReceiptStatusFromPoStatus,
 } from "./client";
+import { finaleDateOnly } from "./core-client";
+
+describe("finaleDateOnly", () => {
+    it("keeps the written calendar date on a naive local timestamp", () => {
+        // Regression: 125394's shipment receiveDate 2026-10-29T18:00:00 shifted
+        // to 2026-10-30 through toISOString, so a same-day receipt read as
+        // future and the Active panel said "need receive".
+        expect(finaleDateOnly("2026-10-29T18:00:00")).toBe("2026-10-29");
+    });
+
+    it("normalizes US-style dates", () => {
+        expect(finaleDateOnly("4/2/2026")).toBe("2026-04-02");
+        expect(finaleDateOnly("10/19/2026")).toBe("2026-10-19");
+    });
+
+    it("passes through plain ISO dates and rejects junk", () => {
+        expect(finaleDateOnly("2026-10-29")).toBe("2026-10-29");
+        expect(finaleDateOnly("")).toBeNull();
+        expect(finaleDateOnly(null)).toBeNull();
+    });
+});
 
 describe("receivings helpers", () => {
     it("widens the query window beyond the visible receipt window", () => {

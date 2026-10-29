@@ -578,8 +578,27 @@ export function parseFinaleNumber(val: string | number | null | undefined): numb
 }
 
 export function parseISODateOnly(value: string): string | null {
+    return finaleDateOnly(value);
+}
+
+/**
+ * Normalize a Finale date to YYYY-MM-DD WITHOUT crossing the UTC boundary
+ * (2026-10-29). Finale returns naive local timestamps ("2026-10-29T18:00:00");
+ * converting them through new Date().toISOString() turns 6 PM Denver into the
+ * NEXT UTC day, so a same-day receipt read as "future" and dropped out of the
+ * receipt evidence — PO 125394 showed "need receive" on Active Purchases while
+ * Receivings showed it received. Trust the calendar date as written.
+ */
+export function finaleDateOnly(value: string | null | undefined): string | null {
     if (!value) return null;
-    const parsed = new Date(value);
+    const s = String(value).trim();
+    // ISO date or naive ISO datetime — take the written calendar date.
+    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    // US-style M/D/YYYY (Finale returns these for some fields).
+    const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (us) return `${us[3]}-${us[1].padStart(2, "0")}-${us[2].padStart(2, "0")}`;
+    const parsed = new Date(s);
     if (isNaN(parsed.getTime())) return null;
     return parsed.toISOString().slice(0, 10);
 }

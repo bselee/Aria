@@ -12,6 +12,7 @@ import {
     type ReceivedPO,
     parseFinaleNumber,
     parseISODateOnly,
+    finaleDateOnly,
     toISOStringOrNull,
     getShipmentsInReceiptWindow,
     getReceiptQueryStartDate,
@@ -1889,11 +1890,10 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                             : parseFinaleNumber(e.node?.productUnitsRemainingToBeShipped),
                     }))
                     .filter((i: any) => i.productId);
-                // Normalize any date to YYYY-MM-DD (Finale returns inconsistent formats like "4/2/2026")
+                // Normalize any date to YYYY-MM-DD without a UTC day-shift
+                // (Finale returns naive local timestamps — see finaleDateOnly).
                 const toISODate = (d: string | null | undefined): string | null => {
-                    if (!d) return null;
-                    const parsed = new Date(d);
-                    return isNaN(parsed.getTime()) ? null : parsed.toISOString().split('T')[0];
+                    return finaleDateOnly(d);
                 };
                 const shipments = (po.shipmentList || []).map((s: any) => ({
                     shipmentId: s.shipmentId,

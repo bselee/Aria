@@ -9,15 +9,14 @@
  */
 
 import type { FinaleClient, FullPO } from "../finale/client";
-import { createClient, probePostgrest } from "../db";
+import { createClient } from "../db";
 import { CACHE_ACTIVE_STATUS_VALUES } from "./active-po-status";
 
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 async function getCacheAge(): Promise<Date | null> {
-    const healthy = await probePostgrest(1500);
-    if (!healthy) return null;
-
+    // No probe gate (2026-10-29): the root probe is slower than the query it
+    // guards and failed intermittently, making a fresh cache look stale.
     const db = createClient();
     if (!db) return null;
     try {
@@ -47,18 +46,32 @@ function isCacheFresh(lastSync: Date | null): boolean {
  * shipment Received 2026-06-12). Prefer max past shipment receiveDate.
  */
 export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
-    const healthy = await probePostgrest(1500);
-    if (!healthy) return;
-
+    // No probe gate (2026-10-29): the PostgREST root endpoint answers in
+    // 1.2-1.4s on this host, so a 1.5s probe failed intermittently and the
+    // cache was silently never written — receipts never reached the cache,
+    // and Active Purchases said "need receive" while Receivings said received.
+    // The batch upsert below fails safely on its own when PostgREST is down.
     const db = createClient();
     if (!db || pos.length === 0) return;
 
     const now = new Date().toISOString();
-    const chunks: any[] = [];
+    // PGRST102 "All object keys must match": rows with a receive_date and rows
+    // without cannot share a batch. Split them so no row is null-wiped and the
+    // batch is accepted (2026-10-29 — this rejected EVERY cache write).
+    const withRecv: Array<Record<string, unknown>> = [];
+    const withoutRecv: Array<Record<string, unknown>> = [];
+    const nullRecv: Array<Record<string, unknown>> = [];
 
     for (const po of pos) {
         const shipRecv = maxPastShipmentReceiveDate(po.shipments);
-        const recv = po.receiveDate || shipRecv || null;
+        // Prefer the shipment receipt date: Finale's PO-level receiveDate can
+        // carry the UTC date of a same-day receipt (off by one day, 125394).
+        // PO-level dates are only trusted when they are PAST — a future date is
+        // a planned ETA, and writing it as a receipt would falsely mark a PO
+        // received (Active Purchases collapsed to 4 rows before this guard).
+        const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+        const poRecv = po.receiveDate && po.receiveDate.slice(0, 10) <= today ? po.receiveDate : null;
+        const recv = shipRecv || poRecv || null;
         const row: Record<string, unknown> = {
             po_number: po.orderId,
             vendor_name: po.vendorName,
@@ -72,19 +85,39 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
             required_date: (po as any).expectedDate || (po as any).dueDate || null,
             updated_at: now,
         };
-        // Only set receive_date when we have a real value — never null-wipe.
-        if (recv) row.receive_date = recv;
-        chunks.push(row);
-    }
-
-    for (let i = 0; i < chunks.length; i += 100) {
-        const batch = chunks.slice(i, i + 100);
-        try {
-            await db.from("purchase_orders").upsert(batch, { onConflict: "po_number" });
-        } catch (e) {
-            console.error("[po-cache] batch upsert failed:", (e as Error).message);
+        if (recv) {
+            row.receive_date = recv;
+            withRecv.push(row);
+        } else if (po.receiveDate && po.receiveDate.slice(0, 10) > today) {
+            // Self-heal: a stored FUTURE receive_date is a planned ETA and must
+            // not survive as receipt evidence. Explicit null, never a silent wipe
+            // of a real past receipt.
+            row.receive_date = null;
+            nullRecv.push(row);
+        } else {
+            withoutRecv.push(row);
         }
     }
+
+    const flush = async (rows: Array<Record<string, unknown>>): Promise<void> => {
+        for (let i = 0; i < rows.length; i += 100) {
+            const batch = rows.slice(i, i + 100);
+            try {
+                // postgrest-js does NOT throw on failure — it resolves with { error }.
+                // Ignoring it made every cache write fail silently (2026-10-29).
+                const { error } = await db.from("purchase_orders").upsert(batch, { onConflict: "po_number" });
+                if (error) {
+                    console.error(`[po-cache] batch upsert rejected (${batch.length} rows):`, error.message);
+                }
+            } catch (e) {
+                console.error("[po-cache] batch upsert failed:", (e as Error).message);
+            }
+        }
+    };
+
+    await flush(withRecv);
+    await flush(nullRecv);
+    await flush(withoutRecv);
 }
 
 /** Latest past shipment receiveDate (YYYY-MM-DD), or null. */
