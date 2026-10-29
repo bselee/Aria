@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/db";
 import { withAdvisoryLock } from "@/lib/purchasing/advisory-lock";
+import { isSalesOrderVariantPoRef } from "@/lib/purchasing/po-ref-validator";
 import { FinaleClient } from "@/lib/finale/client";
 import { upsertTrackingLocal, syncTrackingToPostgREST, getTrackingLocal, registerTrackingForPolling } from "@/lib/storage/tracking-cache";
 import {
@@ -767,15 +768,23 @@ export async function syncLegacyPurchaseOrderTracking(poNumber: string): Promise
 
     // 2. Sync bidirectional back to Finale custom fields
     if (trackingNumbers.length > 0) {
-        try {
-            const finale = new FinaleClient();
-            await finale.updatePurchaseOrderTracking(
-                poNumber,
-                trackingNumbers.join(", "),
-                publicUrls.join(", ")
-            );
-        } catch (err: any) {
-            console.warn(`[tracking-sync] Failed bidirectional Finale sync for PO ${poNumber}: ${err.message}`);
+        // A dashed "-S…-DropshipPO" ref is a Finale SALES_ORDER variant with no
+        // PURCHASE_ORDER counterpart — the push would 404. Keep the local write
+        // above and skip Finale only, with a distinct log line so the skip is
+        // observable and not mistaken for a swallowed error.
+        if (isSalesOrderVariantPoRef(poNumber)) {
+            console.log(`[tracking-sync] PO ${poNumber} is a sales-order variant (no Finale PO) — local tracking written, Finale push skipped`);
+        } else {
+            try {
+                const finale = new FinaleClient();
+                await finale.updatePurchaseOrderTracking(
+                    poNumber,
+                    trackingNumbers.join(", "),
+                    publicUrls.join(", ")
+                );
+            } catch (err: any) {
+                console.warn(`[tracking-sync] Failed bidirectional Finale sync for PO ${poNumber}: ${err.message}`);
+            }
         }
     }
 }

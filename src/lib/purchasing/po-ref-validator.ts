@@ -37,6 +37,15 @@ import { createClient } from "@/lib/db";
 const STANDARD_PO_RE = /^1\d{5}$/;
 const DROPSHIP_PO_RE = /^2\d{7}(?:(?:-?[A-Z0-9]+)?-DROPSHIPPO)?$/i;
 
+// A dashed "-S…" dropship segment marks a Finale SALES_ORDER variant, not a
+// PURCHASE_ORDER. The bare 8-digit base IS the Finale sales-order number, and
+// Finale never creates a PO for these (getRecentPurchaseOrders filters
+// type:["PURCHASE_ORDER"] only), so tracking/ETA writeback 404s. Covers the live
+// family — -S- (314), -SF1- (28), -SA- (3), -S-S- (1) — plus the single
+// "-DropshipsPO" typo row. Deliberately does NOT match plain "-DropshipPO" or
+// attached "…A-DropshipPO": those ARE Finale PURCHASE_ORDERs and must keep pushing.
+const SALES_ORDER_VARIANT_PO_RE = /^2\d{7}-S[A-Z0-9-]*-Dropships?PO$/i;
+
 /**
  * Normalize a raw PO ref for shape/existence checks: trim and strip the common
  * "PO-", "P.O.", "ORDER", "#" prefixes (mirrors normalizePoString in
@@ -62,6 +71,24 @@ export function isPoShaped(ref: string | null | undefined): boolean {
     const s = normalizeRef(ref);
     if (!s) return false;
     return STANDARD_PO_RE.test(s) || DROPSHIP_PO_RE.test(s);
+}
+
+/**
+ * True when `ref` is a dashed "-S…-Dropship(s)PO" sales-order variant — a
+ * dropship purchase Aria tracks in purchase_orders to fulfill a Finale
+ * SALES_ORDER (the bare 8-digit base), which has NO Finale PURCHASE_ORDER
+ * counterpart. Callers that push tracking/ETA to Finale must skip these or they
+ * 404. Pure and synchronous (shape-only, no DB).
+ *
+ * The negative case is deliberate: plain "-DropshipPO" and attached
+ * "…A-DropshipPO" resolve in Finale as PURCHASE_ORDERs, so this returns false
+ * for them and they keep pushing.
+ */
+export function isSalesOrderVariantPoRef(ref: string | null | undefined): boolean {
+    if (!ref) return false;
+    const s = String(ref).trim();
+    if (!s) return false;
+    return SALES_ORDER_VARIANT_PO_RE.test(s);
 }
 
 /**

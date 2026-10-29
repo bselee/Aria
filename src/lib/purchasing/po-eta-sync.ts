@@ -14,6 +14,7 @@
 
 import { createClient } from "@/lib/db";
 import { finaleClient } from "@/lib/finale/client";
+import { isSalesOrderVariantPoRef } from "@/lib/purchasing/po-ref-validator";
 
 /**
  * Push the best-known ETA for a purchase order to Finale's dueDate field.
@@ -37,6 +38,14 @@ export async function syncPOETA(
     // Normalise PO number — Finale uses numeric IDs without "PO-" prefix
     const orderId = poNumber.startsWith("PO-") ? poNumber.slice(3) : poNumber;
     const numericId = orderId;
+
+    // A dashed "-S…-DropshipPO" ref is a Finale SALES_ORDER variant with no
+    // PURCHASE_ORDER counterpart — updateOrderDueDate would 404. Skip the push
+    // with a distinct log line so the skip is observable, not a silent false.
+    if (isSalesOrderVariantPoRef(orderId)) {
+        console.log(`[po-eta-sync] ${orderId} is a sales-order variant (no Finale PO) — Finale dueDate push skipped`);
+        return false;
+    }
 
     try {
         // ── 1. Resolve best ETA ──────────────────────────────────────

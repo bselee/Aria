@@ -20,11 +20,42 @@ vi.mock("@/lib/db", () => ({
 
 import {
     isPoShaped,
+    isSalesOrderVariantPoRef,
     validatePoRef,
     resolveDropshipPOByRef,
     resolveDropshipPOByBase,
     resolveExtractedPOs,
 } from "./po-ref-validator";
+
+describe("isSalesOrderVariantPoRef", () => {
+    it("flags dashed -S…-DropshipPO sales-order variants (no Finale PO)", () => {
+        // Real corpus strings.
+        expect(isSalesOrderVariantPoRef("23582767-S-DropshipPO")).toBe(true);
+        expect(isSalesOrderVariantPoRef("23485747-SF1-DropshipPO")).toBe(true);
+        expect(isSalesOrderVariantPoRef("23356217-SA-DropshipPO")).toBe(true);
+        expect(isSalesOrderVariantPoRef("23433607-S-S-DropshipPO")).toBe(true);
+    });
+
+    it("flags the single -DropshipsPO typo row", () => {
+        expect(isSalesOrderVariantPoRef("23433107-S-DropshipsPO")).toBe(true);
+    });
+
+    it("does NOT flag plain or attached-letter dropship POs (real Finale PURCHASE_ORDERs)", () => {
+        expect(isSalesOrderVariantPoRef("23580227-DropshipPO")).toBe(false);
+        expect(isSalesOrderVariantPoRef("23582647A-DropshipPO")).toBe(false);
+        expect(isSalesOrderVariantPoRef("23579367B-DropshipPO")).toBe(false);
+        expect(isSalesOrderVariantPoRef("23333907F1-DropshipPO")).toBe(false);
+    });
+
+    it("rejects non-dropship and malformed refs", () => {
+        expect(isSalesOrderVariantPoRef(null)).toBe(false);
+        expect(isSalesOrderVariantPoRef(undefined)).toBe(false);
+        expect(isSalesOrderVariantPoRef("")).toBe(false);
+        expect(isSalesOrderVariantPoRef("125257")).toBe(false);
+        expect(isSalesOrderVariantPoRef("4429A-DropshipPO")).toBe(false); // 4-digit base
+        expect(isSalesOrderVariantPoRef("64058931")).toBe(false); // carrier PRO
+    });
+});
 
 /**
  * Build the PostgREST mock. Two query shapes are exercised:

@@ -151,6 +151,20 @@ describe("syncLegacyPurchaseOrderTracking (UPDATE-only guard)", () => {
         );
     });
 
+    it("skips the Finale push for a -S- sales-order variant but still writes local tracking", async () => {
+        state.poRows = [{ po_number: "23582767-S-DropshipPO", vendor_name: "AutoPot", status: "open" }];
+        state.shipments = [{ tracking_number: "1Z22YV580359576490", public_tracking_url: "https://x/t" }];
+
+        await syncLegacyPurchaseOrderTracking("23582767-S-DropshipPO");
+
+        // The local tracking write still lands…
+        expect(state.updateCalls).toHaveLength(1);
+        expect(state.updateCalls[0].po_number).toBe("23582767-S-DropshipPO");
+        expect(state.updateCalls[0].payload.tracking_numbers).toContain("1Z22YV580359576490");
+        // …but the Finale push (which would 404 for a sales-order variant) is skipped.
+        expect(finale.updateTracking).not.toHaveBeenCalled();
+    });
+
     it("skips a row that exists but has NULL vendor_name (phantom / non-Finale ref)", async () => {
         state.poRows = [{ po_number: "113205", vendor_name: null }];
         state.shipments = [{ tracking_number: "466969990027", public_tracking_url: "https://x/t" }];
