@@ -66,6 +66,16 @@ if (!trackings.length) {
                     vendorName: s.vendor_names?.[0] ?? null,
                 });
             }
+            // Stamp the attempt, exactly as carrier-poll does in its finally block.
+            // upsertShipmentEvidence records the carrier's verdict, not our attempt,
+            // so without this the PG row reads "never checked" while the cache says
+            // 17:05 — and the poll loop re-reads it immediately instead of waiting
+            // out the cooldown. Delivered rows are skipped above and never stamped,
+            // because delivered_at is what excludes them from the poll set.
+            await pg.query(
+                `update shipments set last_checked_at = now() where normalized_tracking_number = $1`,
+                [t],
+            );
         } else {
             console.log(`${t}: already delivered ${s.delivered_at} — writer skipped (terminal)`);
         }
