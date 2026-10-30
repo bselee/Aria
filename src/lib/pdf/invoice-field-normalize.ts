@@ -23,6 +23,17 @@ import { extractGoodsLinesFromInvoiceText } from "./invoice-text-lines";
  */
 const SPLIT_LINE_RE = new RegExp("[" + String.fromCharCode(13) + String.fromCharCode(10) + "]+");
 
+/**
+ * AutoPot/QuickBooks prints the sales order as a STANDALONE 8-digit line with no
+ * "P.O." label (APUS-248353: line "23581947"). Built from string parts, not a
+ * regex literal, for the same CRLF-safety reason as SPLIT_LINE_RE.
+ * Deliberately narrow: the line must contain nothing but the 8 digits. Results
+ * are corroborated against purchase_orders downstream.
+ */
+const STANDALONE_SO_RE = new RegExp(
+    "(?:^|" + String.fromCharCode(10) + ")[ \\t]*(2\\d{7})[ \\t]*(?=" + String.fromCharCode(13) + "?" + String.fromCharCode(10) + "|$)",
+);
+
 const BAD_SENTINELS = new Set([
     "",
     "unknown",
@@ -108,14 +119,22 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
 
     // PO: dedicated field, bare Finale-style after P.O. NUMBER, or a dropship
     // 8-digit sales-order base ("2" + 7 digits) that resolves to a
-    // "-DropshipPO" row via validatePoRef/resolveDropshipPOByBase. The 8-digit
-    // arm is last so a standard 6-digit PO always wins on a document carrying
-    // both, and digit runs are bounded so a longer run cannot capture a prefix.
+    // "-DropshipPO" row via validatePoRef/resolveDropshipPOByBase. The labeled
+    // 8-digit arm is last so a standard 6-digit PO always wins on a document
+    // carrying both, and digit runs are bounded so a longer run cannot capture
+    // a prefix.
+    //
+    // The final arm covers AutoPot/QuickBooks, which prints the sales order as a
+    // STANDALONE 8-digit line with no "P.O." label at all (APUS-248353 line 39:
+    // "23581947"). It is deliberately narrow — the line must be nothing but the
+    // 8 digits — and every candidate is corroborated against purchase_orders
+    // downstream, so a stray number cannot become a PO ref.
     const poPatterns = [
         /P\.?\s*O\.?\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(1\d{5})\b/i,
         /PURCHASE\s+ORDER\s*#?\s*[:#\-]?\s*(1\d{5})\b/i,
         /(?:^|\n)\s*#?(12\d{3,4})\b/, // Finale POs often 12xxxx
         /P\.?\s*O\.?\s*(?:NUMBER|NUM|#|NO\.?)?\s*[:#\-]?\s*#?\s*(2\d{7})\b/i,
+        STANDALONE_SO_RE, // standalone sales-order line
     ];
     for (const re of poPatterns) {
         const m = text.match(re);
@@ -158,21 +177,26 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         vendorHint = "Down to Earth Worms";
     }
 
-    // Freight: a shipping/S&H line with a money amount. Evergreen prints
-    // "Shipping-FedExS/H - FedEx Tracking #<n>1ea56.7756.77" — glued OCR with
-    // no spaces — and their "Insulation" line can glue onto the same physical
-    // line, so the LAST amount is NOT the freight (it is the insulation, $7.00).
+    // Freight — read the printed SHIPPING line. Do not infer it.
     //
-    // Rule: anchor on the shipping LABEL, slice everything after it, then take
-    // the FIRST price-like amount. A `(?<!\d)` lookbehind rejects amounts that
-    // are really the tail of a longer digit run — that is how a tracking number
-    // bleeding into the price ("...9104156.77") is refused outright rather than
-    // silently read as freight.
+    // Two real layouts, both verified against live PDFs:
+    //   AutoPot (pdf-parse): "SHIPPING32.00"      label glued straight to amount
+    //   Evergreen (glued OCR): "Shipping-FedExS/H - FedEx Tracking #<n>1ea56.77…"
     //
-    // No label, no freight: this feeds variance review, and a guessed number is
-    // worse than a blank.
+    // The label must NOT carry a trailing \b: in "SHIPPING32.00" the G and the 3
+    // are both word characters, so \bshipping\b never matches and freight came
+    // back null on AutoPot invoices that print it plainly. Leading \b only.
+    //
+    // Then take the FIRST price-like amount after the label. Evergreen's
+    // "Insulation" line can glue onto the same physical line, so LAST is wrong
+    // (it returned 7.00 instead of 56.77). A `(?<![\d.])` lookbehind refuses an
+    // amount that is really the tail of a longer digit run, so a tracking number
+    // bleeding into the price yields null rather than a fabricated figure.
+    //
+    // No label, no freight: this feeds variance review, where a guess is worse
+    // than a blank.
     let freight: number | null = null;
-    const labelRe = /\b(?:shipping|freight|s\s*\/?\s*h)\b/i;
+    const labelRe = /\b(?:shipping|freight|s\s*\/?\s*h)(?![a-z])/i;
     const lines = text.split(SPLIT_LINE_RE);
     const freightLine = lines.find((l) => labelRe.test(l) && /\d+\.\d{2}/.test(l));
     if (freightLine) {

@@ -133,6 +133,57 @@ $152.77`;
         expect(n.subtotal).toBe(96);
     });
 
+    // AutoPot/QuickBooks (pdf-parse) layout, verified from
+    // tmp_bol/1a18c9b656bfba17_…APUS248353….pdf. Two things are unique here:
+    // the shipping label is glued straight to the amount ("SHIPPING32.00"), and
+    // the PO is a STANDALONE unlabeled 8-digit line (AutoPot prints the sales
+    // order there, not "P.O. NO."). Both were previously missed.
+    const AUTOPOT_248353_OCR = [
+        "APUS-248353",
+        "DATE 10/30/2026",
+        "DUE DATE11/14/2026",
+        "SHIP DATETRACKING NO.",
+        "10/30/20261Z22YV580358863869",
+        "ACTIVITYQTYRATEAMOUNT",
+        "APWS010",
+        "FLEXITANK - 25 Gallon FlexiTank",
+        "148.0048.00",
+        "23581947",
+        "Ways to pay",
+        "SUBTOTAL156.03",
+        "TAX0.00",
+        "SHIPPING32.00",
+        "TOTAL188.03",
+        "BALANCE DUE",
+        "$188.03",
+    ].join("\n");
+
+    it("reads a glued SHIPPING32.00 label, not just 'SHIPPING 32.00'", () => {
+        const f = extractInvoiceFieldsFromOcrText(AUTOPOT_248353_OCR);
+        expect(f.freight).toBe(32);
+    });
+
+    it("reads the standalone unlabeled 8-digit AutoPot sales order as the PO", () => {
+        const f = extractInvoiceFieldsFromOcrText(AUTOPOT_248353_OCR);
+        expect(f.poNumber).toBe("23581947");
+    });
+
+    it("reconciles AutoPot goods to the PO total and keeps freight separate", () => {
+        const n = normalizeInvoiceForDb(null, AUTOPOT_248353_OCR, {});
+        expect(n.poNumber).toBe("23581947");
+        expect(n.subtotal).toBe(156.03);
+        expect(n.freight).toBe(32);
+        expect(n.total).toBe(188.03);
+        // goods == PO total to the cent; freight is the only delta
+        expect(156.03 + 32).toBeCloseTo(188.03, 2);
+    });
+
+    it("does not treat an unrelated standalone 8-digit number as a PO", () => {
+        // 8-digit run embedded in a longer line must not match.
+        const noPo = ["ITEM 12345678 units", "SHIPPING5.00", "TOTAL10.00"].join("\n");
+        expect(extractInvoiceFieldsFromOcrText(noPo).poNumber).toBeNull();
+    });
+
     it("pulls inv# PO total date from DTE photo OCR", () => {
         const f = extractInvoiceFieldsFromOcrText(DTE_OCR);
         expect(f.invoiceNumber).toBe("1682");
