@@ -184,6 +184,56 @@ $152.77`;
         expect(extractInvoiceFieldsFromOcrText(noPo).poNumber).toBeNull();
     });
 
+    // Real two-PO fixture: Grassroots invoice 34658, from
+    // tmp_bol/1a18dead968d88f8_….pdf. One invoice, two POs, both printed on a
+    // single line glued after the tracking number, and the invoice number uses a
+    // bare "INVOICE 34658" label with no NO/NUM/# token. Money reconciles both
+    // ways: goods 1059.25 + freight 46.00 = 1105.25, and 942.25 + 163.00 = 1105.25.
+    const GRASSROOTS_34658_OCR = [
+        "Grassroots Fabric Pots Inc.",
+        "614 Springlake Dr",
+        "INVOICE 34658",
+        "DATE 09/30/2026    TERMS Net 30",
+        "DUE DATE 10/30/2026",
+        "SHIP DATESHIP VIATRACKING NO.P.O. NUMBER",
+        "09/30/2026UPS1ZH4D1120321913678125332, 125341",
+        "DESCRIPTIONQTYRATEAMOUNT",
+        '3x3 Living Soil Beds: 33"W x 33"L x 18"H Tan (No fittings)2536.49912.25T',
+        'Living Soil Pot 5g (12"d x 9"h)502.94147.00T',
+        "SUBTOTAL1,059.25",
+        "TAX0.00",
+        "SHIPPING46.00",
+        "TOTAL1,105.25",
+        "TOTAL DUE",
+        "$1,105.25",
+    ].join("\n");
+
+    it("reads a bare 'INVOICE 34658' label with no NO/NUM/# token", () => {
+        expect(extractInvoiceFieldsFromOcrText(GRASSROOTS_34658_OCR).invoiceNumber).toBe("34658");
+    });
+
+    it("captures BOTH POs from a glued comma-separated printed list", () => {
+        const f = extractInvoiceFieldsFromOcrText(GRASSROOTS_34658_OCR);
+        expect(f.poNumbers).toEqual(["125332", "125341"]);
+        // poNumber stays null: one field cannot honestly represent a two-PO
+        // document, and picking either would be a partial truth.
+        expect(f.poNumber).toBeNull();
+    });
+
+    it("keeps a single-PO document's poNumbers to exactly that one PO", () => {
+        const f = extractInvoiceFieldsFromOcrText(EVERGREEN_DROPSHIP_OCR);
+        expect(f.poNumbers).toEqual(["23580437"]);
+    });
+
+    it("reconciles the Grassroots two-PO split against PO totals", () => {
+        const n = normalizeInvoiceForDb(null, GRASSROOTS_34658_OCR, {});
+        expect(n.subtotal).toBe(1059.25);
+        expect(n.freight).toBe(46);
+        expect(n.total).toBe(1105.25);
+        // PO totals: 125332 = 912.25 goods + 30 freight; 125341 = 147 goods + 16 freight
+        expect(912.25 + 30 + 147 + 16).toBeCloseTo(1105.25, 2);
+    });
+
     it("pulls inv# PO total date from DTE photo OCR", () => {
         const f = extractInvoiceFieldsFromOcrText(DTE_OCR);
         expect(f.invoiceNumber).toBe("1682");

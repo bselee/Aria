@@ -34,6 +34,14 @@ const STANDALONE_SO_RE = new RegExp(
     "(?:^|" + String.fromCharCode(10) + ")[ \\t]*(2\\d{7})[ \\t]*(?=" + String.fromCharCode(13) + "?" + String.fromCharCode(10) + "|$)",
 );
 
+/**
+ * Multi-PO list: two or more comma-separated standard Finale POs (1 + 5 digits).
+ * Grassroots prints "…125332, 125341" glued onto the tracking line, so the refs
+ * are not line-anchored. Captures the whole comma run, then callers validate each
+ * member individually — a stray number in the list is dropped, not trusted.
+ */
+const MULTI_PO_RE = /1\d{5}(?: *, *1\d{5})+/g;
+
 const BAD_SENTINELS = new Set([
     "",
     "unknown",
@@ -71,6 +79,13 @@ export function cleanInvoiceField(value: string | null | undefined): string | nu
 export function extractInvoiceFieldsFromOcrText(rawText: string): {
     invoiceNumber: string | null;
     poNumber: string | null;
+    /**
+     * Every PO ref found, in document order. A single invoice can legitimately
+     * cover several POs (Grassroots 34658: "125332, 125341" on one printed
+     * line), and `poNumber` can only carry the first. Callers that allocate
+     * money across POs must use this, not poNumber.
+     */
+    poNumbers: string[];
     total: number | null;
     invoiceDate: string | null;
     vendorHint: string | null;
@@ -92,6 +107,10 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
     // can never be captured as an invoice number.
     const invPatterns = [
         /INVOICE\s*#\s*\n\s*\d{1,2}\/\d{1,2}\/\d{2,4}\s*\n\s*([0-9]{3,8})\b/i,
+        // "INVOICE 34658" — bare label, no NO/NUM/# token. Grassroots prints
+        // exactly this, so every one of their invoices missed its number here
+        // and only survived via the subject-line fallback. Bounded digit run.
+        /INVOICE\s+([0-9]{3,8})\b/i,
         /INVOICE\s+ID(?:ENTIFICATION)?[\s\S]{0,120}?\n\s*([0-9][0-9,\-]{2,18})/i,
         /INVOICE\s*ID(?:ENTIFICATION)?\s*[:.]?\s*([0-9][0-9,\-]{2,18})/i,
         /INVOICE\s*(?:NO|NUM|NUMBER)\.?\s*[:.]?\s*([A-Z0-9][A-Z0-9\-\/]{1,20})/i,
@@ -141,6 +160,20 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         if (m?.[1]) {
             poNumber = /^2\d{7}$/.test(m[1]) ? m[1] : m[1].padStart(5, "0");
             break;
+        }
+    }
+
+    // Multi-PO documents. Grassroots prints both refs on one line, glued after
+    // the tracking number: "...12 5332, 125341". Collect every comma-separated
+    // ref that sits alongside a valid one so the split is never guessed. Only
+    // runs when the document actually presents more than one ref.
+    const poNumbers: string[] = [];
+    if (poNumber) poNumbers.push(poNumber);
+    for (const m of text.matchAll(MULTI_PO_RE)) {
+        for (const raw of m[0].split(",")) {
+            const t = raw.trim();
+            if (!/^1\d{5}$/.test(t)) continue;
+            if (!poNumbers.includes(t)) poNumbers.push(t);
         }
     }
 
@@ -209,7 +242,7 @@ export function extractInvoiceFieldsFromOcrText(rawText: string): {
         if (first != null) freight = first;
     }
 
-    return { invoiceNumber, poNumber, total, invoiceDate, vendorHint, freight };
+    return { invoiceNumber, poNumber, poNumbers, total, invoiceDate, vendorHint, freight };
 }
 
 function looksLikeDate(s: string): boolean {
