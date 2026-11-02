@@ -77,6 +77,8 @@ async function main(): Promise<void> {
   const paymentsPath = arg("payments");
   const from = arg("from");
   const to = arg("to");
+  /** Payments before this date are assumed already applied to the bill set. */
+  const allocFrom = arg("alloc-from") || from;
   if (!csvPath || !paymentsPath || !from || !to) {
     throw new Error("--csv, --payments, --from and --to are required");
   }
@@ -90,7 +92,7 @@ async function main(): Promise<void> {
   if (vendorBills.length === 0) throw new Error(`No bills found for vendor "${vendorArg}"`);
 
   const vendorName = vendorBills[0].vendor;
-  const allocation = applyPayments(bills, payments, from);
+  const allocation = applyPayments(bills, payments, allocFrom);
   const inPeriod = allocation.rows
     .filter(
       (r) =>
@@ -120,7 +122,9 @@ async function main(): Promise<void> {
   parts.push(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>${CSS}</style></head><body>`);
   parts.push(`<h1>Payment Detail — ${esc(vendorName)}</h1>`);
   parts.push(
-    `<div class="meta">BuildASoil · payments processed ${md(from)} to ${md(to)} · vendor remittance</div>`,
+    `<div class="meta">BuildASoil · ${
+      from === to ? `payment processed ${md(from)}` : `payments processed ${md(from)} to ${md(to)}`
+    } · vendor remittance</div>`,
   );
 
   parts.push(`<h2>Payments Sent</h2>`);
