@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { applyPayments, parsePaymentsCsv } from "../src/lib/ap/payments-out";
+import type { PaymentOut } from "../src/lib/ap/payments-out";
 import { esc, money, parseBillsCsv, md } from "../src/lib/ap/overdue-bills";
 
 const ARIA = path.resolve(__dirname, "..");
@@ -46,6 +47,28 @@ function slug(value: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+/**
+ * Parse a `reference,invoice,amount` CSV listing the invoices Bill.com actually
+ * attached to each payment. Used instead of inferred allocations when present.
+ */
+function parseAllocationCsv(text: string): Map<string, { invoice: string; amount: number }[]> {
+  const rows = text
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "");
+  const map = new Map<string, { invoice: string; amount: number }[]>();
+  for (const line of rows.slice(1)) {
+    const cols = line.split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
+    if (cols.length < 3) continue;
+    const [reference, invoice, amount] = cols;
+    const key = reference.toLowerCase();
+    const list = map.get(key) ?? [];
+    list.push({ invoice, amount: Number(amount.replace(/[^0-9.\-]/g, "")) || 0 });
+    map.set(key, list);
+  }
+  return map;
 }
 
 const CSS = `
@@ -104,7 +127,65 @@ async function main(): Promise<void> {
 
   if (inPeriod.length === 0) throw new Error(`No payments for ${vendorName} between ${from} and ${to}`);
 
-  const paidTotal = inPeriod.reduce((a, r) => a + r.applied, 0);
+  // Optional authoritative invoice list per payment (Bill.com "Paid bills" view).
+  // Without it, invoices are inferred oldest-due-first, which can differ from
+  // the invoices Bill.com actually attached to the payment.
+  const allocPath = arg("allocations");
+  const overrides = allocPath ? parseAllocationCsv(fs.readFileSync(allocPath, "utf8")) : null;
+  const overrideFor = (reference: string): { invoice: string; amount: number }[] | undefined => {
+    if (!overrides) return undefined;
+    const exact = overrides.get(reference.trim().toLowerCase());
+    if (exact) return exact;
+    const tail = reference.split("-").pop()?.trim().toLowerCase() ?? "";
+    return overrides.get(tail);
+  };
+
+  type Line = {
+    payment: PaymentOut;
+    invoiceNo: string;
+    invoiceDate: string;
+    dueDate: string;
+    invoiceAmount: number;
+    applied: number;
+  };
+  const lines: Line[] = [];
+  const appliedByRef = new Map<string, number>();
+
+  for (const row of inPeriod) {
+    const override = overrideFor(row.payment.confirmation);
+    if (override) {
+      for (const entry of override) {
+        const bill = vendorBills.find((b) => b.invoiceNo.trim() === entry.invoice);
+        lines.push({
+          payment: row.payment,
+          invoiceNo: entry.invoice,
+          invoiceDate: bill?.invoiceDate ?? "",
+          dueDate: bill?.dueDate ?? "",
+          invoiceAmount: bill?.balanceDue ?? entry.amount,
+          applied: entry.amount,
+        });
+      }
+      appliedByRef.set(
+        row.payment.confirmation,
+        override.reduce((a, e) => a + e.amount, 0),
+      );
+    } else {
+      for (const a of row.allocations) {
+        lines.push({
+          payment: row.payment,
+          invoiceNo: a.bill.invoiceNo,
+          invoiceDate: a.bill.invoiceDate,
+          dueDate: a.bill.dueDate,
+          invoiceAmount: a.bill.balanceDue,
+          applied: a.amount,
+        });
+      }
+      appliedByRef.set(row.payment.confirmation, row.applied);
+    }
+  }
+
+  const paidTotal = [...appliedByRef.values()].reduce((a, v) => a + v, 0);
+  const invoiceCount = lines.length;
   const openRemaining = vendorBills.reduce(
     (a, b) => a + Math.max(0, b.balanceDue - (allocation.paidByBill.get(
       `${b.vendor}|${b.invoiceNo}|${b.dueDate}|${b.balanceDue}`,
@@ -136,7 +217,7 @@ async function main(): Promise<void> {
       `<tr><td>${md(row.payment.processDate)}</td><td>${esc(row.payment.method)}</td><td>${esc(
         row.payment.confirmation,
       )}</td><td>${esc(row.payment.status)}</td><td>${md(row.payment.arrivalDate)}</td><td class="amt">${money(
-        row.applied,
+        appliedByRef.get(row.payment.confirmation) ?? row.applied,
       )}</td></tr>`,
     );
   }
@@ -147,23 +228,23 @@ async function main(): Promise<void> {
 
   parts.push(`<h2>Invoices Covered</h2>`);
   parts.push(
-    `<p class="note">Each payment above was applied to the invoices below, oldest first. Amounts are net of any vendor credit.</p>`,
+    `<p class="note">${
+      overrides
+        ? "Invoices as attached to the payment in Bill.com."
+        : "Each payment above was applied to the invoices below, oldest first."
+    } Amounts are net of any vendor credit.</p>`,
   );
   parts.push(`<table>
   <thead><tr><th>Payment</th><th>Invoice / PRO #</th><th>Invoice date</th><th>Due date</th><th class="amt">Invoice amount</th><th class="amt">Applied</th></tr></thead>
   <tbody>`);
-  let invoiceCount = 0;
-  for (const row of inPeriod) {
-    for (const alloc of row.allocations) {
-      invoiceCount += 1;
-      parts.push(
-        `<tr><td>${md(row.payment.processDate)}</td><td>${esc(alloc.bill.invoiceNo)}</td><td>${md(
-          alloc.bill.invoiceDate,
-        )}</td><td>${md(alloc.bill.dueDate)}</td><td class="amt">${money(
-          alloc.bill.balanceDue,
-        )}</td><td class="amt">${money(alloc.amount)}</td></tr>`,
-      );
-    }
+  for (const line of lines) {
+    parts.push(
+      `<tr><td>${md(line.payment.processDate)}</td><td>${esc(line.invoiceNo)}</td><td>${md(
+        line.invoiceDate,
+      )}</td><td>${md(line.dueDate)}</td><td class="amt">${money(
+        line.invoiceAmount,
+      )}</td><td class="amt">${money(line.applied)}</td></tr>`,
+    );
   }
   parts.push(
     `<tr class="total-row"><td colspan="5">${invoiceCount} invoices · total applied</td><td class="amt">${money(
