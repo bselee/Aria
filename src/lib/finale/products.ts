@@ -56,6 +56,14 @@ export const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
 export class FinaleProductsClient extends FinaleCoreClient {
     protected productListCache: string[] | null = null;
     protected productListBulkCache: Record<string, any[]> | null = null;
+    // Process-wide copy (2026-10-29): the catalog is 8,216 SKUs and changes
+    // rarely. Per-instance caching meant every request — and therefore every
+    // Order click, which builds a fresh FinaleClient — paid a fresh ~3.4s list
+    // fetch before it could validate a single SKU.
+    protected static sharedProductList: { ids: string[]; bulk: Record<string, any[]>; at: number } | null = null;
+    protected static readonly PRODUCT_LIST_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+    /** In-flight list fetch, so concurrent validations share ONE request. */
+    protected static productListInFlight: Promise<void> | null = null;
     protected productCatalogCache: string[] | null = null;
     protected catalogCacheTime: number = 0;
     protected static readonly CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -360,7 +368,18 @@ export class FinaleProductsClient extends FinaleCoreClient {
     async validateProductExists(sku: string): Promise<boolean> {
         const trimmed = sku.trim();
 
-        // Fast path: direct endpoint
+        // Bulk list FIRST (2026-10-29): the one-call product list answers every
+        // SKU on a draft. The old order did a live /api/product/{sku} per item —
+        // measured 1.6s each through the 2-req/s queue, so a 15-SKU draft spent
+        // ~25s before it wrote anything and the Order button looked hung.
+        try {
+            await this.ensureProductListCache();
+            if (this.productListCache?.includes(trimmed)) return true;
+        } catch {
+            // Fall through to the direct endpoint when the list is unavailable.
+        }
+
+        // Fast path: direct endpoint (also catches a SKU newer than the list)
         try {
             await this.get(`/${this.accountPath}/api/product/${encodeURIComponent(trimmed)}`);
             return true;
@@ -382,13 +401,44 @@ export class FinaleProductsClient extends FinaleCoreClient {
      *  arrays for all fields) get populated together. */
     protected async ensureProductListCache(): Promise<void> {
         if (this.productListCache && this.productListBulkCache) return;
-        const data = await this.get(`/${this.accountPath}/api/product`);
-        this.productListCache = data.productId || [];
-        // Strip the productId so we don't double-store it; the rest is
-        // parallel arrays we'll index by SKU position.
-        const { productId: _ignore, ...bulk } = data;
-        this.productListBulkCache = bulk as Record<string, any[]>;
-        console.debug(`[finale] Product list cached: ${this.productListCache!.length} products (with details for 404-fallback)`);
+
+        // Reuse the process-wide list when it is still fresh — see the static
+        // comment above. A brand-new SKU missing from the list is still caught
+        // by validateProductExists()' direct-endpoint fallback.
+        const shared = FinaleProductsClient.sharedProductList;
+        if (shared && Date.now() - shared.at < FinaleProductsClient.PRODUCT_LIST_TTL_MS) {
+            this.productListCache = shared.ids;
+            this.productListBulkCache = shared.bulk;
+            return;
+        }
+
+        // Concurrent callers share one fetch. Without this, N parallel SKU
+        // validations each pulled the 8,216-product list (measured 3.4s each).
+        if (!FinaleProductsClient.productListInFlight) {
+            FinaleProductsClient.productListInFlight = (async () => {
+                try {
+                    const data = await this.get(`/${this.accountPath}/api/product`);
+                    // Strip the productId so we don't double-store it; the rest
+                    // is parallel arrays we index by SKU position.
+                    const { productId: _ignore, ...bulk } = data;
+                    FinaleProductsClient.sharedProductList = {
+                        ids: data.productId || [],
+                        bulk: bulk as Record<string, any[]>,
+                        at: Date.now(),
+                    };
+                    console.debug(`[finale] Product list cached: ${(data.productId || []).length} products (with details for 404-fallback)`);
+                } finally {
+                    FinaleProductsClient.productListInFlight = null;
+                }
+            })();
+        }
+        await FinaleProductsClient.productListInFlight;
+
+        const loaded = FinaleProductsClient.sharedProductList;
+        if (loaded) {
+            this.productListCache = loaded.ids;
+            this.productListBulkCache = loaded.bulk;
+        }
     }
 
     /** Reconstruct a single-product-shaped object by pulling parallel-array

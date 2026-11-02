@@ -36,6 +36,7 @@ import { writeFile } from 'fs/promises';
 import { join } from 'path';
 
 import { FinaleClient, type PurchasingGroup } from '@/lib/finale/client';
+import { FinaleCoreClient } from '@/lib/finale/core-client';
 import { createClient } from '@/lib/db';
 import { poolCartonGroups, type CartonName } from './carton-pooling';
 
@@ -334,11 +335,15 @@ export function runScanCycle(reason = 'manual', deps: CycleDeps = defaultCycleDe
         heartbeat.unref?.();
 
         try {
-            await deps.before?.();
-            await runSlotScan(resaleSlot, 'resale', deps.resale, String(SCAN_RESALE_DAYS));
-            touchCycleLock(reason);
-            await deps.between?.();
-            await runSlotScan(bomSlot, 'bom', deps.bom, String(SCAN_BOM_DAYS));
+            // Background lane (2026-10-29): a cycle is 600s+ of Finale calls.
+            // Run it low-priority so a user's Order click never waits behind it.
+            await FinaleCoreClient.runLowPriority(async () => {
+                await deps.before?.();
+                await runSlotScan(resaleSlot, 'resale', deps.resale, String(SCAN_RESALE_DAYS));
+                touchCycleLock(reason);
+                await deps.between?.();
+                await runSlotScan(bomSlot, 'bom', deps.bom, String(SCAN_BOM_DAYS));
+            });
         } catch (err: unknown) {
             // Never propagate: the snapshot keeps serving and the next cycle retries.
             console.error(`[purchasing/cycle] ${reason} cycle failed:`, errText(err));

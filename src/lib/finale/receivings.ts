@@ -31,6 +31,7 @@ import {
     type SendPurchaseOrderEmailResult,
     type POInfo,
 } from "./core-client";
+import { FinaleCoreClient } from "./core-client";
 import { freightAdjustmentForPo, resolveUnitWeightLb } from "./freight-adjustment";
 
 // ── Concurrency-limited async map ────────────────────────────────────────
@@ -136,7 +137,9 @@ export function runShipmentWarmCycle(): void {
 
     const client = new FinaleReceivingsClient();
     console.log("[receivings-warm] warm cycle pass");
-    client.getTodaysReceivedPOs(startStr, endStr)
+    // Background lane (2026-10-29): warming is never worth delaying a user's
+    // Order click, so its Finale calls yield to interactive work.
+    FinaleCoreClient.runLowPriority(() => client.getTodaysReceivedPOs(startStr, endStr))
         .then((pos) => console.log(`[receivings-warm] warmed ${pos.length} POs`))
         .catch((err: any) => {
             console.warn("[receivings-warm] warm pass failed:", err?.message || err);

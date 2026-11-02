@@ -10,6 +10,7 @@
  * @env     FINALE_API_KEY, FINALE_API_SECRET, FINALE_ACCOUNT_PATH, FINALE_BASE_URL
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { MAX_COOLDOWN_MS, nextCooldownMs, parseRetryAfterMs } from "./rate-limit-backoff";
 import { isCanceledShipmentLeg } from "./shipment-status";
 
@@ -334,10 +335,28 @@ export interface ProductConsumptionAnalysis {
 
 export class FinaleCoreClient {
     // Process-wide static queue and rate-limiting to throttle API requests globally across all instances
-    private static requestQueue: (() => Promise<void>)[] = [];
+    // 2026-10-29: two lanes. A purchasing scan is ~624s of thousands of calls at
+    // 2 req/s; FIFO meant a user's Order click waited behind all of it, so the
+    // button sat for minutes. Background work runs inside bgContext and yields
+    // to interactive calls. A low-priority item older than
+    // LOW_PRIORITY_STARVATION_MS is promoted so scans still progress.
+    private static requestQueue: Array<{ run: () => Promise<void>; low: boolean; enqueuedAt: number }> = [];
     private static isProcessingQueue = false;
     private static lastRequestTime = 0;
     private static readonly REQUEST_INTERVAL_MS = 500; // Throttle to 2 requests per second (120 requests/minute max recommended by Descartes)
+    private static readonly bgContext = new AsyncLocalStorage<true>();
+    private static readonly LOW_PRIORITY_STARVATION_MS = 45_000;
+
+    /**
+     * Run `fn` (and every Finale call it makes, transitively) on the background
+     * lane. Interactive requests enqueued meanwhile jump ahead of it.
+     *
+     * @param fn - Work to run at low priority.
+     * @returns Whatever `fn` returns.
+     */
+    static runLowPriority<T>(fn: () => Promise<T>): Promise<T> {
+        return FinaleCoreClient.bgContext.run(true, fn);
+    }
 
     // HERMIA(2026-10-15): process-wide 429 backpressure. Finale's real limit is
     // tighter than 120/min and is shared with the bot's cron jobs, so a per-call
@@ -388,13 +407,17 @@ export class FinaleCoreClient {
 
     private static async enqueueRequest<T>(fn: () => Promise<T>): Promise<T> {
         return new Promise<T>((resolve, reject) => {
-            FinaleCoreClient.requestQueue.push(async () => {
-                try {
-                    const res = await fn();
-                    resolve(res);
-                } catch (err) {
-                    reject(err);
-                }
+            FinaleCoreClient.requestQueue.push({
+                low: FinaleCoreClient.bgContext.getStore() === true,
+                enqueuedAt: Date.now(),
+                run: async () => {
+                    try {
+                        const res = await fn();
+                        resolve(res);
+                    } catch (err) {
+                        reject(err);
+                    }
+                },
             });
             FinaleCoreClient.processQueue();
         });
@@ -420,14 +443,33 @@ export class FinaleCoreClient {
                 await new Promise(r => setTimeout(r, waitTime));
             }
 
-            const nextReq = FinaleCoreClient.requestQueue.shift();
+            const nextReq = FinaleCoreClient.takeNext();
             if (nextReq) {
                 FinaleCoreClient.lastRequestTime = Date.now();
-                nextReq().catch(() => {});
+                nextReq.run().catch(() => {});
             }
         }
 
         FinaleCoreClient.isProcessingQueue = false;
+    }
+
+    /**
+     * Pick the next queued request: interactive first, background only when no
+     * interactive work is waiting — unless the oldest background item has been
+     * starved past LOW_PRIORITY_STARVATION_MS, in which case it goes next.
+     *
+     * @returns The queue entry to run, removed from the queue.
+     */
+    private static takeNext(): { run: () => Promise<void>; low: boolean; enqueuedAt: number } | undefined {
+        const queue = FinaleCoreClient.requestQueue;
+        const head = queue[0];
+        const starved = head?.low && Date.now() - head.enqueuedAt > FinaleCoreClient.LOW_PRIORITY_STARVATION_MS;
+        if (starved) return queue.shift();
+
+        const interactiveIdx = queue.findIndex(item => !item.low);
+        if (interactiveIdx >= 0) return queue.splice(interactiveIdx, 1)[0];
+
+        return queue.shift();
     }
 
     protected authHeader: string;
