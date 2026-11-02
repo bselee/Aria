@@ -124,4 +124,19 @@ describe("buildOverdueModel with payments", () => {
     expect(plain.paymentSummary).toBeNull();
     expect(plain.totalOverdue).toBeCloseTo(19353.84, 2);
   });
+
+  it("ages past the snapshot date while still applying the payments since it", () => {
+    const later = buildOverdueModel(
+      BILLS_CSV,
+      "2026-11-02",
+      "bills.csv",
+      "2026-11-02T09:00:00Z",
+      PAYMENTS_CSV,
+      [],
+      AS_OF,
+    );
+    expect(later.paymentSummary?.totalApplied).toBeCloseTo(17912.75, 2);
+    expect(later.overdue.find((b) => b.invoiceNo === "B1")?.daysOverdue).toBe(73);
+    expect(later.totalOverdue).toBeCloseTo(1441.09, 2);
+  });
 });

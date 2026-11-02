@@ -91,6 +91,7 @@ async function main(): Promise<void> {
   const asOf = arg("asof") || denverToday();
   const csvPath = arg("csv") || DEFAULT_CSV;
   const paymentsPath = arg("payments");
+  const paymentsFrom = arg("payments-from");
 
   if (!fs.existsSync(csvPath)) {
     throw new Error(`CSV not found: ${csvPath}`);
@@ -109,6 +110,7 @@ async function main(): Promise<void> {
     new Date().toLocaleString("en-US", { timeZone: "America/Denver" }),
     paymentsCsv,
     heldDisputes,
+    paymentsFrom,
   );
 
   if (model.overdue.length === 0 && model.heldDisputes.length === 0) {

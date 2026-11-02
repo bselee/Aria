@@ -491,6 +491,10 @@ export function vendorTotals(overdue: OverdueBill[]): OverdueModel["vendors"] {
  * @param source      Label written in the PDF footer.
  * @param generatedAt ISO timestamp of generation.
  * @param paymentsCsv Optional Bill.com Payments Out export to net off balances.
+ * @param heldDisputes Overbill disputes held out of the pay run.
+ * @param paymentsFrom Cutoff for which payments count (defaults to asOf). Pass
+ *                     the bills snapshot date when aging a later as-of date, so
+ *                     the week of payments since the export is still applied.
  */
 export function buildOverdueModel(
   csvText: string,
@@ -499,9 +503,12 @@ export function buildOverdueModel(
   generatedAt: string,
   paymentsCsv?: string,
   heldDisputes: HeldDispute[] = [],
+  paymentsFrom?: string,
 ): OverdueModel {
   const parsed = parseBillsCsv(csvText);
-  const allocation = paymentsCsv ? applyPayments(parsed, parsePaymentsCsv(paymentsCsv), asOf) : null;
+  const allocation = paymentsCsv
+    ? applyPayments(parsed, parsePaymentsCsv(paymentsCsv), paymentsFrom ?? asOf)
+    : null;
 
   // Net applied payments off the balance; keep the original for the detail table.
   const bills = parsed.map((b) => {
