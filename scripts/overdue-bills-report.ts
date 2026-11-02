@@ -122,7 +122,7 @@ async function main(): Promise<void> {
   const stem = `overdue-bills-${asOf}`;
   const htmlPath = path.join(REPORTS, `${stem}.html`);
   const pdfPath = path.join(REPORTS, `${stem}.pdf`);
-  fs.writeFileSync(htmlPath, renderOverdueHtml(model));
+  fs.writeFileSync(htmlPath, renderOverdueHtml(model, { includeNotes: process.argv.includes("--notes") }));
   chromePdf(htmlPath, pdfPath);
 
   console.log(`WROTE ${pdfPath}`);

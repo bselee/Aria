@@ -630,8 +630,16 @@ const CSS = `
  * Render the overdue-bills report as a self-contained HTML document.
  * Mirrors the EOW purchasing-week layout: dark header rows, zebra body,
  * summary line above every table, and a total row.
+ *
+ * @param model   Report model.
+ * @param options `includeNotes` adds the "Paying On Time" list (off by default
+ *                so the PDF stays at two pages).
  */
-export function renderOverdueHtml(model: OverdueModel): string {
+export function renderOverdueHtml(
+  model: OverdueModel,
+  options: { includeNotes?: boolean } = {},
+): string {
+  const includeNotes = options.includeNotes === true;
   const parts: string[] = [];
   const payableRuns = model.runs.filter((r) => r.bills.length > 0);
   const planTotal = payableRuns.reduce((a, r) => a + r.overdueAmount, 0);
@@ -849,10 +857,12 @@ export function renderOverdueHtml(model: OverdueModel): string {
     parts.push(`</tbody></table></div>`);
   }
 
-  // Notes
-  parts.push(`<div class="keep"><h2>Notes — Paying On Time From Here</h2><ol class="note-list">`);
-  for (const note of onTimeNotes(model)) parts.push(`<li>${note}</li>`);
-  parts.push(`</ol></div>`);
+  // Notes (opt-in: keeps the PDF at two pages)
+  if (includeNotes) {
+    parts.push(`<div class="keep"><h2>Notes — Paying On Time From Here</h2><ol class="note-list">`);
+    for (const note of onTimeNotes(model)) parts.push(`<li>${note}</li>`);
+    parts.push(`</ol></div>`);
+  }
 
   parts.push(
     `<div class="foot">Source: ${esc(model.source)} · ${esc(model.generatedAt)} · Aria overdue-bills report</div>`,

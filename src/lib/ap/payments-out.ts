@@ -34,8 +34,8 @@ export interface PaymentOut {
 export interface AllocatedPayment {
   payment: PaymentOut;
   applied: number;
-  /** Bill keys this payment touched, in allocation order. */
-  billKeys: string[];
+  /** Invoices this payment touched, in allocation order. */
+  allocations: { bill: BillRecord; amount: number }[];
 }
 
 /** Result of applying a Payments Out file to a bill set. */
@@ -198,7 +198,7 @@ export function applyPayments(
       );
 
     let left = payment.amount;
-    const touched: string[] = [];
+    const allocations: { bill: BillRecord; amount: number }[] = [];
 
     for (const bill of candidates) {
       if (left <= 0.005) break;
@@ -207,12 +207,12 @@ export function applyPayments(
       const take = Math.min(open, left);
       remaining.set(bk, open - take);
       paidByBill.set(bk, (paidByBill.get(bk) ?? 0) + take);
-      touched.push(bk);
+      allocations.push({ bill, amount: Number(take.toFixed(2)) });
       left -= take;
       totalApplied += take;
     }
 
-    rows.push({ payment, applied: payment.amount - left, billKeys: touched });
+    rows.push({ payment, applied: Number((payment.amount - left).toFixed(2)), allocations });
 
     if (left > 0.005) {
       unapplied.push({
