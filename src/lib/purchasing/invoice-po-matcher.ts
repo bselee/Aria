@@ -491,6 +491,14 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // date/amount scoring against the full PO total can never win and the
     // bill sits unmatched. Guard: sane vendor identity, positive total, and
     // the open PO issued within the date window of the invoice.
+    //
+    // 2026-10-29: this is EVIDENCE, not a trump card. It used to return early
+    // at 85, so a human-confirmed vendor→PO pair never surfaced its 95 (or its
+    // "previously confirmed" provenance) whenever the vendor had exactly one
+    // open PO — which is the bill-as-they-deliver norm. Fold the candidate into
+    // the scored list below and let the confirmed/Tier A rules upgrade it; fall
+    // back to it at the end when nothing stronger matched.
+    let fastPathCandidate: POCandidate | null = null;
     if (Number(invoice.total || 0) > 0 && (invoice.vendorName || invoice.senderName)) {
         const openStatuses = new Set(["open", "partial", "committed", "locked", "created", "pending"]);
         const openPos = (pos || []).filter((p: any) => openStatuses.has(String(p.status || "").toLowerCase()));
@@ -498,7 +506,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             const po = openPos[0];
             const dateScore = scoreDateProximity(invoice.invoiceDate || "", po.issue_date || "");
             if (dateScore.score >= 6) {
-                const candidate: POCandidate = {
+                fastPathCandidate = {
                     orderId: String(po.po_number),
                     vendorName: po.vendor_name || "",
                     orderDate: po.issue_date || "",
@@ -511,12 +519,6 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
                     ],
                     isOpen: true,
                     matchMethod: "fast_path",
-                };
-                return {
-                    invoice,
-                    candidates: [candidate],
-                    bestMatch: candidate,
-                    autoApplyReady: true,
                 };
             }
         }
@@ -822,6 +824,22 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
     }
 
+    // Fold the single-open-PO evidence into the scored list. Confirmed (95) and
+    // Tier A (90) can now upgrade the same PO and keep their provenance.
+    if (fastPathCandidate) {
+        const same = candidates.find((c) => c.orderId === fastPathCandidate!.orderId);
+        if (same) {
+            same.score = Math.max(same.score, 85);
+            if (!same.matchMethod) same.matchMethod = "fast_path";
+            for (const r of fastPathCandidate.reasons) {
+                if (!same.reasons.includes(r)) same.reasons.push(r);
+            }
+        } else {
+            candidates.push(fastPathCandidate);
+        }
+        candidates.sort((a, b) => b.score - a.score);
+    }
+
     // ── Tier A: Unique vendor + date ±14d ─────────────────────────────────
     // When only one candidate matches the vendor name and is within 14 days,
     // it's high-confidence even if the base score is below threshold.
@@ -885,6 +903,16 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             candidates.sort((a, b) => b.score - a.score);
             autoApplyReady = !isDropshipPo(covering[0].orderId);
         }
+    }
+
+    // Preserve the 2026-10-28 guarantee: a vendor with exactly one open PO gets
+    // its invoice linked even when vendor/date scoring fell short (blanket-PO
+    // vendors never win on amount). This now fires only when no stronger rule
+    // — exact OCR, confirmed pair, Tier A, covering PO — already decided.
+    if (!autoApplyReady && fastPathCandidate) {
+        const idx = candidates.findIndex((c) => c.orderId === fastPathCandidate!.orderId);
+        if (idx > 0) candidates.unshift(...candidates.splice(idx, 1));
+        autoApplyReady = !isDropshipPo(fastPathCandidate.orderId);
     }
 
     return { invoice, candidates, bestMatch: candidates[0] || null, autoApplyReady };

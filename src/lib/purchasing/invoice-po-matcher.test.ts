@@ -503,6 +503,99 @@ describe("findPOCandidates with Tier A auto-match", () => {
         expect(hasConfirmedReason).toBe(true);
     });
 
+    it("keeps the confirmed 95 when the vendor has exactly one open PO (2026-10-29)", async () => {
+        // The fast path used to return early at 85, so the human-confirmed
+        // vendor→PO pair never surfaced its 95 or its provenance for
+        // bill-as-they-deliver vendors — the exact case where one open PO is
+        // normal. The confirmed boost must win.
+        const invoice: InvoiceToMatch = {
+            id: "inv-confirmed-single",
+            invoiceNumber: "INV-CONF-SINGLE",
+            vendorName: "Miles Filippelli",
+            invoiceDate: "2026-07-20",
+            subtotal: 500,
+            freight: 25,
+            tax: 0,
+            total: 525,
+        };
+
+        stubDbForPoSearch([{
+            po_number: "124800",
+            vendor_name: "Miles Filippelli",
+            issue_date: "2026-07-10",
+            total_amount: null,
+            total: 600,
+            status: "open",
+        }], [{ vendor_name: "Miles Filippelli", po_number: "124800" }]);
+
+        const result = await findPOCandidates(invoice);
+        expect(result.bestMatch!.orderId).toBe("124800");
+        expect(result.bestMatch!.score).toBeGreaterThanOrEqual(95);
+        expect(result.bestMatch!.reasons.some(r => r.includes("previously confirmed"))).toBe(true);
+        expect(result.bestMatch!.matchMethod).toBe("confirmed");
+        expect(result.autoApplyReady).toBe(true);
+    });
+
+    it("upgrades a single open PO to the Tier A 90 and names the reason", async () => {
+        const invoice: InvoiceToMatch = {
+            id: "inv-tight-single",
+            invoiceNumber: "INV-TIGHT-SINGLE",
+            vendorName: "AutoPot USA",
+            invoiceDate: "2026-07-16",
+            subtotal: 500,
+            freight: 0,
+            tax: 0,
+            total: 500,
+        };
+
+        stubDbForPoSearch([{
+            po_number: "PO-AUTOPOT",
+            vendor_name: "AutoPot USA",
+            issue_date: "2026-07-14",
+            total_amount: null,
+            total: 500,
+            status: "open",
+        }]);
+
+        const result = await findPOCandidates(invoice);
+        expect(result.bestMatch!.orderId).toBe("PO-AUTOPOT");
+        expect(result.bestMatch!.score).toBeGreaterThanOrEqual(90);
+        expect(result.bestMatch!.reasons.some(r => r.includes("unique vendor") && r.includes("14d"))).toBe(true);
+        expect(result.autoApplyReady).toBe(true);
+    });
+
+    it("still auto-applies the single open PO when no scoring tier reaches it", async () => {
+        // 37 days apart (date 6) + exact vendor (40) = 46, under the 50
+        // suggestion bar, so the scored loop drops the PO entirely; Tier A
+        // needs ≤14d; the covering rule needs the PO to cover $525 and it is
+        // only $400. The single-open-PO guarantee has to carry the link at 85.
+        const invoice: InvoiceToMatch = {
+            id: "inv-fastpath-only",
+            invoiceNumber: "INV-FP-ONLY",
+            vendorName: "Miles Filippelli",
+            invoiceDate: "2026-08-20",
+            subtotal: 525,
+            freight: 0,
+            tax: 0,
+            total: 525,
+        };
+
+        stubDbForPoSearch([{
+            po_number: "124900",
+            vendor_name: "Miles Filippelli",
+            issue_date: "2026-07-14",
+            total_amount: null,
+            total: 400,
+            status: "open",
+        }]);
+
+        const result = await findPOCandidates(invoice);
+        expect(result.bestMatch!.orderId).toBe("124900");
+        expect(result.bestMatch!.score).toBe(85);
+        expect(result.bestMatch!.reasons.some(r => r.includes("single open PO"))).toBe(true);
+        expect(result.autoApplyReady).toBe(true);
+    });
+
     it("does not let a confirmed match boost an invoice dated before the PO exists (2026-10-27)", async () => {
         // Rootwise freight bills dated 2025-03 → 2026-04 rode the
         // Rootwise→125080 confirm to 95 while the PO was issued 2026-07-13.
