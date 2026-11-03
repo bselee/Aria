@@ -103,6 +103,21 @@ type ReceivedPO = {
             incompleteReason: string | null;
             unmatchedInvoiceLines: number;
         } | null;
+        /**
+         * Delivery-vs-bill verdict (2026-11-03). The receiving desk's three
+         * questions, answered per delivery: under delivered? over billed? OK to
+         * load into Bill.com? Identical for every vendor and every carrier —
+         * hand delivery or freight, Miles or Colorado Worm.
+         */
+        deliveryBill?: {
+            disposition: "load" | "hold" | "review";
+            headline: string;
+            underDelivered: boolean;
+            overBilled: boolean;
+            overBilledAmount: number;
+            unbilledAmount: number;
+            reasons: string[];
+        } | null;
     };
 };
 
@@ -300,6 +315,43 @@ function fmtImpact(n: number | null | undefined): string {
     const value = Number(n || 0);
     if (Math.abs(value) < 0.01) return "";
     return ` ${value > 0 ? "+" : "−"}$${Math.abs(value).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+}
+
+/**
+ * Delivery-vs-bill badge (2026-11-03) — the receiving desk's answer, in one
+ * glance. Always the same three words: LOAD, HOLD, or REVIEW.
+ *
+ * Bill's rule: "Were we over billed? Under delivered? Is it in fact OK to load
+ * invoice into bill.com?" The badge answers that; the tooltip carries the why.
+ *
+ * @param v The delivery-bill verdict computed server-side.
+ */
+function DeliveryBillBadge({ v }: { v: NonNullable<ReceivedPO["_reconciliation"]>["deliveryBill"] }) {
+    if (!v) return null;
+
+    const style =
+        v.disposition === "load"
+            ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10"
+            : v.disposition === "hold"
+              ? "text-rose-400 border-rose-500/40 bg-rose-500/10"
+              : "text-amber-300 border-amber-500/40 bg-amber-500/10";
+
+    // HOLD names the amount so the desk does not have to hunt for it.
+    const amount =
+        v.disposition === "hold" && v.overBilledAmount > 0
+            ? ` · $${v.overBilledAmount.toFixed(2)}`
+            : "";
+
+    return (
+        <span
+            data-testid={`delivery-bill-${v.disposition}`}
+            className={`text-[10px] font-mono px-1 rounded border ${style}`}
+            title={[v.headline, ...v.reasons].join("\n")}
+        >
+            {v.disposition.toUpperCase()}
+            {amount}
+        </span>
+    );
 }
 
 /**
@@ -1043,6 +1095,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                 );
                                             })()}
                                             {/* WS4: the verdict sits next to the bill it judges. */}
+                                            {po._reconciliation?.deliveryBill && (
+                                                <DeliveryBillBadge v={po._reconciliation.deliveryBill} />
+                                            )}
                                             {po._reconciliation?.matchedInvoice && (
                                                 <ThreeWayChips tw={po._reconciliation.threeWay} />
                                             )}

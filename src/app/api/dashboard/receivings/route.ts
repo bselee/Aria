@@ -26,6 +26,7 @@ import { isFreightRequiredVendor, freightOnPo } from '@/config/freight-required-
 import { isDeliverAndBillVendor } from '@/lib/purchasing/deliver-bill-vendors';
 import { overbillGracePending } from '@/lib/purchasing/overbill-grace';
 import { buildReceivingsThreeWay, type ReceivingsThreeWay, type ThreeWayInvoiceLine } from '@/lib/purchasing/receivings-three-way';
+import { checkDeliveryAgainstBill, type DeliveryBillVerdict } from '@/lib/purchasing/delivery-bill-verdict';
 import { coversPosForInvoice, isPoCoveredByMultiPoBill, type BillPoLink } from '@/lib/purchasing/bill-po-links';
 
 // ── GET response cache (paint-first) ─────────────────────────────────────
@@ -173,6 +174,11 @@ interface ReceiptReconciliation {
      * "a vendor_invoices row points at this PO".
      */
     threeWay?: ReceivingsThreeWay;
+    /**
+     * Per-delivery bill verdict (2026-11-03): under delivered? over billed?
+     * safe to load into Bill.com? Computed from the receipt against the bill.
+     */
+    deliveryBill?: DeliveryBillVerdict | null;
 }
 
 /** ReceivedPO as this route consumes it: Finale rows carry the PO reference as
@@ -769,11 +775,35 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                             poFreight,
                             hasReceipt: Boolean(po.receiveDate || (po.receiptHistory?.length ?? 0) > 0),
                         });
+
+                        // ── Per-delivery bill verdict (2026-11-03) ──────────
+                        // The desk's three questions — under delivered? over
+                        // billed? OK to load into Bill.com? — answered from the
+                        // RECEIPT (fact) against the BILL (claim), never from
+                        // the PO total. Same rule for every vendor and every
+                        // carrier: hand-delivered or freight.
+                        rec.deliveryBill = checkDeliveryAgainstBill(
+                            items
+                                .filter((it) => Number(it.receivedQty ?? 0) > 0)
+                                .map((it) => ({
+                                    sku: String(it.productId || ""),
+                                    receivedQty: Number(it.receivedQty ?? 0),
+                                    poUnitPrice: Number(it.unitPrice ?? 0),
+                                })),
+                            invoiceLinesForThreeWay(rec.matchedInvoice).map((l) => ({
+                                sku: l.sku ?? null,
+                                description: l.description ?? null,
+                                qty: Number(l.qty ?? 0),
+                                unitPrice: Number(l.unitPrice ?? 0),
+                                extPrice: l.extPrice ?? null,
+                            })),
+                            { billTotal: Number(rec.matchedInvoice.total ?? 0) || null },
+                        );
                     } catch (twErr: unknown) {
                         // Never let one bad row blank the panel; the absence of a
                         // stamp is honest, a fabricated verdict is not.
                         const msg = twErr instanceof Error ? twErr.message : String(twErr);
-                        console.warn(`[receivings] 3-way stamp failed for ${po.orderId}: ${msg}`);
+                        console.warn(`[receivings] 3-way stamp failed for ${po.orderId}: ${msg}`, (twErr as Error)?.stack);
                     }
                 }
             }
