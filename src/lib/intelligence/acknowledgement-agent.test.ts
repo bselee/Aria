@@ -299,15 +299,10 @@ describe("AcknowledgementAgent", () => {
         await new AcknowledgementAgent("default").processUnreadEmails();
 
         expect(gmailSendMock).not.toHaveBeenCalled();
-        // DECISION(2026-09-30): needs_response ALWAYS leaves a reviewable draft.
-        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
-        expect(recordEmailDraftPreparedMock).toHaveBeenCalledWith(
-            expect.objectContaining({
-                gmailMessageId: "gmail-2",
-                kind: "requires_human",
-                draftId: "draft-opp-1",
-            }),
-        );
+        // DECISION(2026-11-03): needs_response leaves NO draft — Needs Response
+        // label + task only. Draft stubs were canned and deleted unread.
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
+        expect(recordEmailDraftPreparedMock).not.toHaveBeenCalled();
         expect(gmailModifyMock).toHaveBeenCalledWith({
             userId: "me",
             id: "gmail-2",
@@ -459,7 +454,8 @@ describe("AcknowledgementAgent", () => {
 
         expect(gmailSendMock).not.toHaveBeenCalled();
         expect(recordSimpleAutoReplyMock).not.toHaveBeenCalled();
-        expect(gmailDraftsCreateMock).toHaveBeenCalledTimes(1);
+        // DECISION(2026-11-03): no draft stubs anywhere — Needs Response + task only.
+        expect(gmailDraftsCreateMock).not.toHaveBeenCalled();
         expect(recordHumanReviewRequiredMock).toHaveBeenCalledWith(
             expect.objectContaining({
                 gmailMessageId: "gmail-biochar",

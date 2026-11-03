@@ -330,34 +330,11 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
             gmailMessageId,
         });
 
-        let draftId: string | null = null;
-        if (myEmail) {
-            try {
-                const raw = buildReplyDraftRaw({
-                    to: senderEmail,
-                    from: myEmail,
-                    subject,
-                    inReplyTo: rfcMessageId,
-                    bodyText: draft.draftBody,
-                });
-                const created = await gmail.users.drafts.create({
-                    userId: "me",
-                    requestBody: {
-                        message: {
-                            raw,
-                            threadId,
-                        },
-                    },
-                });
-                draftId = created.data?.id ?? null;
-                console.log(`     📝 Opportunity draft created${draftId ? ` (${draftId})` : ""}`);
-            } catch (err: any) {
-                console.error(`     ❌ Failed to create opportunity draft:`, err.message);
-            }
-        }
-
+        // DECISION(2026-11-03, Bill): no Gmail draft stubs — canned replies cost
+        // more to delete than they save. Compose stays for the summary/nextAction
+        // that feeds the Needs Response task; nothing is written to Gmail.
         try {
-            await this.addMessageLabels(gmail, gmailMessageId, ["Needs Response", "Draft Ready"]);
+            await this.addMessageLabels(gmail, gmailMessageId, ["Needs Response"]);
         } catch { /* best effort */ }
 
         try {
@@ -367,18 +344,6 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                 fromEmail: senderEmail,
                 subject,
                 reason: "vendor_opportunity",
-            });
-        } catch { /* non-fatal */ }
-
-        try {
-            await recordEmailDraftPrepared({
-                gmailMessageId,
-                threadId,
-                fromEmail: senderEmail,
-                subject,
-                replyBody: draft.draftBody,
-                kind: "vendor_opportunity",
-                draftId,
             });
         } catch { /* non-fatal */ }
 
@@ -394,7 +359,6 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
                     from: senderEmail,
                     subject,
                     nextAction: draft.nextAction,
-                    draftId,
                     gmailMessageId,
                     threadId,
                     kind: "vendor_opportunity",
@@ -405,7 +369,7 @@ NOTE: Inquiry responses with pricing docs or call offers = VENDOR_OPPORTUNITY.`;
         }
 
         await this.finalizeQueueStatus(rowId, "needs_response", draft.nextAction);
-        console.log(`     🎯 VENDOR_OPPORTUNITY — draft ready, no auto-thanks. Next: ${draft.nextAction}`);
+        console.log(`     🎯 VENDOR_OPPORTUNITY — Needs Response set, no draft, no auto-thanks. Next: ${draft.nextAction}`);
     }
 
     /**

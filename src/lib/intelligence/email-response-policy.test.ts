@@ -28,22 +28,24 @@ describe("resolveEmailResponsePolicy", () => {
         expect(p.allowAutoSend).toBe(false);
     });
 
-    it("opportunity = draft + task, never send", () => {
+    it("opportunity = task only, no draft, never send (Bill 2026-11-03)", () => {
         const p = resolveEmailResponsePolicy({ intent: "VENDOR_OPPORTUNITY" });
         expect(p.action).toBe("DRAFT_OPPORTUNITY");
         expect(p.allowAutoSend).toBe(false);
-        expect(p.createDraft).toBe(true);
+        expect(p.createDraft).toBe(false);
         expect(p.openResponseTask).toBe(true);
+        expect(p.labels).toContain("Needs Response");
+        expect(p.labels).not.toContain("Draft Ready");
     });
 
-    it("human escalate = draft stub + task, never auto-send", () => {
+    it("human escalate = task only, no draft stub, never auto-send (Bill 2026-11-03)", () => {
         const p = resolveEmailResponsePolicy({ intent: "REQUIRES_HUMAN" });
         expect(p.action).toBe("ESCALATE_HUMAN");
         expect(p.allowAutoSend).toBe(false);
-        expect(p.createDraft).toBe(true);
+        expect(p.createDraft).toBe(false);
         expect(p.openResponseTask).toBe(true);
         expect(p.labels).toContain("Needs Response");
-        expect(p.labels).toContain("Draft Ready");
+        expect(p.labels).not.toContain("Draft Ready");
     });
 
     it("silent when already in conversation", () => {

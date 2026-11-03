@@ -10,8 +10,9 @@
  *   SILENT           — routine PO/tracking/FYI, already-replied, noreply.
  *                      Leave visible; no draft (Bill deletes boilerplate).
  *   DRAFT_ROUTINE    — unused. Routine no longer drafts.
- *   DRAFT_OPPORTUNITY— Pricing, TDS, inquiry response, call offer. Business draft
- *                      + Needs Response + email_needs_response task.
+ *   DRAFT_OPPORTUNITY— Pricing, TDS, inquiry response, call offer. Needs Response
+ *                      + email_needs_response task. NO draft (Bill 2026-11-03:
+ *                      canned drafts cost more to delete than they save).
  *   ESCALATE_HUMAN   — Questions / problems / conversation needing Bill.
  *                      Needs Response + task. NO draft stub.
  *   INVOICE          — Paid CC invoice → nightshift. No vendor reply.
@@ -96,31 +97,35 @@ export function resolveEmailResponsePolicy(input: ResponsePolicyInput): Response
     }
 
     if (intent === "VENDOR_OPPORTUNITY") {
+        // DECISION(2026-11-03, Bill): draft replies feel canned and deleting them
+        // costs more time than they save. No reply drafts anywhere. Needs Response
+        // + task still surface the email for Bill.
         return {
             action: "DRAFT_OPPORTUNITY",
             allowAutoSend: false,
-            createDraft: true,
+            createDraft: false,
             openResponseTask: true,
             leaveInInbox: true,
-            labels: ["Needs Response", "Draft Ready"],
-            reason: "vendor_opportunity_review",
+            labels: ["Needs Response"],
+            reason: "vendor_opportunity_review_no_draft",
         };
     }
 
     if (intent === "REQUIRES_HUMAN") {
-        // DECISION(2026-09-30, Hermia ticket 2026-08-19): needs_response MUST always
-        // leave Bill something sendable. The Aug-19 Tanner/CYC miss showed a
-        // task-only branch is invisible: no draft, and the task write could fail
-        // silently, so the email looked handled while nothing was queued.
-        // The stub is never sent — it is a starting point Bill edits.
+        // History: the Aug-19 Tanner/CYC miss showed a task-only branch is invisible
+        // (no draft, task write swallowed), so 2026-09-30 mandated a reviewable draft.
+        // DECISION(2026-11-03, Bill): drafts reversed — they are canned and deleting
+        // them costs more time than they save. The no-op risk is closed at the task
+        // write instead: recordHumanReviewRequired failure now errors loudly in the
+        // caller. Needs Response label + task remain the surface Bill actually reads.
         return {
             action: "ESCALATE_HUMAN",
             allowAutoSend: false,
-            createDraft: true,
+            createDraft: false,
             openResponseTask: true,
             leaveInInbox: true,
-            labels: ["Needs Response", "Draft Ready"],
-            reason: "human_review_required",
+            labels: ["Needs Response"],
+            reason: "human_review_required_no_draft",
         };
     }
 
