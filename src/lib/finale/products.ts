@@ -53,6 +53,16 @@ export const EXCLUDED_VENDOR_PATTERN =
 export const _vendorCache = new Map<string, { vendorName: string; vendorPartyId: string | null; ts: number }>();
 export const VENDOR_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
 
+/**
+ * productId → URL slug, for products renamed since creation.
+ *
+ * BUGFIX(2026-11-03): `resolveProductUrlSlug` referenced this map but it was
+ * never declared, so every call threw `_productSlugCache is not defined` and
+ * silently returned no slug. That is why PO 125466's GLP118 line was written
+ * uncategorized — the resolver that should have found /product/GLB118 was dead.
+ */
+const _productSlugCache = new Map<string, string | null>();
+
 export class FinaleProductsClient extends FinaleCoreClient {
     protected productListCache: string[] | null = null;
     protected productListBulkCache: Record<string, any[]> | null = null;

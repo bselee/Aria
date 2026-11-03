@@ -333,6 +333,10 @@ describe("FinaleClient draft PO creation guardrails", () => {
         vi.spyOn(client as any, "checkPriceChange").mockResolvedValue(null);
         vi.spyOn(client as any, "getFacilityUrl").mockResolvedValue("/buildasoil/api/facility/shipping");
         vi.spyOn(client as any, "resolveVendorHistoricalLeadDays").mockResolvedValue(17);
+        // The create path now resolves each SKU's real URL slug first (renamed
+        // products, PO 125466). Stub it so the mocked fetch response is only
+        // consumed by the PO creation POST.
+        vi.spyOn(client as any, "resolveProductUrlSlug").mockResolvedValue(null);
         vi.spyOn(client as any, "verifyDraftAndExpectedDelivery").mockResolvedValue({
             expectedDelivery: {} as any,
             verification: {} as any,

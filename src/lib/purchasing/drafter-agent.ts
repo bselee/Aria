@@ -212,10 +212,19 @@ async function processVendorGroup(
         guardBatch.commitReadyLines.map((entry: any) => entry.line.item.productId),
     );
 
-    const commitReadyItems = draftPolicy.items.filter(item =>
-        commitReadyProductIds.has(item.productId),
-    );
-
+    const commitReadyItems = draftPolicy.items
+        .filter(item => commitReadyProductIds.has(item.productId))
+        // Carry the real product name so Finale's PO line shows a description
+        // instead of rendering the row as "uncategorized" (2026-11-03).
+        .map(item => {
+            const line = draftPolicy.blockedLines
+                .concat(guardBatch.commitReadyLines.map((e: any) => e.line))
+                .find((l: any) => l?.item?.productId === item.productId);
+            return {
+                ...item,
+                productName: (line as any)?.item?.productName ?? null,
+            };
+        });
     if (commitReadyItems.length === 0) {
         baseDetail.reason = 'no_commit_ready_lines';
         baseDetail.guards = guardBatch.guards.map((g: any) => ({

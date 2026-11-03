@@ -111,3 +111,136 @@ export function receiptShorts(
     }
     return shorts;
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// RECEIPT DELTA — the shared primitive (2026-10-29)
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * How one SKU's receipt compares to what was ordered.
+ *
+ * - `short`  — received < ordered. The only class that drives action: goods were
+ *              bought and never arrived, the PO cannot close, and the inbound
+ *              quantity must STOP counting as cover on Ordering.
+ * - `exact`  — received === ordered. Done.
+ * - `over`   — received > ordered. Informational only (Bill 2026-10-29: "over
+ *              receipts are not a big issue here... we are not losing money").
+ *              Rendered as a number on the line; never a queue, never an alert.
+ */
+export type ReceiptDeltaClass = "short" | "exact" | "over";
+
+export interface ReceiptDeltaLine {
+    sku: string;
+    ordered: number;
+    received: number;
+    /** received − ordered. Negative means short by that many units. */
+    delta: number;
+    cls: ReceiptDeltaClass;
+}
+
+/**
+ * Classify every ordered SKU by its receipt delta.
+ *
+ * Ordered SKUs with no shipment lines at all are reported as full shorts
+ * (received 0) rather than skipped — silence is not delivery.
+ *
+ * @param receipt True receipt quantities for one PO.
+ * @returns       One entry per ordered SKU, in ordered order.
+ */
+export function receiptDeltas(receipt: TrueReceiptQuantities): ReceiptDeltaLine[] {
+    const lines: ReceiptDeltaLine[] = [];
+    for (const [sku, ordered] of receipt.orderedBySku) {
+        const received = receipt.receivedBySku.get(sku) || 0;
+        const delta = received - ordered;
+        lines.push({
+            sku,
+            ordered,
+            received,
+            delta,
+            cls: delta < 0 ? "short" : delta > 0 ? "over" : "exact",
+        });
+    }
+    return lines;
+}
+
+/**
+ * The actionable subset of {@link receiptDeltas}: shorts only.
+ *
+ * @param receipt True receipt quantities for one PO.
+ */
+export function receiptDeltaShorts(
+    receipt: TrueReceiptQuantities,
+): Array<ReceiptDeltaLine & { cls: "short" }> {
+    return receiptDeltas(receipt).filter(
+        (l): l is ReceiptDeltaLine & { cls: "short" } => l.cls === "short",
+    );
+}
+
+/**
+ * PO-level receipt verdict, derived from the deltas — NOT from Finale's status.
+ *
+ * The status field is a clerical consequence of receipts and drifts (125080 was
+ * received in July and still reads `open`). This answers the operational
+ * question directly: are all the goods here, are some still coming, or are some
+ * never coming?
+ *
+ * - `complete`    — every ordered SKU received ≥ ordered.
+ * - `partial`     — something arrived, and short units remain.
+ * - `not_received`— nothing arrived at all.
+ * - `unknown`     — no readable ordered lines.
+ */
+export type PoReceiptVerdict = "complete" | "partial" | "not_received" | "unknown";
+
+export interface PoReceiptState {
+    verdict: PoReceiptVerdict;
+    lines: ReceiptDeltaLine[];
+    /** Units still owed on short lines (sum of |delta| where short). */
+    shortUnits: number;
+    /** SKUs still owed, e.g. ["RWBP102 ×30"]. Empty when complete. */
+    shortSkus: string[];
+    /** Units received beyond ordered across all lines — informational. */
+    overUnits: number;
+    /** True when nothing has arrived on a PO that ordered something. */
+    nothingReceived: boolean;
+}
+
+/**
+ * Build the PO receipt state from true quantities.
+ *
+ * @param receipt True receipt quantities for one PO, or null when unreadable.
+ * @returns       Verdict plus the per-line deltas behind it.
+ */
+export function buildPoReceiptState(receipt: TrueReceiptQuantities | null): PoReceiptState {
+    if (!receipt || receipt.orderedBySku.size === 0) {
+        return {
+            verdict: "unknown",
+            lines: [],
+            shortUnits: 0,
+            shortSkus: [],
+            overUnits: 0,
+            nothingReceived: false,
+        };
+    }
+
+    const lines = receiptDeltas(receipt);
+    const shortLines = lines.filter((l) => l.cls === "short");
+    const shortUnits = shortLines.reduce((s, l) => s + Math.abs(l.delta), 0);
+    const overUnits = lines.filter((l) => l.cls === "over").reduce((s, l) => s + l.delta, 0);
+    const receivedUnits = lines.reduce((s, l) => s + l.received, 0);
+    const nothingReceived = receivedUnits === 0;
+
+    const verdict: PoReceiptVerdict = shortLines.length === 0
+        ? "complete"
+        : nothingReceived
+            ? "not_received"
+            : "partial";
+
+    return {
+        verdict,
+        lines,
+        shortUnits,
+        shortSkus: shortLines.map((l) => `${l.sku} ×${Math.abs(l.delta)}`),
+        overUnits,
+        nothingReceived,
+    };
+}

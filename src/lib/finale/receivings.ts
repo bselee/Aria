@@ -1169,7 +1169,15 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
         const merged = [...(existingItems || [])];
 
         for (const incoming of incomingItems) {
-            const index = merged.findIndex((item) => this.normalizeOrderLineProductId(item) === incoming.productId);
+        const index = merged.findIndex((item) => {
+            const existingId = this.normalizeOrderLineProductId(item);
+            if (existingId) return existingId === incoming.productId;
+            // An uncategorized line has no productId and no productUrl. If its
+            // description matches the incoming product's name, treat it as that
+            // line so a re-draft repairs it instead of adding a duplicate.
+            const desc = String(item?.itemDescription || "").trim().toLowerCase();
+            return !!incoming.productName && desc === String(incoming.productName).trim().toLowerCase();
+        });
             if (index >= 0) {
                 const current = merged[index];
                 const existingDesc = String(current.itemDescription || '').trim();
@@ -1277,6 +1285,17 @@ export class FinaleReceivingsClient extends FinalePurchasingClient {
                 const q = Number(line?.quantity) || 0;
                 const p = Number(line?.unitPrice) || 0;
                 totalActual += q * p;
+            }
+            // BUGFIX(2026-11-03): line count and total BOTH passed on PO 125466
+            // while its single line had no product linked — Finale writes an
+            // uncategorized line silently. A PO line with no SKU is never correct,
+            // so this is its own hard mismatch.
+            const unlinked = lines.filter((l: any) => !l?.productUrl && !l?.productId);
+            if (unlinked.length > 0) {
+                const desc = unlinked.map((l: any) => l?.itemDescription || "(no description)").join("; ");
+                mismatches.push(
+                    `unlinked product: ${unlinked.length}/${lines.length} line(s) have no SKU — ${desc}`,
+                );
             }
             if (statusId !== 'ORDER_CREATED') {
                 mismatches.push(`unexpected status: ${statusId || 'unknown'}`);

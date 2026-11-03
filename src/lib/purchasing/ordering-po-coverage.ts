@@ -96,6 +96,63 @@ export function findProductQtyOnPO(po: RecentPOForCoverage, productId: string): 
 }
 
 /**
+ * Does this open PO still owe goods?
+ *
+ * DECISION(2026-10-29, Bill): "completely evaluating in play purchase orders and
+ * their proper state of reception." Finale status LIES about this — 125080 was
+ * received 2026-07-24 and still reads `open`, so it suppressed RWBP102 forever,
+ * and 125289/125414/125441 read `Committed` with every unit already in stock.
+ * A PO that owes nothing is not inbound supply, whatever its status says.
+ *
+ * The receipt truth is `productUnitsRemainingToBeShipped` on each line. When any
+ * ordered line still has units remaining, the PO owes goods regardless of
+ * status. When every line is fully received (all remainders 0, or every ordered
+ * qty received), the PO owes nothing and must stop counting as cover.
+ *
+ * Fails OPEN: if no line carries a readable remainder, we cannot prove the PO is
+ * done, so it keeps counting. Absence of receipt evidence is not evidence of
+ * receipt.
+ *
+ * @param po Finale PO with per-line quantities and (ideally) remainders.
+ */
+export function poStillOwesGoods(po: RecentPOForCoverage): boolean {
+    const lines = (po.items ?? []).filter((l) => Number(l?.quantity) > 0);
+    if (lines.length === 0) return true;
+
+    const readable = lines.filter((l) => l.remainingQty != null);
+    // No remainder evidence at all → cannot prove completion, keep the cover.
+    if (readable.length === 0) return true;
+    // ANY remaining units → still inbound, whatever the status field claims.
+    // This is the "unreceived is a different story" half of the rule: a partial
+    // PO keeps ONLY its outstanding qty as cover (remainingQty, not ordered).
+    if (readable.some((l) => Number(l.remainingQty) > 0)) return true;
+    // Every readable line is fully received. Lines with no remainder field are
+    // unknown, so only call it done when they are a minority.
+    return readable.length !== lines.length && readable.length < lines.length;
+}
+
+/**
+ * Is this PO received-but-not-processed?
+ *
+ * DECISION(2026-10-29, Bill): "if committed (or draft) and items have been
+ * received that is just an unprocessed step. Should not hold up additional
+ * ordering! if unreceived, that is a different story."
+ *
+ * So: fully posted goods + a status that never got advanced = an unprocessed
+ * clerical step, NOT inbound supply. It must not block or add cover. A PO with
+ * ANY outstanding units is a receipt question and is handled by the normal path.
+ *
+ * @param po Finale PO with lines.
+ * @returns  true when every ordered unit is received but the PO is not closed.
+ */
+export function isReceivedNotProcessed(po: RecentPOForCoverage): boolean {
+    if (!po?.orderId) return false;
+    if (!isOpenOrderingStatus(po.status ?? "")) return false;
+    // Drafts count too — 125247 arrived in full while still a Draft.
+    return !poStillOwesGoods(po);
+}
+
+/**
  * Index recent Finale POs by productId → open coverage qty + hits.
  * Skips terminal statuses. Does not require receiveDate null (blanket POs
  * can have a receiveDate while still open for remaining legs).
@@ -107,6 +164,9 @@ export function buildRecentOpenCoverageByProduct(
 
     for (const po of recentPOs) {
         if (!po?.orderId || !isOpenOrderingStatus(po.status ?? "")) continue;
+        // A PO that owes no goods is not inbound supply — Finale's status field
+        // is not evidence of receipt (125080 received 2026-07-24 still `open`).
+        if (!poStillOwesGoods(po)) continue;
         const isDraft = isDraftOrderingStatus(po.status ?? "");
         for (const line of po.items ?? []) {
             if (!line?.productId) continue;

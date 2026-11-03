@@ -1859,6 +1859,28 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             }
         }
 
+        // ── Step 1b: Resolve the REAL product URL per SKU ────────────────────
+        // BUGFIX(2026-11-03): Finale silently writes an UNCATEGORIZED line (no
+        // SKU at all) when a productUrl doesn't resolve — it does not error.
+        // A renamed product keeps its creation slug: GLP118 still lives at
+        // /api/product/GLB118, so the canonical `/api/product/GLP118` 404s and
+        // PO 125466 was created with one uncategorized $187.50 line. Resolve the
+        // slug the same way lookups already do, and carry productId explicitly.
+        const productUrlFor = new Map<string, string>();
+        for (const item of items) {
+            try {
+                const slug = await this.resolveProductUrlSlug(item.productId);
+                if (slug) {
+                    productUrlFor.set(item.productId, `/${this.accountPath}/api/product/${encodeURIComponent(slug)}`);
+                    if (slug !== item.productId) {
+                        console.log(`[finale] PO line slug: ${item.productId} → ${slug} (renamed product)`);
+                    }
+                }
+            } catch (e: any) {
+                console.warn(`[finale] resolveProductUrlSlug failed for ${item.productId} (non-blocking):`, e?.message || e);
+            }
+        }
+
         const adjustedItems = items.map(item => {
             const rawQty = item.quantity;
             const effectiveIncrement = item.orderIncrementQty ?? incrementFallback.get(item.productId) ?? null;
@@ -1871,7 +1893,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
             }
 
             return {
-                productUrl: `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
+                productId: item.productId,
+                productUrl: productUrlFor.get(item.productId)
+                    ?? `/${this.accountPath}/api/product/${encodeURIComponent(item.productId)}`,
                 quantity: snapped,
                 unitPrice: item.unitPrice,
                 ...(itemDescription ? { itemDescription } : {}),
