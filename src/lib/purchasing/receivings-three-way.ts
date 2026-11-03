@@ -79,6 +79,8 @@ export interface ThreeWayInvoiceLine {
     qty: number;
     unitPrice: number;
     extPrice?: number | null;
+    /** How this bill line was tied to a PO line. Absent = printed SKU. */
+    matchedBy?: "sku" | "description";
 }
 
 /** Bill header money the route already has on the matched invoice. */
@@ -292,10 +294,58 @@ export function buildReceivingsThreeWay(input: BuildReceivingsThreeWayInput): Re
 
     // ── Align the three documents by exact SKU ──────────────────────────────
     const invoiceBySku = new Map<string, ThreeWayInvoiceLine>();
+    const skuLessLines: ThreeWayInvoiceLine[] = [];
     for (const line of invoiceLines) {
         const key = skuKey(line.sku ?? line.productId);
-        if (!key || invoiceBySku.has(key)) continue; // first line for a SKU wins
+        if (!key) {
+            // A bill line with no SKU is not automatically incomparable: plenty
+            // of vendor invoices (Fermented Plant Extracts, CR Minerals) print a
+            // description and a price but no part number. Keep it for the
+            // evidence-only fallback below instead of discarding it.
+            skuLessLines.push(line);
+            continue;
+        }
+        if (invoiceBySku.has(key)) continue; // first line for a SKU wins
         invoiceBySku.set(key, line);
+    }
+
+    // ── SKU-less bill lines: align only on PROOF, never on resemblance ──────
+    // A fallback pairing requires the line's qty AND unit price to match the PO
+    // line exactly, the PO line to be otherwise unmatched, and the pairing to be
+    // unique on both sides. Two candidate PO lines at the same qty and price
+    // means the bill cannot say which one it is — that stays unmatched.
+    // DECISION(2026-11-03, Bill): PO 125408 read "3-way: no shared SKUs" and
+    // "Bill identity unverified" for a bill that was demonstrably BASLPE103
+    // (50 × $13 both sides). A missing part number is not a missing match.
+    const descriptionMatches = new Map<string, ThreeWayInvoiceLine>();
+    for (const invLine of skuLessLines) {
+        const qty = num(invLine.qty);
+        const price = num(invLine.unitPrice);
+        if (!(qty > 0) || !(price > 0)) continue;
+
+        const candidates = items.filter((item) => {
+            const key = skuKey(item.productId);
+            if (!key || invoiceBySku.has(key)) return false;
+            if (num(item.orderedQty) !== qty) return false;
+            // Same to the cent: a price difference is a discrepancy, not a match.
+            return Math.abs(num(item.unitPrice) - price) < 0.005;
+        });
+        if (candidates.length !== 1) continue;
+
+        // Uniqueness on the bill side too — two $13×50 lines cannot both be
+        // the one PO line.
+        const twinBills = skuLessLines.filter(
+            (l) => num(l.qty) === qty && Math.abs(num(l.unitPrice) - price) < 0.005,
+        );
+        if (twinBills.length !== 1) continue;
+
+        descriptionMatches.set(skuKey(candidates[0].productId), {
+            ...invLine,
+            // Attach the resolved SKU so downstream display and bucketing treat
+            // this exactly like a printed-part-number match.
+            sku: String(candidates[0].productId),
+            matchedBy: "description",
+        });
     }
 
     const lines: ThreeWayLine[] = [];
@@ -305,7 +355,7 @@ export function buildReceivingsThreeWay(input: BuildReceivingsThreeWayInput): Re
     for (const item of items) {
         const key = skuKey(item.productId);
         if (!key) continue;
-        const inv = invoiceBySku.get(key);
+        const inv = invoiceBySku.get(key) ?? descriptionMatches.get(key);
         if (!inv) continue; // never billed on this bill — nothing to compare (see header)
         consumed.add(key);
         lines.push({

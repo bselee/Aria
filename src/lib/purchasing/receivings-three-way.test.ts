@@ -284,3 +284,76 @@ describe("buildReceivingsThreeWay", () => {
     expect(stamp.verdict).toBe("matched");
   });
 });
+
+describe("SKU-less bill lines (2026-11-03 — PO 125408)", () => {
+  // Fermented Plant Extracts prints no part numbers. The bill was provably
+  // BASLPE103 (50 × $13 on both sides) yet the panel said "no shared SKUs".
+  const poItems = [
+    { productId: "HTF101", orderedQty: 10, receivedQty: 10, unitPrice: 24 },
+    { productId: "BASLCE103", orderedQty: 50, receivedQty: 50, unitPrice: 24 },
+    { productId: "BASLPE103", orderedQty: 50, receivedQty: 50, unitPrice: 13 },
+  ];
+
+  it("aligns a bill line with no SKU on an exact qty + price match", () => {
+    const stamp = buildReceivingsThreeWay({
+      orderId: "125408",
+      items: poItems,
+      invoiceLines: [
+        { sku: "", description: "Pumpkin Half Gallons", qty: 50, unitPrice: 13 },
+      ],
+      invoice: { total: 650, freight: 0 },
+      poFreight: 0,
+    });
+
+    expect(stamp.incompleteReason).toBeNull();
+    expect(stamp.lines).toHaveLength(1);
+    expect(stamp.lines[0].productId).toBe("BASLPE103");
+    expect(stamp.verdict).toBe("matched");
+  });
+
+  it("keeps a SKU-less line unmatched when a printed SKU already claims it", () => {
+    const stamp = buildReceivingsThreeWay({
+      orderId: "125408",
+      items: poItems,
+      invoiceLines: [
+        { sku: "BASLPE103", qty: 50, unitPrice: 13 },
+        // Same qty/price, no SKU — a duplicate, not a second SKU.
+        { sku: "", description: "Pumpkin", qty: 50, unitPrice: 13 },
+      ],
+      invoice: { total: 1300, freight: 0 },
+      poFreight: 0,
+    });
+
+    expect(stamp.lines).toHaveLength(1);
+    expect(stamp.lines[0].productId).toBe("BASLPE103");
+  });
+
+  it("refuses to guess between two PO lines at the same qty and price", () => {
+    // Two $13×50 candidates: the bill cannot say which one it is.
+    const stamp = buildReceivingsThreeWay({
+      orderId: "125408",
+      items: [
+        { productId: "BASLPE103", orderedQty: 50, receivedQty: 50, unitPrice: 13 },
+        { productId: "BASLPE104", orderedQty: 50, receivedQty: 50, unitPrice: 13 },
+      ],
+      invoiceLines: [{ sku: "", description: "Pumpkin", qty: 50, unitPrice: 13 }],
+      invoice: { total: 650, freight: 0 },
+      poFreight: 0,
+    });
+
+    expect(stamp.incompleteReason).toBe("no_comparable_lines");
+  });
+
+  it("refuses a SKU-less line whose price differs from the PO", () => {
+    const stamp = buildReceivingsThreeWay({
+      orderId: "125408",
+      items: poItems,
+      invoiceLines: [{ sku: "", description: "Pumpkin", qty: 50, unitPrice: 15 }],
+      invoice: { total: 750, freight: 0 },
+      poFreight: 0,
+    });
+
+    // Price disagreement is a discrepancy to surface, not a match to invent.
+    expect(stamp.incompleteReason).toBe("no_comparable_lines");
+  });
+});

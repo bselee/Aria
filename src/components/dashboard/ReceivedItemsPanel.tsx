@@ -1238,6 +1238,33 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                         };
                                                     }
                                                     if (rec?.matchedInvoice && !rec.matchedInvoice.identityUnknown) {
+                                                        // DECISION(2026-11-03, Bill): "When a PO is
+                                                        // fulfilled simply and clearly state this
+                                                        // completes this PO, all Delivered."
+                                                        // Full receipt + a bill proven to this PO's
+                                                        // lines = one plain sentence, one action. No
+                                                        // "verify against the PO" hedging on a row
+                                                        // where everything already agrees.
+                                                        const fullyDelivered =
+                                                            receiptStatus === "full" ||
+                                                            (receiptKnown && openTotal === 0);
+                                                        const billProven =
+                                                            !rec.threeWay ||
+                                                            rec.threeWay.verdict === "matched" ||
+                                                            rec.threeWay.canComplete === true;
+                                                        if (fullyDelivered && billProven) {
+                                                            const total = Number(
+                                                                rec.matchedInvoice.total || po.total || 0,
+                                                            );
+                                                            return {
+                                                                text: `All delivered — ${billLabel(rec.matchedInvoice)} matches this PO ($${fmtQty(total)}). Completing closes it.`,
+                                                                button: {
+                                                                    text: "Complete PO",
+                                                                    tone: "success",
+                                                                    onClick: () => toggleModifier(po.orderId, rec!.matchedInvoice!.invoice_number),
+                                                                },
+                                                            };
+                                                        }
                                                         return {
                                                             text: `${receiptLead}. Verify ${billLabel(rec.matchedInvoice)} against the PO.`,
                                                             button: {

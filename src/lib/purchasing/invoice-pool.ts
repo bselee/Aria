@@ -88,6 +88,12 @@ export function isJunkVendorName(vendorName: string | null | undefined): boolean
  * Date-shaped "invoice numbers": OCR of `10/22/2026` collapsed into
  * `10,222,026`. A date is not an invoice identity — two different invoices
  * from the same vendor in the same month would both read as "10,222,026".
+ *
+ * VERIFIED(2026-11-03): Fermented Plant Extracts really does print dates where
+ * a bill number belongs — its rows are 10,222,026 / 4,162,026 / 2,262,026, each
+ * matching its invoice_date (10/22/2026, 4/16/2026, 2/26/2026). So this guard
+ * stays: "Bill identity unverified" on PO 125408 was TRUE, not a false alarm.
+ * Do not widen this pattern to admit comma-grouped numbers.
  */
 const DATE_SHAPED_INVOICE_RE = /^\d{1,2},\d{3},\d{3}$/;
 
