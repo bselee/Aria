@@ -32,7 +32,10 @@
  * Usage:
  *   node --env-file=.env.local --import tsx src/cli/reconcile-parcel-tracking-freight.ts --vendor "safe solutions" --since 2026-01-01
  *   node --env-file=.env.local --import tsx src/cli/reconcile-parcel-tracking-freight.ts --pos 125076,124304 --live
+ *   node --env-file=.env.local --import tsx src/cli/reconcile-parcel-tracking-freight.ts --parcel-vendors --live
  *   --live            append missing freight (default: report only)
+ *   --parcel-vendors  every PO of a vendor in src/config/parcel-billed-vendors.ts
+ *                     (what the `parcel-freight-reconcile` cron runs)
  *   --scan-sender     also scan parcel invoices for the vendor as sender (default on)
  *   --gap <ms>        pause between Finale calls (default 1500)
  *
@@ -64,6 +67,7 @@ import { FinaleClient } from "../lib/finale/client";
 import { freightAdjustmentForPo } from "../lib/finale/freight-adjustment";
 import { getAuthenticatedClient } from "../lib/gmail/auth";
 import { gmail as GmailApi, type gmail_v1 } from "@googleapis/gmail";
+import { isParcelBilledVendor } from "../config/parcel-billed-vendors";
 
 type GmailAuth = Parameters<typeof GmailApi>[0]["auth"];
 
@@ -75,6 +79,7 @@ const argVal = (flag: string, dflt: string): string => {
     return i >= 0 && args[i + 1] ? args[i + 1] : dflt;
 };
 const LIVE = args.includes("--live");
+const PARCEL_MODE = args.includes("--parcel-vendors");
 const VENDOR = argVal("--vendor", "");
 const POS_ARG = argVal("--pos", "");
 const SINCE = argVal("--since", "2026-01-01");
@@ -475,6 +480,49 @@ interface PoRow {
 async function loadPos(): Promise<PoRow[]> {
     const sb = createClient();
     if (!sb) throw new Error("PostgREST client not configured");
+
+    // Parcel mode: every PO of a vendor whose carriage bills to our parcel account,
+    // plus any PO named only on a filed invoice (Aria's PO cache can be missing it).
+    if (PARCEL_MODE) {
+        const rows: PoRow[] = [];
+        const seen = new Set<string>();
+        const { data: cacheRows } = (await sb
+            .from("purchase_orders")
+            .select("po_number, vendor_name, status, issue_date, receive_date, total, tracking_numbers")
+            .gte("issue_date", SINCE)
+            .order("issue_date", { ascending: true })
+            .limit(Math.max(MAX_POS, 400))) as { data: PoRow[] | null };
+        for (const r of cacheRows || []) {
+            if (!isParcelBilledVendor(r.vendor_name)) continue;
+            if (String(r.status || "").toLowerCase() === "closed") continue;
+            if (seen.has(String(r.po_number))) continue;
+            seen.add(String(r.po_number));
+            rows.push(r);
+        }
+        const { data: invRows } = (await sb
+            .from("vendor_invoices")
+            .select("po_number, vendor_name, invoice_date")
+            .not("po_number", "is", null)
+            .gte("invoice_date", SINCE)
+            .limit(400)) as { data: Array<{ po_number: string; vendor_name: string | null; invoice_date: string | null }> | null };
+        for (const r of invRows || []) {
+            const po = String(r.po_number || "");
+            if (!po || seen.has(po)) continue;
+            if (!isParcelBilledVendor(r.vendor_name)) continue;
+            seen.add(po);
+            rows.push({
+                po_number: po,
+                vendor_name: r.vendor_name || "",
+                status: "",
+                issue_date: r.invoice_date,
+                receive_date: null,
+                total: null,
+                tracking_numbers: [],
+            });
+        }
+        return rows.slice(0, MAX_POS);
+    }
+
     let q = sb
         .from("purchase_orders")
         .select("po_number, vendor_name, status, issue_date, receive_date, total, tracking_numbers")
@@ -486,7 +534,7 @@ async function loadPos(): Promise<PoRow[]> {
     } else if (VENDOR) {
         q = q.ilike("vendor_name", `%${VENDOR}%`);
     } else {
-        throw new Error("pass --vendor <name> or --pos <csv>");
+        throw new Error("pass --vendor <name>, --pos <csv> or --parcel-vendors");
     }
     const { data, error } = (await q) as { data: PoRow[] | null; error: { message: string } | null };
     if (error) throw new Error(error.message);

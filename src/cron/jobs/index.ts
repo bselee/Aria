@@ -1438,6 +1438,47 @@ defineJob({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Parcel freight (2026-11-04): vendors that ship on OUR FedEx parcel account
+// (Safe Solutions first) print "Shipping / BAS FedEx Account $0.00" on their own
+// invoice, so their carriage never appears on vendor paper — it lands on a FedEx
+// Billing Online invoice days after delivery with no PO number on it. The join
+// is the tracking ID. Runs after the 9:10 freight-mailbox reconciler so the two
+// carrier lanes stay one writer each (that one owns FedEx Freight, this owns
+// Express/Ground parcel). Silent: logs + ap_activity_log only.
+// ─────────────────────────────────────────────────────────────────────────────
+defineJob({
+    name: "parcel-freight-reconcile",
+    schedule: "40 9 * * 1-5",
+    onFail: "log",
+    description: "Join FedEx parcel charges to their POs by tracking ID and apply missing freight.",
+    handler: async () => {
+        const { execFileSync } = await import("child_process");
+        console.log("[parcel-freight] Reconciling parcel-account vendor POs (--parcel-vendors --live)...");
+        let stdout = "";
+        try {
+            stdout = execFileSync(
+                process.execPath,
+                [
+                    "--import", "tsx",
+                    `${process.cwd()}/src/cli/reconcile-parcel-tracking-freight.ts`,
+                    "--parcel-vendors",
+                    "--live",
+                    "--gap", "1500",
+                ],
+                { encoding: "utf8", timeout: 240_000, env: process.env },
+            );
+            console.log(stdout);
+        } catch (err: unknown) {
+            const e = err as { stdout?: string; stderr?: string; message?: string };
+            console.error(`[parcel-freight] failed: ${e.message ?? String(err)}`);
+            if (e.stdout) console.error(e.stdout.slice(-2000));
+            if (e.stderr) console.error(e.stderr.slice(-2000));
+        }
+    },
+    budget: { durationMs: 6 * 60_000 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DB Retention: Reclaim disk from email_inbox_queue and cron_runs nightly.
 // Runs at 3:00 AM MT (low-activity window). VACUUM FULL on a local dev DB
 // completes in < 1 second; on production replica it needs a maintenance window.
