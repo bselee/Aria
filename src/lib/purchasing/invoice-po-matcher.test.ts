@@ -677,6 +677,50 @@ describe("findPOCandidates with Tier A auto-match", () => {
         expect(shortPo!.score).toBeLessThan(90);
     });
 
+    it("does not let a confirmed match steal the link from a stale PO outside the date window (2026-11-04)", async () => {
+        // Colorado Worm invoice 19500 ($2000, Nov 2) belongs to the NEWER open
+        // PO 125467 (Nov 3), not the human-confirmed 124424 (Mar 1, 8 months
+        // stale). The confirmed boost must not cross the date window.
+        const invoice: InvoiceToMatch = {
+            id: "inv-19500",
+            invoiceNumber: "19500",
+            vendorName: "Colorado Worm Company",
+            invoiceDate: "2026-11-02",
+            subtotal: 2000,
+            freight: 0,
+            tax: 0,
+            total: 2000,
+        };
+
+        stubDbForPoSearch([
+            {
+                po_number: "125467",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-11-03",
+                total_amount: 9000,
+                total: 9000,
+                status: "Committed",
+            },
+            {
+                po_number: "124424",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-03-01",
+                total_amount: 8400,
+                total: 8400,
+                status: "received",
+            },
+        ], [{
+            vendor_name: "Colorado Worm Company",
+            po_number: "124424",
+        }]);
+
+        const result = await findPOCandidates(invoice);
+
+        // The stale confirmed PO is dropped; the date-correct open PO wins.
+        expect(result.bestMatch!.orderId).toBe("125467");
+        expect(result.candidates.some(c => c.orderId === "124424")).toBe(false);
+    });
+
     it("exact OCR match takes priority over confirmed match", async () => {
         const invoice: InvoiceToMatch = {
             id: "inv-priority",

@@ -611,11 +611,18 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
             const invMs = new Date((invoice.invoiceDate || "").slice(0, 10) + "T12:00:00Z").getTime();
             const poMs = new Date((po.issue_date || "").slice(0, 10) + "T12:00:00Z").getTime();
             const predatesPo = !isNaN(invMs) && !isNaN(poMs) && invMs < poMs;
+            // 2026-11-04: a confirmed pair also cannot cross the date window. An
+            // 8-month-old PO (124424, Mar 1) was confirmed for one invoice, but a
+            // fresh invoice (19500, Nov 2) belongs to the vendor's NEWER PO
+            // (125467, Nov 3, same $20 unit price). dateScore is 0 outside
+            // DATE_WINDOW_DAYS, so a stale confirmed PO must not steal the link
+            // from the date-correct candidate.
             if (
                 (invoice.total > 0 &&
                 poTotalForConfirm > 0 &&
                 poTotalForConfirm * CONFIRMED_COVER_TOLERANCE < invoice.total) ||
-                predatesPo
+                predatesPo ||
+                dateScore.score === 0
             ) {
                 confirmedMatchReason = null;
             } else {
