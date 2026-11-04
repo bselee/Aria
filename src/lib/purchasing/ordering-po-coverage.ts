@@ -300,7 +300,23 @@ export function poAnomalyThresholdDays(leadTimeDays?: number | null): number {
 }
 
 /**
+ * A date still ahead of `now` is a plan, not a receipt.
+ * Date-only compare so a time-of-day on the timestamp cannot flip the day.
+ */
+export function isFutureExpectedDate(
+    date: string | null | undefined,
+    now: number = Date.now(),
+): boolean {
+    const day = String(date ?? "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+    return day > new Date(now).toISOString().slice(0, 10);
+}
+
+/**
  * Is this open PO an anomaly that must be assessed rather than counted as cover?
+ *
+ * A future expected date already on the PO is cover until that date passes.
+ * Age alone does not override it. A past date with nothing received stays an anomaly.
  *
  * THE PRINCIPLE: cover has to be evidenced. A PO still open long past the window
  * in which that item could plausibly arrive is not future supply, whatever
@@ -313,12 +329,15 @@ export function poAnomalyThresholdDays(leadTimeDays?: number | null): number {
  * @param orderDate    PO order date.
  * @param leadTimeDays Vendor lead time for this product.
  * @param now          Clock override for tests.
+ * @param expectedDate Planned arrival already on the PO. Future means not an anomaly.
  */
 export function isAnomalousOpenPo(
     orderDate: string | null | undefined,
     leadTimeDays?: number | null,
     now: number = Date.now(),
+    expectedDate?: string | null,
 ): boolean {
+    if (isFutureExpectedDate(expectedDate, now)) return false;
     const age = poAgeDays(orderDate, now);
     if (age === null) return false;
     return age > poAnomalyThresholdDays(leadTimeDays);
@@ -332,21 +351,75 @@ export function isAnomalousOpenPo(
  * @param now          Clock override for tests.
  * @returns            `credible` (usable as cover) and `anomalous` (assess).
  */
-export function partitionOpenPOsByAnomaly<T extends { orderDate?: string }>(
+export function partitionOpenPOsByAnomaly<T extends { orderId?: string; orderDate?: string }>(
     openPOs: T[] | null | undefined,
     leadTimeDays?: number | null,
     now: number = Date.now(),
+    expectedById?: ReadonlyMap<string, string | null> | Record<string, string | null>,
 ): { credible: T[]; anomalous: Array<T & { ageDays: number }> } {
     const credible: T[] = [];
     const anomalous: Array<T & { ageDays: number }> = [];
+    const expectedOf = (id: string | undefined): string | null => {
+        if (!id || !expectedById) return null;
+        return expectedById instanceof Map ? expectedById.get(id) ?? null : expectedById[id] ?? null;
+    };
     for (const po of openPOs ?? []) {
-        if (isAnomalousOpenPo(po?.orderDate, leadTimeDays, now)) {
+        if (isAnomalousOpenPo(po?.orderDate, leadTimeDays, now, expectedOf(po?.orderId))) {
             anomalous.push({ ...po, ageDays: poAgeDays(po.orderDate, now) ?? 0 });
         } else {
             credible.push(po);
         }
     }
     return { credible, anomalous };
+}
+
+/** Same post-lead buffer policy-engine uses before a new PO is justified. */
+const ORDER_POINT_BUFFER_DAYS = 30;
+
+export type CredibleCoverCredit = {
+    /** Qty to show as on order after restoring cover the scan dropped. */
+    onOrder: number;
+    /** True when on hand + inbound already covers lead + 30d. No second buy. */
+    hold: boolean;
+    /** Additional units still needed. 0 when hold. */
+    residualQty: number;
+};
+
+/**
+ * Restore open-PO qty the scan excluded, without retuning the recommender.
+ *
+ * The scan drops an aged PO from stockOnOrder, then asks for a full replenishment
+ * as if that qty did not exist. A future expected date makes the qty cover again.
+ * Credit it with the existing order-point rule: on hand + inbound covers lead + 30d
+ * means hold. Otherwise the row may only ask for the shortfall, never a second
+ * copy of the open PO.
+ *
+ * When credible qty is already inside the scan's on-order figure, this is a no-op.
+ */
+export function creditCredibleOpenCover(input: {
+    stockOnHand: number;
+    scanOnOrder: number;
+    credibleQty: number;
+    dailyRate: number;
+    leadTimeDays: number;
+    suggestedQty: number;
+}): CredibleCoverCredit {
+    const onHand = Math.max(0, Number(input.stockOnHand) || 0);
+    const scan = Math.max(0, Number(input.scanOnOrder) || 0);
+    const credible = Math.max(0, Number(input.credibleQty) || 0);
+    const suggested = Math.max(0, Number(input.suggestedQty) || 0);
+    const onOrder = Math.max(scan, credible);
+    if (credible <= scan) {
+        return { onOrder: scan, hold: false, residualQty: suggested };
+    }
+    const daily = Math.max(0, Number(input.dailyRate) || 0);
+    const lead = Number.isFinite(input.leadTimeDays) ? Math.max(0, Number(input.leadTimeDays)) : 21;
+    const supply = onHand + onOrder;
+    if (daily <= 0 || supply >= daily * (lead + ORDER_POINT_BUFFER_DAYS)) {
+        return { onOrder, hold: true, residualQty: 0 };
+    }
+    const residual = Math.min(suggested, Math.max(0, Math.ceil(daily * (lead + ORDER_POINT_BUFFER_DAYS) - supply)));
+    return { onOrder, hold: residual <= 0, residualQty: residual };
 }
 
 /**
@@ -394,8 +467,10 @@ export type AgedPoFacts = {
     issueDate?: string | null;
     /** `tracking_numbers` — any non-empty entry means the vendor shipped something. */
     trackingNumbers?: string[] | null;
-    /** `receive_date` — set (past or future) means a receipt is on the record. */
+    /** `receive_date` — a past date means the goods arrived. A future date is not stored here. */
     receiveDate?: string | null;
+    /** Finale planned arrival (`required_date`). Future means the qty is still cover. */
+    expectedDate?: string | null;
 };
 
 export type AgedSilentOpenPo = { orderId: string; ageDays: number };
@@ -421,6 +496,7 @@ export function isAgedSilentOpenPo(
         return null;
     }
     if (facts.receiveDate) return null;
+    if (isFutureExpectedDate(facts.expectedDate, now)) return null;
     const age = poAgeDays(facts.issueDate ?? po.orderDate, now);
     if (age === null || age <= AGED_PO_BLOCK_DAYS) return null;
     return { orderId: String(po.orderId), ageDays: age };

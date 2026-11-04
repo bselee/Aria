@@ -18,6 +18,7 @@ import {
     partitionOpenPOsByAnomaly,
     isAnomalousOpenPo,
     anomalousCoverNote,
+    creditCredibleOpenCover,
     findAgedSilentOpenPo,
     agedPoBlockReason,
     AGED_PO_BLOCK_DAYS,
@@ -295,7 +296,7 @@ export async function GET(req: NextRequest) {
             if (db) {
                 const { data: poRows, error: poFactsErr } = await db
                     .from('purchase_orders')
-                    .select('po_number, issue_date, tracking_numbers, receive_date')
+                    .select('po_number, issue_date, tracking_numbers, receive_date, required_date')
                     .in('po_number', Array.from(openPoNumbers).slice(0, 500));
                 if (poFactsErr) {
                     console.warn('[purchasing/route] aged-PO facts read failed:', poFactsErr.message);
@@ -305,6 +306,7 @@ export async function GET(req: NextRequest) {
                         issueDate: row.issue_date,
                         trackingNumbers: row.tracking_numbers,
                         receiveDate: row.receive_date,
+                        expectedDate: row.required_date,
                     });
                 }
             }
@@ -350,8 +352,12 @@ export async function GET(req: NextRequest) {
             const leadForPoAnomaly = Number.isFinite((line.item as { effectiveLeadTimeDays?: number }).effectiveLeadTimeDays)
                 ? (line.item as { effectiveLeadTimeDays?: number }).effectiveLeadTimeDays
                 : line.item.leadTimeDays;
+            const expectedById = new Map<string, string | null>();
+            for (const [id, facts] of agedPoFactsByNumber) {
+                expectedById.set(id, facts.expectedDate ?? null);
+            }
             const { credible: credibleOpenPOs, anomalous: anomalousOpenPOs } =
-                partitionOpenPOsByAnomaly(mergedOpenPOs, leadForPoAnomaly);
+                partitionOpenPOsByAnomaly(mergedOpenPOs, leadForPoAnomaly, Date.now(), expectedById);
             const anomalousQty = anomalousOpenPOs.reduce(
                 (sum: number, po: { quantity?: number }) => sum + Math.max(0, Number(po.quantity) || 0),
                 0,
@@ -372,7 +378,12 @@ export async function GET(req: NextRequest) {
                 0,
             );
             const recentOpenQty = (recentCov?.allHits ?? [])
-                .filter((h) => !isAnomalousOpenPo(h.orderDate, leadForPoAnomaly))
+                .filter((h) => !isAnomalousOpenPo(
+                    h.orderDate,
+                    leadForPoAnomaly,
+                    Date.now(),
+                    agedPoFactsByNumber.get(String(h.orderId))?.expectedDate,
+                ))
                 .reduce((sum: number, h) => sum + Math.max(0, h.quantity || 0), 0);
             const effectiveOpenQty = Math.max(openPoQty, recentOpenQty);
             const openPoCoversSuggested = effectiveOpenQty >= needQty;
@@ -389,6 +400,20 @@ export async function GET(req: NextRequest) {
             const hasOpenPoCoverage = !hasDraftCoverage
                 && (openPoCoversSuggested || policyHeldForOnOrder)
                 && (credibleOpenPOs.length > 0 || recentOpenQty > 0);
+
+            const scanOnOrderCredible = Math.max(0, (line.item.stockOnOrder ?? 0) - anomalousQty);
+            const coverCredit = creditCredibleOpenCover({
+                stockOnHand: line.item.stockOnHand ?? 0,
+                scanOnOrder: scanOnOrderCredible,
+                credibleQty: effectiveOpenQty,
+                dailyRate: Math.max(
+                    Number(line.item.dailyRate) || 0,
+                    Number(line.assessment?.metrics?.directDemand) || 0,
+                    Number(line.assessment?.metrics?.bomDemand) || 0,
+                ),
+                leadTimeDays: Number(leadForPoAnomaly) || 21,
+                suggestedQty: line.assessment?.recommendedQty ?? line.item.suggestedQty ?? 0,
+            });
 
             let assessment = line.assessment;
             let urgency = line.item.urgency;
@@ -417,18 +442,32 @@ export async function GET(req: NextRequest) {
                     explanation: `Already on PO #${primaryId} (qty ${primaryQty}). Not recommending another order unless coverage slips.`,
                 };
                 urgency = 'ok' as const;
+            } else if (coverCredit.hold) {
+                const primaryPo = credibleOpenPOs[0];
+                const expected = String(agedPoFactsByNumber.get(String(primaryPo?.orderId ?? ''))?.expectedDate ?? '').slice(0, 10);
+                const expectedNote = expected ? `, expected ${expected}` : '';
+                assessment = {
+                    ...line.assessment,
+                    decision: 'hold' as const,
+                    recommendedQty: 0,
+                    reasonCodes: ['on_order_already_covers_need'] as Array<'on_order_already_covers_need'>,
+                    explanation: `Already on PO #${primaryPo?.orderId ?? '?'} (qty ${coverCredit.onOrder}${expectedNote}). Not recommending another order.`,
+                };
+                urgency = 'ok' as const;
+            } else if (coverCredit.residualQty < (line.assessment?.recommendedQty ?? line.item.suggestedQty ?? 0)) {
+                assessment = {
+                    ...line.assessment,
+                    recommendedQty: coverCredit.residualQty,
+                    explanation: `Open PO covers ${coverCredit.onOrder}. Order ${coverCredit.residualQty} more. Do not re-cover the open PO.`,
+                };
             }
 
-            // Anomalous cover is not supply, so drop it from the displayed on-order too:
-            // a row must never show a phantom "320 on order" for goods that shipped in
-            // February. The anomaly is named in the row instead.
-            const scanOnOrderCredible = Math.max(0, (line.item.stockOnOrder ?? 0) - anomalousQty);
-
             // When covered by open/draft PO, surface open qty as stockOnOrder.
-            // Any hold decision zeros suggested qty so cards never show "order 1000" while holding.
-            const covered = hasDraftCoverage || hasOpenPoCoverage;
-            const displayOnOrder = covered
-                ? Math.max(scanOnOrderCredible, effectiveOpenQty, draftPOInfo?.quantity ?? 0)
+            // A future-dated PO the scan dropped is cover too, so show that qty
+            // even when the scan's stockOnOrder was zero.
+            const covered = hasDraftCoverage || hasOpenPoCoverage || coverCredit.hold;
+            const displayOnOrder = covered || coverCredit.onOrder > scanOnOrderCredible
+                ? Math.max(scanOnOrderCredible, coverCredit.onOrder, draftPOInfo?.quantity ?? 0)
                 : scanOnOrderCredible;
 
             // HERMIA(2026-10-15): surface the anomaly ON the row, so a PO nobody closed is
@@ -455,7 +494,11 @@ export async function GET(req: NextRequest) {
                 ? null
                 : findAgedSilentOpenPo(mergedOpenPOs, agedPoFactsByNumber);
             const agedReason = agedPoBlock ? agedPoBlockReason(agedPoBlock) : '';
-            const baseGuard = assessPOCommitGuard(line);
+            const baseGuard = assessPOCommitGuard({
+                ...line,
+                assessment,
+                item: { ...line.item, stockOnOrder: displayOnOrder },
+            });
             // A hard block keeps its decision (no qty / no rate) but still carries the
             // reason; anything else becomes 'review' — never 'commit'.
             const commitGuard = agedReason
@@ -511,7 +554,9 @@ export async function GET(req: NextRequest) {
                 urgency: displayUrgency,
                 // The scan's stale explanation refers to cover we just excluded; when an
                 // anomaly is present the row carries the corrected text instead.
-                explanation: anomalyNote
+                explanation: coverCredit.hold || (coverCredit.onOrder > scanOnOrderCredible && assessment.decision !== line.assessment.decision)
+                    ? assessment.explanation
+                    : anomalyNote
                     ? [line.item.explanation, anomalyNote].filter(Boolean).join(' ')
                     : line.item.explanation,
             };

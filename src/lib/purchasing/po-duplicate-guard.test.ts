@@ -131,6 +131,25 @@ describe("coverageStockOnOrder", () => {
         expect(coverageStockOnOrder(open, enriched)).toBe(10);
     });
 
+    it("credits a future-dated PO even past the age gate (RAP101/125283)", () => {
+        const open = [{ quantity: 900 }];
+        const enriched = [{
+            orderId: "125283",
+            quantity: 900,
+            orderDate: "2026-09-09",
+            isDeliverable: false,
+            stuckReason: "no_ack_no_tracking" as const,
+            ageDays: 56,
+            expectedDate: "2099-11-16",
+        }];
+        // Age 56 > staleAfterDays 42, but the future date is the plan, not a ghost.
+        expect(coverageStockOnOrder(open, enriched, { staleAfterDays: 42 })).toBe(900);
+        expect(creditedOpenPOCount(enriched, { staleAfterDays: 42 })).toBe(1);
+        // Same PO with a past date falls back to the age gate → no cover.
+        const past = [{ ...enriched[0], expectedDate: "2026-09-30" }];
+        expect(coverageStockOnOrder(open, past, { staleAfterDays: 42 })).toBe(0);
+    });
+
     it("age-gate does not zero a delivered PO that is already handled as delivered", () => {
         // A delivered PO past the window is subtracted via the delivered branch,
         // not double-counted in staleQty. Quantity net 0 either way.

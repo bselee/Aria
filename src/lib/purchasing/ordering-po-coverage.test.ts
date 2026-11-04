@@ -11,9 +11,11 @@ import {
     agedPoBlockReason,
     anomalousCoverNote,
     buildRecentOpenCoverageByProduct,
+    creditCredibleOpenCover,
     findAgedSilentOpenPo,
     isAgedSilentOpenPo,
     isAnomalousOpenPo,
+    isFutureExpectedDate,
     isDraftOrderingStatus,
     isOpenOrderingStatus,
     isTerminalOrderingStatus,
@@ -253,6 +255,53 @@ describe("aged-PO anomaly", () => {
         expect(anomalous.map((p) => p.ageDays)).toEqual([118, 246]);
         // The credible sum is what the decision may use as cover.
         expect(credible.reduce((s, p) => s + p.quantity, 0)).toBe(500);
+    });
+
+    it("keeps an old PO as cover when its expected date is still ahead", () => {
+        // 125283 ordered 9/9, Finale planned receive 11/16. Age is past the
+        // floor. The date on the PO is the cover, not the missing tracking number.
+        const now = Date.parse("2026-11-03T18:00:00Z");
+        expect(isFutureExpectedDate("2026-11-16T19:00:00", now)).toBe(true);
+        expect(isAnomalousOpenPo("2026-09-09T18:00:00", 21, now, "2026-11-16")).toBe(false);
+        expect(isAnomalousOpenPo("2026-09-09T18:00:00", 21, now, "2026-09-30")).toBe(true);
+        const { credible, anomalous } = partitionOpenPOsByAnomaly(
+            [{ orderId: "125283", quantity: 900, orderDate: "9/9/2026" }],
+            21,
+            now,
+            new Map([["125283", "2026-11-16"]]),
+        );
+        expect(credible.map((p) => p.orderId)).toEqual(["125283"]);
+        expect(anomalous).toHaveLength(0);
+        expect(isAgedSilentOpenPo(
+            { orderId: "125283", orderDate: "9/9/2026" },
+            { issueDate: "2026-09-09", trackingNumbers: [], receiveDate: null, expectedDate: "2026-11-16" },
+            now,
+        )).toBeNull();
+    });
+
+    it("does not ask for a second buy when the dropped PO still covers lead plus 30 days", () => {
+        const credit = creditCredibleOpenCover({
+            stockOnHand: 153,
+            scanOnOrder: 0,
+            credibleQty: 900,
+            dailyRate: 9.44,
+            leadTimeDays: 21,
+            suggestedQty: 1198,
+        });
+        expect(credit.hold).toBe(true);
+        expect(credit.residualQty).toBe(0);
+        expect(credit.onOrder).toBe(900);
+        const short = creditCredibleOpenCover({
+            stockOnHand: 10,
+            scanOnOrder: 0,
+            credibleQty: 20,
+            dailyRate: 9.44,
+            leadTimeDays: 21,
+            suggestedQty: 1198,
+        });
+        expect(short.hold).toBe(false);
+        expect(short.residualQty).toBeLessThan(1198);
+        expect(short.residualQty).toBeGreaterThan(0);
     });
 
     it("names the oldest PO and the action in the row note", () => {

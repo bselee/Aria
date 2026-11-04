@@ -23,6 +23,7 @@
  */
 
 import { createClient } from "@/lib/db";
+import { isFutureExpectedDate } from "./ordering-po-coverage";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,8 @@ export interface OpenPOReliable extends OpenPOBase {
     stuckReason: StuckReason | "";
     /** Days since the PO was ordered (from orderDate). */
     ageDays: number;
+    /** Finale planned arrival (`required_date`). Future means the qty is still cover. */
+    expectedDate?: string | null;
 }
 
 // ── Thresholds ───────────────────────────────────────────────────────────────
@@ -88,6 +91,7 @@ interface PORow {
     vendor_noncomm_at: string | null;
     po_sent_verified_at: string | null;
     po_sent_at: string | null;
+    required_date: string | null;
 }
 
 interface ShipmentRow {
@@ -136,7 +140,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 .from("purchase_orders")
                 .select(
                     "po_number, tracking_numbers, lifecycle_stage, last_movement_summary, " +
-                    "vendor_acknowledged_at, vendor_noncomm_at, po_sent_verified_at, po_sent_at"
+                    "vendor_acknowledged_at, vendor_noncomm_at, po_sent_verified_at, po_sent_at, required_date"
                 )
                 .in("po_number", orderIds),
             supabase
@@ -199,6 +203,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                             vendor_noncomm_at: null,
                             po_sent_verified_at: null,
                             po_sent_at: null,
+                            required_date: null,
                         });
                     }
                 }
@@ -225,6 +230,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
     return openPOs.map(po => {
         const age = daysSince(po.orderDate) ?? 0;
         const row = poMap.get(po.orderId);
+        const expectedDate = row?.required_date ?? null;
         const ships = shipmentsByPO.get(po.orderId) ?? [];
 
         // No Supabase record at all — PO may have just been created in Finale
@@ -236,6 +242,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: age < 3,
                 stuckReason: age < 3 ? ("" as const) : ("no_record" as const),
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -256,6 +263,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: false,
                 stuckReason: "delivered" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -266,6 +274,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: false,
                 stuckReason: "no_ack_no_tracking" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -280,6 +289,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: true,
                 stuckReason: "" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -297,6 +307,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                     isDeliverable: false,
                     stuckReason: "stale_tracking" as const,
                     ageDays: age,
+                    expectedDate,
                 };
             }
             // Tracking with recent movement → deliverable.
@@ -305,6 +316,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: true,
                 stuckReason: "" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -315,6 +327,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: true,
                 stuckReason: "" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -326,6 +339,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: false,
                 stuckReason: "no_ack_no_tracking" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -336,6 +350,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
                 isDeliverable: true,
                 stuckReason: "" as const,
                 ageDays: age,
+                expectedDate,
             };
         }
 
@@ -345,6 +360,7 @@ export async function enrichOpenPOs(openPOs: OpenPOBase[]): Promise<OpenPOReliab
             isDeliverable: false,
             stuckReason: "not_sent" as const,
             ageDays: age,
+            expectedDate,
         };
     });
 }
@@ -428,10 +444,14 @@ export function creditedOpenPOCount(
 
 /** Where a single enriched open PO lands under the cover-credit rules. */
 function classifyCoverPO(po: OpenPOReliable, staleAfterDays: number | null): "credited" | "delivered" | "stale" {
-    // Age-gate: an undelivered PO open longer than (lead time + grace) is no
-    // longer real cover — crediting it hides the shortfall (RWBP105/125271).
+    // A future expected date is a plan, not a ghost. Age alone does not override
+    // it (RAP101/125283: open since 9/9 but Finale planned receive 11/16). The
+    // qty stays cover until that date passes, regardless of how old the PO is.
     // Delivered POs skip this; they are handled by the delivered branch below.
     if (po.stuckReason !== "delivered") {
+        if (isFutureExpectedDate(po.expectedDate)) return "credited";
+        // Age-gate: an undelivered PO open longer than (lead time + grace) is no
+        // longer real cover — crediting it hides the shortfall (RWBP105/125271).
         return staleAfterDays != null && po.ageDays > staleAfterDays ? "stale" : "credited";
     }
 

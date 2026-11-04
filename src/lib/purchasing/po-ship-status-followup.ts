@@ -230,6 +230,7 @@ export function isShipStatusCandidate(
         | "tracking_requested_at"
         | "vendor_noncomm_at"
         | "receive_date"
+        | "required_date"
         | "status"
     >,
     nowMs: number = Date.now(),
@@ -273,6 +274,11 @@ export function isShipStatusCandidate(
         if (!isNaN(rMs) && rMs - nowMs <= RECEIPT_SOON_DAYS * 86_400_000) {
             return { ok: false, reason: "receipt_scheduled_soon" };
         }
+    }
+    const planned = String(po.required_date ?? "").slice(0, 10);
+    const today = new Date(nowMs).toISOString().slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(planned) && planned > today) {
+        return { ok: false, reason: "expected_date_ahead" };
     }
 
     return { ok: true };

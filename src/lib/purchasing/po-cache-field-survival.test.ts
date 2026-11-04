@@ -166,6 +166,19 @@ describe("po-cache PO-fact survival (Gap 6 / Gap 13)", () => {
         expect(late.rebuilt.expectedDate).toBe("2026-01-01");
     });
 
+    it("stores a future Finale receiveDate as the expected date, not as a receipt", async () => {
+        const { rebuilt, writtenRow } = await roundTrip(makePo({
+            orderId: "125283",
+            orderDate: "2026-09-09",
+            expectedDate: null,
+            receiveDate: "2026-11-16T19:00:00",
+        }));
+        expect(writtenRow.required_date).toBe("2026-11-16");
+        expect(writtenRow.receive_date ?? null).toBeNull();
+        expect(rebuilt.expectedDate).toBe("2026-11-16");
+        expect(rebuilt.receiveDate).toBeNull();
+    });
+
     it("returns expectedDate null when the PO has no quoted date", async () => {
         const { rebuilt } = await roundTrip(makePo({ expectedDate: null }));
         expect(rebuilt.expectedDate).toBeNull();

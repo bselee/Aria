@@ -41,6 +41,22 @@ async function getCacheAge(): Promise<Date | null> {
     }
 }
 
+/**
+ * Planned arrival to store on required_date.
+ * Finale puts that date on receiveDate while the PO is still Committed.
+ * An explicit expectedDate/dueDate wins only when receiveDate is not a future plan.
+ */
+function plannedExpectedDate(po: FullPO, today: string): string | null {
+    const planned = po.receiveDate && po.receiveDate.slice(0, 10) > today
+        ? po.receiveDate.slice(0, 10)
+        : null;
+    if (planned) return planned;
+    const quoted = (po as { expectedDate?: string | null; dueDate?: string | null }).expectedDate
+        || (po as { dueDate?: string | null }).dueDate
+        || null;
+    return quoted ? quoted.slice(0, 10) : null;
+}
+
 function isCacheFresh(lastSync: Date | null): boolean {
     if (!lastSync) return false;
     return (Date.now() - lastSync.getTime()) < CACHE_TTL_MS;
@@ -91,7 +107,10 @@ export async function cacheFinalePos(pos: FullPO[]): Promise<void> {
             // BUGFIX(2026-07-27): do NOT JSON.stringify into a jsonb column.
             line_items: po.items || [],
             issue_date: po.orderDate || null,
-            required_date: (po as any).expectedDate || (po as any).dueDate || null,
+            // A future Finale receiveDate is the planned arrival, not a receipt.
+            // Keep it on required_date so ETA and ordering cover can see it.
+            // Never write it to receive_date (that field means the goods arrived).
+            required_date: plannedExpectedDate(po, today),
             updated_at: now,
         };
         if (recv) {

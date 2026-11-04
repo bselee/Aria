@@ -157,7 +157,7 @@ export async function loadActivePurchases(
                                                 "tracking_unavailable_at, tracking_requested_at, vendor_acknowledged_at, vendor_ack_source, " +
                                                 "human_reply_detected_at, po_sent_at, po_sent_verified_at, po_sent_verified_source, " +
                                                 "po_sent_verified_evidence, last_eta_update, vendor_stated_eta, vendor_stated_eta_confidence, " +
-                                                "tracking_paused, tracking_source, status, receive_date"
+                                                "tracking_paused, tracking_source, status, receive_date, required_date"
                                             )
                                             .in("po_number", chunk),
                     db
@@ -399,10 +399,13 @@ export async function loadActivePurchases(
                 // the weekly report never drift. Prefers Finale's planned
                 // receive, then the shared lead-time service, then 21d.
                 const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
+                const plannedOnPo = [po.receiveDate, (po as { expectedDate?: string | null }).expectedDate, poLifecycleRow?.required_date]
+                    .map((d) => (typeof d === "string" ? d.slice(0, 10) : ""))
+                    .find((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && d > todayStr) ?? null;
                 const eta = await resolvePoEta({
                     vendorName: po.vendorName,
                     orderDate: po.orderDate,
-                    plannedReceiveDate: po.receiveDate || poLifecycleRow?.receive_date,
+                    plannedReceiveDate: plannedOnPo,
                     today: todayStr,
                 });
                 const expectedDate = eta.date;
@@ -524,8 +527,8 @@ export async function loadActivePurchases(
         activePos.push({
             ...po,
             receiveDate: resolvedReceiveDate,
-            expectedDate: etaProfile.expectedDate || expectedDate,
-            leadProvenance: etaProfile.label || leadProvenance,
+            expectedDate: eta.provenance === "finale_planned" ? eta.date : (etaProfile.expectedDate || expectedDate),
+            leadProvenance: eta.provenance === "finale_planned" ? eta.label : (etaProfile.label || leadProvenance),
             isReceived,
             completionState,
             trackingNumbers: trackingMap.get(po.orderId) || [],
