@@ -69,6 +69,8 @@ interface VendorInvoiceRow extends InvoicePoolRow {
     po_number?: string | null;
     line_items?: string | InvoiceLineItem[] | null;
     raw_data?: InvoiceRawData | null;
+    /** Free-form invoice note (e.g. "vendor ships on our FedEx account"). */
+    notes?: string | null;
 }
 
 /** A match-pool invoice: a vendor_invoices row plus local-cache provenance. */
@@ -255,7 +257,7 @@ type QueryResult<T> = { data: T | null; error: unknown };
 
 /** Columns the receivings panel reads off a `vendor_invoices` row. */
 const VENDOR_INVOICE_COLUMNS =
-    'po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items';
+    'po_number, invoice_number, subtotal, freight, tax, total, status, created_at, id, pdf_storage_path, source_ref, line_items, notes';
 
 /** What `loadBillPoLinks` hands the enrichment loop. */
 interface BillPoLinkSet {

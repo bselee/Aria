@@ -78,7 +78,7 @@ type ReceivedPO = {
         } | null;
         /** Vendor overbill history: N holds vs M recent bills (2026-10-28). */
         vendorOverbillPattern?: { flagged: number; bills: number } | null;
-        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; identityUnknown?: boolean; /** Gap 24: every PO this bill covers, when it covers more than one. */ coversPos?: string[]; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
+        matchedInvoice: { invoice_number: string; subtotal: number; freight: number; tax: number; total: number; status: string; pdf_storage_path?: string | null; source_ref?: string | null; notes?: string | null; identityUnknown?: boolean; /** Gap 24: every PO this bill covers, when it covers more than one. */ coversPos?: string[]; line_items?: Array<{ sku?: string; qty?: number; quantity?: number; description?: string }> | null } | null;
         /** Gap 24: mirror of `matchedInvoice.coversPos` for rec-only readers. */
         coversPos?: string[];
         /**
@@ -1538,6 +1538,17 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                                 >
                                                                     View PO in Finale
                                                                 </a>
+                                                            </div>
+                                                        )}
+
+                                                        {/* ── Invoice note (e.g. freight not free) ── */}
+                                                        {rec?.matchedInvoice?.notes && (
+                                                            <div
+                                                                className="mt-1 max-w-[70ch] text-[10px] font-mono leading-snug text-amber-300/80"
+                                                                title={rec.matchedInvoice.notes}
+                                                            >
+                                                                <span className="text-zinc-600">📝</span>{" "}
+                                                                <span className="line-clamp-2">{rec.matchedInvoice.notes}</span>
                                                             </div>
                                                         )}
                                                     </>
