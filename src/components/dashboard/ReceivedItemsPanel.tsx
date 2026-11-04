@@ -300,23 +300,6 @@ function multiPoCoversNote(
     return ` covers PO ${pos.join(" + ")}`;
 }
 
-/** Short, honest label for a leg that exists on paper but cannot be compared. */
-const THREE_WAY_INCOMPLETE_LABEL: Record<string, string> = {
-    no_invoice: "no bill",
-    invoice_amount_unknown: "bill amount unreadable",
-    invoice_lines_unreadable: "bill lines unreadable",
-    po_has_no_lines: "PO has no lines",
-    po_prices_missing: "PO has no prices",
-    no_comparable_lines: "no shared SKUs",
-};
-
-/** `+$41.20` / `−$45` / "" — the dollar side of a variance chip. */
-function fmtImpact(n: number | null | undefined): string {
-    const value = Number(n || 0);
-    if (Math.abs(value) < 0.01) return "";
-    return ` ${value > 0 ? "+" : "−"}$${Math.abs(value).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-}
-
 /**
  * Delivery-vs-bill badge (2026-11-03) — the receiving desk's answer, in one
  * glance. Always the same three words: LOAD, HOLD, or REVIEW.
@@ -351,65 +334,6 @@ function DeliveryBillBadge({ v }: { v: NonNullable<ReceivedPO["_reconciliation"]
             {v.disposition.toUpperCase()}
             {amount}
         </span>
-    );
-}
-
-/**
- * 3-way match chips (WS4, 2026-10-29).
- *
- * The Receivings row used to say "matched" whenever a vendor_invoices row
- * pointed at the PO — regardless of whether anything had been compared. Now the
- * row says READY only when the gate passed with an empty variance list, and
- * otherwise names the one thing that differs (freight / tax / fee / sku /
- * price / qty). "Cannot verify" is its own state, never a pass.
- */
-function ThreeWayChips({ tw }: { tw: NonNullable<ReceivedPO["_reconciliation"]>["threeWay"] }) {
-    if (!tw) return null;
-
-    if (tw.canComplete) {
-        return (
-            <span
-                data-testid="threeway-ready"
-                className="text-[10px] font-mono text-emerald-400 border border-emerald-500/40 bg-emerald-500/10 px-1 rounded"
-                title={tw.summary}
-            >
-                READY
-            </span>
-        );
-    }
-
-    if (tw.verdict === "incomplete") {
-        const reason = THREE_WAY_INCOMPLETE_LABEL[String(tw.incompleteReason || "")] || "cannot verify";
-        return (
-            <span
-                data-testid="threeway-incomplete"
-                className="text-[10px] font-mono text-zinc-400 border border-zinc-700/60 bg-zinc-800/40 px-1 rounded"
-                title={tw.summary}
-            >
-                3-way: {reason}
-            </span>
-        );
-    }
-
-    return (
-        <>
-            {tw.variances.map((v) => (
-                <span
-                    key={`${v.bucket}-${v.source}`}
-                    data-testid={`threeway-chip-${v.bucket}`}
-                    className={
-                        v.blocking
-                            ? "text-[10px] font-mono text-rose-300 border border-rose-500/40 bg-rose-500/10 px-1 rounded"
-                            : "text-[10px] font-mono text-amber-300 border border-amber-500/40 bg-amber-500/10 px-1 rounded"
-                    }
-                    title={v.messages.join(" · ")}
-                >
-                    {v.bucket}
-                    {v.count > 1 ? ` ×${v.count}` : ""}
-                    {fmtImpact(v.dollarImpact)}
-                </span>
-            ))}
-        </>
     );
 }
 
@@ -1094,12 +1018,9 @@ export default function ReceivedItemsPanel({ embedded = false }: ReceivedItemsPa
                                                     </span>
                                                 );
                                             })()}
-                                            {/* WS4: the verdict sits next to the bill it judges. */}
+                                            {/* One verdict per row: LOAD / HOLD / REVIEW (delivery-bill). */}
                                             {po._reconciliation?.deliveryBill && (
                                                 <DeliveryBillBadge v={po._reconciliation.deliveryBill} />
-                                            )}
-                                            {po._reconciliation?.matchedInvoice && (
-                                                <ThreeWayChips tw={po._reconciliation.threeWay} />
                                             )}
                                             {!po._reconciliation?.matchedInvoice && po._reconciliation?.coveringBill && (
                                                 <span className="text-[10px] font-mono text-cyan-300/70">
