@@ -169,7 +169,8 @@ function isFromUs(fromHeader: string): boolean {
 /**
  * Run one pass of the PO reply watcher.
  *
- * 1. Queries po_sends for unacknowledged sends (last 21 days, has gmail_message_id)
+ * 1. Queries po_sends for unacknowledged sends (last 30 days AND any open PO
+ *    with a future planned date, has gmail_message_id)
  * 2. For each, resolves gmail_thread_id (backfill if missing)
  * 3. Checks the Gmail thread for vendor replies
  * 4. Updates purchase_orders + po_lifecycle_transitions on detection
@@ -187,7 +188,7 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
     }
 
     const cutoff = new Date(Date.now() - LOOKBACK_DAYS * 86400_000).toISOString();
-    const { data: sends, error: sendErr } = await supabase
+    const { data: recentSends, error: sendErr } = await supabase
         .from("po_sends")
         .select("po_number, vendor_name, sent_to_email, sent_at, gmail_message_id, gmail_thread_id")
         .gte("sent_at", cutoff)
@@ -195,10 +196,33 @@ export async function runPOReplyWatcher(): Promise<VendorReplyDetection[]> {
         .order("sent_at", { ascending: false })
         .limit(100);
 
-    if (sendErr || !sends) {
+    if (sendErr || !recentSends) {
         console.warn("[po-reply-watcher] Failed to fetch po_sends:", sendErr?.message);
         return detections;
     }
+
+    // ── 1b. Open POs with a future planned date — watch until it passes ──
+    // A PO sent long ago but still planned inbound must still be watched for a
+    // vendor date update (RAP101/125283: sent 9/9, planned 11/16, outside the
+    // LOOKBACK_DAYS window). Future required_date + no receipt = still inbound.
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: plannedRows } = await supabase
+        .from("purchase_orders")
+        .select("po_number")
+        .gte("required_date", today)
+        .is("receive_date", null)
+        .limit(200);
+    const plannedNumbers = ((plannedRows ?? []) as Array<{ po_number: string }>).map((r) => r.po_number);
+    const { data: plannedSends } = plannedNumbers.length > 0
+        ? await supabase
+            .from("po_sends")
+            .select("po_number, vendor_name, sent_to_email, sent_at, gmail_message_id, gmail_thread_id")
+            .in("po_number", plannedNumbers)
+            .not("gmail_message_id", "is", null)
+            .order("sent_at", { ascending: false })
+        : { data: [] };
+
+    const sends = [...(recentSends ?? []), ...(plannedSends ?? [])];
 
     if (sends.length === 0) {
         return detections;
