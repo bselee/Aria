@@ -24,6 +24,14 @@ describe("isFreightRequiredVendor", () => {
         expect(isFreightRequiredVendor("")).toBe(false);
         expect(isFreightRequiredVendor(null)).toBe(false);
     });
+
+    it("flags Safe Solutions, which ships on our FedEx parcel account", () => {
+        // Their QuickBooks invoice prints "Free FedEx Shipping"; the carriage is
+        // billed to us directly, so the PO cannot close at $0 freight.
+        expect(isFreightRequiredVendor("Safe Solutions, Inc.")).toBe(true);
+        expect(isFreightRequiredVendor("SafeSolutions")).toBe(true);
+        expect(isFreightRequiredVendor('"Safe Solutions, Inc."')).toBe(true);
+    });
 });
 
 describe("freightOnPo", () => {

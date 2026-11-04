@@ -69,6 +69,25 @@ describe("classifyVendorFreightPattern — Will-known overrides", () => {
         expect(classifyVendorFreightPattern("MILES, INC.", []).pattern).toBe("no_freight");
         expect(classifyVendorFreightPattern("rootwise inc", []).pattern).toBe("bas_freight");
     });
+
+    it("matches Finale's space-stripped vendor names", () => {
+        // Finale stores this vendor as "SafeSolutions" (no space) — the PO's
+        // supplier field, and what the receivings panel prints.
+        const r = classifyVendorFreightPattern("SafeSolutions", []);
+        expect(r.pattern).toBe("bas_freight");
+        expect(r.source).toBe("override");
+    });
+
+    it("matches Safe Solutions under any punctuation variant", () => {
+        for (const name of [
+            "Safe Solutions, Inc.",
+            '"Safe Solutions, Inc."',
+            "safe solutions",
+            "SAFESOLUTIONS LLC",
+        ]) {
+            expect(classifyVendorFreightPattern(name, []).pattern).toBe("bas_freight");
+        }
+    });
 });
 
 // ── Historical classification ──────────────────────────────────────────────

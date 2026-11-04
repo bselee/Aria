@@ -85,6 +85,15 @@ export const VENDOR_PATTERN_OVERRIDES: Array<{
     // ~11-13% of goods). reconcile-invoice-freight.ts lands the PPD-ADD amount.
     { match: "stock bag",      pattern: "no_freight",     note: "Free freight on bag orders >= $400 (vendor pays, no COLLECT bill); under $400 the vendor prepays and PPD-ADDs the freight on their invoice -> reconcile-invoice-freight.ts adds it to the PO" },
     { match: "new moon",       pattern: "no_freight",     note: "Bill 2026-09-28: no freight to attach" },
+    // Safe Solutions (TweetMint Plant Wash) ships on OUR FedEx parcel account —
+    // the label is bill-recipient, account ...5250 — while their QuickBooks
+    // invoice prints "Free FedEx Shipping". Both are true: they charge us $0
+    // freight, and FedEx bills us directly (Ground, 12-18% of a small order).
+    // Seen on 9169 (PO 125394): $14.44 Ground, 14 lb, Howard City MI -> Montrose.
+    // Do not read freight off their invoice and do not treat $0 as landed cost:
+    // join the FedEx Billing Online parcel invoice by tracking number, then put
+    // that amount on the PO. Freight-required gate blocks completion until it lands.
+    { match: "safe solutions", pattern: "bas_freight",    note: "Uses our BAS FedEx parcel account (bill recipient, ...5250); invoice prints 'Free FedEx Shipping' but carriage bills to us ~5-9d after delivery via FedEx Billing Online - join by tracking number, never read freight off their invoice" },
     { match: "rootwise",       pattern: "bas_freight",    note: "FedEx COLLECT multi-delivery; each receive noted on receiving; one FREIGHT line per PRO/invoice via reconcile-fedex / ltlselect" },
     { match: "uline",          pattern: "bas_freight",    note: "Ship Via MUST be Freight Collect FEDEX FREIGHT (Uline calls FedEx). Bill → general FedEx Billing Online, NOT LTL Select. PO# on FedEx bill → reconcile-fedex. $1.50 = Uline house charge. Any other ship method → on Uline invoice, manual." },
     // Colorful Packaging (China) — DDP shipping included on their invoice as a separate line.
@@ -92,10 +101,32 @@ export const VENDOR_PATTERN_OVERRIDES: Array<{
     { match: "colorful",       pattern: "vendor_freight", note: "Will-confirmed: overseas DDP, vendor includes freight on their CC invoice" },
 ];
 
+/**
+ * Alphanumeric-only vendor key, so `Safe Solutions, Inc.`, Finale's
+ * `SafeSolutions`, and an email display name all collapse to one policy key.
+ */
+export function normalizeVendorName(name: string | null | undefined): string {
+    return String(name ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * True when a vendor name matches an override key — either as a raw
+ * case-insensitive substring (`Stock Bag` in `Stock Bag Depot`) or on the
+ * space/punctuation-stripped form (`safe solutions` vs `SafeSolutions`).
+ * Finale stores many vendors with the spaces removed, so a raw substring test
+ * alone silently misses them.
+ */
+export function matchesVendorKey(key: string, vendorName: string | null | undefined): boolean {
+    const lc = String(vendorName ?? "").toLowerCase();
+    if (!lc) return false;
+    if (lc.includes(key)) return true;
+    const nk = normalizeVendorName(key);
+    return nk.length > 0 && normalizeVendorName(lc).includes(nk);
+}
+
 function findOverride(vendorName: string): typeof VENDOR_PATTERN_OVERRIDES[number] | null {
-    const lc = (vendorName || "").toLowerCase();
     for (const o of VENDOR_PATTERN_OVERRIDES) {
-        if (lc.includes(o.match)) return o;
+        if (matchesVendorKey(o.match, vendorName)) return o;
     }
     return null;
 }

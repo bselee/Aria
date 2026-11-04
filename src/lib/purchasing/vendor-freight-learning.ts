@@ -18,6 +18,7 @@
 import { createClient } from "../db";
 import {
     classifyVendorFreightPattern,
+    matchesVendorKey,
     VENDOR_PATTERN_OVERRIDES,
     type PatternEvidence,
     type FreightPattern,
@@ -209,7 +210,7 @@ export async function getVendorFreightClassification(
 ): Promise<FreightLearningResult> {
     // 1. Check hardcoded overrides
     const override = VENDOR_PATTERN_OVERRIDES.find(o =>
-        vendorName.toLowerCase().includes(o.match),
+        matchesVendorKey(o.match, vendorName),
     );
     if (override) {
         return {

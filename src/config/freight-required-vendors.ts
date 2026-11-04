@@ -25,6 +25,12 @@ const FREIGHT_REQUIRED = [
     "international molasses",
     "int molasses",
     "lind marine",
+    // Safe Solutions (TweetMint) ships on OUR FedEx parcel account (bill
+    // recipient, ...5250) while its QuickBooks invoice prints "Free FedEx
+    // Shipping" — that is the vendor's own free-shipping rate, not carriage-free.
+    // The charge lands on our FedEx Billing Online invoice days after delivery,
+    // so the PO must not close with freight at $0. Bill 2026-11-04.
+    "safe solutions",
 ];
 
 function norm(name: string): string {
