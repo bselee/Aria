@@ -37,6 +37,11 @@ import {
     skusFromInvoiceLines,
 } from "@/lib/purchasing/uline-invoice-repair";
 import type { PoMatchMethod } from "@/lib/purchasing/po-match-provenance";
+import {
+    scoreUnitPriceProof,
+    pricedInvoiceLines,
+    type UnitPricePoRow,
+} from "@/lib/purchasing/invoice-line-price-match";
 
 export { sanitizeOcrPoCandidate };
 
@@ -97,8 +102,10 @@ export interface InvoiceToMatch {
     freight: number;
     tax: number;
     total: number;
-    /** Optional line items from OCR or invoice cache. Used for line-level matching. */
-    lineItems?: Array<{ sku?: string; qty?: number; unitPrice?: number; description?: string }>;
+    /** Optional line items from OCR or invoice cache. Used for line-level matching.
+     *  Accepts both the DB snake_case (`unit_price`, `quantity`) and the
+     *  camelCase (`unitPrice`) shape so callers can pass `line_items` verbatim. */
+    lineItems?: Array<{ sku?: string; qty?: number; quantity?: number; unitPrice?: number; unit_price?: number; description?: string }>;
     /** Raw OCR-extracted PO number candidate from invoice PDF/email data.
      *  Sanitized by sanitizeOcrPoCandidate for exact-match lookup. */
     ocrPoCandidate?: string | null;
@@ -760,6 +767,83 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
     }
 
+    // ── Unit-price proof (2026-11-04) ─────────────────────────────────────
+    // A vendor can hold several open POs at different unit prices (Colorado
+    // Worm: COWOCO2 @ $20 vs COWOCO1 @ $10 vs COWOCO3 @ $40). When an invoice
+    // carries no SKU and no printed PO but prints a unit price, the price is
+    // the goods' identity: `100 x $20` belongs to the $20 line's PO. Runs for
+    // ANY vendor (not just Uline). A unique conclusive hit (one PO matches
+    // every priced line) is auto-apply — the price overlap is deterministic,
+    // unlike a vendor+date guess.
+    let unitPriceWinner: string | null = null;
+    if (pricedInvoiceLines(invoice.lineItems ?? []).length > 0) {
+        const vendorPoNumbers = [
+            ...new Set(
+                (pos || []).map((p) => String(p?.po_number ?? "").trim()).filter(Boolean),
+            ),
+        ].slice(0, 40);
+        if (vendorPoNumbers.length > 0) {
+            try {
+                const { data: poLineRows, error: poLineErr } = await db
+                    .from("purchase_orders")
+                    .select("po_number, vendor_name, issue_date, total_amount, total, status, line_items")
+                    .in("po_number", vendorPoNumbers);
+                if (poLineErr) {
+                    console.warn(
+                        `[invoice-po-matcher] unit-price line read failed: ${poLineErr.message}`,
+                    );
+                }
+                const priceHits = scoreUnitPriceProof(
+                    invoice.lineItems ?? [],
+                    (poLineRows || []) as UnitPricePoRow[],
+                );
+                const conclusive = priceHits.filter((h) => h.matchedAllLines);
+                for (const hit of priceHits) {
+                    const reason = `exact unit-price match: ${hit.matchedUnitPrices.map((p) => `$${p}`).join(", ")}`;
+                    const existing = candidates.find((c) => c.orderId === hit.poNumber);
+                    if (existing) {
+                        // Relabel only when the price hit is at least as strong
+                        // as what the candidate already was (a 95 confirmed hit
+                        // stays 'confirmed').
+                        if (existing.score < 90) existing.matchMethod = "unit_price_exact";
+                        if (hit.matchedAllLines) existing.score = Math.max(existing.score, 90);
+                        if (!existing.reasons.some((r) => r.includes("exact unit-price match"))) {
+                            existing.reasons.push(reason);
+                        }
+                    } else {
+                        candidates.push({
+                            orderId: hit.poNumber,
+                            vendorName: hit.vendorName,
+                            orderDate: hit.orderDate,
+                            total: hit.total,
+                            status: hit.status,
+                            score: hit.matchedAllLines ? 90 : 70,
+                            reasons: [reason, "unit-price match on PO line items"],
+                            isOpen: ["open", "partial", "committed", "locked"].includes(
+                                hit.status.toLowerCase(),
+                            ),
+                            matchMethod: "unit_price_exact",
+                        });
+                    }
+                }
+                // One conclusive PO (matches every priced line) is auto-apply;
+                // several means the price recurs across POs and a human picks.
+                if (conclusive.length === 1) unitPriceWinner = conclusive[0].poNumber;
+                if (priceHits.length > 0) {
+                    console.log(
+                        `[invoice-po-matcher] unit-price proof: ` +
+                            priceHits.map((h) =>
+                                `${h.poNumber}(${h.matchedUnitPrices.map((p) => `$${p}`).join("/")}${h.matchedAllLines ? "*" : ""})`,
+                            ).join(", "),
+                    );
+                }
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.warn(`[invoice-po-matcher] unit-price proof failed: ${msg}`);
+            }
+        }
+    }
+
     candidates.sort((a, b) => b.score - a.score);
     const bestMatch = candidates.length > 0 ? candidates[0] : null;
     let autoApplyReady = candidates.length === 1
@@ -769,6 +853,12 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // The exact-SKU winner is high-confidence when it is also the top candidate
     // and the bill carries a real amount.
     if (ulineSkuWinner && invoice.total > 0 && candidates[0]?.orderId === ulineSkuWinner) {
+        autoApplyReady = true;
+    }
+
+    // The unique unit-price winner is high-confidence when it is also the top
+    // candidate and the bill carries a real amount.
+    if (unitPriceWinner && invoice.total > 0 && candidates[0]?.orderId === unitPriceWinner) {
         autoApplyReady = true;
     }
 

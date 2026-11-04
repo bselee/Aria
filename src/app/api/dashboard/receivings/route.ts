@@ -469,6 +469,32 @@ function invoiceLinesForThreeWay(
     return out;
 }
 
+/** Coerce `vendor_invoices.line_items` (JSONB array or JSON string) to an array. */
+function coerceLineItemsArray(lineItems: string | InvoiceLineItem[] | null | undefined): InvoiceLineItem[] {
+    if (Array.isArray(lineItems)) return lineItems;
+    if (typeof lineItems === "string") {
+        try {
+            const parsed: unknown = JSON.parse(lineItems);
+            return Array.isArray(parsed) ? (parsed as InvoiceLineItem[]) : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
+}
+
+/**
+ * The line items to feed the matcher's unit-price proof: the `line_items`
+ * column first (where OCR-priced lines live), falling back to
+ * `raw_data.lineItems`. Returns the DB snake_case shape (unit_price), which
+ * the matcher reads verbatim.
+ */
+function matchableInvoiceLines(inv: Pick<VendorInvoiceRow, 'line_items' | 'raw_data'>): InvoiceLineItem[] {
+    const fromColumn = coerceLineItemsArray(inv.line_items);
+    if (fromColumn.length > 0) return fromColumn;
+    return inv.raw_data?.lineItems || [];
+}
+
 export async function GET(req: NextRequest) {
     // ── Outer guard: the route MUST NEVER hang the socket ──
     // HERMIA(2026-08-06): Dropped 45s → 20s. Panel paint budget is ~5–8s;
@@ -819,7 +845,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                 try {
                     const { data } = (await sb
                         .from('vendor_invoices')
-                        .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, source, source_ref')
+                        .select('id, invoice_number, vendor_name, invoice_date, subtotal, freight, tax, total, raw_data, source, source_ref, line_items')
                         .is('po_number', null)
                         .in('vendor_name', vendorNames)
                         .order('created_at', { ascending: false })
@@ -999,7 +1025,7 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                                 freight: Number(inv.freight || 0),
                                                 tax: Number(inv.tax || 0),
                                                 total: Number(inv.total || 0),
-                                                lineItems: inv.raw_data?.lineItems || [],
+                                                lineItems: matchableInvoiceLines(inv),
                                                 ocrPoCandidate: inv.raw_data?.ocrPoCandidate || inv.raw_data?.poNumber || null,
                                                 ocrOrderCandidate: inv.raw_data?.orderNumber || null,
                                             });

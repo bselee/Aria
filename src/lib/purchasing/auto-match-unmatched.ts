@@ -50,6 +50,21 @@ export interface AutoMatchSummary {
 
 const DEFAULT_BATCH_SIZE = 100;
 
+/** Coerce `vendor_invoices.line_items` (JSONB array or JSON string) to an array
+ *  for the matcher's unit-price proof. Returns the DB snake_case shape. */
+function coerceLineItems(lineItems: unknown): Array<Record<string, unknown>> {
+    if (Array.isArray(lineItems)) return lineItems as Array<Record<string, unknown>>;
+    if (typeof lineItems === "string") {
+        try {
+            const parsed: unknown = JSON.parse(lineItems);
+            return Array.isArray(parsed) ? (parsed as Array<Record<string, unknown>>) : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
+}
+
 // ── Load unmatched invoices ────────────────────────────────────────────────
 
 /**
@@ -72,7 +87,7 @@ export async function loadUnmatchedInvoicesForAutoMatch(
     // no_po_required is not explicitly true.
     const { data: invoices, error } = await db
         .from("vendor_invoices")
-        .select("id, invoice_number, vendor_name, total, subtotal, freight, tax, invoice_date, created_at, po_number, no_po_required, status, source, source_ref")
+        .select("id, invoice_number, vendor_name, total, subtotal, freight, tax, invoice_date, created_at, po_number, no_po_required, status, source, source_ref, line_items")
         .or("po_number.is.null,po_number.eq.,status.eq.unmatched")
         .or("no_po_required.is.null,no_po_required.eq.false")
         .order("created_at", { ascending: false })
@@ -139,6 +154,7 @@ export async function loadUnmatchedInvoicesForAutoMatch(
             freight: Number(inv.freight ?? 0),
             tax: Number(inv.tax ?? 0),
             total: Number(inv.total ?? 0),
+            lineItems: coerceLineItems((inv as any).line_items),
             ocrPoCandidate,
             ocrOrderCandidate,
         });

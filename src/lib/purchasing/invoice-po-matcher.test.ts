@@ -721,6 +721,107 @@ describe("findPOCandidates with Tier A auto-match", () => {
         expect(result.candidates.some(c => c.orderId === "124424")).toBe(false);
     });
 
+    it("auto-applies by unit price when the invoice has no SKU or printed PO (Colorado Worm 19500 → 125467)", async () => {
+        // Colorado Worm 19500 ($2000 = 100 x $20, Nov 2). Three open POs at
+        // three different unit prices; the $20 line identifies 125467.
+        const invoice: InvoiceToMatch = {
+            id: "inv-19500",
+            invoiceNumber: "19500",
+            vendorName: "Colorado Worm Company",
+            invoiceDate: "2026-11-02",
+            subtotal: 2000,
+            freight: 0,
+            tax: 0,
+            total: 2000,
+            lineItems: [{ qty: 100, unit_price: 20 }],
+        };
+
+        stubDbForPoSearch([
+            {
+                po_number: "125467",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-11-03",
+                total_amount: 9000,
+                total: 9000,
+                status: "Committed",
+                line_items: [{ quantity: "450", productId: "COWOCO2", unitPrice: 20, remainingQty: 450 }],
+            },
+            {
+                po_number: "125450",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-10-28",
+                total_amount: 3250,
+                total: 3250,
+                status: "Committed",
+                line_items: [{ quantity: "325", productId: "COWOCO1", unitPrice: 10, remainingQty: 325 }],
+            },
+            {
+                po_number: "125441",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-10-15",
+                total_amount: 8000,
+                total: 8000,
+                status: "Committed",
+                line_items: [{ quantity: "200", productId: "COWOCO3", unitPrice: 40, remainingQty: 200 }],
+            },
+            {
+                po_number: "125411",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-10-15",
+                total_amount: 4500,
+                total: 4500,
+                status: "Committed",
+                line_items: [{ quantity: "225", productId: "COWOCO2", unitPrice: 20, remainingQty: 0 }],
+            },
+        ]);
+
+        const result = await findPOCandidates(invoice);
+
+        expect(result.bestMatch!.orderId).toBe("125467");
+        expect(result.bestMatch!.matchMethod).toBe("unit_price_exact");
+        expect(result.autoApplyReady).toBe(true);
+    });
+
+    it("does not auto-apply when the unit price recurs across two open POs", async () => {
+        // Same $20 price on two POs — the price is ambiguous, so a human picks.
+        const invoice: InvoiceToMatch = {
+            id: "inv-amb",
+            invoiceNumber: "AMB",
+            vendorName: "Colorado Worm Company",
+            invoiceDate: "2026-11-02",
+            subtotal: 1000,
+            freight: 0,
+            tax: 0,
+            total: 1000,
+            lineItems: [{ qty: 50, unit_price: 20 }],
+        };
+
+        stubDbForPoSearch([
+            {
+                po_number: "125467",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-11-03",
+                total_amount: 9000,
+                total: 9000,
+                status: "Committed",
+                line_items: [{ quantity: "450", productId: "COWOCO2", unitPrice: 20, remainingQty: 450 }],
+            },
+            {
+                po_number: "125999",
+                vendor_name: "Colorado Worm Company",
+                issue_date: "2026-11-05",
+                total_amount: 2000,
+                total: 2000,
+                status: "Committed",
+                line_items: [{ quantity: "100", productId: "COWOCO2B", unitPrice: 20, remainingQty: 100 }],
+            },
+        ]);
+
+        const result = await findPOCandidates(invoice);
+
+        expect(result.autoApplyReady).toBe(false);
+    });
+
     it("exact OCR match takes priority over confirmed match", async () => {
         const invoice: InvoiceToMatch = {
             id: "inv-priority",
