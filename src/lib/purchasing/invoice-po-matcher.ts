@@ -42,6 +42,12 @@ import {
     pricedInvoiceLines,
     type UnitPricePoRow,
 } from "@/lib/purchasing/invoice-line-price-match";
+import {
+    scoreDescriptionSkuCandidates,
+    isMilesVendorName,
+    resolveMilesDescriptionToSku,
+    type DescriptionPoRow,
+} from "@/lib/purchasing/invoice-description-match";
 
 export { sanitizeOcrPoCandidate };
 
@@ -491,6 +497,12 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         pos = merged;
     }
 
+    // Miles' two-tier price and multi-product blanket POs mean the single-open-
+    // PO fast path and the price tier cannot identify WHICH product an invoice
+    // names — only the description→SKU lane can. Compute the Miles flag early so
+    // the fast path below and the unit-price proof both defer to it.
+    const milesLane = isMilesVendorName(invoice.vendorName) || isMilesVendorName(invoice.senderName);
+
     // ── Current-open-PO fast path (2026-10-28) ─────────────────────────────
     // Bill: an invoice landing for a vendor with exactly one open PO belongs
     // to that PO — bill-as-they-deliver vendors (Miles, CR Minerals, New Moon,
@@ -498,6 +510,10 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // date/amount scoring against the full PO total can never win and the
     // bill sits unmatched. Guard: sane vendor identity, positive total, and
     // the open PO issued within the date window of the invoice.
+    // 2026-11-04: SKIP for Miles — the single open PO is a multi-product blanket
+    // PO, and "belongs to the one open PO" is wrong when the invoiced product is
+    // not on it (watermelon half gallon vs a peach/hemp/comfrey PO). The
+    // description→SKU lane resolves Miles precisely instead.
     //
     // 2026-10-29: this is EVIDENCE, not a trump card. It used to return early
     // at 85, so a human-confirmed vendor→PO pair never surfaced its 95 (or its
@@ -509,7 +525,7 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     if (Number(invoice.total || 0) > 0 && (invoice.vendorName || invoice.senderName)) {
         const openStatuses = new Set(["open", "partial", "committed", "locked", "created", "pending"]);
         const openPos = (pos || []).filter((p: any) => openStatuses.has(String(p.status || "").toLowerCase()));
-        if (openPos.length === 1) {
+        if (openPos.length === 1 && !milesLane) {
             const po = openPos[0];
             const dateScore = scoreDateProximity(invoice.invoiceDate || "", po.issue_date || "");
             if (dateScore.score >= 6) {
@@ -767,6 +783,87 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
         }
     }
 
+    // ── Description→SKU lane (2026-11-04) ──────────────────────────────────
+    // Miles bills by free-text description ("Comfrey Gallon", "Peach half
+    // gallon") with a two-tier price shared across the whole catalog, so the
+    // SKU column (empty) AND the price (every gallon is $24) are both useless
+    // as identity. Resolve the description to its Finale SKU and exact-match
+    // against PO line items, with the same remaining-quantity guard as the
+    // unit-price proof (a fully-received PO is not cover). A unique conclusive
+    // hit auto-applies and takes precedence over the price tier.
+    let descriptionSkuWinner: string | null = null;
+    if (milesLane) {
+        const resolvableLines = (invoice.lineItems ?? []).filter(
+            (li) => resolveMilesDescriptionToSku(li?.description ?? null) !== null,
+        );
+        if (resolvableLines.length > 0) {
+            const vendorPoNumbers = [
+                ...new Set(
+                    (pos || []).map((p) => String(p?.po_number ?? "").trim()).filter(Boolean),
+                ),
+            ].slice(0, 40);
+            if (vendorPoNumbers.length > 0) {
+                try {
+                    const { data: poLineRows, error: poLineErr } = await db
+                        .from("purchase_orders")
+                        .select("po_number, vendor_name, issue_date, total_amount, total, status, line_items")
+                        .in("po_number", vendorPoNumbers);
+                    if (poLineErr) {
+                        console.warn(
+                            `[invoice-po-matcher] description-SKU line read failed: ${poLineErr.message}`,
+                        );
+                    }
+                    const hits = scoreDescriptionSkuCandidates(
+                        invoice.lineItems ?? [],
+                        (poLineRows || []) as DescriptionPoRow[],
+                    );
+                    const conclusive = hits.filter((h) => h.matchedAllLines);
+                    for (const hit of hits) {
+                        const reason = `description→SKU match: ${hit.matchedSkus.join(", ")}`;
+                        const existing = candidates.find((c) => c.orderId === hit.poNumber);
+                        if (existing) {
+                            if (hit.matchedAllLines) {
+                                existing.score = Math.max(existing.score, 90);
+                                existing.matchMethod = "description_sku";
+                            }
+                            if (!existing.reasons.some((r) => r.includes("description→SKU match"))) {
+                                existing.reasons.push(reason);
+                            }
+                        } else {
+                            candidates.push({
+                                orderId: hit.poNumber,
+                                vendorName: hit.vendorName,
+                                orderDate: hit.orderDate,
+                                total: hit.total,
+                                status: hit.status,
+                                score: hit.matchedAllLines ? 90 : 70,
+                                reasons: [reason, "description resolved to Finale SKU"],
+                                isOpen: ["open", "partial", "committed", "locked"].includes(
+                                    hit.status.toLowerCase(),
+                                ),
+                                matchMethod: "description_sku",
+                            });
+                        }
+                    }
+                    // One conclusive PO (matches every resolved line) is
+                    // auto-apply; several means the SKU recurs and a human picks.
+                    if (conclusive.length === 1) descriptionSkuWinner = conclusive[0].poNumber;
+                    if (hits.length > 0) {
+                        console.log(
+                            `[invoice-po-matcher] description→SKU: ` +
+                                hits.map((h) =>
+                                    `${h.poNumber}(${h.matchedSkus.join("/")}${h.matchedAllLines ? "*" : ""})`,
+                                ).join(", "),
+                        );
+                    }
+                } catch (e) {
+                    const msg = e instanceof Error ? e.message : String(e);
+                    console.warn(`[invoice-po-matcher] description→SKU failed: ${msg}`);
+                }
+            }
+        }
+    }
+
     // ── Unit-price proof (2026-11-04) ─────────────────────────────────────
     // A vendor can hold several open POs at different unit prices (Colorado
     // Worm: COWOCO2 @ $20 vs COWOCO1 @ $10 vs COWOCO3 @ $40). When an invoice
@@ -776,7 +873,11 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // every priced line) is auto-apply — the price overlap is deterministic,
     // unlike a vendor+date guess.
     let unitPriceWinner: string | null = null;
-    if (pricedInvoiceLines(invoice.lineItems ?? []).length > 0) {
+    // Miles' two-tier price ($13 half-gallon, $24 gallon) is shared across the
+    // whole catalog, so unit price cannot identify a Miles product — the
+    // description→SKU lane above is the only price/SKU signal for Miles. Never
+    // fall through to a price match that would point at the wrong PO.
+    if (pricedInvoiceLines(invoice.lineItems ?? []).length > 0 && !descriptionSkuWinner && !milesLane) {
         const vendorPoNumbers = [
             ...new Set(
                 (pos || []).map((p) => String(p?.po_number ?? "").trim()).filter(Boolean),
@@ -853,6 +954,12 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // The exact-SKU winner is high-confidence when it is also the top candidate
     // and the bill carries a real amount.
     if (ulineSkuWinner && invoice.total > 0 && candidates[0]?.orderId === ulineSkuWinner) {
+        autoApplyReady = true;
+    }
+
+    // The unique description→SKU winner is high-confidence when it is also the
+    // top candidate and the bill carries a real amount.
+    if (descriptionSkuWinner && invoice.total > 0 && candidates[0]?.orderId === descriptionSkuWinner) {
         autoApplyReady = true;
     }
 
@@ -940,7 +1047,9 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // ── Tier A: Unique vendor + date ±14d ─────────────────────────────────
     // When only one candidate matches the vendor name and is within 14 days,
     // it's high-confidence even if the base score is below threshold.
-    if (!autoApplyReady && candidates.length > 0 && invoice.total > 0) {
+    // Skipped for Miles: a vendor+date guess cannot identify a Miles product
+    // (multi-product blanket PO) — only the description→SKU lane can.
+    if (!autoApplyReady && candidates.length > 0 && invoice.total > 0 && !milesLane) {
         const tightCandidates = candidates.filter(c => {
             if (isDropshipPo(c.orderId)) return false;
             // Vendor score >= 30 (exact, substring, or alias match)
@@ -981,8 +1090,10 @@ export async function findPOCandidates(invoice: InvoiceToMatch): Promise<MatchRe
     // Partial deliveries (Miles, Thrive) must still link. Amount equality is a
     // close gate, not a link gate. If exactly one open PO for this vendor can
     // cover the invoice and was ordered on or before the invoice date, that is
-    // the link.
-    if (!autoApplyReady && invoice.total > 0) {
+    // the link. Skipped for Miles — "can cover by amount" ignores WHICH product
+    // (the multi-product blanket PO covers many SKUs); the description→SKU lane
+    // is the only product-level signal for Miles.
+    if (!autoApplyReady && invoice.total > 0 && !milesLane) {
         const invDay = (invoice.invoiceDate || "").slice(0, 10);
         const covering = candidates.filter(c => {
             if (isDropshipPo(c.orderId)) return false;

@@ -572,7 +572,7 @@ describe("findPOCandidates with Tier A auto-match", () => {
         const invoice: InvoiceToMatch = {
             id: "inv-fastpath-only",
             invoiceNumber: "INV-FP-ONLY",
-            vendorName: "Miles Filippelli",
+            vendorName: "New Moon",
             invoiceDate: "2026-08-20",
             subtotal: 525,
             freight: 0,
@@ -582,7 +582,7 @@ describe("findPOCandidates with Tier A auto-match", () => {
 
         stubDbForPoSearch([{
             po_number: "124900",
-            vendor_name: "Miles Filippelli",
+            vendor_name: "New Moon",
             issue_date: "2026-07-14",
             total_amount: null,
             total: 400,
@@ -814,6 +814,90 @@ describe("findPOCandidates with Tier A auto-match", () => {
                 total: 2000,
                 status: "Committed",
                 line_items: [{ quantity: "100", productId: "COWOCO2B", unitPrice: 20, remainingQty: 100 }],
+            },
+        ]);
+
+        const result = await findPOCandidates(invoice);
+
+        expect(result.autoApplyReady).toBe(false);
+    });
+
+    it("auto-applies a Miles invoice by description→SKU (Peach Half Gallon → 125465)", async () => {
+        // Miles bills by description, no SKU. "Peach Half Gallon" resolves to
+        // BASLPEE103; the open PO 125465 carries it with remaining qty, while
+        // the received 125261 carries it at remainingQty 0.
+        const invoice: InvoiceToMatch = {
+            id: "inv-miles-peach",
+            invoiceNumber: "INV-MILES",
+            vendorName: "Miles Filippelli",
+            invoiceDate: "2026-11-02",
+            subtotal: 650,
+            freight: 0,
+            tax: 0,
+            total: 650,
+            lineItems: [{ qty: 50, sku: "", unit_price: 13, description: "Peach Half Gallon" }],
+        };
+
+        stubDbForPoSearch([
+            {
+                po_number: "125465",
+                vendor_name: "Miles Filippelli",
+                issue_date: "2026-11-02",
+                total_amount: 2600,
+                total: 2600,
+                status: "Committed",
+                line_items: [
+                    { quantity: "100", productId: "BASLPEE103", unitPrice: 13, remainingQty: 100 },
+                    { quantity: "40", productId: "BASLHE105", unitPrice: 13, remainingQty: 40 },
+                ],
+            },
+            {
+                po_number: "125261",
+                vendor_name: "Miles Filippelli",
+                issue_date: "2026-09-02",
+                total_amount: 1980,
+                total: 1980,
+                status: "received",
+                line_items: [
+                    { quantity: "50", productId: "BASLPEE103", unitPrice: 13, remainingQty: 0 },
+                ],
+            },
+        ]);
+
+        const result = await findPOCandidates(invoice);
+
+        expect(result.bestMatch!.orderId).toBe("125465");
+        expect(result.bestMatch!.matchMethod).toBe("description_sku");
+        expect(result.autoApplyReady).toBe(true);
+    });
+
+    it("does not fall through to price for a Miles line whose SKU is on no open PO", async () => {
+        // "watermelon half gallon" resolves to FWE101, which is NOT on 125465
+        // (peach/hemp/comfrey/nettle). The $13 price WOULD match 125465, but a
+        // Miles price match is meaningless — never auto-apply it.
+        const invoice: InvoiceToMatch = {
+            id: "inv-miles-watermelon",
+            invoiceNumber: "INV-MILES-WM",
+            vendorName: "Miles Filippelli",
+            invoiceDate: "2026-11-02",
+            subtotal: 390,
+            freight: 0,
+            tax: 0,
+            total: 390,
+            lineItems: [{ qty: 30, sku: "", unit_price: 13, description: "watermelon half gallon" }],
+        };
+
+        stubDbForPoSearch([
+            {
+                po_number: "125465",
+                vendor_name: "Miles Filippelli",
+                issue_date: "2026-11-02",
+                total_amount: 2600,
+                total: 2600,
+                status: "Committed",
+                line_items: [
+                    { quantity: "100", productId: "BASLPEE103", unitPrice: 13, remainingQty: 100 },
+                ],
             },
         ]);
 

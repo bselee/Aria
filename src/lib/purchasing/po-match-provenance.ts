@@ -26,6 +26,9 @@ import { sanitizeOcrPoCandidate } from "./ocr-po-sanitize";
  *                   overlap against the PO's line items (still deterministic).
  * - `unit_price_exact` — invoice with no SKU/printed PO; matched by exact unit
  *                   price overlap against the PO's line items (deterministic).
+ * - `description_sku` — invoice with no SKU/printed PO; the line's free-text
+ *                   description resolved to a Finale SKU, then exact-matched
+ *                   (deterministic; Miles bills by description).
  * - `confirmed`   — a human previously confirmed this vendor→PO pair
  *                   (confirmed_po_matches), which boosts the candidate.
  * - `vendor_date` — scored on vendor name + date proximity (a guess: verify).
@@ -36,13 +39,14 @@ export type PoMatchMethod =
     | "exact_po"
     | "sku_exact"
     | "unit_price_exact"
+    | "description_sku"
     | "confirmed"
     | "vendor_date"
     | "fast_path"
     | "unknown";
 
 /** Deterministic methods a human can trust without re-checking. */
-const SOLID_METHODS = new Set<PoMatchMethod>(["exact_po", "sku_exact", "unit_price_exact", "confirmed"]);
+const SOLID_METHODS = new Set<PoMatchMethod>(["exact_po", "sku_exact", "unit_price_exact", "description_sku", "confirmed"]);
 
 /** Short chip label + hover text for each method. */
 export const PO_MATCH_METHOD_LABELS: Record<PoMatchMethod, { label: string; title: string }> = {
@@ -57,6 +61,10 @@ export const PO_MATCH_METHOD_LABELS: Record<PoMatchMethod, { label: string; titl
     unit_price_exact: {
         label: "unit price",
         title: "Matched by exact unit-price overlap on the PO lines — deterministic match",
+    },
+    description_sku: {
+        label: "description→SKU",
+        title: "Line description resolved to a Finale SKU, then exact-matched — deterministic match",
     },
     confirmed: {
         label: "confirmed",

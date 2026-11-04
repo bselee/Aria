@@ -116,15 +116,13 @@ export function pricedPoLines(lineItems: unknown): PricedPoLine[] {
         if (!Number.isFinite(unitPrice) || unitPrice <= 0) continue;
 
         const hasRemaining = li.remainingQty !== undefined && li.remainingQty !== null;
-        const hasQuantity = li.quantity !== undefined && li.quantity !== null;
         let remainingQty: number | null = null;
         if (hasRemaining) {
             const r = Number(li.remainingQty);
             remainingQty = Number.isFinite(r) ? r : null;
-        } else if (hasQuantity) {
-            const q = Number(li.quantity);
-            remainingQty = Number.isFinite(q) ? q : null;
         }
+        // No `quantity` fallback: an ABSENT remainingQty means an old PO that
+        // predates remaining tracking (received), not "quantity still owed".
         out.push({ unitPrice, remainingQty });
     }
     return out;
@@ -161,13 +159,11 @@ export function scoreUnitPriceProof(
         for (const inv of priced) {
             const covered = poLines.some((pl) => {
                 if (!pricesMatch(pl.unitPrice, inv.unitPrice)) return false;
-                // Quantity coverage is a secondary guard. Skip it only when one
-                // side is genuinely unknown (invoice qty absent, or PO remaining
-                // absent). A PO line whose remainingQty is explicitly 0 is fully
-                // received and must NOT cover a new bill (125411 vs 125467).
-                if (inv.qty <= 0) return true;
-                if (pl.remainingQty === null) return true;
-                return pl.remainingQty >= inv.qty;
+                // Only an OPEN line covers: remainingQty must be present and > 0.
+                // An absent (null) or zero remainingQty is a received PO — not cover.
+                if (pl.remainingQty === null || pl.remainingQty <= 0) return false;
+                if (inv.qty > 0) return pl.remainingQty >= inv.qty;
+                return true;
             });
             if (covered && !matched.includes(inv.unitPrice)) matched.push(inv.unitPrice);
         }

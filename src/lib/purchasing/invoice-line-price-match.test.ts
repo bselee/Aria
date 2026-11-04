@@ -74,9 +74,9 @@ describe("pricedPoLines", () => {
         ).toEqual([{ unitPrice: 20, remainingQty: 450 }]);
     });
 
-    it("falls back to quantity when remainingQty is absent (string quantity)", () => {
+    it("returns remainingQty null when absent (no quantity fallback)", () => {
         expect(pricedPoLines([{ quantity: "325", unitPrice: 10 }])).toEqual([
-            { unitPrice: 10, remainingQty: 325 },
+            { unitPrice: 10, remainingQty: null },
         ]);
     });
 
@@ -192,9 +192,9 @@ describe("scoreUnitPriceProof", () => {
         expect(hits[0].matchedAllLines).toBe(true);
     });
 
-    it("is lenient when a PO line has no remainingQty or quantity", () => {
-        // No quantity signal at all — the price is the only identity, so the
-        // PO is credited rather than dropped.
+    it("does not credit a PO line with no remainingQty (old received PO)", () => {
+        // No remainingQty field at all — the PO predates remaining tracking
+        // (received), so the price alone must not credit it.
         const pos: UnitPricePoRow[] = [
             {
                 po_number: "125467",
@@ -206,7 +206,6 @@ describe("scoreUnitPriceProof", () => {
             },
         ];
         const hits = scoreUnitPriceProof([{ qty: 100, unit_price: 20 }], pos);
-        expect(hits).toHaveLength(1);
-        expect(hits[0].poNumber).toBe("125467");
+        expect(hits).toHaveLength(0);
     });
 });
