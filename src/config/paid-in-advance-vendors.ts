@@ -6,21 +6,29 @@
  * @created 2026-10-27
  * @deps    none
  *
- * Bill 2026-10-27: Sustainable Village, Cen-Tec, and Axiom are always paid
- * in advance. Colorful Packaging is the same class (credit card, never
- * Bill.com — vendor-memory). Add a name here when Bill names another.
+ * Bill 2026-11-05 (authoritative list): a handful of vendors require
+ * prepayment — Thirsty Earth, Grove Bags, Calyx (Containers/Cure),
+ * Sustainable Village, Axiom (Print), Colorful Packaging. Some charge the
+ * card on file — PSI / Print Source, Cen-Tec, Stock Bag Depot, Rock On.
+ * None of these ever sends a Bill.com invoice, so Receivings must not say
+ * "Awaiting vendor invoice" / "No bill yet" for them.
  */
 
 const PAID_IN_ADVANCE = [
+    // Prepayment before goods ship:
     "sustainable village",
+    "thirsty earth",
+    "grove bags",
+    "calyx",
+    // Card on file (vendor charges the card):
+    "colorful packaging",
+    "axiom",
+    "rock on",
     "cen tec",
     "centec",
-    "axiom",
-    "colorful packaging",
-    // 2026-11-05 (Bill): Thirsty Earth (Shopify) and Rock On (Podium secure
-    // payment link) are paid by credit card — no Bill.com invoice ever arrives.
-    "thirsty earth",
-    "rock on",
+    "print source",
+    "psi",
+    "stock bag depot",
 ];
 
 /** Bills the whole PO before the shipments finish. Invoice number in Bill.com is the PO number. */

@@ -17,6 +17,13 @@ describe("isPaidInAdvanceVendor", () => {
         expect(isPaidInAdvanceVendor("Thirsty Earth")).toBe(true);
         expect(isPaidInAdvanceVendor("Rock On")).toBe(true);
         expect(isPaidInAdvanceVendor("RockOn")).toBe(true);
+        // 2026-11-05 prepayment / card-on-file additions (Bill's authoritative list)
+        expect(isPaidInAdvanceVendor("Grove Bags (Kinzie Advanced Polymers))")).toBe(true);
+        expect(isPaidInAdvanceVendor("Calyx Containers")).toBe(true);
+        expect(isPaidInAdvanceVendor("Calyx Cure")).toBe(true);
+        expect(isPaidInAdvanceVendor("Print Source Inc.")).toBe(true);
+        expect(isPaidInAdvanceVendor("PSI")).toBe(true);
+        expect(isPaidInAdvanceVendor("Stock Bag Depot")).toBe(true);
     });
     it("does not swallow vendors that still invoice", () => {
         expect(isPaidInAdvanceVendor("ULINE")).toBe(false);
