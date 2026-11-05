@@ -14,6 +14,9 @@ describe("isPaidInAdvanceVendor", () => {
         expect(isPaidInAdvanceVendor("CenTec")).toBe(true);
         expect(isPaidInAdvanceVendor("Axiom Print")).toBe(true);
         expect(isPaidInAdvanceVendor("Colorful Packaging Ltd")).toBe(true);
+        expect(isPaidInAdvanceVendor("Thirsty Earth")).toBe(true);
+        expect(isPaidInAdvanceVendor("Rock On")).toBe(true);
+        expect(isPaidInAdvanceVendor("RockOn")).toBe(true);
     });
     it("does not swallow vendors that still invoice", () => {
         expect(isPaidInAdvanceVendor("ULINE")).toBe(false);

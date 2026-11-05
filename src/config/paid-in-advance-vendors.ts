@@ -17,6 +17,10 @@ const PAID_IN_ADVANCE = [
     "centec",
     "axiom",
     "colorful packaging",
+    // 2026-11-05 (Bill): Thirsty Earth (Shopify) and Rock On (Podium secure
+    // payment link) are paid by credit card — no Bill.com invoice ever arrives.
+    "thirsty earth",
+    "rock on",
 ];
 
 /** Bills the whole PO before the shipments finish. Invoice number in Bill.com is the PO number. */
