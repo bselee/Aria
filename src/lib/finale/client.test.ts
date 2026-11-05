@@ -548,22 +548,28 @@ describe("FinaleClient product activity stock parsing", () => {
     });
 
     it("prefers GraphQL stockOnHand when unitsInStock reports zero", async () => {
-        vi.mocked(global.fetch).mockResolvedValueOnce(jsonResponse({
-            data: {
-                purchasedIn: { edges: [] },
-                soldIn: { edges: [] },
-                committedPOs: { edges: [] },
-                stockInfo: {
-                    edges: [{
-                        node: {
-                            stockOnHand: "300",
-                            stockAvailable: "275",
-                            unitsInStock: "0",
-                        },
-                    }],
+        // getProductActivity() now resolves the creation slug first (renamed-product
+        // fix), so the first fetch is the productViewConnection slug lookup.
+        vi.mocked(global.fetch)
+            .mockResolvedValueOnce(jsonResponse({
+                data: { productViewConnection: { edges: [{ node: { productUrl: "/buildasoil/api/product/BOTTLE-1G" } }] } },
+            }) as any)
+            .mockResolvedValueOnce(jsonResponse({
+                data: {
+                    purchasedIn: { edges: [] },
+                    soldIn: { edges: [] },
+                    committedPOs: { edges: [] },
+                    stockInfo: {
+                        edges: [{
+                            node: {
+                                stockOnHand: "300",
+                                stockAvailable: "275",
+                                unitsInStock: "0",
+                            },
+                        }],
+                    },
                 },
-            },
-        }) as any);
+            }) as any);
 
         const client = new FinaleClient();
         const activity = await client.getProductActivity("BOTTLE-1G", 90);

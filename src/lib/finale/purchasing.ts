@@ -523,7 +523,11 @@ export class FinalePurchasingClient extends FinaleProductsClient {
     ): Promise<{ productId: string; previousPrice: number; currentPrice: number; changePct: number; lastPOId: string; lastPODate: string } | null> {
         if (!currentPrice || currentPrice <= 0) return null;
         try {
-            const productUrl = `/${this.accountPath}/api/product/${productId}`;
+            // Resolve the creation slug for renamed products (GLP118 → GLB118),
+            // otherwise orderViewConnection filters on a 404ing slug and price
+            // history is silently empty.
+            const priceSlug = (await this.resolveProductUrlSlug(productId)) ?? productId;
+            const productUrl = `/${this.accountPath}/api/product/${encodeURIComponent(priceSlug)}`;
             const query = {
                 query: `{
                     orderViewConnection(
@@ -947,7 +951,9 @@ export class FinalePurchasingClient extends FinaleProductsClient {
         beginDate.setDate(beginDate.getDate() - daysBack);
         const beginStr = beginDate.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
         const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
-        const productUrl = `/${this.accountPath}/api/product/${actualProductId}`;
+        // Resolve the creation slug for renamed products (GLP118 → GLB118).
+        const consumptionSlug = (await this.resolveProductUrlSlug(actualProductId)) ?? actualProductId;
+        const productUrl = `/${this.accountPath}/api/product/${encodeURIComponent(consumptionSlug)}`;
 
         const gql = {
             query: `query {
@@ -2107,7 +2113,14 @@ export class FinalePurchasingClient extends FinaleProductsClient {
 
         const beginStr = beginDate.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
         const endStr = end.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
-        const productUrl = `/${this.accountPath}/api/product/${sku}`;
+        // BUGFIX(2026-11-05): a renamed product keeps its creation slug (GLP118
+        // still lives at /api/product/GLB118). Building the orderViewConnection
+        // filter from the canonical sku 404s, so committedPOs returns empty, the
+        // recommender under-credits on-order, and the drafter re-orders every day
+        // (GLP118 drafted 125459/125466/125471/125475 while 125440 already had 40
+        // open). Resolve the slug the same way createDraftPurchaseOrder does.
+        const slug = (await this.resolveProductUrlSlug(sku)) ?? sku;
+        const productUrl = `/${this.accountPath}/api/product/${encodeURIComponent(slug)}`;
 
         const query = {
             query: `query {
