@@ -1412,6 +1412,15 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
 
     /** An item is covered if existing PO incoming + stock ≥ lead_time + 30d demand */
         function itemIsCovered(item: PurchasingItem): boolean {
+            // An on-order hold or a recent draft already covers the item — hide it
+            // even when the scan's openPOs list is empty. The route overlay credits
+            // the PO via stockOnOrder/reasonCodes without repopulating openPOs, so
+            // the reasonCodes are the authoritative "covered" signal and must be
+            // checked before the openPOs early-return below.
+            const reasons = item.assessment?.reasonCodes ?? [];
+            if (reasons.includes("on_order_already_covers_need")) return true;
+            if (reasons.includes("recent_draft_exists")) return true;
+
             if (!item.openPOs || item.openPOs.length === 0) return false;
             // Prefer openPOs qty when Finale stockOnOrder lags (common on labels/print).
             const openQty = item.openPOs.reduce((s, po) => s + Math.max(0, po.quantity || 0), 0);
@@ -1423,9 +1432,6 @@ export default function PurchasingPanel({ embedded = false }: PurchasingPanelPro
             if (needed > 0 && (onHand + incoming) >= needed) return true;
             // Also cover when open PO qty alone meets or exceeds Aria's suggested reorder.
             if (openQty >= Math.max(1, item.suggestedQty ?? 1)) return true;
-            // Policy already held for on-order coverage.
-            if ((item.assessment?.reasonCodes ?? []).includes("on_order_already_covers_need")) return true;
-            if ((item.assessment?.reasonCodes ?? []).includes("recent_draft_exists")) return true;
             return false;
         }
 
