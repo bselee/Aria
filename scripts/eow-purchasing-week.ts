@@ -29,6 +29,9 @@ import {
   keepUpcomingAmount,
   lineQtyOf,
   mdFromIso,
+  mdFromIsoYearAware,
+  fgCoverage,
+  fgLabel,
   minRunway,
   mondayOf,
   money,
@@ -45,12 +48,111 @@ import {
   withQty,
   withinDays,
 } from "../src/lib/purchasing/eow-report";
+import { formatDelayNote, isOurOwnSender, pickDelaySentence, stripQuotedText } from "../src/lib/purchasing/delay-evidence";
 import { computeFreightDrift } from "../src/lib/freight/freight-drift";
 import { resolvePoEta } from "../src/lib/purchasing/po-eta";
 import { poolCartonGroups } from "../src/lib/purchasing/carton-pooling";
+import { loadShipmentSignals } from "../src/lib/purchasing/shipment-signal";
+import { leadTimeService } from "../src/lib/builds/lead-time-service";
+import { listActiveSnoozes, isItemSnoozed } from "../src/lib/purchasing/snoozes";
 
 const NUMERIC = /^\d+$/;
 const TO = "bill.selee@buildasoil.com";
+
+/**
+ * Bulk commodities ship by the truckload. A 90-day cover number is meaningless
+ * above one truck, so cap the suggested order and state the cap in the note.
+ * Bill: "at most we would order one truckload."
+ */
+const TRUCKLOAD_CAP: Record<string, { qty: number; label: string }> = {
+  // Bill, 2026-11-10: a Malibu TL runs about 21 totes / 42,000 lb. Varies, but
+  // 42k is the safe ceiling.
+  RAWMALIBUCOMPOST: { qty: 42_000, label: "21 totes / 42,000 lb" },
+};
+/** Dashboard origin. Overridable so the abort path can be exercised in a test. */
+const DASH = (process.env.ARIA_DASH_URL || "http://localhost:3001").replace(/\/$/, "");
+
+/** One vendor's row on the Ordering board, as the panel receives it. */
+type BoardGroup = { vendorName?: string; vendorPartyId?: string; items?: any[] };
+
+/**
+ * Fetch the exact payload the Ordering panel renders.
+ *
+ * The report must never rebuild the board from `.aria-cache` files. The panel's
+ * route applies open-PO crediting, draft guards, carton pooling and the
+ * assessment decision before anything reaches the screen; a cache read silently
+ * drifts from what the buyer sees (it kept showing items the board had credited
+ * and dropped items the board showed as topping up an open PO).
+ *
+ * @returns The board payload, or null when the dashboard is unreachable.
+ */
+async function fetchOrderingBoard(): Promise<{ groups: BoardGroup[] } | null> {
+  const url = `${DASH}/api/dashboard/purchasing?mode=all`;
+  // The dashboard is the source of truth for this list. It may be mid-restart
+  // at 10:00 Friday, so retry briefly — but never fall back to the cache files:
+  // a report built from stale runway numbers is worse than no report.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j: any = await res.json();
+      if (!Array.isArray(j?.groups)) throw new Error("payload has no groups");
+      console.log(`[eow] ordering board: ${j.groups.length} vendors from ${url}`);
+      return { groups: j.groups as BoardGroup[] };
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[eow] ordering board attempt ${attempt}/3 failed: ${msg}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 20_000));
+    }
+  }
+  return null;
+}
+
+/**
+ * Mirror of the panel's `lifecycleBucket`. Ordering shows only `need` and
+ * `topping`; on-order and held items are deliberately invisible there.
+ *
+ * @param it Ordering item row.
+ * @returns The lifecycle bucket the panel would assign.
+ */
+function orderingBucket(it: any): "need" | "topping" | "on_order" | "other" {
+  const reasons: string[] = it?.assessment?.reasonCodes ?? [];
+  if (reasons.includes("on_order_already_covers_need") || reasons.includes("recent_draft_exists")) {
+    return "on_order";
+  }
+  if (it?.draftPO) return "on_order";
+  if (it?.assessment?.decision === "order") {
+    return (Number(it?.stockOnOrder) || 0) > 0 ? "topping" : "need";
+  }
+  return "other";
+}
+/**
+ * Fetch the open-PO set the Active Purchases panel renders.
+ *
+ * Arriving Soon is a delivery schedule, so it must be built from every open PO,
+ * not from the subset that happened to be placed this week.
+ *
+ * @returns Purchase rows, or null when the dashboard is unreachable.
+ */
+async function fetchActivePurchases(): Promise<any[] | null> {
+  const url = `${DASH}/api/dashboard/active-purchases`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j: any = await res.json();
+      if (!Array.isArray(j?.purchases)) throw new Error("payload has no purchases");
+      console.log(`[eow] active purchases: ${j.purchases.length} open POs from ${url}`);
+      return j.purchases;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[eow] active purchases attempt ${attempt}/3 failed: ${msg}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 20_000));
+    }
+  }
+  return null;
+}
+
 const ARIA = path.resolve(__dirname, "..");
 const REPORTS = path.join(ARIA, "reports");
 
@@ -75,7 +177,7 @@ function esc(s: unknown): string {
     .replace(/>/g, "&gt;");
 }
 
-type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string; desc?: string; qty?: string; recvQty?: string; recvVariance?: string; placedIso?: string; plannedReceive?: string; etaIsEstimate?: boolean };
+type Row = { po: string; vendor: string; amount: number; note: string; sku?: string; eta?: string; status?: string; placed?: string; desc?: string; qty?: string; recvQty?: string; recvVariance?: string; placedIso?: string; plannedReceive?: string; etaIsEstimate?: boolean; etaSource?: string; etaIso?: string; risk?: string; slip?: number; etaAdjusted?: string; fg?: { days: number; rawEquiv: number; items: Array<{ sku: string; qty: number }> } };
 
 /** Shorten a Finale product name for the report. Keeps the product identity
  *  and pack size, drops long brand prefixes and redundant suffix punctuation. */
@@ -121,11 +223,11 @@ function table(headers: string[], rows: string[][], total?: string[]): string {
   const WIDTHS: Record<string, string> = {
     PO: "po", Vendor: "vendor", SKU: "sku", Description: "desc", Amount: "amt",
     Placed: "note", ETA: "eta", Status: "stat", Received: "note",
-    "Vendor Response": "note", "Needed by": "note", Note: "note",
+    "Vendor Response": "resp", "Needed by": "note", Note: "note",
     Sent: "note", Issue: "note",
     Product: "vendor", "Old to New": "desc", "Est. Savings/Yr": "eta",
     "Received By": "eta", "Recv Qty": "eta", "±": "var",
-    Item: "vendor", Detail: "desc",
+    Item: "vendor", Detail: "desc", Arrives: "arr", "Covered until": "stock", "FG in stock": "fg",
   };
   const cols = headers.map((h) => `<col class="${WIDTHS[h] || "note"}">`).join("");
   return `<table>
@@ -139,7 +241,8 @@ function table(headers: string[], rows: string[][], total?: string[]): string {
 }
 
 function invoicesSentSummary(n: number): string {
-  return `<p class="summary">(${n}) invoices sent</p>`;
+  // A plain tally, in the words Bill uses. No verdict, no alarm on zero.
+  return `<p class="summary">${n} ${n === 1 ? "invoice" : "invoices"} forwarded from the AP inbox this week</p>`;
 }
 
 function renderHtml(p: {
@@ -153,12 +256,55 @@ function renderHtml(p: {
   upcoming: Row[];
   priceUpdates: Row[];
   research: Row[];
+  arriving: Row[];
+  arrivingWeek1: Row[];
+  arrivingWeek2: Row[];
+  followingFriIso: string;
+  nextMonIso: string;
+  nextFriIso: string;
+  todayIso: string;
 }): string {
   const sum = (rows: Row[]) => rows.reduce((a, r) => a + (r.amount || 0), 0);
-  const md = (iso: string) => {
-    const [, m, d] = iso.split("-");
-    return `${Number(m)}/${Number(d)}`;
+  const todayIso = p.todayIso;
+  const md = (iso: string) => mdFromIso(iso);
+  // "Next week" is the Mon–Fri after the report week. The team avoids Friday
+  // arrivals (thin dock crew), so those are counted in the summary line.
+  const nextMon = addDays(p.start, 7);
+  const nextFri = addDays(p.start, 11);
+  const fridayIso = addDays(nextMon, 4);
+  const weekday = (iso: string): string => {
+    if (!iso) return "";
+    const d = new Date(`${iso.slice(0, 10)}T12:00:00Z`);
+    return Number.isNaN(d.getTime()) ? "" : ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()];
   };
+  const etaSourceLabel = (src?: string): string =>
+    src === "delivered" ? "Delivered, await receive"
+      : src === "carrier" ? "Tracking"
+      : src === "vendor" ? "Vendor confirmed"
+      : src === "finale_planned" ? "Vendor plan"
+      : src === "lead_time" ? "History"
+      : "Default";
+  // Arriving rows: a bare date when it is real evidence, "~" when it is
+  // estimate-derived. The vendor's slip is already baked into the date, so the
+  // team reads one number instead of a date plus an arithmetic prompt.
+  const ARRIVE_HEAD = ["PO", "Vendor", "SKU", "Description", "Arrives", "Covered until"];
+  const arriveRows = (rows: Row[]) =>
+    rows.map((r) => {
+      const real = r.etaSource === "delivered" || r.etaSource === "carrier" || r.etaSource === "vendor";
+      // One date is the vendor's own expectation; when that vendor's history
+      // says it slips, the planning date follows the arrow. Two dates read as a
+      // sentence; "11/20 (+4d)" made the team do arithmetic.
+      const slipped = r.etaAdjusted && r.etaIso && r.etaAdjusted !== r.etaIso;
+      return [
+        r.po,
+        r.vendor,
+        withQty(r.sku || "", r.qty || ""),
+        r.desc || "",
+        `${real ? "" : "~"}${weekday(r.etaIso || "")} ${mdFromIsoYearAware(r.etaIso || "", todayIso)}${slipped ? ` → ${mdFromIsoYearAware(r.etaAdjusted || "", todayIso)}` : ""}`,
+        r.risk || "",
+      ];
+    });
+  const arriveTable = (rows: Row[]) => table(ARRIVE_HEAD, arriveRows(rows));
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -176,6 +322,11 @@ function renderHtml(p: {
   tr:nth-child(even) td { background: #f8f8f8; }
   .po { width: 8%; } .vendor { width: 14%; } .sku { width: 15%; } .desc { width: 16%; } .amt { width: 10%; text-align: right; white-space: nowrap; }
   th.amt { text-align: right; color: #fff; } .note { width: 9%; } .eta { width: 8%; } .stat { width: 14%; }
+  /* Vendor Response carries a quoted sentence — give it the width or it stacks
+     five lines tall and pushes the report onto a third page. */
+  .resp { width: 30%; } .stock { width: 13%; } .arr { width: 11%; } .fg { width: 14%; }
+  .legend { font-size: 7.5pt; color: #6b7280; margin: 2px 0 0; }
+  h3 { font-size: 8.5pt; font-weight: 600; margin: 6px 0 2px; color: #374151; page-break-after: avoid; }
   .var { width: 14%; }
   .total-row td { font-weight: 600; background: #eee !important; }
   .keep { page-break-inside: avoid; }
@@ -203,6 +354,12 @@ ${table(["PO", "Vendor", "SKU", "Description", "Amount", "Received", "Received B
 ${table(["PO", "Vendor", "SKU", "Description", "Amount", "Placed", "Vendor Response"], p.delayed.map((r) => [r.po, r.vendor, withQty(r.sku || "", r.qty || ""), r.desc || "", r.amount ? money(r.amount) : "", r.placed || "", r.note]))}
 </div>
 <div class="keep">
+<h2>Arriving Soon</h2>
+<p class="summary">${p.arriving.length} POs over two weeks${p.arriving.filter((r) => r.etaIso === fridayIso).length ? ` · ${p.arriving.filter((r) => r.etaIso === fridayIso).length} on Friday ${md(fridayIso)}` : ""}</p>
+${p.arrivingWeek1.length ? `<h3>Next week · Mon ${md(p.nextMonIso)} - Fri ${md(p.nextFriIso)}</h3>${arriveTable(p.arrivingWeek1)}` : ""}
+${p.arrivingWeek2.length ? `<h3>Week after · Mon ${md(addDays(p.nextFriIso, 3))} - Fri ${md(p.followingFriIso)}</h3>${arriveTable(p.arrivingWeek2)}` : ""}
+</div>
+<div class="keep">
 <h2>Invoices to Bill.com</h2>
 ${invoicesSentSummary(p.billVerified.length)}
 </div>
@@ -217,7 +374,7 @@ ${table(["SKU", "Description", "Vendor", "Note"], p.priceUpdates.map((r) => [r.s
 <div class="keep">
 <h2>Upcoming Purchases (Estimated)</h2>
 <p class="summary">Next week estimated · ${money(sum(p.upcoming))}</p>
-${table(["SKU", "Description", "Vendor", "Needed by", "Amount", "Note"], p.upcoming.map((r) => [r.qty ? `${r.sku || r.po} ×${r.qty}` : (r.sku || r.po), r.desc || "", r.vendor, mdFromIso(r.eta || ""), r.amount ? money(r.amount) : "", r.note]))}
+${table(["SKU", "Description", "Vendor", "Needed by", "Amount", "FG in stock", "Note"], p.upcoming.map((r) => [r.qty ? `${r.sku || r.po} ×${r.qty}` : (r.sku || r.po), r.desc || "", r.vendor, mdFromIsoYearAware(r.eta || "", todayIso), r.amount ? money(r.amount) : "", r.fg ? fgLabel(r.fg) : "", r.note]))}
 </div>
 <div class="keep">
 <h2>Research &amp; Pricing Wins</h2>
@@ -276,39 +433,77 @@ function gmailPlain(payload: unknown): string {
 async function gmailDelayThread(
   gmail: Awaited<ReturnType<typeof gmailClient>>,
   po: string
-): Promise<{ lastVendorIso: string | null; emailDueIso: string | null; backorder: boolean }> {
+): Promise<{
+  lastVendorIso: string | null;
+  emailDueIso: string | null;
+  backorder: boolean;
+  quote: string | null;
+  quoteIso: string | null;
+}> {
   const list = await gmail.users.messages.list({
     userId: "me",
     q: `"${po}" -subject:"Purchasing week" -from:calendar-notification`,
     maxResults: 12,
   });
-  let lastVendorIso: string | null = null;
-  let lastVendorId: string | null = null;
+
+  // Read each message ONCE, in full. The metadata format returned empty header
+  // arrays on this mailbox, so every mail looked like a vendor mail and our own
+  // "any update?" nudges were quoted as the vendor's answer. `SENT` is the
+  // reliable discriminator; the From header is the fallback.
+  const vendor: Array<{ iso: string; body: string }> = [];
   for (const m of list.data.messages || []) {
-    const d = await gmail.users.messages.get({
-      userId: "me",
-      id: m.id!,
-      format: "metadata",
-      metadataHeaders: ["From", "Date"],
-    });
-    const from = hdr(d.data.payload?.headers, "From");
-    const dateIso = iso(hdr(d.data.payload?.headers, "Date"));
-    if (FROM_US.test(from) || !dateIso) continue;
-    if (!lastVendorIso || dateIso > lastVendorIso) {
-      lastVendorIso = dateIso;
-      lastVendorId = m.id || null;
+    const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "full" });
+    const labels = full.data.labelIds || [];
+    const from = hdr(full.data.payload?.headers, "From");
+    if (labels.includes("SENT") || isOurOwnSender(from)) continue;
+    const ms = Number(full.data.internalDate || 0);
+    if (!ms) continue;
+    vendor.push({ iso: new Date(ms).toISOString().slice(0, 10), body: gmailPlain(full.data.payload) });
+  }
+  vendor.sort((a, b) => b.iso.localeCompare(a.iso));
+
+  let quote: string | null = null;
+  let quoteIso: string | null = null;
+  let quoteScore = -1;
+  let emailDueIso: string | null = null;
+  let backorder = false;
+
+  // Prefer the sentence that names a date and a commitment ("ETA", "ship date",
+  // "backorder") over a passing mention, and only ever quote a sentence that
+  // survives `pickDelaySentence` on the vendor's own text.
+  const score = (s: string): number => {
+    let n = 0;
+    if (/\beta\b|ship[- ]date|backorder|back order/i.test(s)) n += 2;
+    if (/\d{1,2}\/\d{1,2}|january|february|march|april|may|june|july|august|september|october|november|december/i.test(s)) n += 2;
+    if (/\b(arriv|ship|deliver)/i.test(s)) n += 1;
+    return n;
+  };
+
+  for (const v of vendor) {
+    // Only the vendor's own, unquoted text counts as evidence — otherwise our
+    // own follow-up questions come back as quotes.
+    const bodyOwn = stripQuotedText(v.body);
+    const own = vendorReplyOwnText(v.body) || bodyOwn;
+    if (!backorder && /backorder|back order/i.test(bodyOwn)) backorder = true;
+    const due = parseVendorDueFromText(bodyOwn);
+    if (!emailDueIso && due) emailDueIso = due;
+    const sentence = pickDelaySentence(own) || pickDelaySentence(bodyOwn);
+    if (sentence) {
+      const s = score(sentence);
+      if (s > quoteScore) {
+        quote = sentence;
+        quoteIso = v.iso;
+        quoteScore = s;
+      }
     }
   }
-  let body = "";
-  if (lastVendorId) {
-    const full = await gmail.users.messages.get({ userId: "me", id: lastVendorId, format: "full" });
-    body = gmailPlain(full.data.payload);
-  }
-  const own = vendorReplyOwnText(body);
+
   return {
-    lastVendorIso,
-    emailDueIso: parseVendorDueFromText(body),
-    backorder: /backorder/i.test(own),
+    lastVendorIso: vendor[0]?.iso ?? null,
+    emailDueIso,
+    backorder,
+    quote,
+    quoteIso,
   };
 }
 
@@ -558,6 +753,16 @@ async function main() {
       [committed.map((r) => r.po)]
     );
     const byPo = new Map<string, any>(meta.rows.map((row: any) => [row.po_number, row]));
+
+    // Real movement evidence: carrier ETA or delivery scan per PO, resolved
+    // across the PO's own tracking numbers as well as shipments.po_numbers.
+    let shipByPo = new Map<string, { deliveredAt: string | null; carrierEta: string | null }>();
+    try {
+      shipByPo = await loadShipmentSignals(committed.map((r) => r.po), today);
+    } catch {
+      /* tracking optional — never block the report */
+    }
+
     for (const r of committed) {
       const m = byPo.get(r.po);
       const life = String(m?.lifecycle_stage || "").toUpperCase();
@@ -565,23 +770,24 @@ async function main() {
       else if (m?.tracking_status_summary) r.status = "In Transit";
       else if (m?.vendor_acknowledged_at) r.status = "Acknowledged";
       else r.status = "Sent";
-      // ETA — same shared resolution the Active Purchases dashboard uses
-      // (po-eta → leadTimeService). A vendor-stated date still wins because
-      // it is the most direct evidence.
-      const vendorEta = iso(m?.vendor_stated_eta);
-      if (vendorEta) {
-        r.eta = mdFromIso(vendorEta);
-        r.etaIsEstimate = false;
-      } else {
-        const eta = await resolvePoEta({
-          vendorName: r.vendor,
-          orderDate: r.placedIso,
-          plannedReceiveDate: r.plannedReceive,
-          today,
-        });
-        r.eta = mdFromIso(eta.date);
-        r.etaIsEstimate = eta.provenance !== "finale_planned";
-      }
+      // ETA — same shared resolution the Active Purchases dashboard uses.
+      // Order: carrier scan → carrier ETA → vendor email → Finale planned →
+      // lead time from the PO date. Real tracking always wins.
+      const ship = shipByPo.get(r.po);
+      const eta = await resolvePoEta({
+        vendorName: r.vendor,
+        orderDate: r.placedIso,
+        plannedReceiveDate: r.plannedReceive,
+        vendorStatedEta: iso(m?.vendor_stated_eta),
+        shipment: ship
+          ? { deliveredAt: ship.deliveredAt, estimatedDeliveryAt: ship.carrierEta }
+          : null,
+        today,
+      });
+      r.eta = mdFromIso(eta.date);
+      r.etaIso = eta.date;
+      r.etaIsEstimate = eta.provenance === "lead_time" || eta.provenance === "fallback";
+      r.etaSource = eta.provenance;
     }
   }
 
@@ -602,9 +808,38 @@ async function main() {
     ORDER BY COALESCE(vendor_stated_eta, required_date) ASC
     LIMIT 20
   `);
-  const skuRunway = new Map<string, number>();
+  // One board, one dataset. Fetch it before anything reads runway so every
+  // number below is the one the Ordering screen renders, not last night's cache.
+  const board = await fetchOrderingBoard();
+  if (!board) {
+    console.error(
+      "[eow] ABORT: the Ordering board is unreachable. Refusing to emit a report whose order list is not the board's."
+    );
+    process.exit(1);
+  }
+  const skuRunway = new Map<string, { combined: number; raw: number; fg: number | null }>();
   try {
-    for (const name of ["api-bust.json", "purchasing-resale.json", "purchasing-bom.json"]) {
+    if (board) {
+      for (const g of board.groups) {
+        for (const it of g.items || []) {
+          const id = String(it.productId || "");
+          if (!id || skuRunway.has(id)) continue;
+          const combined = Number(it.adjustedRunwayDays ?? it.runwayDays);
+          if (!Number.isFinite(combined)) continue;
+          const cov = fgCoverage(it.feedsFinishedGoods, Number(it.dailyRate));
+          skuRunway.set(id, {
+            combined,
+            raw: Number.isFinite(Number(it.runwayDays)) ? Number(it.runwayDays) : combined,
+            fg: cov ? cov.days : null,
+          });
+        }
+      }
+    }
+    // Same two caches the purchasing panel renders. `api-bust.json` is a stale
+    // debug snapshot with different runway numbers — reading it here made the
+    // report's Covered-until disagree with the ordering dashboard for the very
+    // same SKU (CEN102: 175d here vs 67d on the board).
+    for (const name of ["purchasing-resale.json", "purchasing-bom.json"]) {
       const p = path.join(ARIA, ".aria-cache", "purchasing", name);
       if (!fs.existsSync(p)) continue;
       const raw = JSON.parse(fs.readFileSync(p, "utf8"));
@@ -617,9 +852,27 @@ async function main() {
         if (typeof x === "object") {
           const o = x as Record<string, unknown>;
           const id = String(o.productId || o.sku || "");
-          const rw = o.adjustedRunwayDays ?? o.runwayDays;
-          if (id && typeof rw === "number" && Number.isFinite(rw) && !skuRunway.has(id)) {
-            skuRunway.set(id, rw);
+          const rw = Number(o.adjustedRunwayDays ?? o.runwayDays);
+          const rawOnly = Number(o.runwayDays);
+          const daily = Number(o.dailyRate);
+          // Raw components feed finished goods that are already packed and on
+          // the shelf. That shelf is real supply, so show its own date next to
+          // the raw one instead of blending them into a single number nobody
+          // can take apart.
+          let fgDays: number | null = null;
+          if (Array.isArray(o.feedsFinishedGoods) && o.feedsFinishedGoods.length > 0 && daily > 0) {
+            const fgRawEquiv = (o.feedsFinishedGoods as any[]).reduce(
+              (s, f) => s + (Number(f?.stockOnHand) || 0) * (Number(f?.qtyPerUnit) || 0),
+              0
+            );
+            if (fgRawEquiv > 0) fgDays = fgRawEquiv / daily;
+          }
+          if (id && Number.isFinite(rw) && !skuRunway.has(id)) {
+            skuRunway.set(id, {
+              combined: rw,
+              raw: Number.isFinite(rawOnly) ? rawOnly : rw,
+              fg: fgDays,
+            });
           }
           for (const k of ["value", "items", "groups"]) walk(o[k]);
         }
@@ -635,7 +888,7 @@ async function main() {
     const eta = iso(r.vendor_stated_eta);
     const skus = skuListOf(r.line_items);
     const rw = minRunway(
-      skus.split(",").map((s) => skuRunway.get(s.trim()))
+      skus.split(",").map((s) => skuRunway.get(s.trim())?.combined)
     );
     if (!keepSilentVendorDelay(r.vendor_name || "", rw)) continue;
     if (!eta) {
@@ -734,7 +987,13 @@ async function main() {
         note: inv || (f.pdf_filename || "").replace(/\.pdf$/i, ""),
       });
     }
-  } catch {
+  } catch (e: unknown) {
+    // Never swallow this: a silent fallback is how the tally read "0 invoices
+    // sent" while 5 had in fact been forwarded.
+    console.warn(
+      "[eow] AP forward tally failed, falling back to invoice week query:",
+      e instanceof Error ? e.message : String(e),
+    );
     billVerified = invWeekQ.rows.map((r) => ({
       po: r.po_number && /^\d+$/.test(r.po_number) ? r.po_number : "",
       vendor: r.vendor_name || "",
@@ -776,7 +1035,10 @@ async function main() {
   try {
     const seen = new Set<string>();
     const seenDims = new Set<string>();
-    const weekOut = addDays(today, 7);
+    // The ordering window ends with NEXT week, not seven days from whenever the
+    // script happens to run. On a Friday run both are the same day; generating a
+    // sample mid-week used to cut the window short and hide items due next week.
+    const weekOut = addDays(start, 11);
 
     // The dashboard pools each slot separately (resale, then BOM), so the
     // report must do the same — pooling both files together would sum the same
@@ -785,8 +1047,18 @@ async function main() {
       (c) => boxDimKey(c.name)
     );
     const stockMemo = new Map<string, number | null>();
+    // Anything snoozed in the purchasing panel is hidden there, so it has no
+    // business appearing here. Same keys the panel writes.
+    const activeSnoozes = listActiveSnoozes();
     const feeds: Array<{ vendor: string; it: any }> = [];
-    for (const name of ["purchasing-resale.json", "purchasing-bom.json"]) {
+    if (board) {
+      // One dataset: exactly the rows the Ordering screen renders.
+      for (const g of board.groups) {
+        for (const it of g.items || []) {
+          feeds.push({ vendor: g.vendorName || it.supplierName || "", it });
+        }
+      }
+    } else for (const name of ["purchasing-resale.json", "purchasing-bom.json"]) {
       const raw = JSON.parse(
         fs.readFileSync(path.join(ARIA, ".aria-cache", "purchasing", name), "utf8")
       );
@@ -818,15 +1090,25 @@ async function main() {
     }
 
     for (const { vendor, it } of feeds) {
-      const qty0 = it.suggestedQty || 0;
-      const oo = it.stockOnOrder || 0;
-      const rw = it.adjustedRunwayDays;
+      // Same gate the panel uses: Ordering shows need and topping only.
+      if (board) {
+        const bucket = orderingBucket(it);
+        if (bucket !== "need" && bucket !== "topping") continue;
+      }
+      // Same quantity the panel puts in the box: the assessment's recommended
+      // qty, falling back to suggestedQty. Anything else is a second opinion.
+      const qty0 = board
+        ? Number(it.assessment?.recommendedQty ?? it.suggestedQty ?? 0) || 0
+        : Number(it.suggestedQty) || 0;
+      // Cache fallback has no assessment, so keep the old on-order skip there.
+      if (!board && (Number(it.stockOnOrder) || 0) > 0) continue;
+      const rw = it.adjustedRunwayDays ?? it.runwayDays;
       if (qty0 <= 0) continue;
-      if (oo > 0) continue;
       if (rw == null) continue;
       const sku = String(it.productId || "");
       if (!sku || seen.has(sku)) continue;
       if (excludeManualVendor(vendor, sku)) continue;
+      if (isItemSnoozed(sku, it.supplierPartyId || null, activeSnoozes)) continue;
 
       const dimKey = boxDimKey(it.productName || skuName.get(sku) || "");
       if (dimKey && seenDims.has(dimKey)) continue;
@@ -840,7 +1122,8 @@ async function main() {
       // short-lead items surface late. Not a flat wish list.
       const mustOrder = addDays(need, -lead);
       if (mustOrder > weekOut) {
-        if (dimKey) seenDims.add(dimKey);
+        // Do NOT reserve the carton dimension here: an out-of-window sibling
+        // would then block a same-size box that IS due, silently hiding it.
         continue;
       }
 
@@ -851,10 +1134,27 @@ async function main() {
         orderQty = floor;
         moq = floor;
       }
+      const cap = TRUCKLOAD_CAP[sku];
+      let capped = false;
+      if (cap) {
+        // A truckload is a ceiling on what sits in the yard, not just on what
+        // we add. Half a truck already on hand means room for half a truck.
+        const onHand = Number(it.stockOnHand) || 0;
+        const room = Math.max(0, cap.qty - onHand);
+        if (orderQty > room) {
+          orderQty = room;
+          capped = true;
+        }
+        if (orderQty <= 0) continue;
+      }
       const amt = orderQty * (it.unitPrice || 0);
       if (!keepUpcomingAmount(amt)) continue;
 
       const flags: string[] = [];
+      if (capped && cap) {
+        const onHand = Number(it.stockOnHand) || 0;
+        flags.push(`topped up to 1 truckload · ${cap.label} (${onHand.toLocaleString("en-US")} on hand)`);
+      }
       if (lead >= 30) flags.push(`${lead}d lead`);
       if (amt >= 2000) flags.push("Large");
       if (moq) flags.push(`MOQ ${moq.toLocaleString("en-US")}`);
@@ -862,6 +1162,17 @@ async function main() {
 
       seen.add(sku);
       if (dimKey) seenDims.add(dimKey);
+      // Raw components only: packed finished goods already in stock are real
+      // cover, and the team forgets to count them. Days come from the board's
+      // own metric when it has one, so the report and the panel never disagree.
+      const cov = fgCoverage(it.feedsFinishedGoods, Number(it.dailyRate));
+      const engineFgDays = Number(it.assessment?.metrics?.finishedGoodsCoverageDays);
+      const fg = cov
+        ? {
+            ...cov,
+            days: Number.isFinite(engineFgDays) && engineFgDays > 0 ? engineFgDays : cov.days,
+          }
+        : undefined;
       upcoming.push({
         po: sku,
         vendor,
@@ -870,6 +1181,7 @@ async function main() {
         amount: amt,
         note: flags.join(" · "),
         eta: need,
+        fg,
       });
     }
     upcoming.sort((a, b) => (a.eta || "").localeCompare(b.eta || ""));
@@ -909,13 +1221,16 @@ async function main() {
     const gmail = await gmailClient();
     for (const r of delayed) {
       const thread = await gmailDelayThread(gmail, r.po);
-      r.note = delayedVendorNote({
-        emailDueIso: thread.emailDueIso,
-        pgEtaIso: r.eta || null,
-        lastVendorReplyIso: thread.lastVendorIso,
-        todayIso: today,
-        backorder: thread.backorder,
-      });
+      // The note must be the vendor's own words with the mail date. Never say
+      // "no reply" — that was wrong on every delayed PO checked, and when the
+      // thread carries no delay language we cite the last vendor email instead
+      // of asserting silence.
+      r.note =
+        thread.quote && thread.quoteIso
+          ? formatDelayNote(thread.quote, thread.quoteIso)
+          : thread.lastVendorIso
+            ? `No delay stated; last vendor email ${mdFromIso(thread.lastVendorIso)}`
+            : "No vendor email on this PO";
       if (thread.emailDueIso && thread.emailDueIso !== r.eta) {
         try {
           await pool.query(
@@ -940,19 +1255,96 @@ async function main() {
   } catch {
     /* gmail optional */
   }
-  for (const r of delayed) {
-    const skus = (r.sku || "").split(",").map((s) => s.trim()).filter(Boolean);
-    const uses = skus.map((s) => skuUse.get(s) || "resale");
-    const hasB = uses.includes("build");
-    const hasR = uses.includes("resale");
-    const hasC = uses.includes("combo");
-    const use = hasC || (hasB && hasR) ? "Combo" : hasB ? "Build" : "Resale";
-    r.note = `${use} · ${r.note}`;
-  }
   for (const r of [...committed, ...received, ...delayed, ...upcoming, ...priceUpdates, ...research]) {
     r.desc = descOf(r.sku || "", skuDesc);
   }
   await pool.end();
+
+  // "Arriving soon" — open POs whose resolved ETA lands in the two weeks after
+  // the report week. Dates are adjusted to the vendor's own p90 arrival before
+  // they are bucketed, so the team plans against the date these vendors
+  // actually hit, not the optimistic one.
+  const nextMonIso = addDays(start, 7);
+  const nextFriIso = addDays(start, 11);
+  const followingFriIso = addDays(start, 18);
+
+  // Vendor slip: p90 − p50 from that vendor's own delivery history.
+  const slipByVendor = new Map<string, number>();
+  for (const v of Array.from(new Set(committed.map((r) => r.vendor)))) {
+    const dist = await leadTimeService.getDistribution(v).catch(() => null);
+    if (dist && dist.p90 > dist.p50) slipByVendor.set(v, dist.p90 - dist.p50);
+  }
+
+  const isRealEta = (source?: string) =>
+    source === "delivered" || source === "carrier" || source === "vendor";
+
+  const apRows = await fetchActivePurchases();
+  if (!apRows) {
+    console.error(
+      "[eow] ABORT: Active Purchases is unreachable. Refusing to emit a delivery schedule that is not the panel's."
+    );
+    process.exit(1);
+  }
+  const arriving = (apRows
+    ? apRows
+        .filter(
+          (p: any) =>
+            !p.isReceived && String(p.completionState || "").toLowerCase() !== "received"
+        )
+        .map((p: any): Row | null => {
+          const items = Array.isArray(p.items) ? p.items : [];
+          const open = items.filter((i: any) => Number(i.remainingQty ?? i.quantity ?? 0) > 0);
+          const etaIso = String(p.expectedDate || "").slice(0, 10);
+          if (open.length === 0 || !etaIso) return null;
+          const prov = String(p.leadProvenance || "");
+          // The board's date already carries the vendor's slip, so it is shown
+          // as one date. "~" only disappears when the date is real movement.
+          const realEta = /carrier|delivered|vendor stated/i.test(prov);
+          return {
+            po: String(p.orderId),
+            vendor: String(p.vendorName || ""),
+            sku: open.map((i: any) => String(i.productId || "")).join(", "),
+            amount: Number(p.total) || 0,
+            note: "",
+            etaIso,
+            etaAdjusted: etaIso,
+            etaSource: realEta ? "carrier" : "finale_planned",
+          };
+        })
+        .filter((r): r is Row => Boolean(r))
+    : committed.map((r) => {
+        const slip = slipByVendor.get(r.vendor) ?? 0;
+        const etaAdjusted = !isRealEta(r.etaSource) && slip > 0 && r.etaIso
+          ? addDays(r.etaIso, slip)
+          : r.etaIso;
+        return { ...r, etaAdjusted };
+      }))
+    .filter((r) => r.etaIso && r.etaIso >= nextMonIso && r.etaIso <= followingFriIso)
+    .sort((a, b) => String(a.etaIso).localeCompare(String(b.etaIso)))
+    .map((r) => {
+      // Descriptions come from Finale's name map, same as every other section.
+      r.desc = r.desc || descOf(r.sku || "", skuDesc);
+      // Does the SKU run out before this delivery lands? That is the question
+      // the list exists to answer — a date alone does not tell the team whether
+      // they are covered. Phrase it as a date someone can act on, not a grade.
+      const skus = (r.sku || "").split(",").map((s) => s.trim()).filter(Boolean);
+      const rows = skus
+        .map((s) => skuRunway.get(s))
+        .filter((x): x is { combined: number; raw: number; fg: number | null } => Boolean(x));
+      if (rows.length === 0 || !r.etaIso) return { ...r, risk: "" };
+      const soonest = (pick: (x: { combined: number; raw: number; fg: number | null }) => number) =>
+        addDays(today, Math.floor(Math.min(...rows.map(pick))));
+      const stockoutIso = soonest((x) => x.combined);
+      // Header already says "Covered until", so the positive cell is just the
+      // date. The negative case must say so plainly.
+      const risk = stockoutIso >= r.etaIso
+        ? mdFromIsoYearAware(stockoutIso, today)
+        : `Out ${mdFromIsoYearAware(stockoutIso, today)}`;
+      return { ...r, risk };
+    });
+
+  const arrivingWeek1 = arriving.filter((r) => String(r.etaIso) <= nextFriIso);
+  const arrivingWeek2 = arriving.filter((r) => String(r.etaIso) > nextFriIso);
 
   const html = renderHtml({
     start,
@@ -965,6 +1357,13 @@ async function main() {
     upcoming: upcoming.slice(0, 12),
     priceUpdates,
     research,
+    arriving,
+    arrivingWeek1,
+    arrivingWeek2,
+    followingFriIso,
+    nextMonIso,
+    nextFriIso,
+    todayIso: today,
   });
 
   fs.mkdirSync(REPORTS, { recursive: true });

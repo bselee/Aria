@@ -14,12 +14,14 @@ import { leadTimeService, type LeadTimeResult } from "../builds/lead-time-servic
 
 const DAY_MS = 86_400_000;
 
-/** Add N days to an ISO date (timezone-safe, UTC math). */
-function addDaysIso(iso: string, days: number): string {
-    const [y, m, d] = iso.slice(0, 10).split("-").map(Number);
-    const dt = new Date(Date.UTC(y, m - 1, d));
+/** Add N days to an ISO date (timezone-safe, UTC math). Null on bad input. */
+function addDaysIso(iso: string, days: number): string | null {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
+    if (!m) return null;
+    const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+    if (Number.isNaN(dt.getTime())) return null;
     dt.setUTCDate(dt.getUTCDate() + days);
-    return dt.toISOString().slice(0, 10);
+    return Number.isNaN(dt.getTime()) ? null : dt.toISOString().slice(0, 10);
 }
 
 /**
@@ -50,7 +52,7 @@ export interface PoEta {
     /** Resolved ETA date (YYYY-MM-DD). */
     date: string;
     /** Which rung of the chain produced the date. */
-    provenance: "finale_planned" | "lead_time" | "fallback";
+    provenance: "delivered" | "carrier" | "vendor" | "finale_planned" | "lead_time" | "fallback";
     /** Human label, e.g. "Finale planned receive" or "13d median · vendor history". */
     label: string;
     /** Vendor lead-time lookup, when one was performed (for callers that
@@ -60,14 +62,34 @@ export interface PoEta {
     plannedReceive: string | null;
 }
 
+/** Real movement evidence from the tracking tables. */
+export interface ShipmentEtaSignal {
+    /** Carrier's own estimated delivery (ISO timestamp or date). */
+    estimatedDeliveryAt?: string | null;
+    /** Actual delivery scan, when it happened. */
+    deliveredAt?: string | null;
+}
+
+/** First YYYY-MM-DD in a value, or null. */
+function isoDay(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(value));
+    return m ? m[1] : null;
+}
+
 /**
  * Resolve a PO's ETA the same way for every consumer.
  *
- * Chain:
- *   1. Finale planned receive date (future + sane) → "Finale planned receive"
- *   2. orderDate + leadTimeService (policy override → SKU observed → vendor
- *      median → Finale product → 21d default)
- *   3. today (last resort)
+ * Chain (best evidence first — Bill: real tracking beats any assumption):
+ *   1. Carrier delivery scan            → "Delivered"
+ *   2. Carrier estimated delivery       → "Carrier ETA"
+ *   3. Vendor-stated date (email)       → "Vendor stated"
+ *   4. Finale planned receive date      → "Finale planned receive"
+ *   5. orderDate + leadTimeService      → policy → SKU → vendor → product → 21d
+ *   6. today                            → last resort
+ *
+ * A carrier date in the past is not an ETA — it means the tracking record is
+ * stale, so it falls through rather than pinning the PO to a dead date.
  *
  * Never throws — a lead-time failure degrades to the 21d default.
  */
@@ -75,9 +97,47 @@ export async function resolvePoEta(input: {
     vendorName: string;
     orderDate?: string | null;
     plannedReceiveDate?: string | null;
+    /** Vendor-stated date from an email reply, when one exists. */
+    vendorStatedEta?: string | null;
+    /** Real carrier evidence for this PO, when a shipment record exists. */
+    shipment?: ShipmentEtaSignal | null;
     sku?: string;
     today: string;
 }): Promise<PoEta> {
+    // Real movement evidence wins outright.
+    const delivered = isoDay(input.shipment?.deliveredAt);
+    if (delivered) {
+        return {
+            date: delivered,
+            provenance: "delivered",
+            label: "Delivered",
+            lead: null,
+            plannedReceive: null,
+        };
+    }
+
+    const carrier = isoDay(input.shipment?.estimatedDeliveryAt);
+    if (carrier && carrier >= input.today) {
+        return {
+            date: carrier,
+            provenance: "carrier",
+            label: "Carrier ETA",
+            lead: null,
+            plannedReceive: null,
+        };
+    }
+
+    const vendor = isoDay(input.vendorStatedEta);
+    if (vendor && vendor >= input.today) {
+        return {
+            date: vendor,
+            provenance: "vendor",
+            label: "Vendor stated",
+            lead: null,
+            plannedReceive: null,
+        };
+    }
+
     let lead: LeadTimeResult | null = null;
     if (input.orderDate) {
         lead = await leadTimeService
@@ -96,14 +156,44 @@ export async function resolvePoEta(input: {
 
     if (input.orderDate) {
         const days = lead?.days ?? 21;
-        return {
-            date: addDaysIso(input.orderDate, days),
-            provenance: "lead_time",
-            label: lead?.label ?? "21d default",
-            lead,
-            plannedReceive: null,
-        };
+        const computed = addDaysIso(input.orderDate, days);
+        if (computed) {
+            return {
+                date: computed,
+                provenance: "lead_time",
+                label: lead?.label ?? "21d default",
+                lead,
+                plannedReceive: null,
+            };
+        }
     }
 
     return { date: input.today, provenance: "fallback", label: "21d default", lead, plannedReceive: null };
+}
+
+/** Provenance values that represent observed movement rather than a forecast. */
+const REAL_MOVEMENT = new Set(["delivered", "carrier", "vendor"]);
+
+/**
+ * Push a forecast date out to the vendor's own worst case.
+ *
+ * The median lead time answers "when does this vendor usually land"; the p90
+ * answers "when do they land when they slip". Planning against the second date
+ * is what stops the board and the Friday report from reading optimistic. Real
+ * movement evidence (a delivery scan, a carrier ETA, a vendor's stated date) is
+ * never adjusted — it is already the truth.
+ *
+ * @param dateIso Resolved ETA date (YYYY-MM-DD).
+ * @param provenance Which rung produced it.
+ * @param slipDays p90 − p50 for that vendor; 0 or negative means no adjustment.
+ * @returns The planning date, or the input when no adjustment applies.
+ */
+export function withVendorSlip(
+    dateIso: string | null,
+    provenance: PoEta["provenance"],
+    slipDays: number,
+): string | null {
+    if (!dateIso || !Number.isFinite(slipDays) || slipDays <= 0) return dateIso;
+    if (REAL_MOVEMENT.has(provenance)) return dateIso;
+    return addDaysIso(dateIso, Math.round(slipDays)) ?? dateIso;
 }

@@ -28,7 +28,80 @@ export function mondayOf(iso: string): string {
 
 export function mdFromIso(isoDate: string): string {
   if (!isoDate || isoDate.length < 10) return "";
-  return `${Number(isoDate.slice(5, 7))}/${Number(isoDate.slice(8, 10))}`;
+  // Zero-pad: "1/8" beside "11/8" is ambiguous at a glance. "01/08" is not.
+  return `${isoDate.slice(5, 7)}/${isoDate.slice(8, 10)}`;
+}
+
+/**
+ * One-line FG label for a table cell.
+ *
+ * A pouch SKU can feed nine finished goods; listing all nine blows the column
+ * apart. Name the largest holding and count the rest, so the cell still answers
+ * "which product is that stock?" without wrapping.
+ *
+ * @param fg Coverage detail.
+ * @returns e.g. `MC102 ×2 · 5d` or `KGD104 ×681 +8 · 54d`.
+ */
+export function fgLabel(fg: FgCoverage): string {
+  if (!fg.items.length) return "";
+  const sorted = [...fg.items].sort((a, b) => b.qty - a.qty);
+  const more = sorted.length > 1 ? ` +${sorted.length - 1}` : "";
+  return `${sorted[0].sku} ×${sorted[0].qty.toLocaleString("en-US")}${more} · ${Math.round(fg.days)}d`;
+}
+
+/**
+ * Same as {@link mdFromIso} but disambiguates a date outside the current year.
+ * "08/26" beside an 11/27 arrival reads as last August; "08/26/27" cannot.
+ *
+ * @param isoDate ISO date to format.
+ * @param todayIso Report day, for the year comparison.
+ */
+export function mdFromIsoYearAware(isoDate: string, todayIso: string): string {
+  if (!isoDate || isoDate.length < 10) return "";
+  if (isoDate.slice(0, 4) === todayIso.slice(0, 4)) return mdFromIso(isoDate);
+  return `${isoDate.slice(5, 7)}/${isoDate.slice(8, 10)}/${isoDate.slice(2, 4)}`;
+}
+
+export interface FgCoverage {
+  /** Days of demand covered by packed stock. */
+  days: number;
+  /** Packed stock converted into raw units. */
+  rawEquiv: number;
+  /** Which finished-goods SKUs that stock actually is. */
+  items: Array<{ sku: string; qty: number }>;
+}
+
+/**
+ * Packed finished goods in stock, for a raw component.
+ *
+ * The team reads a stock number and forgets that a packed shelf is real supply,
+ * so the report has to name it. Resale items return null — no BOM, and when
+ * they are out they are out.
+ *
+ * @param feeds `feedsFinishedGoods` from the purchasing scan.
+ * @param dailyRate Current demand rate for this SKU.
+ * @returns Coverage detail, or null when nothing is packed.
+ */
+export function fgCoverage(
+  feeds: Array<{ sku?: string; stockOnHand?: number; qtyPerUnit?: number }> | null | undefined,
+  dailyRate: number,
+): FgCoverage | null {
+  if (!Array.isArray(feeds) || feeds.length === 0 || !(dailyRate > 0)) return null;
+  const items = feeds
+    .map((f) => ({
+      sku: String(f?.sku || ""),
+      qty: Number(f?.stockOnHand) || 0,
+      raw: (Number(f?.stockOnHand) || 0) * (Number(f?.qtyPerUnit) || 0),
+    }))
+    .filter((f) => f.sku && f.qty > 0);
+  if (items.length === 0) return null;
+  const rawEquiv = items.reduce((s, f) => s + f.raw, 0);
+  if (rawEquiv <= 0) return null;
+  return {
+    days: rawEquiv / dailyRate,
+    rawEquiv,
+    items: items.map((f) => ({ sku: f.sku, qty: f.qty })),
+  };
 }
 
 /** AAA Cooper Pro# PDFs are invoices even when the subject says Stmt. */

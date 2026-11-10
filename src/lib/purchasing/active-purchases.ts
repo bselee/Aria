@@ -19,7 +19,8 @@ import { derivePOSentVerification, type POSentVerification } from "./po-sent-ver
 import { deriveVendorEtaProfile, type VendorEtaProfile } from "./vendor-eta-profile";
 import { normalizeLifecycleStage } from "./po-lifecycle";
 import { isActivePoStatus } from "./active-po-status";
-import { resolvePoEta } from "./po-eta";
+import { resolvePoEta, withVendorSlip } from "./po-eta";
+import { loadShipmentSignals, mergeSignal } from "./shipment-signal";
 import {
     PENDING_REORDER_LOOKBACK_DAYS,
     derivePendingReordersBySku,
@@ -84,6 +85,15 @@ export async function loadActivePurchases(
     const uniqueVendors = [...new Set(pos.map(p => p.vendorName).filter(Boolean))];
     await Promise.all(uniqueVendors.map(v => leadTimeService.getForVendor(v))).catch(() => undefined);
 
+    // Same slip the Friday report applies: a forecast date is pushed to the
+    // vendor's p90 so the board and the report can never disagree about when a
+    // PO is expected. Real movement evidence is left alone by withVendorSlip.
+    const slipByVendor = new Map<string, number>();
+    await Promise.all(uniqueVendors.map(async (v) => {
+        const dist = await leadTimeService.getDistribution(v).catch(() => null);
+        if (dist && dist.p90 > dist.p50) slipByVendor.set(v.toLowerCase(), dist.p90 - dist.p50);
+    })).catch(() => undefined);
+
     const db = createClient();
     if (!db) {
         console.warn("[active-purchases] createClient returned null - Finale-only mode");
@@ -93,6 +103,9 @@ export async function loadActivePurchases(
     const vendorIntelMap = new Map<string, { total_spend?: number; pending_reconciliation?: number; avg_freight?: number }>();
     const trackingMap = new Map<string, string[]>();
     const shipmentMap = new Map<string, ShipmentRecord[]>();
+    /** Real movement evidence per PO, resolved across every link store. */
+    let shipmentSignals = new Map<string, { deliveredAt: string | null; carrierEta: string | null; via: string[] }>();
+    const shipmentBatchToday = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
     const lifecycleMap = new Map<string, Record<string, any>>();
     const poSendMap = new Map<string, Array<Record<string, any>>>();
     const invoiceMap = new Map<string, { status: string; id: string; hasDiscrepancies: boolean; total?: number }>();
@@ -212,6 +225,11 @@ export async function loadActivePurchases(
                     shipmentMap.get(poNumber)!.push(shipment);
                 }
             }
+
+            // Tracking recorded on the PO itself resolves to shipment rows that
+            // never list the PO in `po_numbers` (carrier billing mail carries no
+            // PO). Load the merged signal once for the whole batch.
+            shipmentSignals = await loadShipmentSignals(poNumbers, shipmentBatchToday);
 
             try {
                             for (let i = 0; i < poNumbers.length; i += 100) {
@@ -395,9 +413,44 @@ export async function loadActivePurchases(
                 // Carry-through lifecycle from cache row when enrichment map misses
                 const cacheStage = (po as any).lifecycleStage as string | null | undefined;
 
+                // Real movement evidence from the tracking tables. A delivery
+                // scan beats every typed date; a live carrier ETA beats a guess.
+                // Only confirmed shipments count (an inferred vendor mismatch
+                // must not drive an ETA).
+                const deliveredScan = confirmedShipments
+                    .map((s) => s.delivered_at)
+                    .filter((d): d is string => Boolean(d))
+                    .sort()
+                    .pop() ?? null;
+                const carrierEta = confirmedShipments
+                    .filter((s) => !s.delivered_at && s.estimated_delivery_at)
+                    .map((s) => s.estimated_delivery_at as string)
+                    .sort()[0] ?? null;
+                const shipmentSignal =
+                    deliveredScan || carrierEta
+                        ? { deliveredAt: deliveredScan, estimatedDeliveryAt: carrierEta }
+                        : null;
+
+                // Fold in tracking recorded on the PO (the authoritative link for
+                // carrier billing mail that names no PO).
+                const mergedSignal = { deliveredAt: null as string | null, carrierEta: null as string | null, via: [] as string[] };
+                if (shipmentSignal) {
+                    mergeSignal(mergedSignal, {
+                        deliveredAt: shipmentSignal.deliveredAt,
+                        carrierEta: shipmentSignal.estimatedDeliveryAt,
+                        today: shipmentBatchToday,
+                    });
+                }
+                const poSignal = shipmentSignals.get(po.orderId);
+                if (poSignal) mergeSignal(mergedSignal, poSignal);
+                const resolvedSignal =
+                    mergedSignal.deliveredAt || mergedSignal.carrierEta
+                        ? { deliveredAt: mergedSignal.deliveredAt, estimatedDeliveryAt: mergedSignal.carrierEta }
+                        : null;
+
                 // Expected ETA — shared resolution (po-eta) so the dashboard and
-                // the weekly report never drift. Prefers Finale's planned
-                // receive, then the shared lead-time service, then 21d.
+                // the weekly report never drift. Order: carrier scan → carrier
+                // ETA → Finale planned receive → shared lead time → 21d.
                 const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/Denver" });
                 const plannedOnPo = [po.receiveDate, (po as { expectedDate?: string | null }).expectedDate, poLifecycleRow?.required_date]
                     .map((d) => (typeof d === "string" ? d.slice(0, 10) : ""))
@@ -406,9 +459,14 @@ export async function loadActivePurchases(
                     vendorName: po.vendorName,
                     orderDate: po.orderDate,
                     plannedReceiveDate: plannedOnPo,
+                    shipment: resolvedSignal,
                     today: todayStr,
                 });
-                const expectedDate = eta.date;
+                const expectedDate = withVendorSlip(
+                    eta.date,
+                    eta.provenance,
+                    slipByVendor.get((po.vendorName || "").toLowerCase()) ?? 0,
+                ) ?? eta.date;
                 const leadProvenance = eta.label;
                 const lt = eta.lead;
                 const plannedReceive = eta.plannedReceive;
@@ -524,11 +582,21 @@ export async function loadActivePurchases(
                     isReceived,
                 });
 
+        const baseExpectedDate = eta.provenance === "finale_planned"
+            ? eta.date
+            : (etaProfile.expectedDate || expectedDate);
+        const finalExpectedDate = withVendorSlip(
+            baseExpectedDate,
+            eta.provenance,
+            slipByVendor.get((po.vendorName || "").toLowerCase()) ?? 0,
+        ) ?? expectedDate;
+        const slippedByVendor = finalExpectedDate !== baseExpectedDate;
+
         activePos.push({
             ...po,
             receiveDate: resolvedReceiveDate,
-            expectedDate: eta.provenance === "finale_planned" ? eta.date : (etaProfile.expectedDate || expectedDate),
-            leadProvenance: eta.provenance === "finale_planned" ? eta.label : (etaProfile.label || leadProvenance),
+            expectedDate: finalExpectedDate,
+            leadProvenance: `${eta.provenance === "finale_planned" ? eta.label : (etaProfile.label || leadProvenance)}${slippedByVendor ? " · adjusted for vendor slip" : ""}`,
             isReceived,
             completionState,
             trackingNumbers: trackingMap.get(po.orderId) || [],

@@ -10,10 +10,13 @@ import { describe, expect, it } from "vitest";
 import {
   addDays,
   excludeManualVendor,
+  fgCoverage,
+  fgLabel,
   invoiceAmountLabel,
   isDropshipVendor,
   isStatement,
   mdFromIso,
+  mdFromIsoYearAware,
   mondayOf,
   money,
   needByIso,
@@ -46,7 +49,26 @@ describe("eow-report", () => {
 
   it("addDays and mdFromIso format teammate dates", () => {
     expect(addDays("2026-08-31", 4)).toBe("2026-09-04");
-    expect(mdFromIso("2026-09-11")).toBe("9/11");
+    expect(mdFromIso("2026-09-11")).toBe("09/11");
+    expect(mdFromIsoYearAware("2027-08-26", "2026-11-10")).toBe("08/26/27");
+    expect(mdFromIsoYearAware("2026-12-04", "2026-11-10")).toBe("12/04");
+  });
+
+  it("labels FG stock without listing every sibling SKU", () => {
+    expect(fgLabel({ days: 5.2, rawEquiv: 3000, items: [{ sku: "MC102", qty: 2 }] })).toBe("MC102 ×2 · 5d");
+    expect(
+      fgLabel({ days: 54, rawEquiv: 1, items: [{ sku: "AL106", qty: 4 }, { sku: "KGD104", qty: 681 }] })
+    ).toBe("KGD104 ×681 +1 · 54d");
+  });
+
+  it("converts packed finished goods into days of cover, naming the SKU", () => {
+    const cov = fgCoverage([{ sku: "MC102", stockOnHand: 2, qtyPerUnit: 1500 }], 600);
+    expect(cov?.days).toBe(5);
+    expect(cov?.rawEquiv).toBe(3000);
+    expect(cov?.items).toEqual([{ sku: "MC102", qty: 2 }]);
+    expect(fgCoverage([{ sku: "X", stockOnHand: 0, qtyPerUnit: 2 }], 10)).toBeNull();
+    expect(fgCoverage(null, 10)).toBeNull();
+    expect(fgCoverage([{ sku: "X", stockOnHand: 10, qtyPerUnit: 1 }], 0)).toBeNull();
   });
 
   it("treats AAA Cooper Stmt subjects as invoices", () => {
@@ -167,7 +189,7 @@ describe("eow-report", () => {
         lastVendorReplyIso: "2026-07-23",
         todayIso: "2026-10-19",
       })
-    ).toBe("No reply since 7/23");
+    ).toBe("No reply since 07/23");
     expect(daysBetween("2026-04-29", "2026-10-19")).toBe(173);
   });
 
