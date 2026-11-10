@@ -547,18 +547,16 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
         const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
 
         const DEFAULT_RECEIVINGS_DAYS = 30;
-        const startStr = daysParam
-            ? (() => {
-                const days = parseInt(daysParam, 10);
-                const start = new Date(now);
-                start.setDate(start.getDate() - days);
-                return start.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
-            })()
-            : (() => {
-                const start = new Date(now);
-                start.setDate(start.getDate() - DEFAULT_RECEIVINGS_DAYS);
-                return start.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
-            })();
+        // Descartes INC-7185334: a non-numeric `days` param (parseInt → NaN) made
+        // setDate produce an invalid Date, which toLocaleDateString rendered as
+        // "Invalid Date" and shipped to Finale as orderDate: { begin: "Invalid Date" }.
+        const startStr = (() => {
+            const raw = daysParam ? parseInt(daysParam, 10) : DEFAULT_RECEIVINGS_DAYS;
+            const days = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RECEIVINGS_DAYS;
+            const start = new Date(now);
+            start.setDate(start.getDate() - days);
+            return start.toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+        })();
 
         const cacheKey = `${startStr}|${todayStr}|${matchInvoiceId || ''}`;
         if (!bust && _getCache && _getCache.key === cacheKey && (Date.now() - _getCache.at) < GET_CACHE_TTL_MS) {
@@ -1343,7 +1341,12 @@ async function handleGET(req: NextRequest): Promise<NextResponse> {
                                 // stamped today — the delivery day has not
                                 // settled. Show the comparison softly; the
                                 // hard flag waits for tomorrow.
-                                const grace = rawOverbilled && overbillGracePending(po.receiveDateTime || po.receiveDate);
+                                //
+                                // Deliver-and-bill vendors (2026-11-10): the
+                                // bill IS the delivery claim, so the short is
+                                // immediately meaningful — skip the grace.
+                                const isDeliverBill = isDeliverAndBillVendor(po.supplier);
+                                const grace = rawOverbilled && !isDeliverBill && overbillGracePending(po.receiveDateTime || po.receiveDate);
                                 rec.invoiceVsReceipt = {
                                     invoicedTotal: coveredValue,
                                     receivedValue,

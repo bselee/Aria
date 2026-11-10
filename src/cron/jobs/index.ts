@@ -523,6 +523,45 @@ defineJob({
     handler: async () => { await ops()?.pollPOReceivings(); },
 });
 
+// HERMIA(2026-11-10): Auto-draft short-shipment emails for deliver-and-bill
+// vendors (Miles, Cowoco, CR Minerals, Rootwise, Thrive). When the dashboard
+// receivings reconciliation detects a short (invoice qty > received qty),
+// auto-draft a Gmail reply to the vendor's delivery thread:
+// "Yo {Name}, we are {N} short on {product} compared to invoice. How to handle?"
+// Runs right after the receiving watcher so the dashboard data is fresh.
+defineJob({
+    name: "short-shipment-drafter",
+    schedule: "5,35 8-17 * * 1-5", // 5 min after each receiving poll, weekdays 8–17
+    onFail: "log",
+    description: "Auto-draft short-shipment emails for deliver-and-bill vendors (every 30m during business hours).",
+    handler: async () => {
+        const { draftShortShipmentEmails } = await import("@/lib/purchasing/short-shipment-drafter");
+        try {
+            // Fetch receivings from the local dashboard API (Aria has the data).
+            const resp = await fetch("http://localhost:3001/api/dashboard/receivings?bust=1", {
+                signal: AbortSignal.timeout(30_000),
+            });
+            if (!resp.ok) {
+                console.error(`[short-shipment-drafter] Dashboard API returned ${resp.status}`);
+                return;
+            }
+            const data = await resp.json();
+            const received = (data?.received || []) as any[];
+            const results = await draftShortShipmentEmails(received);
+            const drafted = results.filter((r) => r.drafted);
+            if (drafted.length > 0) {
+                console.log(
+                    `[short-shipment-drafter] Drafted ${drafted.length} short-shipment email(s): ` +
+                    drafted.map((r) => `PO ${r.poNumber} (${r.shortQty} short on ${r.productDescription})`).join(", "),
+                );
+            }
+        } catch (e: any) {
+            console.error(`[short-shipment-drafter] Error:`, e?.message);
+        }
+    },
+    budget: { durationMs: 60_000 },
+});
+
 // KAIZEN(2026-06-01): Post-reconciliation receiving check. When goods arrive
 // after an invoice was reconciled, re-checks quantities and alerts if short.
 defineJob({
@@ -777,6 +816,23 @@ defineJob({
     onFail: "log",
     description: "Refresh stale tracking numbers from carrier APIs into local cache.",
     handler: async () => {
+        // HERMIA(2026-11-09): close dead shipments BEFORE polling. 1,379
+        // undelivered records were past any plausible transit time and were
+        // eating the poll budget, so live parcels were refreshed 13 times out
+        // of 120 attempts. Closing is idempotent — after the first sweep this
+        // only touches rows that cross the age threshold since the last run.
+        const { closeAbandonedShipments } = await import("@/lib/tracking/close-abandoned-shipments");
+        const closed = await closeAbandonedShipments({ limit: 1000 }).catch((err: unknown) => {
+            console.warn(`[tracking-refresh] abandoned-sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+            return null;
+        });
+        if (closed && closed.abandoned > 0) {
+            console.log(
+                `[tracking-refresh] closed ${closed.abandoned} abandoned shipment(s) ` +
+                    `(pg ${closed.updatedPg}, local ${closed.updatedLocal})`,
+            );
+        }
+
         // Fire-and-forget (2026-10-28): a capped tiered refresh must never
         // starve the cron loop — the in-flight guard prevents overlap.
         const { refreshStaleTrackings, countActiveTrackings } = await import("@/lib/storage/tracking-cache");
@@ -787,6 +843,38 @@ defineJob({
                 console.log(`[tracking-refresh] Refreshed ${refreshed} tracking records`);
             }
         });
+    },
+});
+
+// Record what ETA we predicted today and from which evidence, then score past
+// predictions against actual arrivals (2026-11-09). Runs after carrier-poll so
+// the snapshot sees the freshest carrier ETAs. Silent by design.
+defineJob({
+    name: "eta-prediction-snapshot",
+    schedule: "35 6 * * 1-5",
+    onFail: "log",
+    description: "Snapshot open-PO ETAs with their source; log accuracy by source.",
+    handler: async () => {
+        const { recordEtaPredictions, scoreEtaPredictions } = await import("@/lib/purchasing/eta-predictions");
+        const rec = await recordEtaPredictions();
+        if (rec.error) {
+            console.warn(`[eta-predictions] record failed: ${rec.error}`);
+        } else {
+            console.log(`[eta-predictions] recorded ${rec.recorded}/${rec.openPos} open POs`);
+        }
+
+        const score = await scoreEtaPredictions({ days: 90 });
+        if (score.error) {
+            console.warn(`[eta-predictions] score failed: ${score.error}`);
+            return;
+        }
+        if (score.scored === 0) return;
+        for (const b of score.buckets) {
+            console.log(
+                `[eta-predictions] ${b.provenance}: n=${b.n} bias=${b.biasDays}d ` +
+                    `mae=${b.maeDays}d within1d=${b.withinOneDayPct}%`,
+            );
+        }
     },
 });
 
