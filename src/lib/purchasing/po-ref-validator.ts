@@ -62,6 +62,20 @@ function normalizeRef(ref: string): string {
 }
 
 /**
+ * Strip a PO/ORDER/# label from a ref WITHOUT changing its case.
+ *
+ * `normalizePoString()` in shipment-intelligence is a *comparison* normalizer:
+ * it upper-cases as well, which is right for scoring two refs against each other
+ * and wrong for anything that will be stored. The invoice-tracking bridge once
+ * used it on the parsed PO number and wrote "23591647-S-DROPSHIPPO" into
+ * shipments.po_numbers, breaking the join to purchase_orders
+ * ("23591647-S-DropshipPO") on nine rows.
+ */
+export function stripPoLabel(ref: string | null | undefined): string {
+    return normalizeRef(String(ref ?? ""));
+}
+
+/**
  * True when the ref matches a Finale PO shape (standard 6-digit or dropship
  * 8-digit). Pure and synchronous — the deterministic, battery-testable half of
  * the validator.

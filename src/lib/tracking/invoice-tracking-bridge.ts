@@ -25,9 +25,12 @@ import {
 } from "@/lib/carriers/tracking-service";
 import {
     upsertShipmentEvidence,
-    normalizePoString,
 } from "@/lib/tracking/shipment-intelligence";
-import { validatePoRef } from "@/lib/purchasing/po-ref-validator";
+import {
+    validatePoRef,
+    poRefExistsInPurchaseOrders,
+    stripPoLabel,
+} from "@/lib/purchasing/po-ref-validator";
 
 // ──────────────────────────────────────────────────
 // TYPES
@@ -131,17 +134,26 @@ export async function bridgeInvoiceTrackingToShipments(
     }
 
     // 2. Resolve PO: explicit invoice parse wins, then OCR, then null (orphan-safe).
+    //    stripPoLabel removes a "PO-"/"ORDER " label but preserves case: a ref we
+    //    intend to STORE must never go through a comparison normalizer.
     const resolvedPo =
-        normalizePoString(args.poNumber) ||
+        stripPoLabel(args.poNumber) ||
         extractPONumberFromText(ocrText) ||
         null;
     // Validate against Finale shape / purchase_orders before linking — a freight
     // "ADV ORDER 4798" must never become a PO. Rejection nulls the PO (fails
     // open), so the shipment still links at 0.75 as an orphan.
-    const poNumber = await validatePoRef(
+    const validatedPo = await validatePoRef(
         resolvedPo,
         `source=${args.source} ref=${args.sourceRef}`,
     );
+    // Canonicalise to the stored spelling before writing. validatePoRef returns a
+    // shape-accepted ref as-is, so a caller that hands us "23591917-DROPSHIPPO"
+    // would otherwise write a ref that cannot join purchase_orders. Fail open: if
+    // the row is not there yet (a PO created minutes ago), keep the validated ref.
+    const poNumber = validatedPo
+        ? ((await poRefExistsInPurchaseOrders(validatedPo)) ?? validatedPo)
+        : null;
     const confidence = poNumber ? PO_CONFIDENCE : NO_PO_CONFIDENCE;
 
     // 3. Upsert each unique hit. When an LTL carrier is detected in the text

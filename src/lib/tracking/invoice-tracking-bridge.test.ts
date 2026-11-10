@@ -15,9 +15,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // vi.hoisted runs before vi.mock factories (vitest hoists vi.mock above all
 // top-level consts — a plain `const mock = vi.fn()` would be in the TDZ when
 // the factory executes). See skill: vitest-mock-patterns.
-const { upsertShipmentEvidenceMock, validatePoRefMock } = vi.hoisted(() => ({
+const { upsertShipmentEvidenceMock, validatePoRefMock, poRefExistsMock } = vi.hoisted(() => ({
     upsertShipmentEvidenceMock: vi.fn(),
     validatePoRefMock: vi.fn(),
+    poRefExistsMock: vi.fn(),
 }));
 
 vi.mock("@/lib/tracking/shipment-intelligence", async (importOriginal) => {
@@ -28,9 +29,14 @@ vi.mock("@/lib/tracking/shipment-intelligence", async (importOriginal) => {
     };
 });
 
-vi.mock("@/lib/purchasing/po-ref-validator", () => ({
-    validatePoRef: validatePoRefMock,
-}));
+vi.mock("@/lib/purchasing/po-ref-validator", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("@/lib/purchasing/po-ref-validator")>();
+    return {
+        ...actual,
+        validatePoRef: validatePoRefMock,
+        poRefExistsInPurchaseOrders: poRefExistsMock,
+    };
+});
 
 import {
     bridgeInvoiceTrackingToShipments,
@@ -111,6 +117,10 @@ describe("bridgeInvoiceTrackingToShipments", () => {
     beforeEach(() => {
         upsertShipmentEvidenceMock.mockReset();
         validatePoRefMock.mockReset();
+        poRefExistsMock.mockReset();
+        // Default: the PO row lookup misses, so the bridge stores whatever the
+        // validator returned. Tests that care about canonicalisation set this.
+        poRefExistsMock.mockResolvedValue(null);
         // Identity: validatePoRef accepts whatever it is given (the validator's
         // own correctness is covered in po-ref-validator.test.ts).
         validatePoRefMock.mockImplementation(async (ref: string | null) => ref);
@@ -186,6 +196,55 @@ describe("bridgeInvoiceTrackingToShipments", () => {
             expect.objectContaining({ poNumber: null, confidence: 0.75 }),
         );
         expect(result.upserted).toBe(1);
+    });
+
+    it("hands the validator the caller's spelling, never an upper-cased copy", async () => {
+        // Regression: the bridge used to run normalizePoString() on args.poNumber
+        // before validating. That is a *comparison* normalizer — it upper-cases and
+        // strips labels — so the value it wrote into shipments.po_numbers was
+        // "23591647-S-DROPSHIPPO", which no longer joins purchase_orders
+        // ("23591647-S-DropshipPO"). Nine live rows, every one carrying an
+        // ap_invoice @0.92 ref. The bridge must not change case on its own; label
+        // stripping belongs to the validator.
+        await bridgeInvoiceTrackingToShipments(
+            makeArgs({
+                ocrText: "FedEx 520484910873",
+                poNumber: "23591647-S-DropshipPO",
+            }),
+        );
+
+        expect(validatePoRefMock).toHaveBeenCalledWith(
+            "23591647-S-DropshipPO",
+            expect.any(String),
+        );
+    });
+
+    it("stores the purchase_orders spelling even when handed a differently-cased ref", async () => {
+        validatePoRefMock.mockResolvedValue("23591917-DROPSHIPPO");
+        poRefExistsMock.mockResolvedValue("23591917-DropshipPO");
+
+        await bridgeInvoiceTrackingToShipments(
+            makeArgs({ ocrText: "FedEx 520484910862", poNumber: "23591917-DROPSHIPPO" }),
+        );
+
+        expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(
+            expect.objectContaining({ poNumber: "23591917-DropshipPO", confidence: 0.92 }),
+        );
+    });
+
+    it("fails open to the validated ref when the PO row is not found", async () => {
+        // A freshly created PO may not be in purchase_orders yet; storing the
+        // validated ref beats storing nothing.
+        validatePoRefMock.mockResolvedValue("23590001-DropshipPO");
+        poRefExistsMock.mockResolvedValue(null);
+
+        await bridgeInvoiceTrackingToShipments(
+            makeArgs({ ocrText: "FedEx 520484910899", poNumber: "23590001-DropshipPO" }),
+        );
+
+        expect(upsertShipmentEvidenceMock).toHaveBeenCalledWith(
+            expect.objectContaining({ poNumber: "23590001-DropshipPO", confidence: 0.92 }),
+        );
     });
 
     it("stores tracking with null PO at 0.75 confidence when no PO anywhere", async () => {
