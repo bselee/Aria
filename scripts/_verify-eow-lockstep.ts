@@ -124,8 +124,14 @@ async function main(): Promise<void> {
     console.log(`  absent ${b.sku.padEnd(20)} qty ${String(b.qty).padStart(7)} $${amt.toFixed(0).padStart(6)}  ${b.bucket}  (${why})`);
   }
 
-  console.log(`\n${bad === 0 ? "PASS" : `FAIL (${bad})`}`);
-
+  // An empty board plus an empty report is not proof of agreement — it is the
+  // exact signature of a broken data source. Say so instead of printing PASS.
+  const unverified = rows.length === 0 && due.length === 0;
+  if (unverified) {
+    console.log("\nUNVERIFIED: the board returned no purchasable rows and the report printed none.");
+    console.log("           Re-run before trusting this result.");
+  }
+  console.log(`\n${bad === 0 && !unverified ? "PASS" : unverified ? "UNVERIFIED" : `FAIL (${bad})`}`);
   // ── Arriving Soon must be the Active Purchases set, nothing added or lost ──
   const ap: any = await (await fetch("http://localhost:3001/api/dashboard/active-purchases")).json();
   const start = mondayOf(today);
@@ -165,7 +171,7 @@ async function main(): Promise<void> {
   }
   console.log(`arriving: ${apBad === 0 ? "PASS" : `FAIL (${apBad})`}`);
 
-  process.exitCode = bad === 0 && apBad === 0 ? 0 : 1;
+  process.exitCode = bad === 0 && apBad === 0 && !unverified ? 0 : 1;
 }
 
 void main();

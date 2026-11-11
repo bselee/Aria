@@ -1185,8 +1185,14 @@ async function main() {
       });
     }
     upcoming.sort((a, b) => (a.eta || "").localeCompare(b.eta || ""));
-  } catch {
-    /* cache optional */
+  } catch (e: unknown) {
+    // Never swallow this: a throw here empties the whole Upcoming section and
+    // the report still "succeeds", which is worse than failing outright.
+    console.error(
+      "[eow] UPCOMING BUILD FAILED — section will be empty:",
+      e instanceof Error ? e.message : String(e)
+    );
+    throw e;
   }
 
   const skuUse = new Map<string, "build" | "combo" | "resale">();
