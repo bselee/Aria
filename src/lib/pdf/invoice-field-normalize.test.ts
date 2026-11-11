@@ -8,6 +8,7 @@ import {
     extractInvoiceFieldsFromOcrText,
     normalizeInvoiceForDb,
 } from "./invoice-field-normalize";
+import { sanitizeOcrPoCandidate } from "../purchasing/ocr-po-sanitize";
 
 const DTE_OCR = `DOWN TO EARTH WORMS, LLC.
 GARY L. & LUANN AMBRIOLE
@@ -272,5 +273,55 @@ describe("normalizeInvoiceForDb", () => {
             DTE_OCR,
         );
         expect(n.lineItems[0]).toEqual(expect.objectContaining({ qty: 21, unit_price: 375, ext_price: 7875 }));
+    });
+});
+
+describe("vendor sales-order refs must never become a PO", () => {
+    // Maple Jet Limited prints a Shipment Order against THEIR sales order
+    // SO-2681. That reference is the vendor's, not a Finale PO: if it were ever
+    // written to po_number the invoice would match a PO that does not exist and
+    // reconciliation would chase it forever. Verified 2026-11-11 — there is no
+    // purchase_orders row for Maple Jet at all.
+    const SO_REFS = [
+        "SO-2681", "SO 2681", "SO2681", "SO#2681", "SO# 2681", "so-2681",
+        "SHP-00362", "SHP00362", "Sales Order SO-2681", "Sales Order# : SO-2681",
+    ];
+
+    it("extracts no PO from a shipment-order document", () => {
+        const doc = [
+            "Maple Jet Limited",
+            "Aurora Ontario L4G 4B6",
+            "SHIPMENT ORDER",
+            "Shipment Order# SHP-00362",
+            "Sales Order# : SO-2681",
+            "Order Date : 2026/11/11",
+            "HX Chronplast-W Black Cart - 46ml (Tag) - 17282-05",
+            "SKU : 17282-05 HX Chronplast-W Black Cart - 46ml",
+            "Qty 3.00 Cart",
+        ].join("\n");
+        const f = extractInvoiceFieldsFromOcrText(doc);
+        expect(f.poNumber).toBeNull();
+        expect(f.poNumbers).toEqual([]);
+    });
+
+    it("extracts no PO even when the vendor types SO-2681 into a P.O. field", () => {
+        const doc = [
+            "Maple Jet Limited",
+            "INVOICE",
+            "Invoice No: MJ-2026-4471",
+            "Sales Order# : SO-2681",
+            "P.O. Number: SO-2681",
+            "SUBTOTAL135.00",
+            "TOTAL160.00",
+        ].join("\n");
+        const f = extractInvoiceFieldsFromOcrText(doc);
+        expect(f.poNumber).toBeNull();
+        expect(f.poNumbers).toEqual([]);
+    });
+
+    it("no SO-style ref survives the PO-shape sanitiser", () => {
+        for (const ref of SO_REFS) {
+            expect(sanitizeOcrPoCandidate(ref)).toBeNull();
+        }
     });
 });

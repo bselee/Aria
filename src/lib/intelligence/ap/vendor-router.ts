@@ -41,7 +41,14 @@ export interface VendorRoutingRule {
         /** Optional attachment filename fragment (checked by local-forwarder, not Gmail headers). */
         filenameContains?: string;
     };
-    action: 'forward' | 'dropship' | 'skip' | 'amazon_order';
+    /**
+     * 'non_po_consumable' — a real payable that will NEVER have a Finale PO
+     * (consumables bought direct on a vendor store). Forward to Bill.com and pay
+     * it, but do not route it into PO matching: nothing will ever match, so it
+     * would sit in PO_UNMATCHED forever. The vendor's own sales-order reference
+     * (SO-xxxx) is theirs, not ours, and must never be written as a po_number.
+     */
+    action: 'forward' | 'dropship' | 'skip' | 'amazon_order' | 'non_po_consumable';
     label: string;
 }
 
@@ -166,6 +173,22 @@ export const VENDOR_ROUTING_RULES: VendorRoutingRule[] = [
     // QuickBooks variants
     { match: { senderContains: 'quickbooks', subjectContains: 'logan labs' }, action: 'dropship', label: 'Logan Labs (Dropship via QuickBooks)' },
     { match: { senderContains: 'quickbooks', subjectContains: 'autopot' }, action: 'dropship', label: 'AutoPot (Dropship via QuickBooks)' },
+
+    // ── Non-PO consumables: real payables that will never have a Finale PO ──
+    // Maple Jet Limited (Aurora, Ontario) — consumables bought direct on the
+    // vendor's own store (HX Chronplast-W Black Cart 46ml, SKU 17282-05).
+    // Verified 2026-11-11: ZERO purchase_orders rows for maple/chronplast/17282,
+    // the SKU appears in no line_items, and Finale's 206 most recent POs contain
+    // no match — so this is NOT a po-finale-sync lag, there was never a PO.
+    //
+    // Their paperwork is a Shipment Order against THEIR sales order SO-2681.
+    // SO-2681 is the vendor's reference, not ours: it must never be written as a
+    // po_number (sanitizeOcrPoCandidate and isPoShaped both reject it — kept that
+    // way deliberately). Without this rule the invoice forwards, finds no PO, and
+    // parks in PO_UNMATCHED forever with nothing able to resolve it.
+    { match: { senderContains: 'maple jet' }, action: 'non_po_consumable', label: 'Maple Jet (Non-PO Consumable)' },
+    { match: { senderContains: 'maplejet' }, action: 'non_po_consumable', label: 'Maple Jet (Non-PO Consumable)' },
+    { match: { domain: 'maplejet.com' }, action: 'non_po_consumable', label: 'Maple Jet (Non-PO Consumable)' },
 ];
 
 /**

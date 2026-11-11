@@ -432,3 +432,37 @@ describe("vendor-router first-match wins", () => {
         expect(r?.match.domain).toBe("gorgias.com"); // domain rule is first in array
     });
 });
+describe("non-PO consumables (no Finale PO will ever exist)", () => {
+    // Maple Jet Limited — consumables bought direct on the vendor's store.
+    // Verified 2026-11-11: zero purchase_orders rows for maple/chronplast/17282,
+    // the SKU in no line_items, and Finale's 206 most recent POs contain no
+    // match. There was never a PO, so PO matching can never resolve it.
+    it("routes Maple Jet to non_po_consumable, not to unmatched-PO review", () => {
+        const r = matchVendorRouting(
+            "orders@maplejet.com",
+            "Maple Jet Limited",
+            "Shipping notice # SHP-00362",
+        );
+        expect(r?.action).toBe("non_po_consumable");
+        expect(r?.label).toContain("Maple Jet");
+    });
+
+    it("matches on the spaced and unspaced vendor names too", () => {
+        expect(matchVendorRouting("billing@maplejet.com", "Maple Jet Limited", "Invoice")?.action)
+            .toBe("non_po_consumable");
+        expect(matchVendorRouting("ap@maplejet.com", "Maplejet", "Invoice")?.action)
+            .toBe("non_po_consumable");
+    });
+
+    it("is a distinct action from dropship so the two classes stay auditable", () => {
+        const maple = matchVendorRouting("orders@maplejet.com", "Maple Jet Limited", "Invoice");
+        const autopot = matchVendorRouting("x@autopot.com", "AutoPot", "Invoice");
+        expect(maple?.action).toBe("non_po_consumable");
+        expect(autopot?.action).toBe("dropship");
+        expect(maple?.action).not.toBe(autopot?.action);
+    });
+
+    it("does not make unrelated vendors non-PO", () => {
+        expect(matchVendorRouting("some-random@vendor.com", "Random Vendor", "Invoice")).toBeNull();
+    });
+});

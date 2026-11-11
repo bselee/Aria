@@ -1260,6 +1260,26 @@ export async function runReconciliationHandoff(): Promise<{
                 continue;
             }
 
+            // Non-PO consumables: real payables with no Finale PO and no prospect
+            // of one (vendor-direct consumable purchases). Bill.com pays them; the
+            // only correct reconciliation verdict is "complete, no PO required".
+            // Parking these in PO_UNMATCHED would make them unresolvable forever.
+            if (inv.vendor_routing_action === "non_po_consumable") {
+                db.prepare(
+                    `UPDATE ap_local_forwards
+                     SET reconciliation_status = 'COMPLETE',
+                         reconciliation_notes = 'Non-PO consumable - vendor-direct purchase, no Finale PO exists',
+                         reconciled_at = datetime('now'),
+                         completed_at = datetime('now')
+                     WHERE id = ?`
+                ).run(inv.id);
+                summary.autoCompleted++;
+                console.log(
+                    `   [AP-Reconcile] 🧾 non_po_consumable complete (no PO by design): ${inv.pdf_filename}`,
+                );
+                continue;
+            }
+
             // FedEx Billing Online packets: pay Bill.com only — never product-PO match.
             if (inv.vendor_routing_action === "carrier_bill") {
                 db.prepare(
@@ -1627,6 +1647,12 @@ export async function runLocalApForward(opts?: {
                 if (!routingRule && byFile) routingRule = byFile;
             }
             let skipReconciliation = false;
+            // The action actually recorded on the row. skipReconciliation alone
+            // is not enough to infer it — non-PO consumables also skip matching
+            // but must not be labelled "dropship" (they are vendor-direct
+            // purchases, not customer dropships, and the distinction matters when
+            // auditing either class later).
+            let forwardingAction: string | undefined;
 
             if (routingRule) {
                 if (routingRule.action === "skip" || routingRule.action === "amazon_order") {
@@ -1645,7 +1671,18 @@ export async function runLocalApForward(opts?: {
                 }
                 if (routingRule.action === "dropship") {
                     skipReconciliation = true;
+                    forwardingAction = "dropship";
                     console.log(`   [AP-Local] Dropship vendor: ${routingRule.label} — will skip PO matching`);
+                }
+                if (routingRule.action === "non_po_consumable") {
+                    // Forward to Bill.com and pay it, but never enter PO matching:
+                    // there is no Finale PO and there never will be, so matching
+                    // would park it in PO_UNMATCHED forever. Same mechanical
+                    // treatment as dropship (suppress the inferred PO link), but a
+                    // distinct recorded action so the two classes stay auditable.
+                    skipReconciliation = true;
+                    forwardingAction = "non_po_consumable";
+                    console.log(`   [AP-Local] Non-PO consumable: ${routingRule.label} — forward + pay, no PO matching`);
                 }
             }
 
@@ -1874,7 +1911,7 @@ export async function runLocalApForward(opts?: {
                         source: "local-forwarder",
                         gmail,
                         ocrRawText: paidCheck.rawText,
-                        vendorRoutingAction: skipReconciliation ? "dropship" : undefined,
+                        vendorRoutingAction: forwardingAction,
                         vendorName: aaaProNumber
                             ? "AAA Cooper Transportation"
                             : /ambriole|garyambriole|deeremother|down\s*to\s*earth/i.test(from)
