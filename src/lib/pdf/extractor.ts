@@ -1,16 +1,28 @@
 /**
  * @file    extractor.ts
  * @purpose Handles PDF text extraction — text-based via pdf-parse, scanned via OpenRouter Gemini
- * @updated 2026-04-13
+ * @updated 2026-11-11
  *
  * Strategy:
  *   1. pdf-parse (fast, free) — works for digital/text PDFs
  *   2. OpenRouter google/gemini-2.5-flash (vision, ~65s for 22-page PDF) — works with PDF base64
- *   3. Free OpenRouter fallback models if Gemini credits run out
+ *   3. Cheap OpenRouter vision models if Gemini credits run out
+ *   4. Local render + tesseract CLI (zero cost) — last resort when no LLM credits exist
+ *
+ * HERMIA(2026-11-11): Strategy 4 replaced the old tesseract.js branch, which was
+ * dead twice over — `import("tesseract.js").recognize` is undefined under the CJS
+ * default-export wrapper, AND tesseract cannot read a PDF buffer at all (it needs
+ * rasterized pixels). Now delegates to the same PyMuPDF+tesseract primitive the
+ * AP pre-send gate uses (scripts/invoice-ocr-gate.py), so scanned BOLs still
+ * yield tracking numbers when every LLM provider is out of credits.
  */
 
 // @ts-expect-error - No types available for pdf-parse
 import pdfParse from "pdf-parse";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 export interface PDFExtractionResult {
     rawText: string;
@@ -182,12 +194,16 @@ async function extractScannedPDF(
     }
 
     // Strategy 2: cheap fallback models on OpenRouter when Gemini fails
+    // HERMIA(2026-11-11): the previous list was three-for-three dead — an invalid
+    // id (gemini-2.5-flash-preview 404), a text-only model (deepseek-v4-flash has
+    // no image endpoints), and a deprecated one (qwen3-8b, retired Oct 2026).
+    // Every scan burned three guaranteed-fail round-trips before reaching local OCR.
     if (!extractedText) {
             console.log(`[extractor] Trying cheap fallback models...`);
             const freeModels = [
-                "google/gemini-2.5-flash-preview",  // free tier — try first
-                "deepseek/deepseek-v4-flash",        // KAIZEN(2026-06-04): reliable, $0.14/M
-                "qwen/qwen3-8b",                     // free, good at text
+                "deepseek/deepseek-v4.1-flash-1017", // ~$0.01/M in, image-capable
+                "qwen/qwen3.7-flash",                // ~$0.03/M in, image-capable
+                "z-ai/glm-5.3-flash",                // ~$0.04/M in, image-capable
             ];
             for (const model of freeModels) {
                 if (await callOpenRouter(model)) {
@@ -197,32 +213,21 @@ async function extractScannedPDF(
             }
         }
 
-        // Strategy 3: Local tesseract.js OCR as last resort before giving up
+        // Strategy 3: local render + tesseract CLI — zero LLM cost last resort
         if (!extractedText) {
-            console.log(`[extractor] Trying local tesseract.js OCR...`);
-            try {
-                const Tesseract = await import("tesseract.js");
-                const { data } = await Tesseract.recognize(buffer, "eng", {
-                    logger: (m: any) => {
-                        if (m.status === "recognizing text") {
-                            if (m.progress >= 0.5 && m.progress < 0.55) { console.log(`[extractor] tesseract: ${Math.round(m.progress * 100)}%`) };
-                        }
-                    },
-                });
-                if (data?.text && data.text.trim().length > 50) {
-                    extractedText = data.text;
-                    successStrategy = "tesseract.js";
-                    console.log(`[extractor] ✅ tesseract.js — ${extractedText.length} chars`);
-                } else {
-                    console.warn(`[extractor] tesseract.js returned insufficient text (${data?.text?.length || 0} chars)`);
-                }
-            } catch (tessErr: any) {
-                console.warn(`[extractor] tesseract.js failed: ${tessErr.message.slice(0, 80)}`);
+            console.log(`[extractor] Trying local render + tesseract OCR...`);
+            const localText = await localOcrFallback(buffer);
+            if (localText.trim().length > 50) {
+                extractedText = localText;
+                successStrategy = "local-ocr:tesseract";
+                console.log(`[extractor] ✅ local tesseract OCR — ${extractedText.length} chars`);
+            } else {
+                console.warn(`[extractor] local tesseract OCR returned insufficient text`);
             }
         }
 
         if (!extractedText) {
-        throw new Error(`[extractor] All OpenRouter strategies failed for PDF OCR`);
+        throw new Error(`[extractor] All OCR strategies failed (OpenRouter vision + local tesseract)`);
     }
 
     return {
@@ -234,6 +239,116 @@ async function extractScannedPDF(
         ocrStrategy: successStrategy,
         ocrDurationMs: Date.now() - startTime,
     };
+}
+
+/**
+ * Resolve the Python render+OCR helper script. Delegates to the same primitive
+ * the AP pre-send gate uses (scripts/invoice-ocr-gate.py) instead of duplicating
+ * PyMuPDF/tesseract logic here.
+ *
+ * Tries cwd first (correct for CLI runs and Next.js server routes, where cwd is
+ * the repo root) then falls back to a path walk from __dirname (compiled trees).
+ *
+ * @returns absolute script path, or null when the script is not on disk
+ */
+function localOcrScriptPath(): string | null {
+    const candidates = [
+        join(process.cwd(), "scripts", "invoice-ocr-gate.py"),
+        resolve(join(__dirname, "..", "..", "..", "scripts", "invoice-ocr-gate.py")),
+    ];
+    for (const candidate of candidates) {
+        if (existsSync(candidate)) return candidate;
+    }
+    return null;
+}
+
+/**
+ * Resolve a Python interpreter that has PyMuPDF. Bare `python` is unreliable
+ * (node subprocesses can inherit a runtime venv without pymupdf); on Windows
+ * prefer the `py -3` launcher. ARIA_PYTHON overrides everything.
+ */
+function localOcrPython(): { cmd: string; args: string[] } {
+    if (process.env.ARIA_PYTHON) return { cmd: process.env.ARIA_PYTHON, args: [] };
+    if (process.platform === "win32") return { cmd: "py", args: ["-3"] };
+    return { cmd: "python3", args: [] };
+}
+
+/** Hard cap on the local OCR subprocess (page-1 render at 300 DPI + tesseract). */
+const LOCAL_OCR_TIMEOUT_MS = 120_000;
+
+/**
+ * Zero-cost OCR fallback for scanned PDFs: render page 1 with PyMuPDF and OCR it
+ * with the tesseract CLI, via scripts/invoice-ocr-gate.py.
+ *
+ * Used only when every LLM vision strategy fails (no credits, provider outage).
+ * Never throws — returns "" so the caller can report a clean extraction failure.
+ *
+ * @param buffer  raw PDF bytes
+ * @returns OCR text (first ~2500 chars as emitted by the helper), or "" on failure
+ */
+async function localOcrFallback(buffer: Buffer): Promise<string> {
+    const scriptPath = localOcrScriptPath();
+    if (!scriptPath) {
+        console.warn(`[extractor] local OCR skipped — scripts/invoice-ocr-gate.py not found`);
+        return "";
+    }
+
+    let tmpDir: string;
+    try {
+        tmpDir = mkdtempSync(join(tmpdir(), "aria-extract-ocr-"));
+        writeFileSync(join(tmpDir, "doc.pdf"), buffer);
+    } catch (err: any) {
+        console.warn(`[extractor] local OCR temp write failed: ${String(err?.message).slice(0, 80)}`);
+        return "";
+    }
+
+    const py = localOcrPython();
+    const pdfPath = join(tmpDir, "doc.pdf");
+
+    return await new Promise<string>((resolveText) => {
+        let stdout = "";
+        let settled = false;
+        const finish = (text: string) => {
+            if (settled) return;
+            settled = true;
+            try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+            resolveText(text);
+        };
+
+        let child;
+        try {
+            child = spawn(py.cmd, [...py.args, scriptPath, pdfPath], { stdio: ["ignore", "pipe", "pipe"] });
+        } catch (err: any) {
+            console.warn(`[extractor] local OCR spawn failed: ${String(err?.message).slice(0, 80)}`);
+            finish("");
+            return;
+        }
+
+        const timer = setTimeout(() => {
+            console.warn(`[extractor] local OCR timed out after ${LOCAL_OCR_TIMEOUT_MS / 1000}s`);
+            try { child.kill(); } catch { /* ignore */ }
+            finish("");
+        }, LOCAL_OCR_TIMEOUT_MS);
+
+        child.stdout?.on("data", (d) => { stdout += d.toString(); });
+        child.stderr?.on("data", () => { /* helper logs noise on stderr; ignore */ });
+        child.on("error", (err: any) => {
+            clearTimeout(timer);
+            console.warn(`[extractor] local OCR process error: ${String(err?.message).slice(0, 80)}`);
+            finish("");
+        });
+        child.on("close", () => {
+            clearTimeout(timer);
+            try {
+                const parsed = JSON.parse(stdout.trim()) as { ok?: boolean; rawText?: string; error?: string };
+                if (parsed.ok && parsed.rawText) { finish(parsed.rawText); return; }
+                console.warn(`[extractor] local OCR helper reported: ${parsed.error || "no text"}`);
+            } catch {
+                console.warn(`[extractor] local OCR returned unparseable output`);
+            }
+            finish("");
+        });
+    });
 }
 
 /**
