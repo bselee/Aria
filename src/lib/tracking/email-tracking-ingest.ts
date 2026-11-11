@@ -1089,6 +1089,22 @@ function vendorNameTokens(vendorName: string | null | undefined): string[] {
 }
 
 /**
+ * True when `needle` appears in `haystack` as a whole word (or word sequence).
+ *
+ * Both sides are expected to be already normalized by `normalizeComparisonText`,
+ * so separators are plain spaces. Substring matching is deliberately NOT used:
+ * vendor tokens like "cen"/"tec" otherwise match inside "center"/"protected"
+ * and attribute unrelated carrier notifications to the newest PO of that vendor
+ * (PO 125487, 2026-11-11 — 28 parcels mislinked from UPS and FedEx footers).
+ */
+function hasWordSequence(haystack: string, needle: string): boolean {
+    const n = String(needle || "").trim();
+    if (!n) return false;
+    const escaped = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|\\s)${escaped}(?=$|\\s)`).test(haystack);
+}
+
+/**
  * Guard 10 helper: do two vendor-name strings refer to the same vendor?
  * Normalized token-overlap match — ignores case/punctuation and stop words so
  * "New Moon Development Co" matches "New Moon Development Company" but
@@ -1171,6 +1187,20 @@ const GENERIC_3PL_SENDER_DOMAINS = new Set([
     "endicia.com",
     "parcel2go.com",
     "sendcloud.com",
+    // Carrier notification / billing senders (2026-11-11). These are never a
+    // vendor's own order confirmation — they are the carrier or its reseller
+    // telling us a package moved. Text on them is boilerplate (footers, legal
+    // notices, support links), so vendor-token inference must never fire.
+    // Observed failure: "Cen-Tec Systems" was inferred from the word "cen" in
+    // "support center" (UPS) and "tec" in "protected" (FedEx Billing Online),
+    // which linked 28 unrelated parcels to PO 125487.
+    "ups.com",
+    "fedex.com",
+    "gofedex.com",
+    "usps.com",
+    "dhl.com",
+    "netparcel.com",
+    "tnt.com",
 ]);
 
 function extractNumericHints(text: string): string[] {
@@ -1294,18 +1324,27 @@ export function inferPONumberFromRecentPOs(
     }
 
     // Step 2: Vendor-name token overlap scoring
+    // Tokens must appear as whole words. Substring matching is unsafe on email
+    // bodies: "cen" (Cen-Tec) lives inside "center" and "tec" inside
+    // "protected", so every carrier footer scored a match and the newest PO of
+    // that vendor won by default (PO 125487, 2026-11-11). Tokens shorter than 4
+    // characters are dropped entirely — three letters are not distinctive enough
+    // to attribute a parcel to.
     const scored = candidates
         .map((po) => {
-            const tokens = vendorNameTokens(po.vendor_name);
+            const tokens = vendorNameTokens(po.vendor_name).filter((t) => t.length >= 4);
             if (!tokens.length) return { po, score: 0 };
 
             const fullVendor = normalizeComparisonText(po.vendor_name);
-            const fullMatch = fullVendor.length >= 5 && normalizedCombined.includes(fullVendor);
-            const tokenMatches = tokens.filter((token) => normalizedCombined.includes(token)).length;
+            const fullMatch = fullVendor.length >= 5 && hasWordSequence(normalizedCombined, fullVendor);
+            const tokenMatches = tokens.filter((token) => hasWordSequence(normalizedCombined, token)).length;
             return { po, score: (fullMatch ? 10 : 0) + tokenMatches };
         })
-        .filter((entry) => entry.score > 0)
+        // A lone generic token ("systems", "supply") is noise. Require two
+        // distinct vendor words, or the full vendor name (already 10).
+        .filter((entry) => entry.score >= 2)
         .sort((a, b) => b.score - a.score);
+
 
     if (!scored.length) return null;
 
