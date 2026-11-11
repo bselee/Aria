@@ -325,3 +325,87 @@ describe("vendor sales-order refs must never become a PO", () => {
         }
     });
 });
+
+describe("Evergreen glued OCR: freight, not the insulation line", () => {
+    // Real pdf-parse text from invoices 151475 and 151435 (both 2026-11-11).
+    // The Insulation line prints AFTER the shipping line on both, which is the
+    // exact shape that once made a "last money amount" rule return 7.00 instead
+    // of the real freight. These two invoices are the standing regression.
+    const EV_151475 = [
+        "Evergreen Growers Supply, LLC.",
+        "Invoice # 151475",
+        "Date 11/11/2026",
+        "P.O. NO.",
+        "23593207",
+        "Terms Net 30",
+        "Due Date",
+        "12/11/2026",
+        "Shipping-FedExS/H - FedEx Tracking #1ea60.4660.46",
+        "InsulationInsulation for hot or cold weather1ea7.007.00",
+        "Total",
+        "$113.96",
+    ].join("\n");
+
+    const EV_151435 = [
+        "Evergreen Growers Supply, LLC.",
+        "Invoice # 151435",
+        "Date 11/11/2026",
+        "P.O. NO.",
+        "23591857",
+        "Shipping-FedExS/H - FedEx Tracking #1ea61.3461.34",
+        "InsulationInsulation for hot or cold weather1ea7.007.00",
+        "Shipment Date: 11/11/2026 Tracking # 520484911295",
+        "Total",
+        "$99.84",
+    ].join("\n");
+
+    it("reads 60.46 freight on 151475, not the 7.00 insulation", () => {
+        const f = extractInvoiceFieldsFromOcrText(EV_151475);
+        expect(f.freight).toBe(60.46);
+        expect(f.freight).not.toBe(7);
+        expect(f.total).toBe(113.96);
+        expect(f.poNumber).toBe("23593207");
+    });
+
+    it("reads 61.34 freight on 151435, not the 7.00 insulation", () => {
+        const f = extractInvoiceFieldsFromOcrText(EV_151435);
+        expect(f.freight).toBe(61.34);
+        expect(f.freight).not.toBe(7);
+        expect(f.total).toBe(99.84);
+        expect(f.poNumber).toBe("23591857");
+    });
+
+    it("derives a subtotal that reconciles with freight on both", () => {
+        const a = normalizeInvoiceForDb(null, EV_151475, {});
+        expect(a.subtotal + a.freight + a.tax).toBeCloseTo(a.total, 2);
+        const b = normalizeInvoiceForDb(null, EV_151435, {});
+        expect(b.subtotal + b.freight + b.tax).toBeCloseTo(b.total, 2);
+    });
+});
+
+describe("subtotal must reconcile with freight and tax", () => {
+    const OCR = ["Invoice # 151475", "P.O. NO.", "23593207", "Shipping-FedExS/H - FedEx Tracking #1ea60.4660.46", "Insulation1ea7.007.00", "Total", "$113.96"].join("\n");
+
+    it("re-derives a subtotal that contradicts total - freight - tax", () => {
+        // The 151475 defect: LLM returned subtotal == total, freight on top.
+        const n = normalizeInvoiceForDb({ subtotal: 113.96, freight: 60.46, tax: 0, total: 113.96 } as any, OCR, {});
+        expect(n.subtotal).toBe(53.5);
+        expect(n.subtotal + n.freight + n.tax).toBeCloseTo(n.total, 2);
+    });
+
+    it("keeps a subtotal that already reconciles", () => {
+        const n = normalizeInvoiceForDb({ subtotal: 38.5, freight: 61.34, tax: 0, total: 99.84 } as any, OCR, {});
+        expect(n.subtotal).toBe(38.5);
+    });
+
+    it("never leaves an inconsistent row behind", () => {
+        for (const parsed of [
+            { subtotal: 113.96, freight: 60.46, tax: 0, total: 113.96 },
+            { subtotal: 31.5, freight: 61.34, tax: 0, total: 99.84 },
+            { subtotal: 0, freight: 12.68, tax: 0, total: 52.68 },
+        ]) {
+            const n = normalizeInvoiceForDb(parsed as any, OCR, {});
+            expect(n.subtotal + n.freight + n.tax).toBeCloseTo(n.total, 2);
+        }
+    });
+});

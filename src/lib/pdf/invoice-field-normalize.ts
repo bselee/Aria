@@ -305,10 +305,36 @@ export function normalizeInvoiceForDb(
     if (!freight && fb.freight != null) freight = fb.freight;
     const tax = Number(parsed?.tax) || 0;
     let subtotal = Number(parsed?.subtotal) || 0;
-    // Derive subtotal only when the pieces are present and it reconciles —
-    // never to make a number look tidy.
-    if (!subtotal && total > 0 && freight > 0 && total - freight - tax > 0) {
-        subtotal = Math.round((total - freight - tax) * 100) / 100;
+
+    // Subtotal is DEFINED as everything that is not freight or tax:
+    //     subtotal + freight + tax == total
+    // When the LLM's subtotal contradicts that identity the row is written
+    // inconsistent, and an inconsistent row is worse than a derived one: it
+    // silently corrupts variance/freight review. Two real Evergreen invoices
+    // (151475, 151435 — 2026-11-11) landed that way: 151475 carried
+    // subtotal == total with freight 60.46 on top (freight double-counted),
+    // 151435 dropped the 7.00 insulation out of subtotal entirely.
+    //
+    // So: keep the parsed subtotal when it reconciles; otherwise re-derive it
+    // from the printed total less freight and tax, which by definition
+    // reconciles. The disagreement is surfaced rather than swallowed, so a
+    // misread freight figure still shows up in the log instead of being hidden
+    // inside a subtotal that happens to add up.
+    const reconciles = (s: number) => Math.abs(s + freight + tax - total) < 0.005;
+    if (total > 0) {
+        if (!subtotal && total - freight - tax > 0) {
+            subtotal = Math.round((total - freight - tax) * 100) / 100;
+        } else if (subtotal > 0 && !reconciles(subtotal)) {
+            const derived = Math.round((total - freight - tax) * 100) / 100;
+            if (derived > 0) {
+                console.warn(
+                    `[invoice-field-normalize] subtotal does not reconcile ` +
+                    `(subtotal=${subtotal} + freight=${freight} + tax=${tax} != total=${total}); ` +
+                    `using derived subtotal ${derived} — check the freight/tax reading.`,
+                );
+                subtotal = derived;
+            }
+        }
     }
     const lineItems = Array.isArray(parsed?.lineItems)
         ? parsed!.lineItems!.map((li: any) => ({
