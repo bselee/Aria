@@ -52,6 +52,23 @@ shell.Environment("Process")("HERMES_HOME") = envHome
 ' Clear profile override if present in process env
 shell.Environment("Process")("HERMES_PROFILE") = ""
 
+' --- Managed Node 24 PATH (survives hermes update; beats system Node 25) --
+' System OpenJS.NodeJS is v25.2.1 (odd, non-LTS). engine-strict + nanoid@6
+' rejects it (^22 || ^24 || >=26). Hermes-managed portable Node lives at
+' %LOCALAPPDATA%\hermes\node (outside hermes-agent, so updates never wipe it).
+' find_node_executable / with_hermes_node_path also prefer this tree; PATH
+' prepend is belt-and-suspenders for any bare `npm` spawn during rebuild.
+Dim managedNode
+managedNode = envHome & "\node"
+If fso.FolderExists(managedNode) Then
+  If fso.FileExists(managedNode & "\node.exe") Then
+    shell.Environment("Process")("PATH") = managedNode & ";" & shell.Environment("Process")("PATH")
+    ' Keep heal on 24 LTS if Hermes re-provisions the managed tree later
+    shell.Environment("Process")("HERMES_NODE_TARGET_MAJOR") = "24"
+  End If
+End If
+' --- End managed Node PATH -----------------------------------------------
+
 ' --- Single-instance lock -------------------------------------------------
 ' The logon task and a desktop double-click can fire within the same second.
 ' Whoever creates the lock wins; the loser exits. Stale locks (>120s) are
@@ -157,6 +174,38 @@ On Error GoTo 0
 If alreadyUp Then
   WScript.Quit 0
 End If
+
+' --- Ensure the gateway is actually alive before Desktop boots ------------
+' 2026-11-12 (Hermia): Desktop boot FAILS outright when the gateway is unreachable
+' ("Desktop boot failed: Gateway inaccessible"), and the gateway can be *wedged* -
+' process alive, port open, event loop dead (01:01 incident: 2h of downtime). A TCP
+' probe cannot see that, so healing is delegated to scripts\hermes_gateway_ctl.py,
+' which probes HTTP:8642/health with a deadline, kills ONLY the recorded PID, waits for
+' the port to clear, relaunches hidden, and waits for /health. It no-ops in ~50ms when
+' the gateway is healthy, so this costs nothing on a normal launch.
+Dim ctl, pyw
+ctl = envHome & "\scripts\hermes_gateway_ctl.py"
+pyw = envHome & "\tools"
+Dim toolsFolder, bestPy, bestName
+bestPy = ""
+bestName = ""
+On Error Resume Next
+If fso.FolderExists(pyw) Then
+  For Each toolsFolder In fso.GetFolder(pyw).SubFolders
+    If fso.FileExists(toolsFolder.Path & "\pythonw.exe") Then
+      If toolsFolder.Name > bestName Then
+        bestName = toolsFolder.Name
+        bestPy = toolsFolder.Path & "\pythonw.exe"
+      End If
+    End If
+  Next
+End If
+Err.Clear
+On Error GoTo 0
+If fso.FileExists(ctl) And Len(bestPy) > 0 Then
+  shell.Run Chr(34) & bestPy & Chr(34) & " " & Chr(34) & ctl & Chr(34) & " ensure --wait 120", 0, True
+End If
+' --- End gateway ensure ---------------------------------------------------
 
 ' Optional: keep Aria services alive (silent)
 If fso.FileExists(ariaDir & "\aria-launcher.py") Then

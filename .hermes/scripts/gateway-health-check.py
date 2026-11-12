@@ -1,139 +1,57 @@
 #!/usr/bin/env python3
 """
-Gateway health watchdog — checks port 8642, auto-recovers aiohttp corruption.
-Runs every 5 minutes via cron. Silent when healthy, reports only on recovery.
+@file    gateway-health-check.py
+@purpose DETECT only. Reports whether the default gateway's event loop is answering.
+         Healing is deliberately NOT done here: this script runs as a Hermes cron job, so
+         it executes inside the very gateway it would be restarting, and it cannot run at
+         all when that loop is wedged. Restarts belong to the external
+         Hermes_Gateway_Keepalive task -> scripts/hermes_gateway_ctl.py ensure.
+@author  Hermia
+@created 2026-11-12 (rewritten; see archive backups/gateway-cleanup-20261112.tar.gz)
+@deps    scripts/hermes_gateway_ctl.py (same directory), stdlib only
+@env     HERMES_HOME, HERMES_GATEWAY_PORT
+
+2026-11-12 rewrite (Hermia) - what the old version did wrong:
+  * It treated "TCP 127.0.0.1:8642 accepts a connect" as healthy. A wedged event loop keeps
+    the listen socket open, so it reported a dead gateway as fine for hours (01:01 incident).
+  * Worse, on a *failed* port check it deleted gateway.lock + gateway.pid for both the
+    default and hermia profiles. Those files are the control identity the Desktop reads,
+    so unlinking them under a live gateway is how the Desktop started reporting
+    "Gateway inaccessible (invalid_control_peer)".
+  * It force-reinstalled aiohttp inline on a probe miss, which could spend minutes of the
+    shared venv during an unrelated outage.
+Exit codes: 0 healthy, 1 unhealthy (cron surfaces it), 2 probe unavailable.
 """
-import subprocess
+
+from __future__ import annotations
+
 import sys
-import time
-import os
+from pathlib import Path
 
-HERMES_VENV = os.path.expandvars(
-    r"%USERPROFILE%\AppData\Local\hermes\hermes-agent\venv\Scripts"
-)
-GATEWAY_PORT = 8642
-HERMES_AGENT_DIR = os.path.expandvars(
-    r"%USERPROFILE%\AppData\Local\hermes\hermes-agent"
-)
-HERMES_EXE = os.path.join(HERMES_VENV, "hermes.exe")
-PYTHON_EXE = os.path.join(HERMES_VENV, "python.exe")
-UV_EXE = os.path.expandvars(r"%USERPROFILE%\AppData\Local\hermes\bin\uv.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hermes_gateway_ctl import PORT, probe  # noqa: E402  (same-directory sibling)
 
 
-def check_port(port):
-    """Check if something is listening on the given port."""
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(2)
+def main() -> int:
     try:
-        s.connect(("127.0.0.1", port))
-        s.close()
-        return True
-    except Exception:
-        return False
+        status = probe()
+    except Exception as exc:  # noqa: BLE001 - a probe crash must not look like an outage
+        print(f"PROBE ERROR: {type(exc).__name__}: {exc}")
+        return 2
 
-
-def _hide_kwargs():
-    """Windows CREATE_NO_WINDOW so cron ticks never flash a console."""
-    if sys.platform == "win32":
-        return {"creationflags": 0x08000000}
-    return {}
-
-
-def check_aiohttp():
-    """Returns True if aiohttp imports cleanly."""
-    try:
-        result = subprocess.run(
-            [PYTHON_EXE, "-c", "import aiohttp; print(aiohttp.__version__)"],
-            capture_output=True, text=True, timeout=10,
-            **_hide_kwargs(),
-        )
-        return result.returncode == 0 and "3." in result.stdout
-    except Exception:
-        return False
-
-
-def fix_aiohttp():
-    """Force-reinstall aiohttp in the venv."""
-    result = subprocess.run(
-        [UV_EXE, "pip", "install", "--python", PYTHON_EXE,
-         "--force-reinstall", "aiohttp==3.13.4"],
-        capture_output=True, text=True, timeout=120,
-        cwd=HERMES_AGENT_DIR,
-        **_hide_kwargs(),
+    print(
+        f"port={PORT} verdict={status['verdict']} pid={status.get('pid') or '-'} "
+        f"http={status.get('http') or '-'} detail={status.get('detail')}"
     )
-    return result.returncode == 0
-
-
-def kill_stale_gateways():
-    """Clean lock files for default + hermia profiles (never force-kill live PIDs)."""
-    base = os.path.expandvars(r"%USERPROFILE%\AppData\Local\hermes")
-    for rel in (
-        r"gateway.lock",
-        r"gateway.pid",
-        r"profiles\hermia\gateway.lock",
-        r"profiles\hermia\gateway.pid",
-    ):
-        f = os.path.join(base, rel)
-        if os.path.exists(f):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-
-
-def start_gateway():
-    """Start default gateway hidden via proven silent VBS (no console)."""
-    vbs = os.path.expandvars(
-        r"%USERPROFILE%\AppData\Local\hermes\gateway-service\silent-gateway-default.vbs"
+    if status.verdict == "healthy":
+        return 0
+    print(
+        "UNHEALTHY: the external keepalive task (Hermes_Gateway_Keepalive -> "
+        "hermes_gateway_ctl.py ensure) heals this within 10 minutes."
     )
-    kwargs = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "stdin": subprocess.DEVNULL,
-    }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-    subprocess.Popen(
-        ["wscript.exe", "//nologo", vbs],
-        **kwargs,
-    )
-    for _ in range(40):
-        time.sleep(0.5)
-        if check_port(GATEWAY_PORT):
-            return True
-    return False
-
-
-def main():
-    if check_port(GATEWAY_PORT):
-        # Gateway is up — silent exit
-        print("OK: gateway healthy")
-        return
-
-    # Gateway is DOWN
-    aiohttp_ok = check_aiohttp()
-    
-    if not aiohttp_ok:
-        print("ACTION: aiohttp corrupted — reinstalling...")
-        if fix_aiohttp():
-            print("ACTION: aiohttp reinstalled successfully")
-        else:
-            print("FATAL: aiohttp reinstall failed")
-            sys.exit(1)
-    
-    # Kill stale processes and clean locks
-    kill_stale_gateways()
-    time.sleep(1)
-    
-    # Start gateway
-    print("ACTION: starting gateway...")
-    if start_gateway():
-        print("RECOVERED: gateway auto-restarted successfully")
-    else:
-        print("FATAL: gateway failed to start after recovery")
-        sys.exit(1)
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
