@@ -409,3 +409,49 @@ describe("subtotal must reconcile with freight and tax", () => {
         }
     });
 });
+
+describe("pure freight bills: subtotal 0 is CORRECT, not a failure", () => {
+    // AAA Cooper PRO 64058950 (statement ACT_STMD_ID_2973) is our own outbound
+    // move. The rate block prints:
+    //   gross line charge 2,487.21, + notify 23.50, - discount 93.60% 2,328.03,
+    //   + fuel surcharge 88.34  =>  AMOUNT DUE 271.02
+    // The extractor saw the GROSS rate (2,487.21) and a ledger row was written
+    // as subtotal 2487.21 + freight 271.02 vs total 271.02. The gross is NOT a
+    // subtotal: the entire payable is freight, so subtotal must derive to 0.
+    // A `derived > 0` guard skipped this case and left the row inconsistent.
+    const OCR = [
+        "AAA COOPER TRANSPORTATION",
+        "P.O.NUMBER B.L.NUMBER ADV",
+        "ORDER 4813 18924041 $.00",
+        "1 1PK BUILD A SOUL PRODUCTS 60 2812 88.45 $2,487.21",
+        "NOTIFY CHARGE $23.50",
+        "DISCOUNT 93.60% - $2,328.03",
+        "FUEL SURCHARGE @ 55.50% $88.34",
+        "1 Pcs TTL ( 1 ON 1 PLT) *Prepaid*: 2812 $271.02 PPD",
+        "AMOUNT DUE 11/26/26 64058950 $271.02",
+    ].join("\n");
+
+    it("derives subtotal 0 when the whole payable is freight", () => {
+        const n = normalizeInvoiceForDb(
+            { subtotal: 2487.21, freight: 271.02, tax: 0, total: 271.02 } as any,
+            OCR, {},
+        );
+        expect(n.subtotal).toBe(0);
+        expect(n.freight).toBe(271.02);
+        expect(n.subtotal + n.freight + n.tax).toBeCloseTo(n.total, 2);
+    });
+
+    it("still refuses to derive a negative subtotal", () => {
+        // freight > total is a misread, not a zero-subtotal bill: leave for review.
+        const n = normalizeInvoiceForDb(
+            { subtotal: 500, freight: 600, tax: 0, total: 100 } as any,
+            OCR, {},
+        );
+        expect(n.subtotal).toBe(500);
+    });
+
+    it("does not turn a carrier statement's references into a PO", () => {
+        expect(extractInvoiceFieldsFromOcrText(OCR).poNumber).toBeNull();
+        expect(extractInvoiceFieldsFromOcrText(OCR).poNumbers).toEqual([]);
+    });
+});

@@ -322,11 +322,18 @@ export function normalizeInvoiceForDb(
     // inside a subtotal that happens to add up.
     const reconciles = (s: number) => Math.abs(s + freight + tax - total) < 0.005;
     if (total > 0) {
-        if (!subtotal && total - freight - tax > 0) {
+        if (!subtotal && total - freight - tax >= 0) {
             subtotal = Math.round((total - freight - tax) * 100) / 100;
         } else if (subtotal > 0 && !reconciles(subtotal)) {
             const derived = Math.round((total - freight - tax) * 100) / 100;
-            if (derived > 0) {
+            // `>= 0`, not `> 0`. A freight bill's entire payable IS freight, so
+            // subtotal 0 is the CORRECT answer and must not be skipped. Real case:
+            // AAA Cooper PRO 64058950 — subtotal 2487.21 (the pre-discount gross
+            // rate) + freight 271.02 vs total 271.02. The gross was not a
+            // subtotal at all, and a `> 0` guard left that row inconsistent.
+            // A negative derivation still means freight > total, i.e. a misread,
+            // so it is left alone for review.
+            if (derived >= 0) {
                 console.warn(
                     `[invoice-field-normalize] subtotal does not reconcile ` +
                     `(subtotal=${subtotal} + freight=${freight} + tax=${tax} != total=${total}); ` +
