@@ -1,9 +1,15 @@
 # Hermes Desktop launcher + reaper (startup hardening)
 
 **Live install paths (what actually runs):**
-- `%USERPROFILE%\Desktop\Hermes-Desktop.vbs` — canonical launcher (double-click, Startup task, Start Menu redirects)
+- `%USERPROFILE%\Desktop\Hermes-Desktop.vbs` — canonical launcher (double-click, Start Menu redirects). **Manual start only** since 2026-11-12: it first runs `hermes_gateway_ctl.py ensure`, so the UI cannot open onto a dead or wedged gateway and hang on "Connecting…".
 - `%LOCALAPPDATA%\hermes\scripts\hermes-pf-desktop-reaper.py` — 10-minute backstop cron that reaps the stale Program Files build
 - `%LOCALAPPDATA%\hermes\scripts\repoint-hermes-shortcuts.ps1` — repoints both Start Menu tiles at the VBS (one-time; ProgramData tile needs admin)
+
+**Not started at logon any more (2026-11-12):** the `Startup\hermes-desktop-launch.vbs` entry
+(moved to `%LOCALAPPDATA%\hermes\backups\startup\`) and the `Hermes_Gateway` scheduled task
+(deleted, needed one UAC approval). Logon starts nothing; the only automatic actor left is
+`Hermes_Gateway_Keepalive`, which heals the *gateway* (the cron host) every 10 minutes. See
+`README-gateway-lifecycle.md`.
 
 **After editing the repo copy, install:**
 ```bat
@@ -58,7 +64,7 @@ Note: the `sessions` table has no `updated_at` / `created_at` column — order b
 
 ## One launcher rule
 
-`Desktop\Hermes-Desktop.vbs` is canonical. `Desktop\Hermes-Desktop.bat`, `Startup\hermes-desktop-launch.vbs`, and the Start Menu `Hermes.lnk` are THIN REDIRECTS to it. The Startup copy had drifted into a stale FULL COPY running different logic from double-click — that is how a second racing instance got introduced. Never paste launch logic back into a redirect.
+`Desktop\Hermes-Desktop.vbs` is canonical. `Desktop\Hermes-Desktop.bat` and the Start Menu `Hermes.lnk` are THIN REDIRECTS to it. (The `Startup\hermes-desktop-launch.vbs` copy was retired on 2026-11-12 — logon no longer launches anything, see `README-gateway-lifecycle.md`.) That Startup copy had drifted into a stale FULL COPY running different logic from double-click — that is how a second racing instance got introduced. Never paste launch logic back into a redirect.
 
 ## Resolved 2026-08-10: the stale build is GONE
 
