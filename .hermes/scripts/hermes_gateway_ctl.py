@@ -10,8 +10,9 @@
 @created 2026-11-12
 @deps    Python 3.11+ stdlib only (urllib, socket, subprocess, ctypes). No Hermes imports,
          so it keeps working while the hermes-agent venv is mid-repair or mid-update.
-@env     HERMES_HOME          default %LOCALAPPDATA%\\hermes
-         HERMES_GATEWAY_PORT  default 8642
+@env     HERMES_HOME           default %LOCALAPPDATA%\\hermes
+         HERMES_GATEWAY_PORT   default 8642
+         HERMES_GATEWAY_STATE   override the state file (tests only)
 
 WHY THIS EXISTS (incident 2026-11-12):
   The overnight failure was NOT a dead gateway process - it was a *wedged* one:
@@ -66,7 +67,9 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path(os.environ["LOCALAPPDA
 PORT = int(os.environ.get("HERMES_GATEWAY_PORT") or 8642)
 HOST = "127.0.0.1"
 
-STATE_FILE = HERMES_HOME / "gateway_state.json"
+# HERMES_GATEWAY_STATE exists so stop()/restart() can be exercised against a throwaway
+# process in a test. Production always reads the real state file.
+STATE_FILE = Path(os.environ.get("HERMES_GATEWAY_STATE") or (HERMES_HOME / "gateway_state.json"))
 PID_FILE = HERMES_HOME / "gateway.pid"
 LOCK_FILE = HERMES_HOME / "gateway.lock"
 LAUNCHER = HERMES_HOME / "gateway-service" / "start-gateway.vbs"
