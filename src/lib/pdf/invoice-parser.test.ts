@@ -186,3 +186,47 @@ describe("parseInvoice", () => {
         expect(invoice.lineItems[0].description).toContain("GroAloe");
     });
 });
+
+describe("header-row layout where the value cell repeats the PO label", () => {
+    // Stock Bag Depot (Soestern Packaging) invoice 112690 — PO 125492 printed
+    // in a header cell, and pdf-parse glues the neighbouring columns onto the
+    // value with no space:
+    //   "Customer PO No.Payment TermsShip ViaShipping TermsOrder No."
+    //   "PO 125492PBS-CARDFEDEX-GNDCIP113742"
+    // The extractor returned null here and the link was made by hand.
+    const REAL_GLUED = [
+        "Customer PO No.Payment TermsShip ViaShipping TermsOrder No.",
+        "PO 125492PBS-CARDFEDEX-GNDCIP113742",
+    ].join("\n");
+
+    it("extracts the printed PO from the glued header/value layout", () => {
+        expect(extractPOByRegex(REAL_GLUED)).toBe("125492");
+    });
+
+    it("refuses the vendor's Order No. in the last column", () => {
+        // 113742 is Stock Bag Depot's own order number, printed to the right of
+        // the PO. Grabbing it would match a PO that has nothing to do with this
+        // invoice — the exact failure that once turned a carrier statement's
+        // customer order into a PO.
+        const got = extractPOByRegex(REAL_GLUED);
+        expect(got).not.toBe("113742");
+        expect(got).toBe("125492");
+    });
+
+    it("still refuses the P.O. Box address trap", () => {
+        for (const s of ["PO Box 4808", "P.O. Box 4808", "PO Box 4808 Montrose CO 81401"]) {
+            expect(extractPOByRegex(s)).toBeNull();
+        }
+    });
+
+    it("keeps extracting when the value cell is bare digits (no regression)", () => {
+        expect(extractPOByRegex("P.O. NUMBER   INVOICE DATE   TERMS\n125213   10/15/26   NET 30")).toBe("125213");
+    });
+
+    it("a trailing-word-boundary pattern would NOT have worked — keep the anchor", () => {
+        // Documents why the fix is anchored rather than \bPO\s+(\d{4,})\b:
+        // the glued `125492PBS` has no word boundary after the digits.
+        expect("PO 125492PBS-CARDFEDEX-GNDCIP113742".match(/\bPO\s+(\d{4,})\b/)).toBeNull();
+        expect("PO 125492PBS-CARDFEDEX-GNDCIP113742".match(/^(?:PO\s+)?(\d{4,})/i)?.[1]).toBe("125492");
+    });
+});

@@ -379,7 +379,19 @@ export function extractPOByRegex(rawText: string, tables?: string[][]): string |
             if (isShipmentContextLine(headerLine) || isShipmentContextLine(nextLine)) {
                 // freight header (e.g. "SHIP DATE") — not a PO layout
             } else {
-                const firstToken = nextLine.trim().match(/^(\d{4,})/);
+                // The value cell usually starts with the bare digits. Some
+                // vendors repeat the label in the value cell instead, and
+                // pdf-parse glues neighbouring columns onto it with NO space:
+                //   header "Customer PO No.Payment TermsShip Via...Order No."
+                //   value  "PO 125492PBS-CARDFEDEX-GNDCIP113742"
+                // So allow one optional leading "PO" token. Note the trailing
+                // columns make the digits non-final (`125492PBS`), which is why
+                // a \bPO\s+(\d{4,})\b pattern cannot match this layout at all —
+                // verified against the real page text, it returns null even
+                // though the PO is plainly printed. Anchor to the start of the
+                // value cell instead, so the vendor's Order No. (113742, the
+                // last column) can never be reached.
+                const firstToken = nextLine.trim().match(/^(?:PO\s+)?(\d{4,})/i);
                 if (firstToken?.[1]) return firstToken[1];
             }
         }
